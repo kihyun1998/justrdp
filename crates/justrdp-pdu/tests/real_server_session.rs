@@ -117,9 +117,9 @@ fn a_real_servers_logon_notifications_decode_in_order() {
 /// a real server puts in them — because in both cases the spec says something else.
 ///
 /// `Size`: 2.2.10.1.1.2 defines it as the structure excluding `Domain` and `UserName`, which is
-/// **576**. This WS2022 sends **18**, the same as the Windows Server 2019 behaviour FreeRDP
-/// records. IronRDP accepts only 18 and would reject a spec-conformant server; justrdp accepts
-/// both and reads neither.
+/// **576**. This server, a Windows Server 2019, sends **18**: the behaviour FreeRDP records for
+/// that same version, confirmed rather than extended to another. IronRDP accepts only 18 and
+/// would reject a spec-conformant server; justrdp accepts both and reads neither.
 ///
 /// `Length`: 2.2.10.1.1.4 calls it *"the total size in bytes of this structure, including the
 /// variable LogonFields field"* — and this structure ends with a 570-byte pad. This server sends

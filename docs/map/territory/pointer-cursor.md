@@ -40,7 +40,7 @@ pixels in the frame — but nothing records that as a decision.
 No verified external-fact store; `differential_pointer_ironrdp` compares
 behaviour as a test rather than recording it as a citable fact.
 
-**Measured against the WS2022 test VM (#310, 2026-09-22), over fast-path:**
+**Measured against the WS2019 test VM (#310, 2026-09-22), over fast-path:**
 
 | What is under the pointer | What the server sends |
 |---|---|

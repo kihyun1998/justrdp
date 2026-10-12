@@ -80,13 +80,13 @@ channel and the server's fallback to it. #388 adds A-law, #389 MS-ADPCM and IMA-
 - **ADPCM decodes block by block**, each block's per-channel header restarting the predictor,
   so a Wave carries whole blocks and nothing passes between them (#389). Three choices
   diverge from FreeRDP, the oracle, and are **derivations**:
-  - **An IMA block's header sample is its first sample.** WS2022 declares `wSamplesPerBlock`
+  - **An IMA block's header sample is its first sample.** WS2019 declares `wSamplesPerBlock`
     1017 at `nBlockAlign` 1024 stereo and 2041 at 1024 mono, one more per channel than the
     nibbles hold; FreeRDP's `freerdp_dsp_decode_ima_adpcm` emits only the nibbles, so it loses
     one sample per channel per block. CPython's `audioop.adpcm2lin` agrees with this decoder.
     FreeRDP's drop is on the FreeRDP defect ledger, #398.
   - **MS-ADPCM takes its coefficients from the format's extra**, which carries them;
-    FreeRDP uses the seven standard pairs whatever the server sent. WS2022 sends those seven,
+    FreeRDP uses the seven standard pairs whatever the server sent. WS2019 sends those seven,
     so the two agree on every block measured.
   - **The MS-ADPCM step is capped at `i32::MAX / 768`**, ffmpeg's bound, and the prediction is
     computed in `i64`. FreeRDP's `INT32` arithmetic overflows, which C leaves undefined, once a
@@ -111,7 +111,7 @@ channel and the server's fallback to it. #388 adds A-law, #389 MS-ADPCM and IMA-
 - `justrdp-codecs/src/adpcm.rs` — `MsAdpcm`, `ImaAdpcm`, `AdpcmError`; its encoders are
   [Audio input](audio-input.md)'s
 - `justrdp-codecs/tests/adpcm_oracle.rs` and `justrdp-codecs/tests/fixtures/adpcm/` — the FreeRDP oracle on
-  generated blocks and on WS2022's own (the directory's README says how they were made)
+  generated blocks and on WS2019's own (the directory's README says how they were made)
 - `justrdp/src/rdpsnd.rs` — `AudioOutput`, `AudioOutputConfig`, `AudioOutputConfigError`,
   `AudioOutputEvent`, `AudioBlock`, `WaveConfirm`, `QualityMode`, `CLIENT_VERSION`,
   `DECODABLE_FORMAT_TAGS`
@@ -123,7 +123,7 @@ channel and the server's fallback to it. #388 adds A-law, #389 MS-ADPCM and IMA-
 
 ## Reference behaviour
 
-**Measured against the WS2022 test VM (#389, 2026-10-07):**
+**Measured against the WS2019 test VM (#389, 2026-10-07):**
 
 - **A host listing only MS-ADPCM, or only IMA-ADPCM, gets it.** Of the eight formats of each
   that it took, in the server's order with 44.1 kHz stereo first, the server sent **44.1 kHz
@@ -136,7 +136,7 @@ channel and the server's fallback to it. #388 adds A-law, #389 MS-ADPCM and IMA-
   seven standard coefficient pairs; IMA declares 2041. The captured MS blocks use predictors 0
   and 6, so the real-server corpus exercises a non-trivial coefficient pair.
 
-**Measured against the WS2022 test VM (#388, 2026-10-07):**
+**Measured against the WS2019 test VM (#388, 2026-10-07):**
 
 - **A host that lists only A-law gets A-law**: the server picked its one A-law format, 22,050 Hz
   stereo 8-bit, and sent the same sound as 30 Wave2 blocks, 245,760 samples. That is half the
@@ -147,7 +147,7 @@ channel and the server's fallback to it. #388 adds A-law, #389 MS-ADPCM and IMA-
   into small values and the comparison runs backwards. Measured: PCM 158.8 against 17,612.7, A-law 305.0 against 16,089.8.
   An A-law decoder that skips the even-bit inversion read 5,398.5 against 9,429.4 and failed it.
 
-**Measured against the WS2022 test VM (#387, 2026-10-07):**
+**Measured against the WS2019 test VM (#387, 2026-10-07):**
 
 - **The server falls back to `rdpsnd` when `AUDIO_PLAYBACK_DVC` is refused.** With `rdpsnd`,
   `rdpdr` and `drdynvc` requested and no audio channel registered, the server asked for
@@ -156,7 +156,7 @@ channel and the server's fallback to it. #388 adds A-law, #389 MS-ADPCM and IMA-
   samples, little-endian as on the dynamic channel
   (`a_sound_falls_back_to_the_static_channel_when_the_dynamic_one_is_refused_on_the_real_vm`,
   which asserts the refusal record). `[MS-RDPEA]` product note 11 says this of Windows 8 /
-  Server 2012; WS2022 does it too.
+  Server 2012; WS2019 does it too.
 - **Without `drdynvc` at all, audio comes on `rdpsnd` the same way**, the same 30 blocks
   (`a_sound_reaches_the_host_over_the_static_channel_without_drdynvc_on_the_real_vm`).
 - **`rdpsnd` requested with `INITIALIZED` alone is answered**, so `CHANNEL_OPTION_SHOW_PROTOCOL`,
@@ -164,7 +164,7 @@ channel and the server's fallback to it. #388 adds A-law, #389 MS-ADPCM and IMA-
 - This also settles #307's silent `rdpsnd`: that probe refused the dynamic channel too, but
   played no sound, and the server sends nothing on either channel until a sound plays.
 
-**Measured against the WS2022 test VM (#386, 2026-10-07):**
+**Measured against the WS2019 test VM (#386, 2026-10-07):**
 
 - **Each audio VM test also asserts the transport**: every block arrives on the channel its
   mode names, and none on the other.

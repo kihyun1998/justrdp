@@ -3,9 +3,9 @@
 ## What it is
 
 How this project knows it is right: a differential oracle against
-`ironrdp-graphics` / `ironrdp` for codecs and crypto, a corpus of real Server 2022
+`ironrdp-graphics` / `ironrdp` for codecs and crypto, a corpus of real Server 2019
 captures for ClearCodec, property tests that assert decoders never panic, a nightly
-libFuzzer lane, a coverage discovery job, and a real Windows Server 2022 VM for the
+libFuzzer lane, a coverage discovery job, and a real Windows Server 2019 VM for the
 things only a server can prove. Verification is a territory because it is something
 the system does — and because a claim about correctness here is load-bearing
 everywhere else.
@@ -31,7 +31,7 @@ everywhere else.
 - **Byte-identical output or it is not proof** (codecs). A visual check or a demo is
   a smoke test.
 - **The corpus encodes tolerances that no spec states** — `clearcodec_corpus`
-  fixtures are real Server 2022 streams, and the divergences from FreeRDP they force
+  fixtures are real Server 2019 streams, and the divergences from FreeRDP they force
   are requirements, not bugs (#127).
 - **The oracle is scaffolding with a retirement condition, not a standing gate**
   (ADR-0011). A codec's oracle dev-dependency drops once its correctness rests on an
@@ -263,7 +263,7 @@ was checked against.
   which is a **derivation, not a second corpus**: `.github/scripts/seed_fuzz_corpus.py`
   splits the fixture at run time rather than duplicating ~900 KB into `fuzz/`.
 - **One VM is one server, and there are two.** The audio input VM (#404) drives only the audio
-  input tests; see its bullet among the VM-configuration dependencies. The WS2022 box advertises a fixed cap set; paths it does
+  input tests; see its bullet among the VM-configuration dependencies. The WS2019 box advertises a fixed cap set; paths it does
   not advertise have never been exercised against anything.
 - **A test can pass on pixels another test's session painted, and only a working teardown
   exposes it.** `progressive_assembles`' live-framebuffer floor (≥ 1/8 of the screen
@@ -281,7 +281,7 @@ was checked against.
   number: **a correctness proof was resting on another test's leftovers, and the thing that
   revealed it was fixing the isolation.**
 - **The suite has a named VM-configuration dependency, and it is not in the repo.** The
-  teardown signs out through the Windows UI, and Server 2022 answers a sign-out with the
+  teardown signs out through the Windows UI, and Server 2019 answers a sign-out with the
   **Shutdown Event Tracker** — a dialog whose description field is *mandatory*, so its OK
   button stays disabled and no blind keystroke clears it. It is raised on the **next
   logon**, not at the shutdown, so a single occurrence poisons every later test exactly the
@@ -309,12 +309,15 @@ was checked against.
   moved; it now reads the depth from the Demand Active and strips the same two sets, since NSCodec
   is lossy and its comparison is exact.
 - **Audio input cannot be proven on this VM, and the VM is Windows Server 2019** (#400,
-  2026-10-07). An in-session `Win32_OperatingSystem` read *Microsoft Windows Server 2019
-  Standard*; the records that call it WS2022 predate that reading. The probe was FreeRDP 3.31
-  with `/microphone:sys:pulse` (which sets `INFO_AUDIOCAPTURE`, `client/common/cmdline.c` 3.31.0)
-  and a winmm MCI `record` in the session, its WAV read back over `/drive`. In every
-  configuration tried, the server opened no `AUDIO_INPUT` channel for the whole session and the
-  WAV held a 44-byte header and no data:
+  2026-10-07). An in-session `Win32_OperatingSystem` read *Microsoft Windows Server 2019 Standard*.
+  Until #405 the repository called it WS2022, a label first written with the ClearCodec corpus
+  (2026-06-11) and never measured. The box was rebuilt on 2026-08-10 from the same WS2019 image
+  (the maintainer's account, 2026-10-12; no OS reading predates 2026-10-07), so records from before
+  the rebuild, that corpus among them, are WS2019 as well. The probe was FreeRDP 3.31 with
+  `/microphone:sys:pulse` (which sets `INFO_AUDIOCAPTURE`, `client/common/cmdline.c` 3.31.0) and a
+  winmm MCI `record` in the session, its WAV read back over `/drive`. In every configuration tried,
+  the server opened no `AUDIO_INPUT` channel for the whole session and the WAV held a 44-byte
+  header and no data:
 
   | VM state | MCI `record` |
   |---|---|

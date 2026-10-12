@@ -92,7 +92,7 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 behaviour note <45> (on 3.2.5.9.4.1): from Windows 7 / Server 2008 R2 on, *"all system and
 application-generated beeps are dispatched … by using the RDP audio redirection protocol
 [MS-RDPEA]. If a client does not support RDP audio redirection, it will not receive any beep
-notifications."* Measured against the WS2022 VM with the default Sound set (`SOUND_FLAG_BEEPS`)
+notifications."* Measured against the WS2019 VM with the default Sound set (`SOUND_FLAG_BEEPS`)
 and no `rdpsnd`: `[console]::beep(800,300)`, a console BEL, `SystemSounds.Beep` and
 `SystemSounds.Asterisk`, with the script's run confirmed on the framebuffer, gave **0 Play Sound
 PDUs in 3 runs** (`play_sound_probe_against_real_vm`). The decoder and `SessionOutput::PlaySound`

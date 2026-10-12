@@ -119,7 +119,7 @@ during a session (#340).
   Information repeating its `Length`. A request for a device never announced is still
   ignored (3.1.5.2).
 - **A drive's name** goes in full into `DeviceData` and cut to seven ASCII characters into
-  `PreferredDosName`. **`DeviceData` is ASCII, not the UTF-16 2.2.3.1 names**: WS2022 reads
+  `PreferredDosName`. **`DeviceData` is ASCII, not the UTF-16 2.2.3.1 names**: WS2019 reads
   it as 8-bit characters, so a UTF-16 name registers as its first letter (measured below).
   FreeRDP sends ASCII; IronRDP sends UTF-16. The helper refuses a name that is empty, not
   ASCII, holds a NUL or one of `< > " / \ |`, or has a `:` before its end (2.2.1.3), and two
@@ -272,7 +272,7 @@ during a session (#340).
 
 ## Reference behaviour
 
-**Measured against the WS2022 test VM (#336, 2026-09-28):**
+**Measured against the WS2019 test VM (#336, 2026-09-28):**
 
 - The server announces version 13 (0x0D) with `ClientId` 65, and confirms the echoed ID. Its
   capability request holds General version 2 (`protocolMinor` 13, `ioCode1` 0xFFFF,
@@ -288,7 +288,7 @@ during a session (#340).
   announces the drive and the test times out: one run, the mutation that proves the test
   observes the bit.
 
-**Measured against the WS2022 test VM (#337, 2026-09-28):**
+**Measured against the WS2019 test VM (#337, 2026-09-28):**
 
 - **A UTF-16 `DeviceData` names the share by its first letter.** With `justrdp` sent as
   UTF-16, `\\tsclient\justrdp` is "network name not found" and `net view \\tsclient` fails
@@ -306,7 +306,7 @@ during a session (#340).
   84 requests per run, 3 of 3 runs alike.
 - No `.` or `..` entry is needed: the host lists neither and both listings are complete.
 
-**Measured against the WS2022 test VM (#338, 2026-09-29):**
+**Measured against the WS2019 test VM (#338, 2026-09-29):**
 
 - `Copy-Item` of `hello.txt` (12 bytes of UTF-8) and `big.bin` (300,000 bytes, byte `i` is
   `i % 251`) lands on the server byte-exact, checked there, 2 of 2 runs alike.
@@ -323,7 +323,7 @@ during a session (#340).
   ("the device is not connected", no IRP after it); see
   [Virtual channels](virtual-channels.md) for the rule that replaced it.
 
-**Measured against the WS2022 test VM (#339, 2026-09-29):**
+**Measured against the WS2019 test VM (#339, 2026-09-29):**
 
 - On `\\tsclient\justrdp`, `WriteAllText` of a new file, `Rename-Item`, a second
   `WriteAllText` and `Remove-Item` leave the host's tree with the renamed file holding what
@@ -339,7 +339,7 @@ during a session (#340).
   deleted file stays on the host and the test fails; with the read-only drive writable, the
   write succeeds and the test fails. 1 run each.
 
-**Measured against the WS2022 test VM (#340, 2026-09-29):**
+**Measured against the WS2019 test VM (#340, 2026-09-29):**
 
 - A drive added after the desktop is up, to a helper that began with none, is accepted and
   listed at once (`Test-Path` true on its first try, its file listed). Removed, it is gone on
@@ -358,7 +358,7 @@ during a session (#340).
 - A file the server held open across the removal: its later read is refused by the server
   itself, with no request sent.
 
-**Measured against the WS2022 test VM (#349, 2026-09-29), before the flag was advertised:** a
+**Measured against the WS2019 test VM (#349, 2026-09-29), before the flag was advertised:** a
 throwaway probe, not merged, set `ENABLE_ASYNCIO` from an environment variable. PowerShell
 copied an 8 MiB file (named anew each run) from the drive with `copy` and wrote it back with
 `WriteAllBytes`, each timed with

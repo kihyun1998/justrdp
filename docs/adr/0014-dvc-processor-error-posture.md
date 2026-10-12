@@ -16,7 +16,7 @@ channel state by re-advertising capabilities (`[MS-RDPEGFX]` 3.3.5.19), **3** cl
 
 ### What was measured before deciding
 
-- **Rung 3's cost is a frozen screen** (real VM, WS2022, #270 comment 2026-09-02). An unsolicited
+- **Rung 3's cost is a frozen screen** (real VM, WS2019, #270 comment 2026-09-02). An unsolicited
   client `DYNVC_CLOSE` on the graphics channel keeps the session, input and drdynvc alive, but
   frames go 778 → 0 under identical stimulus, the server never falls back to slow-path bitmaps and
   never re-offers the channel. One VM is one server (ADR-0009, 2026-09-04 amendment).
@@ -311,4 +311,4 @@ updates) painting clean.
   and RemoteFX holds only its sticky video-mode refusal. So none is expected to matter, but none
   is measured.
 - Whether a host switch is added (#273's territory).
-- Any server but one WS2022 box, at any version but 10.4.
+- Any server but one WS2019 box, at any version but 10.4.

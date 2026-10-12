@@ -277,7 +277,7 @@ fn oracle_still_rejects_the_full_quality_sentinel() {
 /// contexts by that id and errors for every unseen one.
 ///
 /// The direction of this divergence does not rest on the oracle at all — restated without
-/// naming it: *a real Server 2022 sends these streams and a real client must paint them, so
+/// naming it: *a real Server 2019 sends these streams and a real client must paint them, so
 /// refusing them is a receive-path defect.* This is the layer where ADR-0009 gives authority
 /// to **the VM's observed behaviour, then FreeRDP's tolerance code** — the
 /// tolerant-receive posture that record owns — rather than to a strict reading of the spec, so no

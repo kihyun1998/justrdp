@@ -16,7 +16,7 @@ Both are, notably, **tolerant on version misreporting**: FreeRDP takes `MIN(serv
 justrdp already applies a **split posture** in code, without having named the principle:
 
 - **Strict** where a mismatch is a security/integrity threat: the connect machine rejects a server that selects a security protocol we never advertised (`connect.rs`), rejects Standard RDP Security, rejects an unsolicited Channel Join Confirm, and the DVC layer rejects a compressed chunk when compression was never advertised (`dvc.rs`).
-- **Tolerant** where a mismatch is a rendering-feature divergence: the ClearCodec decoder keeps real-server leniencies the spec and the ironrdp oracle reject (over-region RLEX clip, NSCodec subcodec) because the captured WS2022 corpus requires them (ADR-0007 amendment, #120/#121/#127).
+- **Tolerant** where a mismatch is a rendering-feature divergence: the ClearCodec decoder keeps real-server leniencies the spec and the ironrdp oracle reject (over-region RLEX clip, NSCodec subcodec) because the captured WS2019 corpus requires them (ADR-0007 amendment, #120/#121/#127).
 - **Not yet exercised** for drawing orders — order decode is epic #22, so the advertised-but-violated-order problem has not bitten us yet. This ADR sets the posture *before* it does.
 
 This mirrors the project's stated identity (`CLAUDE.md`): *derivation from the normative spec, proof from the oracle/real VM* — "스펙 ≠ 상호운용". We already accept that real servers diverge from spec; the open question is only where the tolerance lives and how it is bounded. justrdp takes **IronRDP's default-tolerant stance on rendering, but with the two bounds IronRDP lacks** (still-validate-the-bytes, always-observable) — neither FreeRDP's disconnect-by-default nor IronRDP's silent, unbounded swallow.
@@ -93,7 +93,7 @@ Salvaged from a retired build document. This record routes receive-path question
 real server actually does; what follows bounds that authority, and was written down nowhere
 else.
 
-**One VM is one server.** The authority for *what we accept* is a single WS2022 box (memory
+**One VM is one server.** The authority for *what we accept* is a single WS2019 box (memory
 `test_environment`, `vm_advertised_graphics_caps`). It proves the paths it **advertises** and
 says nothing about the ones it does not. *"The VM is happy"* is not *"servers are happy"*, and
 a tolerance derived from it alone is a **hypothesis** until FreeRDP shows the same shape.
@@ -271,7 +271,7 @@ from the Caps Confirm, which is the opposite of what this change does.
 `()` (`crates/ironrdp-egfx/src/compositor.rs`) — the same structural reason row 3 already records
 for the paint budget: it has nowhere to put a refusal.
 
-### Measured on the WS2022 VM, 2026-09-18
+### Measured on the WS2019 VM, 2026-09-18
 
 Throwaway `eprintln!` instrumentation in the three arms, never committed; two invocations, four
 runs, **9,965 slot observations**, each run ~45 s of mouse sweeps and Start-menu opens.
@@ -331,7 +331,7 @@ chose warn-and-skip. A better derivation does not reopen it; the maintainer does
   tolerates both silently.
 - **Cache import** (2.2.2.16/.17) and the persistent bitmap cache (3.3.1.5, epic #28), neither of
   which this client implements.
-- Any server but one WS2022 box, at any version but 10.4 and 10.3.
+- Any server but one WS2019 box, at any version but 10.4 and 10.3.
 
 ## Amendment (2026-10-06, #376): row 5 — a WireToSurface1 bitmap larger than its surface is skipped
 

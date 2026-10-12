@@ -247,7 +247,7 @@ Read this before starting so the graph does not read as abstractions.
 
 - **The VM proves what the VM sends, and the only way to know that is to count it
   (#189).** The zgfx swap's round-trip was the existing EGFX acceptance test, and it passed —
-  198 frames, a correct Server 2022 desktop, dumped and looked at. What the pass does *not*
+  198 frames, a correct Server 2019 desktop, dumped and looked at. What the pass does *not*
   say is which of the decoder's paths carried it, so a throwaway probe counted: **25 messages,
   every one `ZGFX_SEGMENTED_SINGLE` and every one `PACKET_COMPRESSED`** — 18 488 literals,
   19 024 matches, 7 unencoded runs, longest match 5 062 bytes, **longest distance 133 937**.

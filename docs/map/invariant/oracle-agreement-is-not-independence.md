@@ -45,10 +45,10 @@ Three shapes, and none of them announces itself:
    same ambiguous field identically; the test is byte-identical and the picture is
    wrong on a server neither was tested against.
 2. **A "fix" that regresses against real servers.** The oracle rejects a stream a
-   real Server 2022 sends, someone treats the divergence as our bug, and the
+   real Server 2019 sends, someone treats the divergence as our bug, and the
    corpus-required tolerance is removed. `justrdp-codecs`'s own module doc records
    that ClearCodec **corrects two bit-level defects in the oracle** which otherwise
-   reject genuine Server 2022 streams — so this is not hypothetical here.
+   reject genuine Server 2019 streams — so this is not hypothetical here.
 
 3. **An owned basis that is derived too narrowly to be independent of anything.** The
    subtlest shape, and the only one that survives *replacing* the oracle: hand-derived

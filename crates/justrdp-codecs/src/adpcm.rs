@@ -757,7 +757,7 @@ mod tests {
         (392, -232),
     ];
 
-    /// The formats WS2022 offers (`[MS-RDPEA]` 4.1.1 and the #386 capture) are accepted:
+    /// The formats WS2019 offers (`[MS-RDPEA]` 4.1.1 and the #386 capture) are accepted:
     /// MS-ADPCM at `nBlockAlign` 1024 stereo declares 1012 samples per block, IMA 1017.
     #[test]
     fn the_servers_formats_are_accepted() {

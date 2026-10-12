@@ -1552,7 +1552,7 @@ impl SessionStateMachine {
     /// header is the whole thing, which is why this takes no arguments and cannot fail.
     ///
     /// What it is *not* is session control. The server decides, and may refuse — Windows Server
-    /// 2022 refuses **unconditionally**, measured against the test VM with nothing open and
+    /// 2019 refuses **unconditionally**, measured against the test VM with nothing open and
     /// nothing unsaved (issue #228, `docs/map/territory/session-loop-dispatch.md`). A refusal
     /// arrives as [`SessionOutput::ShutdownDenied`]; a grant arrives as the session ending, which
     /// the adapter already classifies through [`Self::disconnect_reason`]. So a host that needs the

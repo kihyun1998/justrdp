@@ -85,7 +85,7 @@ Consequence 1 of the 2026-06-18 amendment says *"we never carried a `[patch.crat
 
 ### Result of the real-VM acceptance suite (2026-08-10, VM rebuilt)
 
-**The version-bump gate is satisfied for what an `sspi` bump can break.** With the account restored, `connect_reaches_session_active_against_real_vm` — the full X.224 → TLS → **CredSSP/NLA** → MCS/GCC → licensing → activation sequence against the live WS2022 box — passed in **every** run, as did EGFX rendering, first-frame rendering, keyboard/mouse input, the ClearCodec corpus capture, the ironrdp differential decode of captured bitmap rectangles, the advertised-caps probe, and severed-transport classification.
+**The version-bump gate is satisfied for what an `sspi` bump can break.** With the account restored, `connect_reaches_session_active_against_real_vm` — the full X.224 → TLS → **CredSSP/NLA** → MCS/GCC → licensing → activation sequence against the live WS2019 box — passed in **every** run, as did EGFX rendering, first-frame rendering, keyboard/mouse input, the ClearCodec corpus capture, the ironrdp differential decode of captured bitmap rectangles, the advertised-caps probe, and severed-transport classification.
 
 **Every one of the 12 tests passed on a clean session; no single run was 12/12.** The tail is a harness property, not a product defect, and it is worth recording because it will recur on the next bump:
 

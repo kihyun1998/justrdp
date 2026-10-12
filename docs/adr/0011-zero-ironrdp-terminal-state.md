@@ -25,7 +25,7 @@ So "justrdp eventually depends on no `ironrdp` crate at all" is the project's ev
 academic: it makes the oracle's authority open-ended, and an instrument nobody has agreed to
 retire is one nobody re-examines.
 
-Three findings, all measured against the real WS2022 VM on 2026-08-10 while working #168,
+Three findings, all measured against the real WS2019 VM on 2026-08-10 while working #168,
 turned that from untidy into load-bearing:
 
 1. **The oracle rejects the first frame this server sends.** Its `TILE_FIRST` tiles carry
@@ -46,7 +46,7 @@ turned that from untidy into load-bearing:
 This is the fourth adjudication the oracle has lost in this repo (#122, #127, #118, now this),
 and the first where it is wrong on the **live** path rather than merely same-lineage. The map's
 `oracle-agreement-is-not-independence` invariant already predicts this shape — *"the oracle
-rejects a stream a real Server 2022 sends"* is one of the two violations it names; what it lacks
+rejects a stream a real Server 2019 sends"* is one of the two violations it names; what it lacks
 is an end date.
 
 ## Decision

@@ -805,7 +805,7 @@ mod tests {
     }
 
     /// `[MS-RDPEA]` 4.1.1's server format list, whose MS-ADPCM and IMA-ADPCM entries are the
-    /// shapes WS2022 offers: `nBlockAlign` 1024 stereo, 1012 and 1017 samples per block.
+    /// shapes WS2019 offers: `nBlockAlign` 1024 stereo, 1012 and 1017 samples per block.
     fn spec_server_formats() -> Vec<u8> {
         const HEX: &str = concat!(
             "072b900008fb8b00e0f1090070271f7700000500ff050000010002002256000088580100040010000000",

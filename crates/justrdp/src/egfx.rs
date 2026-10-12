@@ -9,7 +9,7 @@
 //! The client speaks first: `start()` sends a Caps Advertise carrying the host's `EgfxConfig`
 //! (ADR-0015) — by default six capsets, 8 through CAPVERSION_104 without 10.1. The ladder is chosen
 //! by which versions this client can *honour* rather than by how high the number goes — 10.5 and
-//! 10.6 make the scaled map-surface command a MUST, and offering them to a real WS2022 server got
+//! 10.6 make the scaled map-surface command a MUST, and offering them to a real WS2019 server got
 //! 10.6 confirmed and **zero** frames painted with no error anywhere (#271). AVC (H.264) stays
 //! structurally excluded: every advertised 10.x capset carries `CAPS_FLAG_AVC_DISABLED`, and 10.1,
 //! which implies AVC444v2 with no flag to decline it, is not advertised (#296). The derivation is
@@ -381,7 +381,7 @@ pub struct GraphicsProcessor {
     /// RGBA bytes painted by the list-bearing commands since this frame opened (#268). The
     /// ceiling is [`MAX_TOTAL_SURFACE_BYTES`], **derived rather than picked**: the most a frame
     /// can legitimately paint is every surface that could exist, once — and past that it is
-    /// repainting pixels it already painted. Measured against a real WS2022 server, the busiest
+    /// repainting pixels it already painted. Measured against a real WS2019 server, the busiest
     /// of 89 frames painted 4 096 000 bytes, exactly one 1280x800 desktop, so the ceiling sits
     /// ~64x above observed traffic while the unbounded case reached ~6.4 TiB in one PDU.
     frame_paint: usize,
@@ -1778,7 +1778,7 @@ mod tests {
         );
     }
 
-    /// The slot range must not skip what a real server sends. Measured against the WS2022 VM on
+    /// The slot range must not skip what a real server sends. Measured against the WS2019 VM on
     /// 2026-09-18, four runs and 9 965 observations: slots are a plain counter from **2**,
     /// contiguous and strictly increasing, never reused and never evicted, and the highest seen
     /// was **216** — in the run that confirmed 10.3, whose 4 096 is the tighter of the two
@@ -3308,7 +3308,7 @@ mod tests {
         b
     }
 
-    /// Feed several PDUs in ONE message, which is what a real server does — the WS2022 VM
+    /// Feed several PDUs in ONE message, which is what a real server does — the WS2019 VM
     /// measured for #268 sent up to 266 PDUs per message. A helper that wraps one PDU per
     /// message cannot tell a per-frame reset from a per-message one.
     fn feed_many(p: &mut GraphicsProcessor, pdus: &[(u16, Vec<u8>)]) -> Vec<Out> {
@@ -3367,7 +3367,7 @@ mod tests {
         );
     }
 
-    /// The budget must not refuse what a real server sends. Measured against the WS2022 VM for
+    /// The budget must not refuse what a real server sends. Measured against the WS2019 VM for
     /// #268: 2 748 `CACHE_TO_SURFACE` PDUs, **every one with `destPtsCount == 1`**, cache
     /// entries of 64x64 or 64x32, and a busiest frame of 4 096 000 bytes — exactly one
     /// 1280x800 desktop, which is ~64x under the ceiling.

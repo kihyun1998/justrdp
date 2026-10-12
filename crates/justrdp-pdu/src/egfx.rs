@@ -78,7 +78,7 @@ pub const CAPVERSION_104: u32 = 0x000A_0400;
 /// specified in 2.2.3, which needs the full set to be nameable.
 pub const CAPVERSION_105: u32 = 0x000A_0502;
 /// `RDPGFX_CAPVERSION_106` (2.2.3.9). Declared, never advertised, same reason as
-/// [`CAPVERSION_105`] — a real WS2022 server confirms this one when it is offered and then
+/// [`CAPVERSION_105`] — a real WS2019 server confirms this one when it is offered and then
 /// sends the scaled map-surface command, painting nothing.
 pub const CAPVERSION_106: u32 = 0x000A_0600;
 /// The value 2.2.3.9 carried before the 180912 errata; the published text now reads

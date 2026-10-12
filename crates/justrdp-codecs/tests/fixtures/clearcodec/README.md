@@ -1,7 +1,7 @@
 # ClearCodec corpus (issue #56)
 
 `replay.bin` is one full session's worth of genuine ClearCodec (`RDPGFX_CODECID_CLEARCODEC`)
-bitmap streams harvested from the live test VM (192.168.136.136, Windows Server 2022) by the
+bitmap streams harvested from the live test VM (192.168.136.136, Windows Server 2019) by the
 `capture_clearcodec_corpus_against_real_vm` `#[ignore]` test in `justrdp-tokio`, **in arrival
 order**. Each payload is one post-zgfx `CODECID_CLEARCODEC` stream exactly as it reached
 `ClearDecoder::decode` on the wire, with the destination-rectangle dimensions it was decoded

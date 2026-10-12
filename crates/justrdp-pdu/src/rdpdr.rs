@@ -838,7 +838,7 @@ fn utf16_bytes(text: &str) -> Vec<u8> {
 }
 
 /// A Query Information buffer of `class` for `file` (2.2.3.3.8): `FileBasicInformation` or
-/// `FileStandardInformation`, the two WS2022 asks for, and `None` for any other. `FileBasicInformation` and `FileStandardInformation` omit the
+/// `FileStandardInformation`, the two WS2019 asks for, and `None` for any other. `FileBasicInformation` and `FileStandardInformation` omit the
 /// trailing `Reserved` field, as 2.2.3.3.8 requires.
 pub fn encode_file_information(class: u32, file: &FileInformation) -> Option<Vec<u8>> {
     let mut out = Vec::new();
@@ -871,7 +871,7 @@ pub fn encode_file_information(class: u32, file: &FileInformation) -> Option<Vec
 }
 
 /// A Query Volume Information buffer of `class` (2.2.3.3.6): `FileFsVolumeInformation`,
-/// `FileFsAttributeInformation` or `FileFsFullSizeInformation`, the three WS2022 asks for, and
+/// `FileFsAttributeInformation` or `FileFsFullSizeInformation`, the three WS2019 asks for, and
 /// `None` for any other. `FileFsVolumeInformation` omits its `Reserved` byte, as
 /// 2.2.3.3.6 requires, and its label length counts the terminating NUL.
 pub fn encode_volume_information(class: u32, volume: &VolumeInformation) -> Option<Vec<u8>> {
@@ -907,7 +907,7 @@ pub fn encode_volume_information(class: u32, volume: &VolumeInformation) -> Opti
 
 /// One Query Directory entry of `class` for the file `name` (2.2.3.3.10), alone in its
 /// buffer so `NextEntryOffset` is zero: `FileFullDirectoryInformation` or
-/// `FileBothDirectoryInformation`, the two WS2022 asks for, and `None` for any other. `FileBothDirectoryInformation` omits its `Reserved` byte, as 2.2.3.3.10
+/// `FileBothDirectoryInformation`, the two WS2019 asks for, and `None` for any other. `FileBothDirectoryInformation` omits its `Reserved` byte, as 2.2.3.3.10
 /// requires, and its short name is empty.
 pub fn encode_directory_entry(class: u32, name: &str, file: &FileInformation) -> Option<Vec<u8>> {
     if !matches!(

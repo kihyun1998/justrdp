@@ -133,7 +133,7 @@ fn every_single_byte_corruption_of_the_gcc_user_data_is_survivable() {
 /// immediately. So its discriminating power is over **false positives** -- a guard that would
 /// drop a real session -- and the defect side belongs to the unit tests in
 /// `justrdp-pdu/src/finalization.rs` and `justrdp/src/connect.rs`. Both mutations were run.
-/// And it is one WS2022 box on one advertised config: it proves what *this* server sends,
+/// And it is one WS2019 box on one advertised config: it proves what *this* server sends,
 /// never what servers send.
 #[test]
 fn a_real_servers_finalization_replies_decode_in_order() {
