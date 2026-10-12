@@ -1300,6 +1300,39 @@ mod tests {
     use super::*;
     use crate::dvc::ProcessorOutput as Out;
 
+    /// Asserts the paint-budget warns a `#[traced_test]` recorded, exactly: one `note_budget`
+    /// record per `(pdu, "declared=… painted=… skipped=…")`, in order, and no other. A macro
+    /// because `logs_assert` is generated inside each traced test.
+    macro_rules! assert_budget_warns {
+        ($expected:expr) => {
+            logs_assert(|lines: &[&str]| {
+                let expected: &[(&str, &str)] = $expected;
+                let warns: Vec<&str> = lines
+                    .iter()
+                    .copied()
+                    .filter(|l| l.contains("per-frame paint budget reached"))
+                    .collect();
+                if warns.len() != expected.len() {
+                    return Err(format!(
+                        "expected {} budget warns, got {}: {warns:#?}",
+                        expected.len(),
+                        warns.len()
+                    ));
+                }
+                for (line, (pdu, counts)) in warns.iter().zip(expected) {
+                    let fields = format!("pdu=\"{pdu}\" {counts}");
+                    if !(line.contains(" WARN ")
+                        && line.contains("rdp_egfx:")
+                        && line.contains(&fields))
+                    {
+                        return Err(format!("expected a WARN with {fields}, got {line}"));
+                    }
+                }
+                Ok(())
+            })
+        };
+    }
+
     fn header(cmd_id: u16, body: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&cmd_id.to_le_bytes());
@@ -1868,10 +1901,11 @@ mod tests {
 
     /// An evict naming a slot outside the range frees nothing — which was **already** true
     /// before the range check, because the fill path is what keeps such a slot from ever being
-    /// occupied. So this asserts the in-range behaviour and the absence of collateral damage;
-    /// the guard's own effect on this PDU is the `rdp_egfx` warn, and this crate has no
-    /// tracing-assertion facility to reach it (neither does #268's row-3 warn).
+    /// occupied. So this asserts the in-range behaviour, the absence of collateral damage, and
+    /// the guard's own effect on this PDU, which is the `rdp_egfx` warn: one per out-of-range
+    /// slot, none for the in-range one (#435).
     #[test]
+    #[tracing_test::traced_test]
     fn an_out_of_range_evict_frees_nothing_and_an_in_range_one_still_works() {
         let mut p = confirmed(egfx::CAPVERSION_104);
         feed(
@@ -1894,6 +1928,29 @@ mod tests {
         feed(&mut p, egfx::CMDID_EVICT_CACHE_ENTRY, &evict_body(1));
         assert!(p.cache.is_empty(), "an in-range evict still works");
         assert_eq!(p.cache_bytes, 0);
+
+        logs_assert(|lines: &[&str]| {
+            let warns: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|l| l.contains("cache slot outside 3.3.1.4's one-based range"))
+                .collect();
+            let expected = [0u16, 25_601].map(|slot| {
+                format!("pdu=\"RDPGFX_EVICT_CACHE_ENTRY_PDU\" cache_slot={slot} max=25600")
+            });
+            if warns.len() == expected.len()
+                && warns
+                    .iter()
+                    .zip(&expected)
+                    .all(|(line, fields)| line.contains(" WARN ") && line.contains(fields))
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected one warn per {expected:?}, got {warns:#?}"
+                ))
+            }
+        });
     }
 
     /// 3.3.5.19: *"If the capability set received in capsSet field ... is not specified in
@@ -2977,6 +3034,7 @@ mod tests {
     /// Issue #377: a Progressive tile's painting is charged its clipped bytes against the
     /// per-frame paint budget, and skipped once the frame cannot afford it.
     #[test]
+    #[tracing_test::traced_test]
     fn progressive_painting_is_charged_to_the_frame_budget() {
         let tile = 64 * 64 * 4;
         let run = |left: usize| {
@@ -2998,6 +3056,10 @@ mod tests {
             (MAX_TOTAL_SURFACE_BYTES, 0),
             "an exhausted frame paints nothing and charges nothing"
         );
+        assert_budget_warns!(&[(
+            "RDPGFX_WIRE_TO_SURFACE_PDU_2",
+            "declared=1 painted=0 skipped=1",
+        )]);
     }
 
     /// The clip is what #171 added and #172 wires: a tile is painted **only where its region's
@@ -3345,6 +3407,7 @@ mod tests {
     /// for the lesson that a test which takes two minutes and passes is indistinguishable from
     /// one that hangs.
     #[test]
+    #[tracing_test::traced_test]
     fn a_paste_list_is_cut_at_the_per_frame_paint_budget() {
         // A 1 MiB cached bitmap: the budget admits 256 pastes of it and no more.
         let mut p = two_surfaces_and_a_cached_bitmap(64);
@@ -3365,6 +3428,10 @@ mod tests {
             16_384,
             "16384 pastes fit"
         );
+        assert_budget_warns!(&[(
+            "RDPGFX_CACHE_TO_SURFACE_PDU",
+            "declared=65535 painted=16384 skipped=49151",
+        )]);
     }
 
     /// The budget must not refuse what a real server sends. Measured against the WS2019 VM for
@@ -3512,6 +3579,7 @@ mod tests {
     /// Issue #372: a WireToSurface1 decode is charged its decoded size against the per-frame
     /// paint budget before it decodes, and skipped once the frame cannot afford it.
     #[test]
+    #[tracing_test::traced_test]
     fn a_wire_to_surface_decode_is_charged_to_the_frame_budget() {
         let mut p = GraphicsProcessor::default();
         create_surface(&mut p, 1, 4, 4);
@@ -3549,6 +3617,10 @@ mod tests {
             surface.rgba[0], 10,
             "the over-budget decode painted nothing"
         );
+        assert_budget_warns!(&[(
+            "RDPGFX_WIRE_TO_SURFACE_PDU_1",
+            "declared=1 painted=0 skipped=1",
+        )]);
     }
 
     #[test]
@@ -3597,6 +3669,7 @@ mod tests {
     /// `SOLID_FILL` and `SURFACE_TO_SURFACE` carry the same wire shape and were not named in
     /// the issue. ADR-0012 §3 asks a family for one answer, so all three are charged.
     #[test]
+    #[tracing_test::traced_test]
     fn solid_fill_and_surface_to_surface_are_charged_to_the_same_budget() {
         let mut p = two_surfaces_and_a_cached_bitmap(64);
         let mut body = Vec::new();
@@ -3631,6 +3704,16 @@ mod tests {
             p.frame_paint, MAX_TOTAL_SURFACE_BYTES,
             "SURFACE_TO_SURFACE is bounded",
         );
+        assert_budget_warns!(&[
+            (
+                "RDPGFX_SOLIDFILL_PDU",
+                "declared=65535 painted=16384 skipped=49151",
+            ),
+            (
+                "RDPGFX_SURFACE_TO_SURFACE_PDU",
+                "declared=65535 painted=16384 skipped=49151",
+            ),
+        ]);
     }
 
     // ── #267 — the ADR-0008 artifacts for the graphics processor ─────────────────────────
