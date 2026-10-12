@@ -369,9 +369,16 @@ was checked against.
     Windows ticks to a 15.6 ms quantum and now and then missed two or three ticks, and the burst
     that followed lost audio on the server (#411). It records when it woke more than 15 ms late,
     and a failed signal check names those times, so a stall of this host shows as one.
-  - **The PCM audio input test fails in about two runs of five**: Windows 11 drops PCM packets
-    it receives on time ([Audio input](audio-input.md), Reference behaviour). Rerun it before
-    reading a failure as a regression; the A-law test recorded whole in every run measured.
+  - **The PCM audio input test fails in about two runs of five**: the guest's audio engine
+    skips processing passes and overruns the endpoint buffer the PCM packets arrive in, which
+    ETW inside the VM shows as `Audio` event 35, "Read Pointer Overwrite" (#416,
+    [Audio input](audio-input.md), Reference behaviour). Rerun it before reading a failure as a
+    regression; the A-law test recorded whole in every run measured.
+  - **Tracing inside the audio input VM needs an elevated process**: `rdptest` is in
+    Administrators and the VM's `ConsentPromptBehaviorAdmin` is 0, so a script started from the
+    Run dialog can `Start-Process -Verb RunAs` without a prompt (#416, the maintainer's change,
+    2026-10-12). Killing a test mid-session once left the VM's next logons on a black screen
+    with no rdpdr "User Logged On"; a reboot cleared it, so stop a VM test only between runs.
 - **Driving a desktop by synthesised keystrokes is open-loop, and the acknowledgement
   the harness needs is the one it already receives.** Every VM test that has to make
   something happen *inside* Windows — sign out, launch an app, run `tsdiscon` — types

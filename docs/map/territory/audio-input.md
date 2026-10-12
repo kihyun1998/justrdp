@@ -216,9 +216,21 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   of five (13 of 34), though every packet is written to the socket the moment it is pushed, no
   read took more than 2 ms to process, and TCP retransmitted no more than the idle host does.
   Pushing 0.5 % slower or faster, single-fragment 5 ms packets (5 of 6 lost), and four vCPUs
-  for the VM (8 of 16) did not remove it. Why Windows drops them is not visible from the wire.
-  A host should deliver captured audio steadily: the helper keeps no clock and sends what it
-  is given when it is given it.
+  for the VM (8 of 16) did not remove it; neither did MCI recording in the pushed format,
+  44.1 kHz 16-bit stereo (2 of 7).
+- **The PCM loss is the guest's audio engine falling behind** (#416). Traced inside the VM with
+  ETW (`Microsoft-Windows-Audio`, `TerminalServices-RdpSoundDriver`, `RdpCoreTS`, logged by an
+  elevated `logman` around the recording): in the one run of five that lost audio, the engine's
+  pump logged **"Pump: Processing pass skipped"** 94 times (1 to 55 in the clean runs) and then
+  **"Engine Glitch: CP Server Output Endpoint - Read Pointer Overwrite"** (`Audio` event 35) 12
+  times, each of 1,764 bytes, one 10 ms packet; the recording lost 10 + 30 + 30 + 50 ms,
+  120 ms, twelve packets. The clean runs logged no event 35. So the RDP endpoint writes each
+  packet on time into the buffer it shares with the audio engine, and when the engine's pump
+  misses its passes the writer overruns what the reader has not taken, packet by packet; the
+  per-period "CrossProcess packet added" events arrived 20 to 47 ms apart in that stretch,
+  against at most 21 ms in clean runs. The client cannot prevent it: its packets arrive whole
+  and on time. A host should still deliver captured audio steadily, since bursts overrun the
+  same buffer: the helper keeps no clock and sends what it is given when it is given it.
 - **These Data PDUs found a static channel defect**: each DVC fragment has to ride one SVC
   chunk, and until #404 an SVC chunk carried 1,592 data bytes where `[MS-RDPBCGR]` 2.2.6.1
   allows 1,600, so a 1,594-byte fragment straddled two chunks and Windows 11 ended the session
@@ -265,9 +277,10 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   ADPCM whole would bring them back: their tags into `ENCODABLE_FORMAT_TAGS`, packets of whole
   blocks, and a live proof. AAC waits on #21's decoder-backend question; GSM 6.10 is not
   encoded.
-- **PCM audio input loses packets on Windows 11** in about two runs of five, by the server
-  (Reference behaviour); the cause is #416, and the PCM live test
-  says it fails that often.
+- **PCM audio input loses packets on this Windows 11 VM** in about two runs of five, by the
+  guest's audio engine overrunning its endpoint buffer when it skips processing passes (#416,
+  Reference behaviour). Not measured on Windows on hardware; the PCM live test says it fails
+  that often, and why.
 - **8-bit PCM is unmeasured.** Windows 11 offers none, and at the capture rate its packet is
   `FramesPerPacket` × `nBlockAlign` bytes, the size it discards for A-law.
 - **One server.** Only a Windows 11 client SKU has been measured; a Server SKU with the RD
