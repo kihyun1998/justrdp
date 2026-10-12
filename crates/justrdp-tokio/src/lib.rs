@@ -3895,23 +3895,6 @@ mod tests {
         .await;
     }
 
-    /// Issue #304's DoD ④: the logon notification actually reaches a host, against the real
-    /// server rather than against bytes this repo wrote.
-    ///
-    /// **Which leg was the open question, and it is now measured.** The connect leg sees
-    /// **none** and the session leg sees **two** — an `INFOTYPE_LOGON_EXTENDED_INFO` followed by
-    /// an `INFOTYPE_LOGON_LONG` — so `ActivationResult::save_session_info` is empty on this VM
-    /// and `SessionOutput::SaveSessionInfo` carries everything. Both legs are built because the
-    /// PDU is not bound to either by the spec; only one of them fires here, and a capture from
-    /// one WS2019 box on one advertised configuration proves what *this* server does
-    /// (`docs/map/invariant/capture-coverage-follows-what-we-advertise.md`).
-    ///
-    /// **This is also why `crates/justrdp-pdu/tests/fixtures/session/` exists.**
-    /// `capture_connect_chunk` runs only in the connect read loop and stops at
-    /// `Action::SessionActive`, so the repo's committable-capture mechanism structurally cannot
-    /// see this PDU. The fixture beside that README was teed by hand during #304 and the offline
-    /// assertions live in `justrdp-pdu/tests/real_server_session.rs`; this test is the live half,
-    /// and what it adds is that the bytes reach a **host sink** rather than merely decoding.
     /// Real-VM acceptance for #307: static channels carry messages both ways. The server's
     /// first `cliprdr` and `rdpdr` messages reach the host byte-exact, and an `rdpdr` Client
     /// Announce Reply sent through [`SessionCommand::ChannelData`] is answered with a Server
@@ -7292,6 +7275,23 @@ mod tests {
         .await
     }
 
+    /// Issue #304's DoD ④: the logon notification actually reaches a host, against the real
+    /// server rather than against bytes this repo wrote.
+    ///
+    /// **Which leg was the open question, and it is now measured.** The connect leg sees
+    /// **none** and the session leg sees **two** — an `INFOTYPE_LOGON_EXTENDED_INFO` followed by
+    /// an `INFOTYPE_LOGON_LONG` — so `ActivationResult::save_session_info` is empty on this VM
+    /// and `SessionOutput::SaveSessionInfo` carries everything. Both legs are built because the
+    /// PDU is not bound to either by the spec; only one of them fires here, and a capture from
+    /// one WS2019 box on one advertised configuration proves what *this* server does
+    /// (`docs/map/invariant/capture-coverage-follows-what-we-advertise.md`).
+    ///
+    /// **This is also why `crates/justrdp-pdu/tests/fixtures/session/` exists.**
+    /// `capture_connect_chunk` runs only in the connect read loop and stops at
+    /// `Action::SessionActive`, so the repo's committable-capture mechanism structurally cannot
+    /// see this PDU. The fixture beside that README was teed by hand during #304 and the offline
+    /// assertions live in `justrdp-pdu/tests/real_server_session.rs`; this test is the live half,
+    /// and what it adds is that the bytes reach a **host sink** rather than merely decoding.
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn save_session_info_reaches_the_host_against_real_vm() {
