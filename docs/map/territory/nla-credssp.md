@@ -43,7 +43,7 @@ and binding the exchange to the server's public key.
   `Credentials`, the `Action::StartNla` arm
 - `justrdp/src/connect.rs` — `Action::StartNla`, `Event::NlaComplete`,
   `ConnectStateMachine`
-- `Cargo.toml` — `sspi = "=0.22.0"`, the exact pin ADR-0004 requires (the
+- `Cargo.toml` — `sspi = "=0.23.0"`, the exact pin ADR-0004 requires (the
   `[patch.crates-io]` bridge that used to sit here was removed 2026-08-10)
 - Stage string: `nla-credssp`
 
@@ -73,10 +73,14 @@ defect), #689 (the maintainer's rework that fixed it).
 ## Known holes / open
 
 - **The version-bump gate ADR-0004 requires is satisfied for the current pin** (`sspi
-  = "=0.22.0"`, 2026-10-06). `connect_reaches_session_active_against_real_vm`
+  = "=0.23.0"`, 2026-10-12, Dependabot #413). `connect_reaches_session_active_against_real_vm`
   — the whole X.224 → TLS → CredSSP → MCS/GCC → activation sequence against the live
-  WS2022 box — passes, as do `first_frames_render_the_desktop_against_real_vm` and the
-  loopback full-CredSSP test. The first exact pin after the fork bridge (`=0.21.3`,
+  test VM — passes, as do `first_frames_render_the_desktop_against_real_vm` and the
+  loopback full-CredSSP test (`connect_completes_credssp_against_a_loopback_server`). The
+  bump took in 0.22.1, which stopped NTLM MIC generation resetting the RC4 sealing state
+  CredSSP's `pubKeyAuth` is wrapped with, so it touched this path; 0.23.0 itself changed only
+  Kerberos and `winscard`, neither of which this client builds. The pin before it (`=0.22.0`,
+  2026-10-06) passed the same gate. The first exact pin after the fork bridge (`=0.21.3`,
   2026-08-10) passed the same gate; see ADR-0004's *Result* section for that run and
   for the suite's session-isolation caveat.
 - **0.22 made `TsRequest::buffer_len()` fallible** (`Result<u16>`): a request whose
