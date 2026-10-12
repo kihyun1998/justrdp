@@ -124,7 +124,8 @@ Three places this server disagrees with a reading somebody holds, each now a tes
 
 - **`Size = 18`, where 2.2.10.1.1.2 defines it as 576** (the structure excluding the two variable
   strings). FreeRDP records Windows Server 2019 doing this and accepts both; **IronRDP accepts
-  only 18** and so would reject a server that obeyed the spec. WS2022 behaves like WS2019.
+  only 18** and so would reject a server that obeyed the spec. This box *is* WS2019, so it
+  confirms FreeRDP's note on the same version rather than adding a second one.
 - **`Length = 18`** — the fields without the 570-byte pad. 2.2.10.1.1.4 calls it *"the total size
   in bytes of this structure, including the variable LogonFields field"*, and this structure ends
   with that pad. A decoder framing from `Length` under the spec's own sentence mis-parses this
@@ -159,7 +160,7 @@ proxy that cut its connection, and our derivation of the cookie it had been issu
 `ARC_CS` verifier it sent (`d1734b75…`). A malformed `ARC_CS` (the inner `cbLen` dropped) makes
 the server refuse the connect, so the live test does guard the framing.
 
-**Bounded: one WS2022 box, one advertised configuration, one account.** It proves what this
+**Bounded: one WS2019 box, one advertised configuration, one account.** It proves what this
 server sends, never what servers send.
 
 ## Cross-cutting invariants

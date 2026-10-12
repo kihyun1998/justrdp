@@ -41,7 +41,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
-/// Issue #150. One logon's desktop, captured 2026-10-01 from the WS2022 VM with its colour depth
+/// Issue #150. One logon's desktop, captured 2026-10-01 from the WS2019 VM with its colour depth
 /// policy at 32 bpp.
 #[test]
 fn a_real_desktop_painted_in_nscodec_surface_bits_replays() {

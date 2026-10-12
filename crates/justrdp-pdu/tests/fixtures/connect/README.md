@@ -2,7 +2,7 @@
 
 Server-to-client only, so no credential crosses into these files: the Client Info PDU carrying
 the password travels the other way and never reaches a capture. Captured from the real VM
-(`docs/agents/thegraph.md`'s third source; memory `test_environment`), one WS2022 box on one
+(`docs/agents/thegraph.md`'s third source; memory `test_environment`), one WS2019 box on one
 advertised configuration — **they prove what this server sends, never what servers send.**
 
 They are the repo's only server-to-client connect-sequence bytes that no encoder of ours

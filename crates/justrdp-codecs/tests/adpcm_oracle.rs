@@ -60,7 +60,7 @@ fn ima_adpcm_matches_freerdp_and_audioop_on_generated_blocks() {
     }
 }
 
-/// Real WS2022 blocks (#389): the first three loud Wave2 samples of a stock sound, four blocks
+/// Real WS2019 blocks (#389): the first three loud Wave2 samples of a stock sound, four blocks
 /// each, in the 44.1 kHz mono format the server chose, decoded with the `cbSize` extra it sent.
 #[test]
 fn real_server_adpcm_blocks_match_the_oracle() {

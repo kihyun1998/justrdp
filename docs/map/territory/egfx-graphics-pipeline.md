@@ -60,7 +60,7 @@ acknowledge frames. It is server→client only, and it is reachable only if
   `RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU`, and this client does not. `ironrdp-egfx` advertises
   10.5/10.6 and discharges the MUST without a resampler — it accepts the command, records the
   origin and forwards the target size — and this server's scaled map is 1:1 anyway (measured:
-  `target` equals the surface's own 1280x800). Offered the full ladder, the WS2022 VM confirmed
+  `target` equals the surface's own 1280x800). Offered the full ladder, the WS2019 VM confirmed
   10.6 and painted zero frames; offered the honoured set it confirms 10.4 and paints. 10.7 *can*
   decline the obligation and is still left out: offered beside 10.4 the same server chose 10.4, so
   nothing measured shows a benefit. The wire order is the one that measurement used and what both
@@ -90,7 +90,7 @@ acknowledge frames. It is server→client only, and it is reachable only if
   — a server confirmed at 10.3 gets 100 MB and 25 600 slots for the length of the ignore window,
   until its new confirm narrows them. The byte budget has behaved this way since #273; #297 only
   gave it a second reader.
-- **Measured against the WS2022 VM (2026-09-17, #273 probe, 45 s each with mouse sweeps and three
+- **Measured against the WS2019 VM (2026-09-17, #273 probe, 45 s each with mouse sweeps and three
   Start-menu opens):** `EgfxConfig::versions` narrowed to 10.3 confirmed `0x000A0301` flags `0x20`;
   10.4 with `Small` confirmed `0x000A0400` flags `0x22` (the server echoes `SMALL_CACHE`); 8 + 8.1
   with `ThinClient` confirmed `0x00080105` flags `0x01`; the default confirmed 10.4 flags `0x20`.
@@ -276,7 +276,7 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
 - **The cache slot range is bounded as of #297, and this is the evidence the verdict does not
   carry.** The verdict is [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)'s row 4
   (2026-09-18): out of 3.3.1.4's one-based range is warned and skipped, not refused.
-  **Measured here on the WS2022 VM, 2026-09-18**, with throwaway `eprintln!` instrumentation in
+  **Measured here on the WS2019 VM, 2026-09-18**, with throwaway `eprintln!` instrumentation in
   the three cache arms that was never committed — two invocations, four runs, ~45 s of mouse
   sweeps and Start-menu opens each, **9,965 slot observations**:
 
@@ -384,7 +384,7 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
 
 - **The 3.3.5.19 reset is the rung for a semantic miss** (#272,
   [ADR-0014](../../adr/0014-dvc-processor-error-posture.md)'s 2026-09-17 amendment). All
-  measured on 2026-09-17 on the WS2022 VM at confirmed **10.4**, with throwaway probes that
+  measured on 2026-09-17 on the WS2019 VM at confirmed **10.4**, with throwaway probes that
   were never committed. Neither reference client ever re-advertises (FreeRDP only in
   `rdpgfx_on_open`, `ironrdp-egfx` only in `start`), so this server is the only evidence.
   - **With both MUSTs held, the session survives: 4/4 sessions**, two short and two with two

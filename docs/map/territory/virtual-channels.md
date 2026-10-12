@@ -98,7 +98,7 @@ glossary, which is vocabulary rather than a decision.
   echoes it too, then rejects Cmd 6/7 as an unsupported `Cmd` — advertising the obligation and
   refusing it. **Not covered:** soft-sync (gated by multitransport, which justrdp never
   advertises, not by this version) and unassigned `Cmd` values, still skipped, with 3.1.5.2.4's
-  "MUST terminate" left as ADR-0014's open item; any server but this WS2022 box; and a
+  "MUST terminate" left as ADR-0014's open item; any server but this WS2019 box; and a
   multitransport UDP-R tunnel. Decompression is revisited when a channel we accept has a server
   that compresses on it — that capture is its proof.
 - **A dynamic channel can be host-terminated** (#385,
@@ -202,7 +202,7 @@ glossary, which is vocabulary rather than a decision.
   channel with `CHANNEL_OPTION_SHOW_PROTOCOL`**, a single chunk included, and never
   otherwise, however many chunks the message spans. That is FreeRDP's rule (`channels.c`).
   3.1.5.2.1 says chunked data MUST carry the flag, and IronRDP sets it on every multi-chunk
-  message, which `encode_chunks` did until #338. **WS2022 takes 2.2.6.1.1's meaning
+  message, which `encode_chunks` did until #338. **WS2019 takes 2.2.6.1.1's meaning
   literally, so the rdpdr endpoint reads each 8-byte header as data**: the first rdpdr
   message over one chunk, a 32 KiB Read response, lost the drive ("the device is not
   connected") and no IRP followed; without the flag, the 300,000-byte copy is byte-exact.
@@ -400,7 +400,7 @@ glossary, which is vocabulary rather than a decision.
     transfer in flight, so when to let go is the host's. **The host announcing its own files
     releases nothing either** (#332): IronRDP's `initiate_file_copy` sends its Unlocks first,
     on the ground (its PR #1375, with no measurement given) that `rdpclip.exe` then fails to
-    pull the new copy and desyncs. Against the WS2022 VM nothing breaks with the lock held;
+    pull the new copy and desyncs. Against the WS2019 VM nothing breaks with the lock held;
     the measurement is below.
   - **Cancelling.** `cancel_file_request` ends a wait. The VM does not answer an unlocked
     request for files it no longer holds (measured below), and how long to wait is the host's.
@@ -466,7 +466,7 @@ glossary, which is vocabulary rather than a decision.
   `MAX_PENDING_SERVER_REQUESTS` (100, the shape of `MAX_SERVER_LOCKS`) in `owed` and as many in
   `serving`, and a request past either is answered with a failure while the session goes on
   (ADR-0009). Neither reference bounds them: IronRDP queues without a cap, and FreeRDP answers
-  synchronously so it has no queue. The WS2022 VM sends one File Contents Request and waits for
+  synchronously so it has no queue. The WS2019 VM sends one File Contents Request and waits for
   its answer (#325), so only a non-conforming server reaches either bound. All of it is
   derivation:
   - **`serving` refuses at once**, because a File Contents Response carries its `streamId`.
@@ -535,13 +535,13 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
 1280x1024 with `DesktopScaleFactor` 150; the same run at 100 percent read 96 after
 (`a_resize_at_150_percent_changes_the_server_dpi_on_the_real_vm`).
 
-**Measured against the WS2022 test VM (#385, 2026-10-06):**
+**Measured against the WS2019 test VM (#385, 2026-10-06):**
 
 - **The server opens `AUDIO_PLAYBACK_DVC` and sends nothing on `rdpsnd`.** With `rdpsnd`, `rdpdr`
   and `drdynvc` requested and `AUDIO_PLAYBACK_DVC` registered, the Create Request came 134–286 ms
   into the session in six runs, and no `rdpsnd` static channel message arrived in any. So this
   server takes the dynamic channel first, as `[MS-RDPEA]` product note 11 says of Windows 8 /
-  Server 2012; WS2022 is not named there.
+  Server 2012; WS2019 is not named there.
 - **Nothing arrives on `AUDIO_PLAYBACK_DVC` while the session plays no sound**: 0 messages in
   90 s, both with `rdpdr` unanswered and with its initialization run to User Logged On (531 ms).
   FreeRDP 3.31 (`/sound /network:lan`, `WLOG_FILTER=com.freerdp.channels.rdpsnd.client:TRACE`)
@@ -559,7 +559,7 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   `Microsoft::Windows::RDS::Telemetry`, `…::Video::Control::v08.01`, `…::Video::Data::v08.01`,
   `…::Geometry::v08.01`, `AUDIO_PLAYBACK_LOSSY_DVC` and `…::Input`, which FreeRDP refuses too.
 
-**Measured against the WS2022 test VM (#307, 2026-09-22):**
+**Measured against the WS2019 test VM (#307, 2026-09-22):**
 
 - Every requested channel is granted: `cliprdr`, `rdpsnd`, `rdpdr`, `rail` and `drdynvc` got
   consecutive IDs from 1004. The server's Virtual Channel capset is `flags=2`
@@ -586,7 +586,7 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   above has the counts). The clipboard-direction policy #307 suspected was not the cause:
   FreeRDP against the same VM is answered in 63 ms.
 
-**Measured against the WS2022 test VM (#321, 2026-09-23):**
+**Measured against the WS2019 test VM (#321, 2026-09-23):**
 
 - The server's general capability set is version 2 with `generalFlags=0x3E`: long format
   names, stream fileclip, no file paths, can lock, huge files. FreeRDP 3.31 answers `0x2E`,
@@ -595,7 +595,7 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   answered OK too. Taken with `/dump` and `WLOG_FILTER=com.freerdp.channels.cliprdr.client:TRACE`.
 - The server sent no Format List of its own during the handshake, with its clipboard empty.
 
-**Measured against the WS2022 test VM (#322, 2026-09-23):**
+**Measured against the WS2019 test VM (#322, 2026-09-23):**
 
 - Text copied in Notepad arrives as a server Format List of `13` (`CF_UNICODETEXT`), `16`
   (`CF_LOCALE`), `1` (`CF_TEXT`) and `7` (`CF_OEMTEXT`), every name empty, in long-name
@@ -610,7 +610,7 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   It did not end the session, but nothing the server sends depended on it. A chunked rdpdr
   message the server has to read was first sent in #338, and was lost *with* the flag.
 
-**Measured against the WS2022 test VM (#323, 2026-09-23):**
+**Measured against the WS2019 test VM (#323, 2026-09-23):**
 
 - **A multi-chunk message is received live.** Print Screen lists `8` (`CF_DIB`) and `17`
   (`CF_DIBV5`). The `CF_DIB` response is one 4,096,060-byte message, about 2,561 chunks at the
@@ -625,7 +625,7 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
 - Under a 1 MiB cap the Print Screen response is dropped and reported, and the session goes
   on. With the cap back at 64 MiB, a second Print Screen arrives whole.
 
-**Measured against the WS2022 test VM (#324, 2026-09-23):**
+**Measured against the WS2019 test VM (#324, 2026-09-23):**
 
 - `Set-Clipboard -Path` with two files is announced **twice**, as `49315`
   ("FileGroupDescriptorW"), `49264` ("FileContents") and `49320` ("Preferred DropEffect").
@@ -646,7 +646,7 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   twice), and the rest of `big.bin` still arrives under the lock. **Without the lock, the
   first request after that copy gets no answer in 60 s**: not a failure, silence.
 
-**Measured against the WS2022 test VM (#325, 2026-09-28):**
+**Measured against the WS2019 test VM (#325, 2026-09-28):**
 
 - **The server locks every host announcement and unlocks the one before.** Lock `clipDataId` 0
   arrives right after the host's Format List naming `FileGroupDescriptorW`, then a Format Data
@@ -674,7 +674,7 @@ DPI aware, read `GetDpiForMonitor` at the origin: 96 before, 144 after a Monitor
   response whenever nothing followed it; the measurements and the cause are in
   [adapter-drive-loop](adapter-drive-loop.md).
 
-**Measured against the WS2022 test VM (#332, 2026-09-28):**
+**Measured against the WS2019 test VM (#332, 2026-09-28):**
 
 - **A lock this side holds on the server's files survives the host announcing its own.** The
   host locks the server's copied files with `request_file_list` (lock 1) and fetches

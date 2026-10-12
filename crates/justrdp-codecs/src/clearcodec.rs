@@ -19,7 +19,7 @@
 //!    hit" rejection (bands that previously aborted mid-decode now finish and store their
 //!    columns).
 //!
-//! 2. **RLEX region over-fill is clipped, not fatal.** A captured real Windows Server 2022
+//! 2. **RLEX region over-fill is clipped, not fatal.** A captured real Windows Server 2019
 //!    stream over-fills its RLEX region (replay corpus entry 0). FreeRDP `clear.c` and the
 //!    ironrdp oracle both *reject* an over-region run/suite (`:260`/`:286`/`:321`), but a client
 //!    must not drop a live frame over a server's over-encode, so we clip the surplus at the
@@ -644,7 +644,7 @@ impl ClearDecoder {
             match codec_id {
                 0x00 => decode_raw_region(bitmap, output, x_start, y_start, width, height, sw)?,
                 0x02 => decode_rlex_region(bitmap, output, x_start, y_start, width, height, sw)?,
-                // NSCodec (0x01): a real WS2022 stream sends it (replay corpus entry 30, 48x78).
+                // NSCodec (0x01): a real WS2019 stream sends it (replay corpus entry 30, 48x78).
                 // Decoded via the self-owned NSCodec codec (epic #132) and composited like the raw
                 // subcodec. The ironrdp oracle still *skips* NSCodec, so this sub-region is the one
                 // place our output legitimately exceeds the oracle (see the corpus differential).
@@ -810,7 +810,7 @@ fn decode_rlex_region(
     };
 
     // Clip surplus at the region boundary rather than reject. A captured real Windows Server
-    // 2022 stream over-fills its RLEX region (replay corpus entry 0, 64x32); FreeRDP `clear.c`
+    // 2019 stream over-fills its RLEX region (replay corpus entry 0, 64x32); FreeRDP `clear.c`
     // and the ironrdp oracle both reject that (`suite exceeds region pixel count`), but a client
     // must not drop a live frame over a server's over-encode, so we stop emitting at the region
     // boundary and short-fill under-runs. (NB: this is *not* FreeRDP parity — FreeRDP rejects;
@@ -1119,7 +1119,7 @@ mod tests {
         stream
     }
 
-    // #120 — RLEX over/under-region is tolerated, not rejected. A captured real WS2022 stream
+    // #120 — RLEX over/under-region is tolerated, not rejected. A captured real WS2019 stream
     // over-fills its region (corpus entry 0); FreeRDP `clear.c` and the ironrdp oracle both reject
     // that, but a client must not drop a live frame, so justrdp clips the surplus and short-fills
     // under-runs. These assertions pin that intentional tolerance (independent of the oracle,

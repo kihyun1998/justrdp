@@ -2,7 +2,7 @@
 
 Server-to-client only, so no credential crosses into these files: the Client Info PDU carrying
 the password travels the other way and never reaches a capture. Captured from the real VM
-(`docs/agents/thegraph.md`'s third source; memory `test_environment`), one WS2022 box on one
+(`docs/agents/thegraph.md`'s third source; memory `test_environment`), one WS2019 box on one
 advertised configuration — **they prove what this server sends, never what servers send.**
 
 The sibling `connect/` holds bytes from before the Font Map, recorded by `justrdp_tokio`'s
@@ -37,8 +37,9 @@ Two complete TPKT frames, 625 + 661 = 1286 bytes, carved out of a 27 260-byte se
   here is the two-PDU case.
 - **The session leg carries them and the connect leg carries none.** Five logons, no exception.
 - **`Size` is 18, where 2.2.10.1.1.2 defines it as 576** (the structure excluding the two
-  variable strings). FreeRDP notes Windows Server 2019 does this; WS2022 does it too. IronRDP
-  accepts *only* 18 and would reject a server that obeyed the spec. justrdp reads and ignores it.
+  variable strings). FreeRDP notes Windows Server 2019 does this, and this box is a WS2019, so it
+  confirms that note on the same version rather than adding another. IronRDP accepts *only* 18
+  and would reject a server that obeyed the spec. justrdp reads and ignores it.
 - **`Length` is 18 — the fields without the 570-byte pad.** 2.2.10.1.1.4 calls it *"the total
   size in bytes of this structure, including the variable LogonFields field"*, which reads as
   including the pad. This server disagrees with that reading, so a decoder that framed from

@@ -917,7 +917,7 @@ pub enum SessionCommand {
     /// Ask the server to end the session — the Shutdown Request PDU (MS-RDPBCGR 2.2.2.1,
     /// issue #228). The server decides: a refusal arrives as
     /// [`SessionEvent::ShutdownDenied`] and leaves the session running, a grant arrives as
-    /// the session ending with its usual attribution. Windows Server 2022 refuses
+    /// the session ending with its usual attribution. Windows Server 2019 refuses
     /// unconditionally (measured — `docs/map/territory/session-loop-dispatch.md`), so this is a
     /// request, never a teardown: a host that needs the session *gone* still has to end it from
     /// inside.
@@ -3903,7 +3903,7 @@ mod tests {
     /// an `INFOTYPE_LOGON_LONG` — so `ActivationResult::save_session_info` is empty on this VM
     /// and `SessionOutput::SaveSessionInfo` carries everything. Both legs are built because the
     /// PDU is not bound to either by the spec; only one of them fires here, and a capture from
-    /// one WS2022 box on one advertised configuration proves what *this* server does
+    /// one WS2019 box on one advertised configuration proves what *this* server does
     /// (`docs/map/invariant/capture-coverage-follows-what-we-advertise.md`).
     ///
     /// **This is also why `crates/justrdp-pdu/tests/fixtures/session/` exists.**
@@ -9085,7 +9085,7 @@ mod tests {
         /// times over, zero repaint), and a click is the only input class that always lands.
         /// A keyboard sweep therefore has to guess what is on screen, and guessing wrong is not
         /// free: an Alt+F4 that reaches the bare desktop raises the *Shut Down Windows* dialog
-        /// on Server 2022, which a later stray Enter would act on.
+        /// on Server 2019, which a later stray Enter would act on.
         ///
         /// The sign-out costs the *connect* nothing — a cold logon reaches session-active in
         /// ~380 ms, indistinguishable from the ~350 ms reattach it replaces, because the connect
@@ -10089,7 +10089,7 @@ mod tests {
     /// assertion cannot see that; a frame count can, and "no EGFX command was skipped" names
     /// the cause rather than the symptom.
     ///
-    /// **One WS2022 box.** That this server selects 10.4 from the advertised ladder is an
+    /// **One WS2019 box.** That this server selects 10.4 from the advertised ladder is an
     /// observation about this pair (server + our advertised config), not a fact about servers
     /// — see `docs/map/invariant/capture-coverage-follows-what-we-advertise.md`. What is
     /// asserted is the invariant: whatever it selects is something we offered, and it paints.
@@ -11741,7 +11741,7 @@ mod tests {
     /// nothing at all.
     ///
     /// The assertion was known before this test was written, which is unusual and worth saying:
-    /// #198 probed this path with a throwaway build and Windows Server 2022 answered
+    /// #198 probed this path with a throwaway build and Windows Server 2019 answered
     /// `PDUTYPE2_SHUTDOWN_DENIED` on a **clean** desktop — nothing open, nothing unsaved — with
     /// the session still alive 30 s later. The build plan of the time had guessed *"Denied
     /// (typical)"* long before either; this pins it for this server

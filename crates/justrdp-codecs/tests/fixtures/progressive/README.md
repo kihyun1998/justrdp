@@ -1,7 +1,7 @@
 # RemoteFX Progressive corpus (issue #194)
 
 `replay.bin` is one session's worth of genuine `WireToSurface2` block streams harvested from the
-live test VM (192.168.136.136, Windows Server 2022) by the
+live test VM (192.168.136.136, Windows Server 2019) by the
 `capture_progressive_corpus_against_real_vm` `#[ignore]` test in `justrdp-tokio`, **in arrival
 order**. Each payload is one post-zgfx `RDPGFX_CODECID_CAPROGRESSIVE` stream exactly as it
 reached `Progressive::decode` on the wire, with the `codecContextId` and surface dimensions it
@@ -76,7 +76,7 @@ Asserted by `corpus_spans_the_axes_the_epic_needs`, so the list cannot rot silen
   rotates `codecContextId` — **24 distinct ids across 52 payloads**, a fresh id per refinement
   group. Nothing in the capture frees one, which is the live shape of the #83 leak semantics
   #170 has to answer.
-- **One server, one session.** The standing caveat: the WS2022 box advertises a fixed cap set,
+- **One server, one session.** The standing caveat: the WS2019 box advertises a fixed cap set,
   so this corpus can prove the paths it walks and says nothing about the ones it does not.
 
 ## What the oracle does with it

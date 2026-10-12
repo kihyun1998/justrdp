@@ -147,7 +147,7 @@ More detail:
   ("never panics") and a `cargo-fuzz` target run in a nightly CI lane (`fuzz/`, outside the
   workspace).
 - **A 32-bit overflow lane.** Dimension overflow guards are proven on a 32-bit target.
-- **Real VM runs.** Connect and session behaviour is verified against a real Windows Server 2022
+- **Real VM runs.** Connect and session behaviour is verified against a real Windows Server 2019
   VM.
 
 ```sh

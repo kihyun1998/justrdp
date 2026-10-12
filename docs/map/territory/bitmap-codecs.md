@@ -32,7 +32,7 @@ attacker-controlled bytes in the repo.
   accepted evidence.
 - **Tolerances are corpus-driven, not spec-driven.** ClearCodec accepts RLEX runs
   that overflow the declared rect (clipping them) and skips the NSCodec subcodec
-  path where FreeRDP rejects — both are required by real Server 2022 streams (#127).
+  path where FreeRDP rejects — both are required by real Server 2019 streams (#127).
   These are recorded as deliberate divergences against #127 and memory
   `clearcodec_corpus_required_tolerances`.
 - **NSCodec accepts a zero luma, Co or Cg plane count, which `[MS-RDPNSC]` 2.2.2 forbids** (#371,

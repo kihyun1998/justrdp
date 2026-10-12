@@ -1,7 +1,7 @@
 # `session/` — server bytes after session-active, replayed through the session machine
 
 Server-to-client only, so no credential crosses into these files. Captured from the real VM
-(`docs/agents/thegraph.md`'s third source; memory `test_environment`), one WS2022 box on one
+(`docs/agents/thegraph.md`'s third source; memory `test_environment`), one WS2019 box on one
 advertised configuration — **they prove what this server sends, never what servers send.**
 
 This directory sits in `justrdp` rather than beside `justrdp-pdu/tests/fixtures/session/` because

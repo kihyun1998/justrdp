@@ -78,7 +78,7 @@ confusion arises here.
   (`justrdp-codecs/tests/fixtures/progressive/`) exists because of this, and its README records
   the advertised config as provenance.
 - Memory `vm_advertised_graphics_caps` records the server-side half of the same limit.
-- **#305** — committed the exact shape item 1 above warns against: *"this WS2022 VM never sends
+- **#305** — committed the exact shape item 1 above warns against: *"this WS2019 VM never sends
   0x29"*, from five justrdp runs, into a territory note and an epic comment. Connecting FreeRDP
   to the same VM refuted it in one session, and refuted #306's *"no cookie on this VM"* in the
   same log. What was missing was not a sweep of our own fields but a second client.

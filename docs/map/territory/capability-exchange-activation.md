@@ -172,7 +172,7 @@ FONT_MAP      mapFlags=0x0003  entrySize=4
 `grantId` is the MCS user channel and `controlId` is the server channel — the two
 values `[MS-RDPBCGR]` 2.2.1.21 marks MUST. Pinned as
 `justrdp-pdu/tests/fixtures/connect/finalization-replies.bin`, walked by
-`a_real_servers_finalization_replies_decode_in_order`. **One WS2022 box on one
+`a_real_servers_finalization_replies_decode_in_order`. **One WS2019 box on one
 advertised config**: it proves what *this* server sends, never what servers send
 (see [capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md)).
 
