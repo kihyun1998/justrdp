@@ -1273,9 +1273,9 @@ Good! I found KDC proxy support. Now let me compile comprehensive information ab
 
 ### 7b.3 Codec reference implementation notes (for our crate)
 
-- [ ] **O — PCM passthrough.** Decode: identity (raw bytes → samples). Encode: samples → raw bytes. Audio sink integration: feed to OS/CPAL/Pulse for playback.
+- [x] **O — PCM passthrough.** *Built: `justrdp-codecs::pcm` `decode` (#386) and `encode` (#401); the audio sink is the host's.* Decode: identity (raw bytes → samples). Encode: samples → raw bytes. Audio sink integration: feed to OS/CPAL/Pulse for playback.
 
-- [ ] **O — ADPCM (Microsoft/IMA).** Decode: step-index state machine (RFC). Open-source: libsndfile, ffmpeg ADPCM decoder. Encode: delta-prediction + quantization. *Low priority (rare in practice).*
+- [x] **O — ADPCM (Microsoft/IMA).** *Built: decoders (#389) and encoders (#403) in `justrdp-codecs::adpcm`; audio input does not offer ADPCM, since Windows 11 keeps only 30 ms of each block packet (`docs/map/territory/audio-input.md`).* Decode: step-index state machine (RFC). Open-source: libsndfile, ffmpeg ADPCM decoder. Encode: delta-prediction + quantization. *Low priority (rare in practice).*
 
 - [ ] **O — GSM 6.10 decoder.** External: libgsm-full (GSM encode/decode, 264-sample frames → 33 bytes). Integrate via FFI or fork decoder code. *Very niche (speech only, 8kHz).*
 
@@ -1303,11 +1303,11 @@ Good! I found KDC proxy support. Now let me compile comprehensive information ab
 
 ###  Open questions (audio subsystem)
 
-1. **MVP scope:** Is audio playback (RDPSND output) in v1, or explicitly deferred? Mic input (AUDIN) separate slice?
-2. **Codec strategy:** PCM-only baseline, or add one lossy codec (ADPCM/GSM/AAC) for bandwidth savings? Audio sink integration: CPAL/Pulse/Windows MME/coreaudio choice?
+1. ~~**MVP scope:** Is audio playback (RDPSND output) in v1, or explicitly deferred? Mic input (AUDIN) separate slice?~~ **Answered:** both are in v1 — audio output (epic #11) and audio input (epic #12, its own slices #400–#416).
+2. ~~**Codec strategy:** PCM-only baseline, or add one lossy codec (ADPCM/GSM/AAC) for bandwidth savings? Audio sink integration: CPAL/Pulse/Windows MME/coreaudio choice?~~ **Answered:** output decodes PCM, A-law, MS-ADPCM and IMA-ADPCM; input encodes PCM and A-law. AAC waits on #21, GSM is out. The audio sink and capture device are the host's (ADR-0001's boundary), so the core picks no audio backend.
 3. **Licensing:** MP3 patents clear in target regions? If not, drop from spec; client will hear server's "unsupported format" and can fall back to codec server offers (likely PCM or AAC).
 4. **Timestamp sync:** Full A/V sync (audio ↔ graphics) or "best effort" (ignore server timestamp, assume monotonic delivery)?
-5. **Test vectors:** Can we capture real RDPSND PDU traces (Windows Server + audio enabled) to validate codec decoders?
+5. ~~**Test vectors:** Can we capture real RDPSND PDU traces (Windows Server + audio enabled) to validate codec decoders?~~ **Answered:** yes — the ADPCM decoders are checked against captured Wave2 samples from the test VM (`crates/justrdp-codecs/tests/fixtures/adpcm/`), and audio input against the Windows 11 VM's recording.
 
 ---
 
