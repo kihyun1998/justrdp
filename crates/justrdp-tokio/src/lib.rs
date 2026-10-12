@@ -3734,12 +3734,12 @@ mod tests {
     /// Real-VM acceptance for #404: the server opens `AUDIO_INPUT` when the session records,
     /// the helper negotiates PCM and answers its Open, and the signal the host pushes is what the
     /// session's recording holds, whole, read back over drive redirection. Known to fail in
-    /// about two runs of five: Windows 11 drops whole PCM packets that reach it on time
-    /// (`docs/map/territory/audio-input.md`).
+    /// about two runs of five: the guest's audio engine skips processing passes and overruns the
+    /// buffer the packets arrive in (#416, `docs/map/territory/audio-input.md`).
     #[tokio::test]
     #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation, \
                 expires around 2027-01) and JUSTRDP_TEST_* env vars; fails in about two runs of \
-                five, Windows dropping PCM packets"]
+                five, the guest's audio engine overrunning its buffer (#416)"]
     async fn a_signal_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm() {
         let run =
             record_a_signal_pushed_as_audio_input(true, &[justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM])
