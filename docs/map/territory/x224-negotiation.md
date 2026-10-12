@@ -52,7 +52,12 @@ deciding the exchange itself.
 
 ## Reference behaviour
 
-**None.** This repo keeps no verified external-fact store (see the hub's *what the
+**Measured on the test VM** (#429, 2026-10-12): justrdp requests `0xb` (SSL | HYBRID | HYBRID_EX)
+and the server selects `0x8` (HYBRID_EX), on 5 of 5 connects; both are recorded as `rdp_x224`
+(`step="request"`, `step="selected"`) and asserted in order by
+`connect_reaches_session_active_against_real_vm`. One WS2019 box.
+
+**No implementation comparison.** This repo keeps no verified external-fact store (see the hub's *what the
 map cannot answer*), so no FreeRDP / IronRDP behaviour is recorded here with a
 pinned citation. The modules cite `[MS-RDPBCGR]` section numbers inline, which is a
 *spec* pin — the implementation comparison this project's tie-breaker table relies

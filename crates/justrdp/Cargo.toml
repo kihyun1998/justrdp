@@ -43,6 +43,10 @@ ironrdp-pdu = "0.9.0"
 # server-supplied X.509 through a leaf dependency, and `framebuffer`, which sizes and indexes
 # from server-declared dimensions.
 proptest.workspace = true
+# Captures the core's PDU-milestone records in-test, so the connect and reactivation
+# sequences are asserted in order without a VM (#429). "no-env-filter" because the records
+# use `target: "rdp_*"`, which the default crate-name filter drops.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 
 [features]
 # The fuzz seam (#267). Off by default and never enabled by the workspace build, so the

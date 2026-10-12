@@ -175,9 +175,7 @@ pub enum SessionOutput {
 
 /// Record one Save Session Info at its arrival, for whichever leg received it.
 ///
-/// Shared because the connect leg and the session leg both dispatch this PDU, and the existing
-/// asymmetry is already a known hole: `on_data_pdu`'s reactivation arms note that `connect.rs`
-/// emits an `rdp_finalization` record per reply while they emit nothing. One function is the
+/// Shared because the connect leg and the session leg both dispatch this PDU. One function is the
 /// same move `Control::check_server_action` made for a value check in #252 — one family, one
 /// answer, whichever leg asks.
 ///
@@ -972,23 +970,43 @@ impl SessionStateMachine {
             // very site — one of the two non-codec cases that showed the rule derives past the
             // layer it was written about.
             //
-            // **Observability is not yet symmetric.** `connect.rs` emits an `rdp_finalization`
-            // record per reply; these two arms emit nothing, so a reactivation is still three
-            // asserted milestones out of six PDUs. The value checks match on both legs; the
-            // milestones do not, and this comment is here so the gap is a known one.
+            // Each reply is recorded as `rdp_finalization` with `leg = "reactivation"`, the
+            // record the connect leg emits with `leg = "connect"` (#429).
             share::PDU_TYPE2_SYNCHRONIZE if self.phase == Phase::Reactivating => {
                 finalization::Synchronize::decode(cur).map_err(SessionError::Decode)?;
+                tracing::debug!(
+                    target: "rdp_finalization",
+                    leg = "reactivation",
+                    reply = "synchronize",
+                    "server Synchronize"
+                );
                 Ok(())
             }
             share::PDU_TYPE2_CONTROL if self.phase == Phase::Reactivating => {
-                finalization::Control::decode(cur)
-                    .map_err(SessionError::Decode)?
+                let control = finalization::Control::decode(cur).map_err(SessionError::Decode)?;
+                control
                     .check_server_action()
                     .map_err(SessionError::Decode)?;
+                tracing::debug!(
+                    target: "rdp_finalization",
+                    leg = "reactivation",
+                    reply = "control",
+                    action = format_args!("{:#06x}", control.action),
+                    grant_id = control.grant_id,
+                    control_id = control.control_id,
+                    "server Control"
+                );
                 Ok(())
             }
             share::PDU_TYPE2_FONT_MAP if self.phase == Phase::Reactivating => {
-                finalization::FontMap::decode(cur).map_err(SessionError::Decode)?;
+                let map = finalization::FontMap::decode(cur).map_err(SessionError::Decode)?;
+                tracing::debug!(
+                    target: "rdp_finalization",
+                    leg = "reactivation",
+                    reply = "font-map",
+                    map_flags = format_args!("{:#06x}", map.map_flags),
+                    "server Font Map"
+                );
                 tracing::debug!(target: "rdp_font_map", "Font Map received — reactivation complete");
                 self.phase = Phase::Active;
                 // Reactivation complete: re-emit the full screen so the host repaints
@@ -3037,6 +3055,60 @@ mod tests {
             ),
             "a Synchronize whose messageType is not SYNCMSGTYPE_SYNC should be a typed error"
         );
+    }
+
+    /// The reactivation leg records each finalization reply the way the connect leg does, told
+    /// apart by `leg` (#429).
+    #[test]
+    #[tracing_test::traced_test]
+    fn reactivation_records_each_finalization_reply_in_order() {
+        let mut sm = reactivating();
+        let control = |action, grant_id, control_id| {
+            finalization::Control {
+                action,
+                grant_id,
+                control_id,
+            }
+            .encode()
+        };
+        for (pdu_type2, body) in [
+            (
+                share::PDU_TYPE2_SYNCHRONIZE,
+                finalization::Synchronize { target_user: 0 }.encode(),
+            ),
+            (
+                share::PDU_TYPE2_CONTROL,
+                control(finalization::CTRLACTION_COOPERATE, 0, 0),
+            ),
+            (
+                share::PDU_TYPE2_CONTROL,
+                control(finalization::CTRLACTION_GRANTED_CONTROL, 1007, 0x03EA),
+            ),
+            (share::PDU_TYPE2_FONT_MAP, vec![0, 0, 0, 0, 3, 0, 4, 0]),
+        ] {
+            sm.process_bytes(&server_data_pdu(pdu_type2, &body))
+                .expect("a well-formed finalization reply is not an error");
+        }
+        logs_assert(|lines: &[&str]| {
+            let leg = "leg=\"reactivation\"";
+            crate::connect::tests::assert_records_in_order(
+                lines,
+                &[
+                    ("rdp_finalization", &[leg, "reply=\"synchronize\""]),
+                    (
+                        "rdp_finalization",
+                        &[leg, "reply=\"control\"", "action=0x0004"],
+                    ),
+                    (
+                        "rdp_finalization",
+                        &[leg, "reply=\"control\"", "action=0x0002"],
+                    ),
+                    ("rdp_finalization", &[leg, "reply=\"font-map\""]),
+                    ("rdp_font_map", &[]),
+                ],
+            );
+            Ok(())
+        });
     }
 
     #[test]

@@ -44,7 +44,16 @@ decision of its own. That inference has never been written down as a record.
 
 ## Reference behaviour
 
-**None.** No verified external-fact store.
+**The test VM takes the valid-client short-circuit** (#429, 2026-10-12): an Error Alert with
+`STATUS_VALID_CLIENT` (`0x7`) right after Client Info, on 5 of 5 connects in one run, recorded as
+`rdp_licensing` `branch="valid-client"`. The full exchange (License Request, Platform Challenge,
+New License) has never been observed live here; it is proven against the scripted server in
+`full_license_negotiation_answers_request_challenge_and_accepts_grant`. Which branch a server takes
+is its state, so `connect_reaches_session_active_against_real_vm` asserts that a licensing record
+fired and prints its branch rather than pinning one. One WS2019 box in Remote Desktop for
+Administration mode; the RD Session Host role made it send a License Request instead
+([verification harness](verification-harness.md), #400). No FreeRDP / IronRDP behaviour is
+recorded here.
 
 ## Cross-cutting invariants
 

@@ -56,7 +56,14 @@ places the sequence in a state machine.
 
 ## Reference behaviour
 
-**None.** No verified external-fact store. The tolerance questions here (a server
+**Measured on the test VM** (#429, 2026-10-12): the server does not skip the channel join
+(`skip_channel_join=false` on every connect), and its Channel Join Confirms arrive in the order
+the requests went out: user channel, I/O channel (`1003`), then each static channel. Recorded as
+`rdp_mcs` (`step="connect-response"`, `step="attach-user"`) and one `rdp_channel_join` per
+confirm, and asserted in order by `connect_reaches_session_active_against_real_vm`. The machine
+accepts confirms in any order; this server never exercised that. One WS2019 box.
+
+**No implementation comparison.** No verified external-fact store. The tolerance questions here (a server
 that omits a requested channel, an unexpected join order) are exactly the class
 ADR-0009 says is spec-unwritten and lives in FreeRDP's source — and none of it is
 recorded.
@@ -92,5 +99,6 @@ recorded.
 ## Known holes / open
 
 - Multi-monitor and DPI (epic #27) add GCC monitor data that is not built.
-- `SUPPORT_SKIP_CHANNELJOIN` is defined as a constant; whether the client honours
-  the skip path is not recorded anywhere.
+- The skip-channel-join path is proven only against the scripted server
+  (`skip_channel_join_bypasses_joins_when_both_sides_advertise_it`): the test VM never skips
+  (`rdp_mcs` records `skip_channel_join=false`, #429), so no live server has exercised it.

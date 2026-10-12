@@ -502,6 +502,12 @@ impl ConnectStateMachine {
         match (self.stage, event) {
             (Stage::TcpConnect, Event::Connected) => {
                 self.stage = Stage::X224Negotiate;
+                tracing::debug!(
+                    target: "rdp_x224",
+                    step = "request",
+                    requested = format_args!("{:#x}", self.config.requested.bits()),
+                    "X.224 Connection Request sent"
+                );
                 let neg = NegRequest::new(self.config.requested).encode();
                 let tpdu = x224::encode_connection_request(&neg);
                 vec![Action::WriteBytes(tpkt::encode(&tpdu))]
@@ -616,6 +622,12 @@ impl ConnectStateMachine {
                 {
                     // The server picked a TLS-based protocol we advertised: remember it and ask
                     // the adapter to upgrade the socket.
+                    tracing::debug!(
+                        target: "rdp_x224",
+                        step = "selected",
+                        selected = format_args!("{:#x}", selected.bits()),
+                        "X.224 Connection Confirm"
+                    );
                     self.stage = Stage::TlsHandshake { selected };
                     vec![Action::StartTls { selected }]
                 }
@@ -730,6 +742,14 @@ impl ConnectStateMachine {
             .early_capability_flags
             .contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN);
         self.skip_channel_join = server_skips && client_skips;
+        tracing::debug!(
+            target: "rdp_mcs",
+            step = "connect-response",
+            io_channel_id = self.io_channel_id,
+            static_channels = self.static_channels.len(),
+            skip_channel_join = self.skip_channel_join,
+            "MCS Connect-Response; Erect Domain + Attach User sent"
+        );
 
         self.stage = Stage::McsAttach { selected };
         vec![
@@ -755,6 +775,13 @@ impl ConnectStateMachine {
             });
         }
         self.user_channel_id = confirm.initiator_id;
+        tracing::debug!(
+            target: "rdp_mcs",
+            step = "attach-user",
+            user_channel_id = self.user_channel_id,
+            skip_channel_join = self.skip_channel_join,
+            "MCS Attach User Confirm"
+        );
 
         if self.skip_channel_join {
             return self.finish(selected);
@@ -805,6 +832,12 @@ impl ConnectStateMachine {
             ));
         };
         self.pending_joins.swap_remove(pos);
+        tracing::debug!(
+            target: "rdp_channel_join",
+            channel_id = confirm.requested_channel_id,
+            remaining = self.pending_joins.len(),
+            "MCS Channel Join Confirm"
+        );
         if self.pending_joins.is_empty() {
             self.finish(selected)
         } else {
@@ -918,6 +951,16 @@ impl ConnectStateMachine {
                 if alert.error_code == license::STATUS_VALID_CLIENT
                     || alert.state_transition == license::ST_NO_TRANSITION
                 {
+                    tracing::debug!(
+                        target: "rdp_licensing",
+                        branch = if alert.error_code == license::STATUS_VALID_CLIENT {
+                            "valid-client"
+                        } else {
+                            "no-transition"
+                        },
+                        error_code = format_args!("{:#x}", alert.error_code),
+                        "licensing complete: server Error Alert"
+                    );
                     self.stage = Stage::CapabilityExchange { selected };
                     Ok(Vec::new())
                 } else {
@@ -947,6 +990,11 @@ impl ConnectStateMachine {
                     &encrypted_premaster,
                     &self.config.client_info.username,
                     &self.config.core.client_name,
+                );
+                tracing::debug!(
+                    target: "rdp_licensing",
+                    branch = "license-request",
+                    "server License Request; New License Request sent"
                 );
                 Ok(vec![self.send_io(&msg)])
             }
@@ -984,6 +1032,11 @@ impl ConnectStateMachine {
                     &license_crypto::rc4(&keys.license_key, &hwid),
                     &mac,
                 );
+                tracing::debug!(
+                    target: "rdp_licensing",
+                    branch = "platform-challenge",
+                    "server Platform Challenge; Platform Challenge Response sent"
+                );
                 Ok(vec![self.send_io(&msg)])
             }
             license::MSG_NEW_LICENSE | license::MSG_UPGRADE_LICENSE => {
@@ -1003,6 +1056,15 @@ impl ConnectStateMachine {
                 // Persistent license caching is optional (MS-RDPELE) and not built
                 // (`docs/map/territory/licensing.md`): the grant is integrity-verified and
                 // discarded.
+                tracing::debug!(
+                    target: "rdp_licensing",
+                    branch = if preamble.msg_type == license::MSG_NEW_LICENSE {
+                        "new-license"
+                    } else {
+                        "upgrade-license"
+                    },
+                    "licensing complete: server license grant verified"
+                );
                 self.stage = Stage::CapabilityExchange { selected };
                 Ok(Vec::new())
             }
@@ -1172,6 +1234,7 @@ impl ConnectStateMachine {
                             .map_err(ConnectError::Decode)?;
                         tracing::debug!(
                             target: "rdp_finalization",
+                            leg = "connect",
                             reply = "font-map",
                             map_flags = format_args!("{:#06x}", map.map_flags),
                             "server Font Map"
@@ -1203,6 +1266,7 @@ impl ConnectStateMachine {
                             .map_err(ConnectError::Decode)?;
                         tracing::debug!(
                             target: "rdp_finalization",
+                            leg = "connect",
                             reply = "synchronize",
                             "server Synchronize"
                         );
@@ -1220,6 +1284,7 @@ impl ConnectStateMachine {
                         // server sent all four in order" is an assertion nobody can test.
                         tracing::debug!(
                             target: "rdp_finalization",
+                            leg = "connect",
                             reply = "control",
                             action = format_args!("{:#06x}", control.action),
                             grant_id = control.grant_id,
@@ -1817,6 +1882,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[tracing_test::traced_test]
     fn skip_channel_join_bypasses_joins_when_both_sides_advertise_it() {
         // Client advertises SUPPORT_SKIP_CHANNELJOIN, server answers SKIP_CHANNELJOIN_SUPPORTED:
         // after Attach User Confirm the machine finishes without a single join request.
@@ -1840,6 +1906,11 @@ pub(crate) mod tests {
             }
             other => panic!("expected immediate McsConnected, got {other:?}"),
         }
+        // The skip is visible in the record, and no join is recorded.
+        assert!(logs_contain(
+            "step=\"attach-user\" user_channel_id=1009 skip_channel_join=true"
+        ));
+        assert!(!logs_contain("rdp_channel_join:"));
     }
 
     #[test]
@@ -2538,6 +2609,68 @@ pub(crate) mod tests {
         }
     }
 
+    /// Asserts that `expected` occurs in `lines` in order: each entry matches a later line than
+    /// the one before it, by its target and every one of its fields as written
+    /// (`reply="control"`, never the bare word).
+    pub(crate) fn assert_records_in_order(lines: &[&str], expected: &[(&str, &[&str])]) {
+        let mut from = 0;
+        for (target, fields) in expected {
+            let hit = lines[from..].iter().position(|line| {
+                line.contains(&format!("{target}:")) && fields.iter().all(|f| line.contains(f))
+            });
+            match hit {
+                Some(offset) => from += offset + 1,
+                None => panic!(
+                    "no `{target}` record with {fields:?} after record {from}; recorded:\n{}",
+                    lines.join("\n")
+                ),
+            }
+        }
+    }
+
+    /// Every connect milestone is recorded, in wire order, from the X.224 request to
+    /// session-active (#429; #252 covered Demand Active onwards).
+    #[test]
+    #[tracing_test::traced_test]
+    fn the_connect_sequence_records_every_milestone_in_wire_order() {
+        let _ = session_active();
+        logs_assert(|lines: &[&str]| {
+            assert_records_in_order(
+                lines,
+                &[
+                    ("rdp_x224", &["step=\"request\""]),
+                    ("rdp_x224", &["step=\"selected\""]),
+                    ("rdp_mcs", &["step=\"connect-response\""]),
+                    ("rdp_mcs", &["step=\"attach-user\"", "user_channel_id=1007"]),
+                    ("rdp_channel_join", &["channel_id=1007"]),
+                    ("rdp_channel_join", &["channel_id=1003"]),
+                    ("rdp_channel_join", &["channel_id=1004"]),
+                    ("rdp_channel_join", &["channel_id=1005", "remaining=0"]),
+                    ("rdp_licensing", &["branch=\"valid-client\""]),
+                    ("rdp_demand_active", &[]),
+                    (
+                        "rdp_finalization",
+                        &["leg=\"connect\"", "reply=\"synchronize\""],
+                    ),
+                    (
+                        "rdp_finalization",
+                        &["leg=\"connect\"", "reply=\"control\""],
+                    ),
+                    (
+                        "rdp_finalization",
+                        &["leg=\"connect\"", "reply=\"control\""],
+                    ),
+                    (
+                        "rdp_finalization",
+                        &["leg=\"connect\"", "reply=\"font-map\""],
+                    ),
+                    ("rdp_session_active", &[]),
+                ],
+            );
+            Ok(())
+        });
+    }
+
     #[test]
     fn licensing_error_with_total_abort_fails_typed() {
         let mut sm = licensing();
@@ -2556,6 +2689,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[tracing_test::traced_test]
     fn licensing_error_with_no_transition_advances_like_a_grace_period_server() {
         // A grace-period server reports an error code yet declares the exchange over
         // (ST_NO_TRANSITION) and proceeds to Demand Active — the client must advance, not
@@ -2569,6 +2703,8 @@ pub(crate) mod tests {
             actions.is_empty(),
             "exchange-ending alert produces no output"
         );
+        // The branch is named apart from the valid-client short-circuit it shares an arm with.
+        assert!(logs_contain("branch=\"no-transition\" error_code=0x2"));
 
         let actions = sm.process(Event::Received(&server_io_frame(&server_demand_active(
             1920, 1080,
@@ -2593,6 +2729,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[tracing_test::traced_test]
     fn full_license_negotiation_answers_request_challenge_and_accepts_grant() {
         let mut sm = licensing();
 
@@ -2658,6 +2795,17 @@ pub(crate) mod tests {
             &grant,
         ))));
         assert!(actions.is_empty());
+        logs_assert(|lines: &[&str]| {
+            assert_records_in_order(
+                lines,
+                &[
+                    ("rdp_licensing", &["branch=\"license-request\""]),
+                    ("rdp_licensing", &["branch=\"platform-challenge\""]),
+                    ("rdp_licensing", &["branch=\"new-license\""]),
+                ],
+            );
+            Ok(())
+        });
 
         let actions = sm.process(Event::Received(&server_io_frame(&server_demand_active(
             1920, 1080,
