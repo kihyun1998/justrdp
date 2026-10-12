@@ -323,9 +323,11 @@ chose warn-and-skip. A better derivation does not reopen it; the maintainer does
 
 - **Whether the evict-side guard earns its place.** Its skip is unobservable by construction: the
   fill path already prevents an out-of-range slot from being occupied, so `remove` was always a
-  no-op there. Mutation testing confirms it — deleting that one guard reddens no test. It is kept
-  for the warn and for uniformity across the three PDUs, and this crate has no tracing-assertion
-  facility to pin the warn (neither does #268's row-3 warn).
+  no-op there. Mutation testing confirmed it — deleting that one guard reddened no test. It is kept
+  for the warn and for uniformity across the three PDUs. Since #435 the warn is pinned
+  (`an_out_of_range_evict_frees_nothing_and_an_in_range_one_still_works`), so deleting the guard
+  now reddens that test through its warn; the cache's behaviour still cannot tell the two apart.
+  #268's row-3 warn is pinned at each of its five call sites the same way.
 - **Whether an in-range unfilled slot should keep taking the reset.** Unchanged, and neither
   reference has this two-rung split: FreeRDP fails both cases identically and `ironrdp-egfx`
   tolerates both silently.
