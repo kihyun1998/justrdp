@@ -1221,6 +1221,7 @@ dependencies = [
  "proptest",
  "rcgen",
  "tracing",
+ "tracing-test",
  "x509-cert 0.3.0",
 ]
 

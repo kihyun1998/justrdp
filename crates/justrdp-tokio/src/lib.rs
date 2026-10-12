@@ -1393,6 +1393,25 @@ mod tests {
     use justrdp_pdu::nego::SecurityProtocol;
     use justrdp_pdu::{client_info, gcc};
 
+    /// Asserts that `expected` occurs in `lines` in order: each entry matches a later line than
+    /// the one before it, by its target and every one of its fields as written
+    /// (`reply="control"`, never the bare word). The core's unit tests hold the same helper.
+    fn assert_records_in_order(lines: &[&str], expected: &[(&str, &[&str])]) {
+        let mut from = 0;
+        for (target, fields) in expected {
+            let hit = lines[from..].iter().position(|line| {
+                line.contains(&format!("{target}:")) && fields.iter().all(|f| line.contains(f))
+            });
+            match hit {
+                Some(offset) => from += offset + 1,
+                None => panic!(
+                    "no `{target}` record with {fields:?} after record {from}; recorded:\n{}",
+                    lines.join("\n")
+                ),
+            }
+        }
+    }
+
     /// A full connect config for the tests: SSL|HYBRID|HYBRID_EX advertised, a modest GCC core,
     /// two static channels, and explicitly chosen early-capability flags (caller policy — set
     /// here, in the host layer, exactly as the anti-hardcode rule demands).
@@ -2493,9 +2512,40 @@ mod tests {
                     "no `rdp_finalization` record with reply=\"{reply}\""
                 );
             }
+            // #429: the whole sequence, in wire order, from the X.224 request. The licensing
+            // record is matched by target only and its branch printed, because which branch a
+            // server takes is its state, not ours (`docs/map/territory/licensing.md`).
+            logs_assert(|lines: &[&str]| {
+                assert_records_in_order(
+                    lines,
+                    &[
+                        ("rdp_x224", &["step=\"request\""]),
+                        ("rdp_x224", &["step=\"selected\""]),
+                        ("rdp_mcs", &["step=\"connect-response\""]),
+                        ("rdp_mcs", &["step=\"attach-user\""]),
+                        ("rdp_channel_join", &["remaining=0"]),
+                        ("rdp_licensing", &[]),
+                        ("rdp_demand_active", &[]),
+                        ("rdp_finalization", &["leg=\"connect\"", "reply=\"synchronize\""]),
+                        ("rdp_finalization", &["leg=\"connect\"", "reply=\"control\""]),
+                        ("rdp_finalization", &["leg=\"connect\"", "reply=\"control\""]),
+                        ("rdp_finalization", &["leg=\"connect\"", "reply=\"font-map\""]),
+                        ("rdp_session_active", &[]),
+                    ],
+                );
+                for line in lines.iter().filter(|l| {
+                    ["rdp_x224:", "rdp_mcs:", "rdp_channel_join:", "rdp_licensing:"]
+                        .iter()
+                        .any(|t| l.contains(t))
+                }) {
+                    eprintln!("{line}");
+                }
+                Ok(())
+            });
             eprintln!(
-                "milestones observed: rdp_demand_active → rdp_finalization(synchronize, \
-                 control, font-map) → rdp_session_active"
+                "milestones observed in order: rdp_x224(request, selected) → rdp_mcs(connect-response, \
+                 attach-user) → rdp_channel_join → rdp_licensing → rdp_demand_active → \
+                 rdp_finalization(synchronize, control, control, font-map) → rdp_session_active"
             );
         })
         .await
@@ -11582,14 +11632,12 @@ mod tests {
     /// `rdp_displaycontrol_resize`, `rdp_deactivate_all`, `rdp_demand_active`,
     /// `rdp_font_map` — visible with `--nocapture`.
     ///
-    /// **Milestones, not the sequence** — this doc claimed the sequence until #252, and a
-    /// capture of this very test shows the server also sending Synchronize and both Controls
-    /// between the last two. The *connect* leg now names them (`rdp_finalization`, one record
-    /// per reply, asserted in `connect_reaches_session_active_against_real_vm`), so #8's
-    /// criterion is met there. **It is not met on this leg**: `session.rs`'s reactivation arms
-    /// decode and check those replies but emit nothing, so the list below is still six
-    /// milestones out of nine PDUs. Extending `rdp_finalization` to the reactivation arms is
-    /// the obvious next step and is deliberately not in #252's scope.
+    /// The reactivation itself is then asserted **in order**, reply by reply: from the resize
+    /// request through `rdp_deactivate_all`, `rdp_demand_active`, the four server replies as
+    /// `rdp_finalization` with `leg="reactivation"` (Synchronize, Control Cooperate, Control
+    /// Granted Control, Font Map; #429), to `rdp_font_map`. Until #429 the three replies before
+    /// the Font Map had no record on this leg, so the test could name six milestones out of
+    /// nine PDUs and not their order.
     #[tokio::test]
     #[traced_test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
@@ -11712,11 +11760,35 @@ mod tests {
                     "{what} was never logged ({target_name})"
                 );
             }
+            // The reactivation in wire order (#429). `leg` keeps the connect leg's records, which
+            // this process emitted first, from satisfying the reactivation entries.
+            logs_assert(|lines: &[&str]| {
+                let leg = "leg=\"reactivation\"";
+                assert_records_in_order(
+                    lines,
+                    &[
+                        ("rdp_displaycontrol_resize", &[]),
+                        ("rdp_deactivate_all", &[]),
+                        ("rdp_demand_active", &[]),
+                        ("rdp_finalization", &[leg, "reply=\"synchronize\""]),
+                        (
+                            "rdp_finalization",
+                            &[leg, "reply=\"control\"", "action=0x0004"],
+                        ),
+                        (
+                            "rdp_finalization",
+                            &[leg, "reply=\"control\"", "action=0x0002"],
+                        ),
+                        ("rdp_finalization", &[leg, "reply=\"font-map\""]),
+                        ("rdp_font_map", &[]),
+                    ],
+                );
+                Ok(())
+            });
             eprintln!(
                 "PDU milestones asserted: DYNVC caps → create → EDISP caps → Monitor Layout → \
-             DeactivateAll → Demand Active → Font Map. The server also sends Synchronize and \
-             both Controls between the last two — measured by capture in #252 — but neither has \
-             a tracing target, so this line is what the test asserts, not the whole sequence."
+             DeactivateAll → Demand Active → Synchronize → Control(Cooperate) → \
+             Control(GrantedControl) → Font Map, the reactivation in order."
             );
             eprintln!(
                 "resize verified: {}x{} → {}x{}",
