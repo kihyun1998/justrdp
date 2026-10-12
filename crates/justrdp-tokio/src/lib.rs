@@ -857,8 +857,9 @@ pub async fn run_session_with_input(
                     // them through run_session_with_commands, and the core already emitted the
                     // `rdp_drdynvc` record.
                 }
-                SessionOutput::DynamicChannelData { channel_id, data } => {
+                SessionOutput::DynamicChannelData { channel, data } => {
                     // No event sink here either; the core keeps no per-message record.
+                    let channel_id = channel.channel_id();
                     tracing::debug!(target: "rdp_drdynvc", channel_id, bytes = data.len(), "host dynamic channel message");
                 }
             }
@@ -941,8 +942,8 @@ pub enum SessionCommand {
     /// [`justrdp::SessionStateMachine::send_dynamic_channel`]. A refused send
     /// ([`justrdp::DynamicChannelError`]) is logged and dropped — the session keeps running.
     DynamicChannelData {
-        /// The channel's id, as in [`SessionEvent::DynamicChannelOpened`].
-        channel_id: u32,
+        /// The channel, as in [`SessionEvent::DynamicChannelOpened`].
+        channel: justrdp::DynamicChannelHandle,
         /// The message.
         data: Vec<u8>,
     },
@@ -950,8 +951,8 @@ pub enum SessionCommand {
     /// [`justrdp::SessionStateMachine::close_dynamic_channel`]. A refused close is logged and
     /// dropped.
     CloseDynamicChannel {
-        /// The channel's id.
-        channel_id: u32,
+        /// The channel, as in [`SessionEvent::DynamicChannelOpened`].
+        channel: justrdp::DynamicChannelHandle,
     },
 }
 
@@ -1002,21 +1003,21 @@ pub enum SessionEvent {
     DynamicChannelOpened {
         /// The name the host registered.
         name: String,
-        /// The id the server gave the channel.
-        channel_id: u32,
+        /// The channel: its id, and which binding of the id it is.
+        channel: justrdp::DynamicChannelHandle,
     },
     /// One whole message on a host dynamic channel. What it means, and whether anything
     /// answers it, is the host's.
     DynamicChannelData {
-        /// The channel's id, as in [`Self::DynamicChannelOpened`].
-        channel_id: u32,
+        /// The channel, as in [`Self::DynamicChannelOpened`].
+        channel: justrdp::DynamicChannelHandle,
         /// The message.
         data: Vec<u8>,
     },
     /// The server closed a host dynamic channel, or reused its id for a new channel.
     DynamicChannelClosed {
-        /// The channel's id.
-        channel_id: u32,
+        /// The channel.
+        channel: justrdp::DynamicChannelHandle,
     },
 }
 
@@ -1086,14 +1087,14 @@ pub async fn run_session_with_commands(
                         total_length,
                     });
                 }
-                SessionOutput::DynamicChannelOpened { name, channel_id } => {
-                    on_event(SessionEvent::DynamicChannelOpened { name, channel_id });
+                SessionOutput::DynamicChannelOpened { name, channel } => {
+                    on_event(SessionEvent::DynamicChannelOpened { name, channel });
                 }
-                SessionOutput::DynamicChannelData { channel_id, data } => {
-                    on_event(SessionEvent::DynamicChannelData { channel_id, data });
+                SessionOutput::DynamicChannelData { channel, data } => {
+                    on_event(SessionEvent::DynamicChannelData { channel, data });
                 }
-                SessionOutput::DynamicChannelClosed { channel_id } => {
-                    on_event(SessionEvent::DynamicChannelClosed { channel_id });
+                SessionOutput::DynamicChannelClosed { channel } => {
+                    on_event(SessionEvent::DynamicChannelClosed { channel });
                 }
             }
         }
@@ -1163,8 +1164,9 @@ pub async fn run_session_with_commands(
                             tracing::warn!(channel, error = %e, "channel message cap refused");
                         }
                     }
-                    Some(SessionCommand::DynamicChannelData { channel_id, data }) => {
-                        match machine.send_dynamic_channel(channel_id, &data) {
+                    Some(SessionCommand::DynamicChannelData { channel, data }) => {
+                        let channel_id = channel.channel_id();
+                        match machine.send_dynamic_channel(channel, &data) {
                             Ok(frames) => {
                                 for frame in frames {
                                     write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
@@ -1174,8 +1176,9 @@ pub async fn run_session_with_commands(
                             Err(e) => tracing::warn!(channel_id, error = %e, "dynamic channel send refused"),
                         }
                     }
-                    Some(SessionCommand::CloseDynamicChannel { channel_id }) => {
-                        match machine.close_dynamic_channel(channel_id) {
+                    Some(SessionCommand::CloseDynamicChannel { channel }) => {
+                        let channel_id = channel.channel_id();
+                        match machine.close_dynamic_channel(channel) {
                             Ok(frames) => {
                                 for frame in frames {
                                     write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
@@ -2552,8 +2555,8 @@ mod tests {
             };
             let frames_in_sink = frames.clone();
             let started = std::time::Instant::now();
-            let mut opened: Vec<(String, u32, Duration)> = Vec::new();
-            let mut messages: Vec<(u32, Vec<u8>, Duration)> = Vec::new();
+            let mut opened: Vec<(String, justrdp::DynamicChannelHandle, Duration)> = Vec::new();
+            let mut messages: Vec<(justrdp::DynamicChannelHandle, Vec<u8>, Duration)> = Vec::new();
             let mut rdpsnd_messages = 0usize;
             let ended = tokio::time::timeout(
                 Duration::from_secs(90),
@@ -2566,11 +2569,11 @@ mod tests {
                     |_| {},
                     |event| {
                         match event {
-                            SessionEvent::DynamicChannelOpened { name, channel_id } => {
-                                opened.push((name, channel_id, started.elapsed()));
+                            SessionEvent::DynamicChannelOpened { name, channel } => {
+                                opened.push((name, channel, started.elapsed()));
                             }
-                            SessionEvent::DynamicChannelData { channel_id, data } => {
-                                messages.push((channel_id, data, started.elapsed()));
+                            SessionEvent::DynamicChannelData { channel, data } => {
+                                messages.push((channel, data, started.elapsed()));
                             }
                             SessionEvent::ChannelData { channel, .. } if channel == rdpsnd => {
                                 rdpsnd_messages += 1;
@@ -2672,7 +2675,7 @@ mod tests {
 
         #[derive(Default)]
         struct Heard {
-            dynamic_channel: Option<u32>,
+            dynamic_channel: Option<justrdp::DynamicChannelHandle>,
             msg_types: Vec<u8>,
             negotiated: Vec<(Instant, Vec<AudioFormat>)>,
             server_formats: Vec<(u16, Vec<AudioFormat>)>,
@@ -2836,19 +2839,19 @@ mod tests {
                         // whether that channel is the static one.
                         let (data, reply, on_static): (Vec<u8>, Reply, bool) =
                             match event {
-                                SessionEvent::DynamicChannelOpened { name, channel_id }
+                                SessionEvent::DynamicChannelOpened { name, channel }
                                     if name == DVC_CHANNEL_NAME =>
                                 {
-                                    heard.dynamic_channel = Some(channel_id);
+                                    heard.dynamic_channel = Some(channel);
                                     return;
                                 }
-                                SessionEvent::DynamicChannelData { channel_id, data }
-                                    if Some(channel_id) == heard.dynamic_channel =>
+                                SessionEvent::DynamicChannelData { channel, data }
+                                    if Some(channel) == heard.dynamic_channel =>
                                 {
                                     (
                                         data,
                                         Box::new(move |data| SessionCommand::DynamicChannelData {
-                                            channel_id,
+                                            channel,
                                             data,
                                         }),
                                         false,
@@ -3122,8 +3125,8 @@ mod tests {
     /// What [`record_a_signal_pushed_as_audio_input`] saw.
     #[derive(Debug, Default)]
     struct AudioInputRun {
-        /// The id the server gave `AUDIO_INPUT`, if it opened it.
-        channel: Option<u32>,
+        /// `AUDIO_INPUT`, if the server opened it.
+        channel: Option<justrdp::DynamicChannelHandle>,
         /// Every server PDU on the channel, decoded, in order.
         server_pdus: Vec<justrdp_pdu::audin::ServerPdu>,
         /// What the helper answered the server's list with.
@@ -3212,7 +3215,9 @@ mod tests {
                 AudioInput::new(AudioInputConfig { format_tags }).expect("the tags are encodable"),
             ));
             // The format and channel the pusher pushes in, once recording.
-            let recording = Arc::new(Mutex::new(None::<(u32, u16, u32)>));
+            let recording = Arc::new(Mutex::new(
+                None::<(justrdp::DynamicChannelHandle, u16, u32)>,
+            ));
             let host = Arc::new(Mutex::new(Host::default()));
             host.lock().unwrap().drives.insert(
                 1,
@@ -3266,7 +3271,7 @@ mod tests {
                         std::thread::sleep(
                             due.saturating_duration_since(std::time::Instant::now()),
                         );
-                        let Some((channel_id, channels, rate)) = *recording.lock().unwrap() else {
+                        let Some((channel, channels, rate)) = *recording.lock().unwrap() else {
                             continue;
                         };
                         let since = *recording_since.get_or_insert(due);
@@ -3293,10 +3298,7 @@ mod tests {
                                 run.lock().unwrap().data_lengths.push(data.len());
                             }
                             if commands_tx
-                                .blocking_send(SessionCommand::DynamicChannelData {
-                                    channel_id,
-                                    data,
-                                })
+                                .blocking_send(SessionCommand::DynamicChannelData { channel, data })
                                 .is_err()
                             {
                                 return;
@@ -3412,22 +3414,19 @@ mod tests {
                     },
                     |_| {},
                     |event| match event {
-                        SessionEvent::DynamicChannelOpened { name, channel_id }
+                        SessionEvent::DynamicChannelOpened { name, channel }
                             if name == CHANNEL_NAME =>
                         {
-                            eprintln!("AUDIO_INPUT opened as channel {channel_id}");
-                            run_in.lock().unwrap().channel = Some(channel_id);
+                            eprintln!("AUDIO_INPUT opened as channel {channel}");
+                            run_in.lock().unwrap().channel = Some(channel);
                         }
-                        SessionEvent::DynamicChannelData { channel_id, data } => {
+                        SessionEvent::DynamicChannelData { channel, data } => {
                             if let Ok(pdu) = ServerPdu::decode(&data) {
                                 run_in.lock().unwrap().server_pdus.push(pdu);
                             }
                             let send = |data| {
                                 commands_tx
-                                    .try_send(SessionCommand::DynamicChannelData {
-                                        channel_id,
-                                        data,
-                                    })
+                                    .try_send(SessionCommand::DynamicChannelData { channel, data })
                                     .expect("the command queue has room")
                             };
                             let events = input_in.lock().unwrap().process(&data);
@@ -3446,14 +3445,14 @@ mod tests {
                                             .expect("an Open waits for this answer");
                                         send(reply);
                                         *recording_in.lock().unwrap() = Some((
-                                            channel_id,
+                                            channel,
                                             format.channels,
                                             format.samples_per_sec,
                                         ));
                                     }
                                     AudioInputEvent::FormatChanged(format) => {
                                         *recording_in.lock().unwrap() = Some((
-                                            channel_id,
+                                            channel,
                                             format.channels,
                                             format.samples_per_sec,
                                         ));

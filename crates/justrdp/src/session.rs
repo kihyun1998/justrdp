@@ -12,7 +12,7 @@
 
 use crate::cursor::{CursorEvent, CursorImage};
 use crate::disconnect::{DisconnectReason, ServerDisconnectCause};
-use crate::dvc::{Drdynvc, DvcError, DvcEvent, DynamicChannelError};
+use crate::dvc::{Drdynvc, DvcError, DvcEvent, DynamicChannelError, DynamicChannelHandle};
 use crate::framebuffer::{FrameUpdate, Framebuffer};
 use justrdp_codecs::color::{self, Palette};
 use justrdp_codecs::{nscodec, planar, pointer as pointer_codec, rle};
@@ -148,27 +148,28 @@ pub enum SessionOutput {
         total_length: usize,
     },
     /// The server opened a dynamic channel the host registered in
-    /// [`SessionConfig::dynamic_channels`] (ADR-0018). Messages and sends on it use
-    /// `channel_id` until [`Self::DynamicChannelClosed`] names it, or until the host closes it
-    /// with [`SessionStateMachine::close_dynamic_channel`].
+    /// [`SessionConfig::dynamic_channels`] (ADR-0018). Messages and sends on it use `channel`
+    /// until [`Self::DynamicChannelClosed`] names it, or until the host closes it with
+    /// [`SessionStateMachine::close_dynamic_channel`]; after that the handle is refused, even
+    /// when the server gives its id to another channel.
     DynamicChannelOpened {
         /// The name the host registered.
         name: String,
-        /// The id the server gave the channel.
-        channel_id: u32,
+        /// The channel.
+        channel: DynamicChannelHandle,
     },
     /// One whole message on a host dynamic channel, reassembled from its data PDUs
     /// (`[MS-RDPEDYC]` 3.1.5.2). What the bytes mean is the host's.
     DynamicChannelData {
-        /// The channel's id, as in [`Self::DynamicChannelOpened`].
-        channel_id: u32,
+        /// The channel, as in [`Self::DynamicChannelOpened`].
+        channel: DynamicChannelHandle,
         /// The message.
         data: Vec<u8>,
     },
     /// The server closed a host dynamic channel, or reused its id for a new channel.
     DynamicChannelClosed {
-        /// The channel's id.
-        channel_id: u32,
+        /// The channel.
+        channel: DynamicChannelHandle,
     },
 }
 
@@ -1523,14 +1524,14 @@ impl SessionStateMachine {
                         self.config.desktop_size = (width, height);
                     }
                 }
-                DvcEvent::HostOpened { name, channel_id } => {
-                    outputs.push(SessionOutput::DynamicChannelOpened { name, channel_id });
+                DvcEvent::HostOpened { name, channel } => {
+                    outputs.push(SessionOutput::DynamicChannelOpened { name, channel });
                 }
-                DvcEvent::HostData { channel_id, data } => {
-                    outputs.push(SessionOutput::DynamicChannelData { channel_id, data });
+                DvcEvent::HostData { channel, data } => {
+                    outputs.push(SessionOutput::DynamicChannelData { channel, data });
                 }
-                DvcEvent::HostClosed { channel_id } => {
-                    outputs.push(SessionOutput::DynamicChannelClosed { channel_id });
+                DvcEvent::HostClosed { channel } => {
+                    outputs.push(SessionOutput::DynamicChannelClosed { channel });
                 }
             }
         }
@@ -1667,35 +1668,35 @@ impl SessionStateMachine {
         Ok(self.unless_suspended(frames))
     }
 
-    /// Encode `message` for the host dynamic channel `channel_id` (ADR-0018): drdynvc data
+    /// Encode `message` for the host dynamic channel `channel` (ADR-0018): drdynvc data
     /// PDUs, fragmented when longer than one (`[MS-RDPEDYC]` 3.1.5.1.2), each split into chunks
     /// on the drdynvc channel. While the server has suspended virtual channel traffic the frames
     /// are held instead, returned empty here, and surface as [`SessionOutput::WriteBytes`] when
     /// it resumes.
     pub fn send_dynamic_channel(
         &mut self,
-        channel_id: u32,
+        channel: DynamicChannelHandle,
         message: &[u8],
     ) -> Result<Vec<Vec<u8>>, DynamicChannelError> {
-        let pdus = self.drdynvc.host_send(channel_id, message)?;
+        let pdus = self.drdynvc.host_send(channel, message)?;
         if self.suspended.is_some() {
             let held_bytes = self.held_bytes.saturating_add(message.len());
             if held_bytes > crate::svc::CHANNEL_MESSAGE_CAP {
-                return Err(DynamicChannelError::SuspendedQueueFull { channel_id });
+                return Err(DynamicChannelError::SuspendedQueueFull { channel });
             }
             self.held_bytes = held_bytes;
         }
         Ok(self.drdynvc_frames(&pdus))
     }
 
-    /// Close the host dynamic channel `channel_id` (`[MS-RDPEDYC]` 2.2.4): the channel is gone
-    /// on this side at once, and the returned frames carry the Close PDU. No
+    /// Close the host dynamic channel `channel` (`[MS-RDPEDYC]` 2.2.4): the channel is gone on
+    /// this side at once, and the returned frames carry the Close PDU. No
     /// [`SessionOutput::DynamicChannelClosed`] follows for it.
     pub fn close_dynamic_channel(
         &mut self,
-        channel_id: u32,
+        channel: DynamicChannelHandle,
     ) -> Result<Vec<Vec<u8>>, DynamicChannelError> {
-        let pdu = self.drdynvc.host_close(channel_id)?;
+        let pdu = self.drdynvc.host_close(channel)?;
         Ok(self.drdynvc_frames(&[pdu]))
     }
 
@@ -3842,6 +3843,36 @@ mod tests {
         sm
     }
 
+    /// The handle in the [`SessionOutput::DynamicChannelOpened`] among `outputs`.
+    fn opened_handle(outputs: &[SessionOutput]) -> DynamicChannelHandle {
+        outputs
+            .iter()
+            .find_map(|output| match output {
+                SessionOutput::DynamicChannelOpened { channel, .. } => Some(*channel),
+                _ => None,
+            })
+            .expect("a host dynamic channel opened")
+    }
+
+    /// A session with the host channel `name` open as `channel_id`, and its handle.
+    fn open_host_dvc(
+        config: SessionConfig,
+        channel_id: u8,
+        name: &str,
+    ) -> (SessionStateMachine, DynamicChannelHandle) {
+        let mut sm = SessionStateMachine::new(config, Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        let mut outputs = Vec::new();
+        for frame in server_dvc_frames(&[0x50, 0x00, 0x01, 0x00])
+            .into_iter()
+            .chain(server_dvc_create(channel_id, name))
+        {
+            outputs.extend(sm.process_bytes(&frame).unwrap());
+        }
+        let handle = opened_handle(&outputs);
+        (sm, handle)
+    }
+
     /// An `RDPGFX_SOLIDFILL_PDU` body filling one 4×4 rect of surface 1.
     fn solid_fill_surface_1() -> Vec<u8> {
         [
@@ -4510,10 +4541,12 @@ mod tests {
     fn a_host_registered_dynamic_channel_is_accepted_and_announced() {
         let mut sm = with_open_dvc(9, "Some::Other::Channel");
         let outputs = feed_all(&mut sm, server_dvc_create(9, HOST_DVC));
+        let channel = opened_handle(&outputs);
+        assert_eq!(channel.channel_id(), 9);
         let mut expected = client_dvc_frames(&sm, &dvc::encode_create_response(9, 0));
         expected.push(SessionOutput::DynamicChannelOpened {
             name: HOST_DVC.to_string(),
-            channel_id: 9,
+            channel,
         });
         assert_eq!(outputs, expected);
     }
@@ -4522,12 +4555,12 @@ mod tests {
     /// as Data First plus Data.
     #[test]
     fn a_host_dynamic_channel_message_reaches_the_host_whole() {
-        let mut sm = with_open_dvc(9, HOST_DVC);
+        let (mut sm, channel) = open_host_dvc(config(), 9, HOST_DVC);
         let short = b"one data pdu".to_vec();
         assert_eq!(
             feed_all(&mut sm, server_dvc_data(9, &short)),
             vec![SessionOutput::DynamicChannelData {
-                channel_id: 9,
+                channel,
                 data: short,
             }]
         );
@@ -4539,7 +4572,7 @@ mod tests {
         assert_eq!(
             feed_all(&mut sm, server_dvc_data(9, &long)),
             vec![SessionOutput::DynamicChannelData {
-                channel_id: 9,
+                channel,
                 data: long,
             }]
         );
@@ -4549,16 +4582,16 @@ mod tests {
     /// that reuses the id, and nothing more reaches it on that id.
     #[test]
     fn the_host_learns_when_the_server_ends_its_dynamic_channel() {
-        let mut sm = with_open_dvc(9, HOST_DVC);
+        let (mut sm, channel) = open_host_dvc(config(), 9, HOST_DVC);
         assert_eq!(
             feed_all(&mut sm, server_dvc_frames(&dvc::encode_close(9))),
-            vec![SessionOutput::DynamicChannelClosed { channel_id: 9 }]
+            vec![SessionOutput::DynamicChannelClosed { channel }]
         );
         assert!(feed_all(&mut sm, server_dvc_data(9, b"late")).is_empty());
 
-        let mut sm = with_open_dvc(9, HOST_DVC);
+        let (mut sm, channel) = open_host_dvc(config(), 9, HOST_DVC);
         let outputs = feed_all(&mut sm, server_dvc_create(9, "Some::Other::Channel"));
-        let mut expected = vec![SessionOutput::DynamicChannelClosed { channel_id: 9 }];
+        let mut expected = vec![SessionOutput::DynamicChannelClosed { channel }];
         expected.extend(client_dvc_frames(
             &sm,
             &dvc::encode_create_response(9, 0x8000_4005),
@@ -4571,7 +4604,7 @@ mod tests {
     /// is longer than one.
     #[test]
     fn a_host_message_goes_out_on_its_dynamic_channel() {
-        let mut sm = with_open_dvc(9, HOST_DVC);
+        let (mut sm, channel) = open_host_dvc(config(), 9, HOST_DVC);
         for message in [b"short".to_vec(), vec![0x5A; 4000]] {
             let pdus = dvc::encode_data(9, &message);
             let expected: Vec<Vec<u8>> = pdus
@@ -4582,7 +4615,7 @@ mod tests {
                     other => panic!("{other:?}"),
                 })
                 .collect();
-            assert_eq!(sm.send_dynamic_channel(9, &message), Ok(expected));
+            assert_eq!(sm.send_dynamic_channel(channel, &message), Ok(expected));
         }
     }
 
@@ -4591,14 +4624,16 @@ mod tests {
     #[test]
     fn a_send_or_close_needs_an_open_host_dynamic_channel() {
         let mut sm = with_open_dvc(7, displaycontrol::CHANNEL_NAME);
+        // Handles from another session where 7 and 9 are host channels.
         for channel_id in [7, 9] {
+            let (_, channel) = open_host_dvc(config(), channel_id, HOST_DVC);
             assert_eq!(
-                sm.send_dynamic_channel(channel_id, b"x"),
-                Err(DynamicChannelError::NotOpen { channel_id })
+                sm.send_dynamic_channel(channel, b"x"),
+                Err(DynamicChannelError::NotOpen { channel })
             );
             assert_eq!(
-                sm.close_dynamic_channel(channel_id),
-                Err(DynamicChannelError::NotOpen { channel_id })
+                sm.close_dynamic_channel(channel),
+                Err(DynamicChannelError::NotOpen { channel })
             );
         }
     }
@@ -4608,7 +4643,7 @@ mod tests {
     /// 3.2.5.2: the server does not answer a client-initiated Close).
     #[test]
     fn the_host_closes_its_dynamic_channel() {
-        let mut sm = with_open_dvc(9, HOST_DVC);
+        let (mut sm, channel) = open_host_dvc(config(), 9, HOST_DVC);
         let expected: Vec<Vec<u8>> = client_dvc_frames(&sm, &dvc::encode_close(9))
             .into_iter()
             .map(|output| match output {
@@ -4616,13 +4651,55 @@ mod tests {
                 other => panic!("{other:?}"),
             })
             .collect();
-        assert_eq!(sm.close_dynamic_channel(9), Ok(expected));
+        assert_eq!(sm.close_dynamic_channel(channel), Ok(expected));
         assert!(feed_all(&mut sm, server_dvc_data(9, b"in flight")).is_empty());
         assert!(feed_all(&mut sm, server_dvc_frames(&dvc::encode_close(9))).is_empty());
         assert_eq!(
-            sm.send_dynamic_channel(9, b"x"),
-            Err(DynamicChannelError::NotOpen { channel_id: 9 })
+            sm.send_dynamic_channel(channel, b"x"),
+            Err(DynamicChannelError::NotOpen { channel })
         );
+    }
+
+    /// A handle names one binding of an id (#408): after the server closes id 9 and creates it
+    /// again for another host name, a send or a close through the old handle is refused rather
+    /// than delivered to the new channel, and the new handle reaches it. The same holds when a
+    /// Create Request reuses the id with no Close between (#270).
+    #[test]
+    fn a_handle_to_a_closed_binding_is_refused_after_its_id_is_reused() {
+        const OTHER_HOST_DVC: &str = "Test::Other::Host::Channel";
+        let two_hosts = || SessionConfig {
+            dynamic_channels: vec![HOST_DVC.to_string(), OTHER_HOST_DVC.to_string()],
+            ..config()
+        };
+        for close_first in [true, false] {
+            let (mut sm, old) = open_host_dvc(two_hosts(), 9, HOST_DVC);
+            if close_first {
+                feed_all(&mut sm, server_dvc_frames(&dvc::encode_close(9)));
+            }
+            let new = opened_handle(&feed_all(&mut sm, server_dvc_create(9, OTHER_HOST_DVC)));
+            assert_eq!((old.channel_id(), new.channel_id()), (9, 9));
+            assert_ne!(old, new);
+            assert_eq!(
+                sm.send_dynamic_channel(old, b"for the old channel"),
+                Err(DynamicChannelError::NotOpen { channel: old })
+            );
+            assert_eq!(
+                sm.close_dynamic_channel(old),
+                Err(DynamicChannelError::NotOpen { channel: old })
+            );
+            let sent = sm
+                .send_dynamic_channel(new, b"for the new channel")
+                .unwrap();
+            let expected: Vec<Vec<u8>> =
+                client_dvc_frames(&sm, &dvc::encode_data(9, b"for the new channel")[0])
+                    .into_iter()
+                    .map(|output| match output {
+                        SessionOutput::WriteBytes(frame) => frame,
+                        other => panic!("{other:?}"),
+                    })
+                    .collect();
+            assert_eq!(sent, expected);
+        }
     }
 
     /// A host may not register a name the core terminates.
@@ -4651,10 +4728,10 @@ mod tests {
     /// held, and goes out on the resume.
     #[test]
     fn a_host_dynamic_channel_send_is_held_while_suspended() {
-        let mut sm = with_open_dvc(9, HOST_DVC);
+        let (mut sm, channel) = open_host_dvc(config(), 9, HOST_DVC);
         let suspend = server_channel_frame(DRDYNVC, &flag_chunk(crate::svc::CHANNEL_FLAG_SUSPEND));
         assert!(sm.process_bytes(&suspend).unwrap().is_empty());
-        assert_eq!(sm.send_dynamic_channel(9, b"held"), Ok(Vec::new()));
+        assert_eq!(sm.send_dynamic_channel(channel, b"held"), Ok(Vec::new()));
         let resume = server_channel_frame(DRDYNVC, &flag_chunk(crate::svc::CHANNEL_FLAG_RESUME));
         assert_eq!(
             sm.process_bytes(&resume).unwrap(),
@@ -4666,14 +4743,14 @@ mod tests {
     /// channel send is refused and the session goes on.
     #[test]
     fn a_host_dynamic_channel_send_past_the_suspended_bound_is_refused() {
-        let mut sm = with_open_dvc(9, HOST_DVC);
+        let (mut sm, channel) = open_host_dvc(config(), 9, HOST_DVC);
         let suspend = server_channel_frame(DRDYNVC, &flag_chunk(crate::svc::CHANNEL_FLAG_SUSPEND));
         sm.process_bytes(&suspend).unwrap();
         let big = vec![0u8; crate::svc::CHANNEL_MESSAGE_CAP];
-        assert_eq!(sm.send_dynamic_channel(9, &big), Ok(Vec::new()));
+        assert_eq!(sm.send_dynamic_channel(channel, &big), Ok(Vec::new()));
         assert_eq!(
-            sm.send_dynamic_channel(9, b"x"),
-            Err(DynamicChannelError::SuspendedQueueFull { channel_id: 9 })
+            sm.send_dynamic_channel(channel, b"x"),
+            Err(DynamicChannelError::SuspendedQueueFull { channel })
         );
     }
 
@@ -4706,7 +4783,7 @@ mod tests {
     /// length, as it did before host channels existed; the excess is dropped.
     #[test]
     fn a_host_dynamic_channel_message_is_cut_at_its_declared_length() {
-        let mut sm = with_open_dvc(9, HOST_DVC);
+        let (mut sm, channel) = open_host_dvc(config(), 9, HOST_DVC);
         let long: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
         let mut pdus = dvc::encode_data(9, &long);
         pdus.last_mut()
@@ -4716,7 +4793,7 @@ mod tests {
         assert_eq!(
             feed_all(&mut sm, frames),
             vec![SessionOutput::DynamicChannelData {
-                channel_id: 9,
+                channel,
                 data: long,
             }]
         );
@@ -4781,10 +4858,8 @@ mod tests {
                 }
             }
             for output in feed_all(&mut sm, server_dvc_data(9, message)) {
-                if let SessionOutput::DynamicChannelData {
-                    channel_id: 9,
-                    data,
-                } = output
+                if let SessionOutput::DynamicChannelData { channel, data } = output
+                    && channel.channel_id() == 9
                 {
                     on_dynamic.push(data);
                 }

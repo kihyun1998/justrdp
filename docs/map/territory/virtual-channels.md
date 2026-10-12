@@ -104,7 +104,8 @@ glossary, which is vocabulary rather than a decision.
 - **A dynamic channel can be host-terminated** (#385,
   [ADR-0018](../../adr/0018-host-terminated-dynamic-channels.md)). The host lists names in
   `SessionConfig::dynamic_channels`. A Create Request for one is accepted and surfaces as
-  `SessionOutput::DynamicChannelOpened { name, channel_id }`; each reassembled message as
+  `SessionOutput::DynamicChannelOpened { name, channel }`, `channel` a `DynamicChannelHandle`
+  (#408); each reassembled message as
   `DynamicChannelData`; a server Close, or a Create Request that reuses the id, as
   `DynamicChannelClosed`. The host answers with `send_dynamic_channel` and ends one with
   `close_dynamic_channel`, both refused with `DynamicChannelError::NotOpen` for an id that is
@@ -114,8 +115,9 @@ glossary, which is vocabulary rather than a decision.
   and the open-channel cap. A name a core processor terminates is
   `SessionError::DynamicChannelConfig` from `SessionStateMachine::new`.
   **Derivations, not the ADR's call**, and they fall to a better one:
-  - The host is told the id and addresses the channel by it, because a server may reuse an id
-    for another name, which only an id-keyed event can show.
+  - The host is told the channel's handle and addresses the channel by it, because a server
+    may reuse an id for another name, which only an id-keyed event can show; the handle carries
+    the id (`DynamicChannelHandle::channel_id`) and which binding of it this is.
   - A host close drops the binding at once and emits no `DynamicChannelClosed`, since the host
     already knows. `[MS-RDPEDYC]` 3.2.5.2: the server does not respond to a client-initiated
     Close, and a Close for an id no longer active MUST be ignored, so a stray one meets no
@@ -130,14 +132,21 @@ glossary, which is vocabulary rather than a decision.
   channel, so ADR-0014's ladder does not reach them.
   **Two choices recorded at the maintainer's call (2026-10-06, #385)**, each shown with its
   alternatives:
-  - **The raw id stays the host's handle.** Its known race: a host message queued for id 9 while
-    the server closes 9 and creates 9 again under *another host name* goes to the new channel.
-    It cannot reach a core channel, since a send needs a host endpoint, and with one host name
-    it is harmless. #270 measured this server reusing an id within 40 ms, for refused channels.
-    Revisit when a slice runs several host channels at once (audio input, #12). Shown:
-    per-binding generation handles now, or a follow-up issue. Audio input reached that trigger
-    with #404, whose tests open one host dynamic channel; the measurement and the handles are
-    #408 (the maintainer's call, 2026-10-08).
+  - ~~**The raw id stays the host's handle.**~~ Replaced in #408 by **per-binding handles**:
+    each binding the manager makes takes the next generation, and a `DynamicChannelHandle` names
+    the id and that generation, so a send or a close through a handle whose binding ended, by a
+    server Close or by a Create Request reusing the id, is `DynamicChannelError::NotOpen` rather
+    than delivered to the id's next channel. The race it closes: a host message queued for id 9
+    while the server closes 9 and creates 9 again under *another host name* went to the new
+    channel. **The maintainer's call (2026-10-12)**, shown that a measurement can show reuse but
+    never its absence, and the alternative the issue held open of keeping raw ids if none was
+    seen; the handle's shape (an opaque type, fields named `channel`) was theirs too, shown a
+    `channel_id` field of the new type and a separate `generation` field. **Measured (Windows 11
+    VM, 2026-10-12)**, with `AUDIO_INPUT` and `AUDIO_PLAYBACK_DVC` both registered over two
+    sessions: `AUDIO_PLAYBACK_DVC` opened as 10 at logon and stayed open; each recording opened
+    `AUDIO_INPUT` under a fresh id, 15 then 16, closed when it ended; no id was reused. #270
+    measured WS2019 reusing an id within 40 ms, for refused channels. A generation is a `u32`
+    that wraps after 2^32 bindings in one session.
   - **A server Close is not answered.** `[MS-RDPEDYC]` 3.2.5.2 makes the reply a MAY; FreeRDP
     (`dvcchannel_send_close`) and IronRDP (`process_close`) both send one. The host cannot send
     it either, since the binding is gone when `DynamicChannelClosed` arrives. This predates #385
@@ -492,7 +501,7 @@ glossary, which is vocabulary rather than a decision.
 - `justrdp/src/dvc.rs` — `DisplayControlProcessor`, `OpenChannel`, `DvcError`, `Endpoint`,
   `CoreOwnedDynamicChannel`, `DynamicChannelError`
 - `justrdp/src/session.rs` — `SessionConfig::dynamic_channels`,
-  `SessionOutput::DynamicChannelOpened`, `SessionOutput::DynamicChannelData`,
+  `DynamicChannelHandle`, `SessionOutput::DynamicChannelOpened`, `SessionOutput::DynamicChannelData`,
   `SessionOutput::DynamicChannelClosed`, `send_dynamic_channel`, `close_dynamic_channel`,
   `SessionError::DynamicChannelConfig`
 - `justrdp/src/svc.rs` — `Reassembler`, `Reassembled`, `CHANNEL_MESSAGE_CAP`

@@ -103,21 +103,43 @@ pub(crate) enum DvcEvent {
     HostOpened {
         /// The name the host registered.
         name: String,
-        /// The id the server gave it.
-        channel_id: u32,
+        /// The channel.
+        channel: DynamicChannelHandle,
     },
     /// One complete message on a host channel.
     HostData {
-        /// The channel's id.
-        channel_id: u32,
+        /// The channel.
+        channel: DynamicChannelHandle,
         /// The message.
         data: Vec<u8>,
     },
     /// The server closed a host channel, or replaced its binding with a new Create Request.
     HostClosed {
-        /// The channel's id.
-        channel_id: u32,
+        /// The channel.
+        channel: DynamicChannelHandle,
     },
+}
+
+/// A host dynamic channel as the host addresses it (#408): the id the server gave it, and which
+/// binding of that id it is. A server may close an id and give it to another channel, so a
+/// handle to a binding that has ended is refused rather than reaching its successor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DynamicChannelHandle {
+    channel_id: u32,
+    generation: u32,
+}
+
+impl DynamicChannelHandle {
+    /// The id the server gave the channel.
+    pub fn channel_id(self) -> u32 {
+        self.channel_id
+    }
+}
+
+impl core::fmt::Display for DynamicChannelHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} (binding {})", self.channel_id, self.generation)
+    }
 }
 
 /// Why [`crate::SessionStateMachine::send_dynamic_channel`] or
@@ -125,29 +147,30 @@ pub(crate) enum DvcEvent {
 /// unaffected).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DynamicChannelError {
-    /// No host channel with this id is open.
+    /// The host channel this handle names is not open: never opened, closed, or its id given to
+    /// another channel since.
     NotOpen {
-        /// The id asked for.
-        channel_id: u32,
+        /// The channel asked for.
+        channel: DynamicChannelHandle,
     },
     /// The server suspended virtual channel traffic and the messages held for its resume
     /// would exceed 64 MiB with this one.
     SuspendedQueueFull {
-        /// The id asked for.
-        channel_id: u32,
+        /// The channel asked for.
+        channel: DynamicChannelHandle,
     },
 }
 
 impl core::fmt::Display for DynamicChannelError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            DynamicChannelError::NotOpen { channel_id } => {
-                write!(f, "no host dynamic channel {channel_id} is open")
+            DynamicChannelError::NotOpen { channel } => {
+                write!(f, "host dynamic channel {channel} is not open")
             }
-            DynamicChannelError::SuspendedQueueFull { channel_id } => write!(
+            DynamicChannelError::SuspendedQueueFull { channel } => write!(
                 f,
                 "virtual channel traffic is suspended and the held messages would exceed 64 MiB \
-                 (dynamic channel {channel_id})"
+                 (dynamic channel {channel})"
             ),
         }
     }
@@ -236,11 +259,13 @@ enum Endpoint {
     Host(usize),
 }
 
-/// One open dynamic channel: its server-assigned ID, the endpoint that terminates it, and any
-/// fragmented message in flight (DataFirst total + accumulated bytes).
+/// One open dynamic channel: its server-assigned ID, which binding of the ID it is, the endpoint
+/// that terminates it, and any fragmented message in flight (DataFirst total + accumulated
+/// bytes).
 #[derive(Debug)]
 struct OpenChannel {
     channel_id: u32,
+    generation: u32,
     endpoint: Endpoint,
     reassembly: Option<(usize, Vec<u8>)>,
 }
@@ -270,6 +295,8 @@ pub(crate) struct Drdynvc {
     /// The dynamic channel names whose messages go to the host (ADR-0018).
     host_names: Vec<String>,
     open: Vec<OpenChannel>,
+    /// The generation the next binding takes.
+    next_generation: u32,
     /// SVC chunk reassembly for the drdynvc channel itself.
     svc: crate::svc::Reassembler,
     /// The Display Control channel ID + server caps, recorded off the processor's output.
@@ -312,6 +339,7 @@ impl Drdynvc {
             processors,
             host_names: host_names.to_vec(),
             open: Vec::new(),
+            next_generation: 0,
             svc: crate::svc::Reassembler::new(SVC_MESSAGE_CAP),
             display_control: None,
         })
@@ -397,8 +425,11 @@ impl Drdynvc {
                     return Ok(events);
                 }
                 tracing::debug!(target: "rdp_drdynvc", channel_id, name, "DYNVC create accepted");
+                let generation = self.next_generation;
+                self.next_generation = generation.wrapping_add(1);
                 self.open.push(OpenChannel {
                     channel_id,
+                    generation,
                     endpoint,
                     reassembly: None,
                 });
@@ -414,7 +445,10 @@ impl Drdynvc {
                     }
                     Endpoint::Host(host) => events.push(DvcEvent::HostOpened {
                         name: self.host_names[host].clone(),
-                        channel_id,
+                        channel: DynamicChannelHandle {
+                            channel_id,
+                            generation,
+                        },
                     }),
                 }
                 Ok(events)
@@ -497,9 +531,17 @@ impl Drdynvc {
     fn unbind(&mut self, channel_id: u32) -> Option<DvcEvent> {
         let mut closed = None;
         if let Some(at) = self.open.iter().position(|c| c.channel_id == channel_id) {
-            match self.open.remove(at).endpoint {
+            let open = self.open.remove(at);
+            match open.endpoint {
                 Endpoint::Processor(processor) => self.processors[processor].close(),
-                Endpoint::Host(_) => closed = Some(DvcEvent::HostClosed { channel_id }),
+                Endpoint::Host(_) => {
+                    closed = Some(DvcEvent::HostClosed {
+                        channel: DynamicChannelHandle {
+                            channel_id,
+                            generation: open.generation,
+                        },
+                    })
+                }
             }
         }
         if self.display_control.map(|(id, _)| id) == Some(channel_id) {
@@ -508,30 +550,38 @@ impl Drdynvc {
         closed
     }
 
-    /// The drdynvc PDUs carrying `message` on the open host channel `channel_id`.
+    /// The drdynvc PDUs carrying `message` on the open host channel `channel`.
     pub(crate) fn host_send(
         &self,
-        channel_id: u32,
+        channel: DynamicChannelHandle,
         message: &[u8],
     ) -> Result<Vec<Vec<u8>>, DynamicChannelError> {
-        self.host_channel(channel_id)?;
-        Ok(dvc::encode_data(channel_id, message))
+        self.host_channel(channel)?;
+        Ok(dvc::encode_data(channel.channel_id, message))
     }
 
-    /// Drop the open host channel `channel_id`'s binding and return the Close PDU to send.
-    pub(crate) fn host_close(&mut self, channel_id: u32) -> Result<Vec<u8>, DynamicChannelError> {
-        let at = self.host_channel(channel_id)?;
+    /// Drop the open host channel `channel`'s binding and return the Close PDU to send.
+    pub(crate) fn host_close(
+        &mut self,
+        channel: DynamicChannelHandle,
+    ) -> Result<Vec<u8>, DynamicChannelError> {
+        let at = self.host_channel(channel)?;
         self.open.remove(at);
+        let channel_id = channel.channel_id;
         tracing::debug!(target: "rdp_drdynvc", channel_id, "DYNVC close sent for a host channel");
         Ok(dvc::encode_close(channel_id))
     }
 
-    /// The index in [`Self::open`] of the open host channel `channel_id`.
-    fn host_channel(&self, channel_id: u32) -> Result<usize, DynamicChannelError> {
+    /// The index in [`Self::open`] of the host channel binding `channel` names.
+    fn host_channel(&self, channel: DynamicChannelHandle) -> Result<usize, DynamicChannelError> {
         self.open
             .iter()
-            .position(|c| c.channel_id == channel_id && matches!(c.endpoint, Endpoint::Host(_)))
-            .ok_or(DynamicChannelError::NotOpen { channel_id })
+            .position(|c| {
+                c.channel_id == channel.channel_id
+                    && c.generation == channel.generation
+                    && matches!(c.endpoint, Endpoint::Host(_))
+            })
+            .ok_or(DynamicChannelError::NotOpen { channel })
     }
 
     /// Route one complete message to its channel's endpoint and apply the outputs.
@@ -543,7 +593,10 @@ impl Drdynvc {
             Endpoint::Processor(processor) => processor,
             Endpoint::Host(_) => {
                 return Ok(vec![DvcEvent::HostData {
-                    channel_id,
+                    channel: DynamicChannelHandle {
+                        channel_id,
+                        generation: open.generation,
+                    },
                     data: message,
                 }]);
             }
