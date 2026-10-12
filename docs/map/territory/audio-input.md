@@ -266,7 +266,7 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   blocks, and a live proof. AAC waits on #21's decoder-backend question; GSM 6.10 is not
   encoded.
 - **PCM audio input loses packets on Windows 11** in about two runs of five, by the server
-  (Reference behaviour); the cause is the subject of a follow-up of #411, and the PCM live test
+  (Reference behaviour); the cause is #416, and the PCM live test
   says it fails that often.
 - **8-bit PCM is unmeasured.** Windows 11 offers none, and at the capture rate its packet is
   `FramesPerPacket` × `nBlockAlign` bytes, the size it discards for A-law.
