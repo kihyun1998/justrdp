@@ -362,9 +362,16 @@ was checked against.
   - **The Shutdown Request PDU is denied** here as on Server, so a session left open is
     recovered by signing out from inside it: a connect, a click on whatever window repaints,
     then the teardown.
-  - **The tone pusher keeps real time by a running count**: each 10 ms tick it pushes up to
-    `ticks × rate ÷ 100` frames. 22,050 frames are no whole number of hundredths, and pushing
-    `rate ÷ 100` a tick fell 50 frames a second behind at A-law's rate (#402).
+  - **The audio input pusher keeps real time by a running count, on its own thread**: each
+    10 ms tick it pushes up to `ticks × rate ÷ 100` frames, since 22,050 frames are no whole
+    number of hundredths and pushing `rate ÷ 100` a tick fell 50 frames a second behind at
+    A-law's rate (#402). It sleeps to each tick's deadline on an OS thread: a tokio interval on
+    Windows ticks to a 15.6 ms quantum and now and then missed two or three ticks, and the burst
+    that followed lost audio on the server (#411). It records when it woke more than 15 ms late,
+    and a failed signal check names those times, so a stall of this host shows as one.
+  - **The PCM audio input test fails in about two runs of five**: Windows 11 drops PCM packets
+    it receives on time ([Audio input](audio-input.md), Reference behaviour). Rerun it before
+    reading a failure as a regression; the A-law test recorded whole in every run measured.
 - **Driving a desktop by synthesised keystrokes is open-loop, and the acknowledgement
   the harness needs is the one it already receives.** Every VM test that has to make
   something happen *inside* Windows — sign out, launch an app, run `tsdiscon` — types
