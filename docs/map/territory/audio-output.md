@@ -108,7 +108,8 @@ channel and the server's fallback to it. #388 adds A-law, #389 MS-ADPCM and IMA-
   `encode_wave_confirm`, `CHANNEL_NAME`, `DVC_CHANNEL_NAME`
 - `justrdp-codecs/src/pcm.rs` — `decode`, `PcmError`
 - `justrdp-codecs/src/g711.rs` — `alaw_to_i16`, `decode_alaw`
-- `justrdp-codecs/src/adpcm.rs` — `MsAdpcm`, `ImaAdpcm`, `AdpcmError`
+- `justrdp-codecs/src/adpcm.rs` — `MsAdpcm`, `ImaAdpcm`, `AdpcmError`; its encoders are
+  [Audio input](audio-input.md)'s
 - `justrdp-codecs/tests/adpcm_oracle.rs` and `justrdp-codecs/tests/fixtures/adpcm/` — the FreeRDP oracle on
   generated blocks and on WS2022's own (the directory's README says how they were made)
 - `justrdp/src/rdpsnd.rs` — `AudioOutput`, `AudioOutputConfig`, `AudioOutputConfigError`,
