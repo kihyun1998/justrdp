@@ -62,7 +62,7 @@ pub use session::{
 };
 
 // The host dynamic channel seam's errors (ADR-0018).
-pub use dvc::{CoreOwnedDynamicChannel, DynamicChannelError};
+pub use dvc::{CoreOwnedDynamicChannel, DynamicChannelError, DynamicChannelHandle};
 
 /// The `fuzz/` lane's door into the EGFX graphics processor (#267) — **not host API**.
 ///
