@@ -11743,8 +11743,9 @@ mod tests {
     /// The assertion was known before this test was written, which is unusual and worth saying:
     /// #198 probed this path with a throwaway build and Windows Server 2022 answered
     /// `PDUTYPE2_SHUTDOWN_DENIED` on a **clean** desktop — nothing open, nothing unsaved — with
-    /// the session still alive 30 s later. §V.3 had guessed *"Denied (typical)"* long before
-    /// either; this pins it for this server.
+    /// the session still alive 30 s later. The build plan of the time had guessed *"Denied
+    /// (typical)"* long before either; this pins it for this server
+    /// (`docs/map/territory/session-loop-dispatch.md`).
     ///
     /// So what is under test is not *whether* the server grants it. It is that we can ask at
     /// all (the send path, byte-identical to the frame that probe put on the wire — see
