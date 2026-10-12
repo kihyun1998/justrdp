@@ -220,7 +220,7 @@ impl BitmapCapabilitySet {
 
 /// Order Capability Set (TS_ORDER_CAPABILITYSET, 2.2.7.1.3). `order_support` indexes which
 /// drawing orders the sender handles — all zeros means "send me bitmap updates instead",
-/// which is exactly right until the orders epic (plan.md §7: false positives crash us).
+/// which is exactly right until the orders epic (#22: false positives crash us).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderCapabilitySet {
     /// `orderFlags` (must include the two mandatory `ORDER_*` bits).
@@ -906,7 +906,7 @@ pub fn encode_confirm_active(
 ///
 /// This is a **default**, not a policy: the caller owns `ConnectConfig::capabilities` and may
 /// replace or edit any entry (the same anti-hardcode contract as `earlyCapabilityFlags`,
-/// plan.md §0), within what `justrdp`'s connect layer honours (#357).
+/// ADR-0016), within what `justrdp`'s connect layer honours (#357).
 pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<CapabilitySet> {
     vec![
         CapabilitySet::General(GeneralCapabilitySet {
@@ -941,7 +941,7 @@ pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<Cap
         }),
         // MOUSEX and MOUSE_HWHEEL are advertised because the input encoder handles both
         // (extended buttons; the horizontal wheel folds into pointerFlags exactly like the
-        // vertical one) — "advertise everything we can actually handle" (plan.md §1).
+        // vertical one) — what the core can honour is advertised (ADR-0016).
         // FASTPATH_INPUT/2 are deliberately absent — those are *server* flags the client
         // reads from Demand Active to pick its input transport.
         CapabilitySet::Input(InputCapabilitySet {
@@ -1087,7 +1087,7 @@ mod tests {
 
     #[test]
     fn default_input_capset_advertises_every_handled_input_feature() {
-        // "Advertise everything we can actually handle" (plan.md §1, gate #7): the encoder
+        // What the core can honour is advertised (ADR-0016; gate #7): the encoder
         // supports scancodes, MouseX, Unicode, and the horizontal wheel — every one must be
         // advertised, and the fast-path flags must NOT be (those are server-side).
         let sets = default_client_capabilities(&sample_core());

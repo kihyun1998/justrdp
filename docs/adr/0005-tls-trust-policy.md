@@ -2,13 +2,13 @@
 
 - Status: Accepted
 - Date: 2026-06-11
-- Closes the plan.md §22 "(a) chain vs (b) TOFU" question tracked by issue #36
+- Closes the build plan's "(a) chain vs (b) TOFU" question tracked by issue #36
 
 ## Context
 
-slice-2 (#2) shipped a deliberately permissive TLS verifier — `AcceptAnyServerCert` trusted every certificate so the connect sequence could be built before validation existed. That left a MITM hole on the production path, tracked as a ship-blocker by issue #36 lest it become a documented-but-unenforced requirement (the plan.md §0 failure mode).
+slice-2 (#2) shipped a deliberately permissive TLS verifier — `AcceptAnyServerCert` trusted every certificate so the connect sequence could be built before validation existed. That left a MITM hole on the production path, tracked as a ship-blocker by issue #36 lest it become a documented-but-unenforced requirement (the failure mode the build plan warned of).
 
-plan.md §22 offered two validation options: (a) chain-of-trust, recommended for multi-server deployments, and (b) TOFU pinning, recommended for the single-server PoC target. Both have real constituencies among RDP deployments: enterprise fleets have CA-issued certificates; standalone hosts (like our test VM) present self-signed ones that no chain can validate.
+The build plan offered two validation options: (a) chain-of-trust, recommended for multi-server deployments, and (b) TOFU pinning, recommended for the single-server PoC target. Both have real constituencies among RDP deployments: enterprise fleets have CA-issued certificates; standalone hosts (like our test VM) present self-signed ones that no chain can validate.
 
 ## Decision
 
@@ -24,5 +24,5 @@ Trust failures of every policy surface as the existing typed `ConnectFailure::Tl
 
 - The default-constructed connect is safe but **strict**: self-signed servers (labs, fresh VMs) no longer connect out of the box; callers choose TOFU or the danger policy deliberately. Mock-server and real-VM tests opt in at the test site rather than weakening the default.
 - The trust decision is the host's, the enforcement is ours: interactive allow-once/allow-always UX stays out of the library (hosts get the typed error plus `pin_fingerprint` to build it).
-- Out of scope, deliberately: CRL/OCSP revocation (plan.md open question 7), RD Gateway certificates (epic #23), and pin-store schema/profile integration beyond the minimal trait.
+- Out of scope, deliberately: CRL/OCSP revocation (tracked for a future decision in epic #425), RD Gateway certificates (epic #23), and pin-store schema/profile integration beyond the minimal trait.
 - `rustls-platform-verifier` joins the ADR-0002 dependency set as a leaf, security-critical, non-RDP crate on the rustls side of the boundary (OS bindings: `windows-sys` / Security.framework / JNI — no aws-lc, no new crypto).

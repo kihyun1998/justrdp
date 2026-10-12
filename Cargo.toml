@@ -1,5 +1,6 @@
 # Virtual workspace for justrdp — a from-scratch, sans-IO RDP client library.
-# Crate split per ADR-0001 (sans-IO core) + plan.md decision 6 (pragmatic 3+1).
+# Crate split per ADR-0001 (sans-IO core) (its Amendment: the crate count grows only when a boundary
+# hardens).
 [workspace]
 resolver = "2"
 members = ["crates/justrdp-pdu", "crates/justrdp", "crates/justrdp-codecs", "crates/justrdp-tokio"]
@@ -17,14 +18,14 @@ justrdp-codecs = { path = "crates/justrdp-codecs" }
 # The only external dependency slice-1 introduces: the async runtime the I/O adapter drives the
 # sans-IO core with. rustls / sspi (ADR-0002) arrive in later slices.
 tokio = { version = "1", default-features = false }
-# Structured observability (plan.md §11d): each Connect Stage is a tracing span; a no-op without a
+# Structured observability: each Connect Stage is a tracing span; a no-op without a
 # subscriber, so it does not compromise sans-IO purity or portability.
 tracing = { version = "0.1", default-features = false }
 # TLS (slice-2, ADR-0002): rustls is a leaf, security-critical, non-RDP dependency used verbatim.
 # `ring` provider avoids the aws-lc-rs NASM build requirement on Windows.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-# Server-certificate trust (issue #36, plan.md §22): chain/SAN validation against the **OS trust
+# Server-certificate trust (issue #36, ADR-0005): chain/SAN validation against the **OS trust
 # store** — real RDP servers are overwhelmingly signed by enterprise CAs that live there, not in
 # Mozilla's webpki roots. Leaf, security-critical, non-RDP (ADR-0002); adapter-only like rustls.
 rustls-platform-verifier = { version = "0.7", default-features = false }
@@ -34,7 +35,7 @@ ring = "0.17"
 # X.509 SubjectPublicKeyInfo extraction for CredSSP public-key binding — a leaf ASN.1/encoding lib,
 # not RDP protocol (ADR-0002). Lives in `justrdp` only; `justrdp-pdu` stays zero-dependency.
 x509-cert = "0.3"
-# NLA authentication (slice-3, ADR-0002 / plan.md decision 10): `sspi` owns CredSSP / SPNEGO / NTLM /
+# NLA authentication (slice-3, ADR-0002): `sspi` owns CredSSP / SPNEGO / NTLM /
 # Kerberos verbatim — security-critical, non-RDP. Lives in the adapter (`justrdp-tokio`) only, the
 # same place `rustls` landed: it drives the `CredSspClient` token loop, so the sans-IO core never
 # sees a TSRequest.

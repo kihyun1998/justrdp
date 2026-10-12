@@ -128,7 +128,7 @@ fn our_connect_initial_decodes_identically_in_ironrdp() {
     assert_eq!(
         optional.early_capability_flags.unwrap().bits(),
         0x0FFF,
-        "earlyCapabilityFlags must reach the wire verbatim — the EGFX gate (plan.md §0)"
+        "earlyCapabilityFlags must reach the wire verbatim — the EGFX gate (ADR-0017)"
     );
     assert_eq!(
         optional.server_selected_protocol.unwrap().bits(),

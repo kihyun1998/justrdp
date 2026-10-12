@@ -1,12 +1,13 @@
 //! TLS certificate handling for the connect sequence (sans-IO). The TLS *handshake* itself runs in
 //! the I/O adapter (rustls is its own sans-IO state machine — shuttling its records through our
-//! connect machine would add nothing; see plan.md §3 and ADR-0002). What the core owns is the pure,
+//! connect machine would add nothing; see ADR-0002). What the core owns is the pure,
 //! RDP-relevant step: given the server's leaf certificate, extract the `subjectPublicKey` that
-//! CredSSP later binds to (`pubKeyAuth`, plan.md §0 — FreeRDP/IronRDP convention binds to the
-//! certificate's `subjectPublicKey`, the inner BIT STRING of the `SubjectPublicKeyInfo`, **not** the
-//! whole `SubjectPublicKeyInfo` and not the whole certificate). Binding to the full SPKI makes a
-//! Windows server reject the channel binding and abort the TLS session (proven on the real VM,
-//! slice-3): the server hashes only the inner key, so we must too.
+//! CredSSP later binds to (`pubKeyAuth`, `docs/map/territory/tls-transport-security.md` —
+//! FreeRDP/IronRDP convention binds to the certificate's `subjectPublicKey`, the inner BIT STRING
+//! of the `SubjectPublicKeyInfo`, **not** the whole `SubjectPublicKeyInfo` and not the whole
+//! certificate). Binding to the full SPKI makes a Windows server reject the channel binding and
+//! abort the TLS session (proven on the real VM, slice-3): the server hashes only the inner key, so
+//! we must too.
 
 use x509_cert::Certificate;
 use x509_cert::der::Decode;

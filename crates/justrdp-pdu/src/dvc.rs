@@ -76,7 +76,7 @@ pub enum DvcMessage<'a> {
     },
     /// A command justrdp never negotiates (compressed data, soft-sync) or does not know. The
     /// session machine refuses the compressed pair (ADR-0009 §1) and skips the rest
-    /// (plan.md §11c).
+    /// (ADR-0009).
     Unsupported {
         /// The header's `Cmd` value.
         cmd: u8,

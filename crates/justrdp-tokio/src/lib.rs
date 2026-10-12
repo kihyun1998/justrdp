@@ -8,7 +8,7 @@
 //! `tls-handshake` → `nla-credssp` → the MCS/GCC half of `capability-exchange` (Connect-Initial,
 //! channel join). The TLS handshake and the CredSSP token exchange run here, not in the core:
 //! rustls and `sspi` are their own state machines, so shuttling their records through the
-//! connect machine would add nothing (plan.md §3, decision 10). After [`Action::StartTls`] the
+//! connect machine would add nothing (ADR-0002). After [`Action::StartTls`] the
 //! machine's writes and reads transparently ride the TLS stream (`Transport`).
 
 #![doc(
@@ -47,8 +47,8 @@ pub use trust::{FilePinStore, MemoryPinStore, PinStore, TrustPolicy, pin_fingerp
 
 /// Timeout for the TCP dial.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Timeout for each post-TCP connect stage (X.224 round trip, TLS handshake, …). Per plan.md §11e
-/// these share one bound, applied per stage rather than cumulatively.
+/// Timeout for each post-TCP connect stage (X.224 round trip, TLS handshake, …). These
+/// share one bound, applied per stage rather than cumulatively.
 const STAGE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Upper bound on a single CredSSP `TsRequest` we will buffer from the server. A real TSRequest is a
 /// few KB at most (NTLM / SPNEGO tokens; Kerberos PACs are larger but still modest); this caps a
@@ -142,7 +142,7 @@ impl Transport {
 
 /// Credentials for NLA (CredSSP / NTLM). The adapter converts these into an `sspi` auth identity and
 /// drives the CredSSP exchange with them; they never enter the sans-IO core (no secrets in the pure
-/// machine — plan.md decision 10).
+/// machine — ADR-0002).
 #[derive(Clone)]
 pub struct Credentials {
     /// The account name without domain, e.g. `"rdptest"`.
@@ -295,7 +295,7 @@ impl From<io::Error> for ConnectFailure {
 /// IP-literal behavior.
 ///
 /// `config` carries the caller's GCC settings — including all twelve `earlyCapabilityFlags`,
-/// which reach the wire verbatim (plan.md §0; nothing in justrdp hardcodes them).
+/// which reach the wire verbatim (ADR-0016; nothing in justrdp hardcodes them).
 ///
 /// Returns the MCS results (user channel, I/O channel, granted static channels) and the
 /// authenticated TLS stream, ready for the Client Info PDU. `credentials` is `skip`ped from the
@@ -319,8 +319,9 @@ pub async fn connect(
 /// The per-stage timeout policy for [`connect`]: how long the TCP dial may take, and how long
 /// each subsequent connect stage (an X.224 round trip, the TLS handshake, each NLA/MCS read)
 /// may sit idle before the connect fails with [`ConnectFailure::Timeout`] carrying the stage
-/// name. [`connect`] uses [`ConnectTimeouts::default`] (10 s dial / 15 s per stage, plan.md
-/// §11e); hosts with tighter UX budgets inject their own via [`connect_with_timeouts`].
+/// name. [`connect`] uses [`ConnectTimeouts::default`] (10 s dial / 15 s per stage,
+/// each stage bounded on its own, not cumulatively); hosts with tighter UX budgets inject their own
+/// via [`connect_with_timeouts`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectTimeouts {
     /// Timeout for the TCP dial.
@@ -509,7 +510,7 @@ async fn connect_inner(
                     server_public_key,
                 } => {
                     // CredSSP runs here, never in the core machine: `sspi` owns the token loop and
-                    // we drive it over the TLS stream (plan.md decision 10). The core only sees the
+                    // we drive it over the TLS stream (ADR-0002). The core only sees the
                     // completion signal, plus — for HYBRID_EX — the early-auth result bytes.
                     let stream = transport.tls_mut().ok_or_else(|| {
                         ConnectFailure::Io(io::Error::new(
@@ -917,8 +918,9 @@ pub enum SessionCommand {
     /// issue #228). The server decides: a refusal arrives as
     /// [`SessionEvent::ShutdownDenied`] and leaves the session running, a grant arrives as
     /// the session ending with its usual attribution. Windows Server 2022 refuses
-    /// unconditionally (measured — `docs/plan.md` §0), so this is a request, never a
-    /// teardown: a host that needs the session *gone* still has to end it from inside.
+    /// unconditionally (measured — `docs/map/territory/session-loop-dispatch.md`), so this is a
+    /// request, never a teardown: a host that needs the session *gone* still has to end it from
+    /// inside.
     Shutdown,
     /// Send one message on a host static channel (issue #307), chunked by the machine. A
     /// channel the machine refuses ([`justrdp::ChannelSendError`]) is logged and dropped — the
@@ -1250,14 +1252,14 @@ async fn with_stage_timeout<T>(
 /// Drive the CredSSP / NLA token exchange to completion over the (already TLS-upgraded) `stream`,
 /// binding `pubKeyAuth` to `server_public_key` and delegating `credentials` once the SPNEGO/NTLM
 /// handshake finalizes. `sspi` owns the protocol; we only shuttle its `TsRequest`s over TLS
-/// (plan.md decision 10).
+/// (ADR-0002; `docs/map/territory/nla-credssp.md`).
 ///
 /// This slice drives **NTLM only** — but wrapped in SPNEGO (`ClientMode::Negotiate` with a package
 /// list pinned to `ntlm`), which is what Windows servers expect ("per spec we should always use the
 /// Negotiate security package in CredSSP"); a bare-NTLM token makes the server abort the TLS session
 /// with a fatal `internal_error` alert (proven on the real VM). The package list excludes Kerberos /
-/// PKU2U so `sspi` never yields a KDC network request; if it ever does (AD / Kerberos, a later
-/// slice — plan.md §4 marks it optional), we surface it as an `Nla` failure rather than reach out.
+/// PKU2U so `sspi` never yields a KDC network request; if it ever does (AD / Kerberos,
+/// epic #45), we surface it as an `Nla` failure rather than reach out.
 async fn run_credssp(
     stream: &mut TlsStream<TcpStream>,
     server_public_key: Vec<u8>,
@@ -10877,11 +10879,13 @@ mod tests {
     /// (slice 6's). A pixel-diff between the two looks like the obvious third claim and is not
     /// one — see the comment where that comparison used to be.
     ///
-    /// # Two traps this inherits rather than rediscovers (`docs/plan.md` §0)
+    /// # Two traps this inherits rather than rediscovers
     ///
-    /// - **`connectionType` decides whether refinement exists at all.** On `LAN` the server has
-    ///   bandwidth to spare and sends `TILE_FIRST` at `quality = 0xFF` with **zero** upgrades,
-    ///   so a run that forgot this would measure half the codec and report success. `MODEM`.
+    /// - **`connectionType` decides whether refinement exists at all**
+    ///   (`docs/map/invariant/capture-coverage-follows-what-we-advertise.md`). On `LAN` the
+    ///   server has bandwidth to spare and sends `TILE_FIRST` at `quality = 0xFF` with **zero**
+    ///   upgrades, so a run that forgot this would measure half the codec and report success.
+    ///   `MODEM`.
     /// - **A static desktop sends one payload.** The mouse sweeps and Start-menu open/close are
     ///   what make the server spend WireToSurface2 traffic, and the idle windows between them
     ///   are the condition an upgrade pass is sent under, not padding.
@@ -11732,7 +11736,7 @@ mod tests {
         vec![sc.press(), sc.release()]
     }
 
-    /// Real-VM acceptance (issue #228, `docs/plan.md` §V.3): the client asks the server to end
+    /// Real-VM acceptance (issue #228): the client asks the server to end
     /// the session, and the server's **refusal arrives as a typed output** rather than as
     /// nothing at all.
     ///

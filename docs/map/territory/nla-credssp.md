@@ -32,8 +32,19 @@ and binding the exchange to the server's public key.
   SPKI (see [TLS transport security](tls-transport-security.md)). A wrong binding
   still *completes* a loopback handshake, which is precisely why the loopback test
   is not sufficient proof here.
+- **Tokens are SPNEGO-wrapped, never bare NTLM.** `run_credssp` builds
+  `ClientMode::Negotiate` with the package list pinned to `"ntlm,!kerberos,!pku2u"`, so SPNEGO
+  wraps NTLM and `sspi` never yields a KDC request. Measured on the VM (slice-3):
+  `ClientMode::Ntlm` sends raw NTLM messages and the Windows server aborts the TLS session
+  with a fatal `internal_error` alert. CredSSP over TLS 1.3 works against the same VM; no
+  TLS-version pin is needed. Widening the package list is #45's work.
 - **HYBRID_EX adds a fourth message**: after CredSSP finishes, the server sends a
-  4-byte Early User Authorization Result PDU that the adapter reads before MCS.
+  4-byte Early User Authorization Result PDU that the adapter reads before MCS. Left
+  unread, capability exchange desyncs and hangs.
+- **No secret enters the sans-IO machine.** Credentials are a `connect()` input the adapter
+  holds; the machine's `Action::StartNla` carries only the selected protocol and the
+  server key it extracted itself. This is why `justrdp-pdu` has no `TSRequest` codec and the
+  core hand-rolls none of the CredSSP crypto (ADR-0002).
 - Credentials are host-supplied and `Debug` is implemented by hand so a password
   never reaches a log.
 

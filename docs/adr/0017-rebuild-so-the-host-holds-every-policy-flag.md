@@ -1,7 +1,7 @@
 # 0017 — Rebuild the RDP client so the host holds every policy flag
 
 - Status: Accepted
-- Date: 2026-06-08 (decided while grilling `docs/plan.md`); recorded 2026-10-06, moved out of
+- Date: 2026-06-08 (decided while grilling the build plan); recorded 2026-10-06, moved out of
   `GLOSSARY.md` §Project intent
 - Kind: **judgement**. This is the founding decision; the maintainer reopens it, not a better
   derivation.
@@ -35,4 +35,5 @@ is kept.
 - Codec ownership does not follow from this record alone, since a connector defect argues only for
   owning the connector; [ADR-0002](0002-dependency-boundary.md)'s 2026-07-02 amendment gives it an
   independent rationale.
-- `docs/plan.md` holds the scope this implies (§2–§23, the MVP cut in §9).
+- The scope this implies lives in the tracker: the shipped slices and the open `epic` issues.
+  The build plan that first listed it was retired on 2026-10-12, once every item had an issue.

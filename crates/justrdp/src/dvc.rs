@@ -517,7 +517,7 @@ impl Drdynvc {
                 reason: "compressed DVC data but version 3 was never negotiated",
             })),
             // Soft-sync (uninvited: no multitransport is advertised) and unassigned commands:
-            // skipped (plan.md §11c).
+            // skipped (ADR-0009).
             DvcMessage::Unsupported { cmd } => {
                 tracing::debug!(target: "rdp_drdynvc", cmd, "unsupported DYNVC command skipped");
                 Ok(Vec::new())

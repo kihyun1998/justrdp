@@ -1,4 +1,4 @@
-//! T.125 MCS PDUs (plan.md §3 Layer 1): the BER-encoded Connect-Initial / Connect-Response pair
+//! T.125 MCS PDUs: the BER-encoded Connect-Initial / Connect-Response pair
 //! carrying the GCC conference payloads ([`crate::gcc`]), and the ALIGNED-PER domain PDUs that
 //! follow them — Erect Domain, Attach User, and Channel Join.
 //!

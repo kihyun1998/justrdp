@@ -24,9 +24,9 @@ pub const SYSPTR_NULL: u32 = 0x0000_0000;
 pub const SYSPTR_DEFAULT: u32 = 0x0000_7F00;
 
 /// The MS-RDPBCGR cap on color/new pointer dimensions (2.2.9.1.1.4.4): shapes are at most
-/// 96×96. Enforced before any decoder allocates from the wire-declared size (plan.md §11c —
-/// the same hostile-dimensions guard as bitmap rectangles). LargePointer (384×384) is a
-/// separate, opt-in capability this client does not advertise.
+/// 96×96. Enforced before any decoder allocates from the wire-declared size
+/// (`docs/map/invariant/untrusted-decode-never-panics.md` — the same hostile-dimensions guard as
+/// bitmap rectangles). LargePointer (384×384) is a separate, opt-in capability this client does not advertise.
 pub const MAX_POINTER_DIMENSION: u16 = 96;
 
 /// TS_COLORPOINTERATTRIBUTE (2.2.9.1.1.4.4): one pointer shape as XOR color data plus a 1-bpp

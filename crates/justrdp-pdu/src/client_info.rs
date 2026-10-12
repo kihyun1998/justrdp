@@ -1,6 +1,6 @@
 //! The Client Info PDU (MS-RDPBCGR 2.2.1.11) — the Secure Settings Exchange payload the client
 //! MUST send on the I/O channel right after MCS channel join; the server does not begin
-//! licensing until it arrives (plan.md §3 Layer 1).
+//! licensing until it arrives.
 //!
 //! Layout: a [`basic security header`](encode_basic_security_header) with [`SEC_INFO_PKT`],
 //! then `TS_INFO_PACKET` (code page, INFO_* flags, five length-prefixed strings) followed by
@@ -37,8 +37,8 @@ pub fn decode_basic_security_header(cur: &mut ReadCursor<'_>) -> Result<u16, Dec
 }
 
 /// `flags` in the `TS_INFO_PACKET` (MS-RDPBCGR 2.2.1.11.1.1). A dependency-free bitflag newtype
-/// (decision 6); all bits are caller-set — justrdp adds only [`ClientInfoFlags::UNICODE`], the
-/// encoding-mechanics bit that must match the UTF-16 strings the encoder actually writes.
+/// (ADR-0001 Amendment); all bits are caller-set — justrdp adds only [`ClientInfoFlags::UNICODE`],
+/// the encoding-mechanics bit that must match the UTF-16 strings the encoder actually writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClientInfoFlags(u32);
 
@@ -233,7 +233,7 @@ impl core::fmt::Debug for ClientAutoReconnect {
 /// The Client Info PDU body (security header excluded — see [`ClientInfo::encode`] for the
 /// framed form). String fields are always encoded UTF-16; the password field exists because the
 /// wire demands one, and stays empty under NLA where CredSSP already delegated the real
-/// credentials (plan.md decision 10 keeps secrets out of the sans-IO machine entirely).
+/// credentials (ADR-0002 keeps secrets out of the sans-IO machine entirely).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientInfo {
     /// `CodePage` (0 with UTF-16 strings; carries the ANSI code page only for ANSI clients).

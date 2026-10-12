@@ -35,8 +35,8 @@
 //! Every length here is server-chosen, so
 //! [`untrusted-decode-never-panics`]
 //! governs the whole module. Two allocation bounds exist that neither reference has, both
-//! anticipated by `docs/plan.md` §V.3 (*"malformed sequences could cause OOM; use a
-//! max-decompressed-size limit"*):
+//! anticipated by the build plan's verification section (*"malformed sequences could
+//! cause OOM; use a max-decompressed-size limit"*):
 //!
 //! - `MAX_SEGMENT_OUTPUT` caps what one **compressed** segment may expand to. The
 //!   uncompressed segment path is deliberately *not* capped: its bytes are copied, not

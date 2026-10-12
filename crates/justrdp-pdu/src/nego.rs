@@ -5,7 +5,7 @@
 
 /// The set of transport security protocols a client advertises / a server selects, as the
 /// `requestedProtocols` / `selectedProtocol` bitmask. A hand-rolled bitflag newtype keeps
-/// `justrdp-pdu` dependency-free (decision 6). Note: legacy RC4 "Standard RDP Security"
+/// `justrdp-pdu` dependency-free (ADR-0001 Amendment). Note: legacy RC4 "Standard RDP Security"
 /// (`PROTOCOL_RDP` = 0x0000) is deliberately absent — justrdp never offers it (ADR-0002).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SecurityProtocol(u32);

@@ -43,7 +43,6 @@ renderer begins.
   `copy_rect_into`, `pixels`, `full_frame`, `resize`
 - `justrdp/src/session.rs` — `SessionOutput::Frame`
 - Module doc: mirrors ironrdp-session's decode-complete image-buffer model
-  (plan.md §7)
 
 ## Reference behaviour
 

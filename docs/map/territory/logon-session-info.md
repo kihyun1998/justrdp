@@ -150,7 +150,7 @@ with a corrupted one, and with no cookie at all produced the same thing: the sam
 fresh cookie, no logon notification, no Auto-Reconnect Status PDU. CredSSP has already
 authenticated the user by the time Client Info arrives, so the server reattaches the session
 either way. The VM refuses a TLS-only connect (`HYBRID_REQUIRED_BY_SERVER`), and justrdp is
-NLA-mandatory by `plan.md`'s scope note, so the differential that would expose the verifier —
+NLA-mandatory ([X.224 negotiation](x224-negotiation.md)), so the differential that would expose the verifier —
 a credential-less reconnect — is not available here.
 
 **What does stand behind the verifier.** RFC 2202's HMAC-MD5 vectors, Python's `hmac` for
@@ -213,7 +213,7 @@ server sends, never what servers send.
 - ~~**The cookie is decoded and nothing replays it.**~~ **Closed by #306.**
 - **Whether the server checks our verifier is not observable on this VM.** Enforced NLA
   reattaches the session whatever the cookie holds. A server that accepts TLS-only would show
-  it, and justrdp has no TLS-only path (`plan.md` scope note). The verifier stands on the known
+  it, and justrdp has no TLS-only path ([X.224 negotiation](x224-negotiation.md)). The verifier stands on the known
   answers and the FreeRDP cross-check instead.
 - **No committed fixture of an `ARC_SC_PRIVATE_PACKET`.** The real bytes carry a live session
   credential; the cookie branch is still covered by hand-built bodies in `session_info.rs`.
@@ -226,5 +226,5 @@ server sends, never what servers send.
   types, to be ignored for `ERROR_CODE_ACCESS_DENIED`, and a `LOGON_FAILED_*` code when the type
   is an NTSTATUS. `LogonErrorNotification::data_is_session_id` encodes that rule; the field
   itself stays raw. **#304 first shipped this rule wrong** — four types instead of seven, taken
-  from plan.md and IronRDP without reading the section — and its test shared the model, so the
+  from the build plan and IronRDP without reading the section — and its test shared the model, so the
   two agreed. Corrected against the spec text, which is now the test's stated source.

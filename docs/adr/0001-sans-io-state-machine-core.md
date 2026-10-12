@@ -5,7 +5,7 @@
 
 ## Context
 
-A from-scratch RDP client must be tested without network access, portable across async runtimes (tokio, blocking, WASM), and isolated from host concerns (frame sinks, I/O loops). Additionally, the phased-codec strategy (decision 3) requires feeding identical bytes to both justrdp and ironrdp simultaneously to verify bit-for-bit output equivalence — the differential test oracle.
+A from-scratch RDP client must be tested without network access, portable across async runtimes (tokio, blocking, WASM), and isolated from host concerns (frame sinks, I/O loops). Additionally, the phased-codec strategy (ADR-0003) requires feeding identical bytes to both justrdp and ironrdp simultaneously to verify bit-for-bit output equivalence — the differential test oracle.
 
 Traditional async-coupled designs embed socket I/O directly in connection logic (e.g., `async fn connect() { socket.write(...).await; socket.read(...).await }`), which makes all three goals impossible:
 
@@ -174,3 +174,13 @@ recorded here rather than dropped.
   tests only** — where **h2** and **quinn** put ordinary integration tests in `tests/`.
   Measured 15/15 conforming at the time of writing. Keeping `tests/` reserved is what
   makes "does an owned basis exist for this codec?" answerable by listing a directory.
+
+### The crate count grows only when a boundary hardens (2026-06-08, recorded 2026-10-12)
+
+Decided while grilling the build plan ("pragmatic 3+1") and recorded here when that plan was
+retired. The workspace started as `justrdp-pdu`, `justrdp` and `justrdp-codecs`, plus
+`justrdp-tokio` once the I/O loop existed. **A per-channel, `-svc` or `-dvc` crate is split out
+only when a boundary has actually hardened** — a dependency that must not reach the rest, or a
+consumer that needs the part alone — never upfront to mirror IronRDP's crate-per-channel
+layout. Every channel shipped so far (clipboard, device redirection, audio, Display Control,
+EGFX) is a module, under the tree rule above.

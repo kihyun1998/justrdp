@@ -130,7 +130,7 @@ impl RsaPublicKey {
     /// Parse a DER `RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }` —
     /// the inner `subjectPublicKey` of an X.509 RSA certificate. This is the only ASN.1 the
     /// licensing path needs, so it is hand-walked here rather than pulling a DER dependency
-    /// into this crate (decision 6).
+    /// into this crate (ADR-0001 Amendment).
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, DecodeError> {
         let mut cur = ReadCursor::new(der, "RSAPublicKey DER");
         read_der_tag(&mut cur, 0x30)?; // SEQUENCE (length implicitly bounds the cursor)
@@ -391,7 +391,8 @@ pub fn encode_platform_challenge_response(
 
 /// A decoded Server New License / Upgrade License (MS-RDPELE 2.2.2.6 / 2.2.2.3) — the full
 /// negotiation's happy ending. The license blob is RC4-encrypted; this slice verifies its MAC
-/// (in the core) and discards it (persistent caching is plan.md backlog).
+/// (in the core) and discards it (persistent caching is not built;
+/// `docs/map/territory/licensing.md`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewLicense {
     /// `EncryptedLicenseInfo` blob data (still encrypted).
