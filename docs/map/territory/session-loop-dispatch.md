@@ -120,6 +120,17 @@ such as FreeRDP's, whose `update_send_play_sound` exists) is what they are for. 
 reaches a client through audio output (#11). Keeping `SOUND_FLAG_BEEPS` advertised on that
 evidence was the maintainer's call, recorded in ADR-0016.
 
+**Set Keyboard IME Status: skipped on purpose — the maintainer's call** (#439, 2026-10-13).
+`pduType2` 0x2D stays in the catch-all, read by nothing. What it was decided on: `[MS-RDPBCGR]`
+product behaviour note <35> (on 2.2.8.2.2), *"Only Microsoft RDP 5.0, 5.1, 5.2, 6.0, 6.1, 7.0, and
+7.1 servers send the Set Keyboard IME Status PDU"*, so by the spec neither test VM (RDP 10.x)
+sends one; 3.2.5.8.2.2, *"Non-IME aware clients MAY ignore this PDU"*; its stated purpose, the
+input to *"a Fujitsu Oyayubi-specific IME control function"*; and that nothing the client
+advertises invites it, unlike Play Sound. FreeRDP decodes it into a callback, active state only; IronRDP keeps the raw bytes. The
+options shown were this, decoding it to a session output proven by unit tests alone, and that plus
+standing up a server that sends one. Nothing was measured: a host on an RDP 7.1-or-older server is
+what would reopen it.
+
 **Shutdown Request: this VM refuses it, even on a clean desktop** (#198 probed, #228 built).
 `PDUTYPE2_SHUTDOWN_REQUEST` (36) goes out and `PDUTYPE2_SHUTDOWN_DENIED` (37) comes back. Both
 are bodyless: the Share Data header *is* the PDU. The refusal comes with no open application
@@ -193,5 +204,5 @@ Measured with throwaway probes and by mutating the adapter's command handler
 - Auto-reconnect on transient disconnect is unbuilt: `classify`
   distinguishes the cases, and nothing acts on the distinction. When to reconnect is the
   host's reconnect strategy; the cookie it needs shipped in #306.
-- IME Status (#439) and Status Info (#440) have no arm: epic #426. Refresh Rect and Suppress
-  Output are sent since #438.
+- Status Info (#440) has no arm: epic #426. Refresh Rect and Suppress Output are sent since #438.
+  Set Keyboard IME Status is skipped on purpose (Reference behaviour).
