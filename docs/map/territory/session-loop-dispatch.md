@@ -204,5 +204,7 @@ Measured with throwaway probes and by mutating the adapter's command handler
 - Auto-reconnect on transient disconnect is unbuilt: `classify`
   distinguishes the cases, and nothing acts on the distinction. When to reconnect is the
   host's reconnect strategy; the cookie it needs shipped in #306.
-- Status Info (#440) has no arm: epic #426. Refresh Rect and Suppress Output are sent since #438.
+- Status Info has no arm: its flag stays refused and the PDU belongs to server redirection (#24;
+  [Capability exchange & activation](capability-exchange-activation.md)). Refresh Rect and Suppress
+  Output are sent since #438.
   Set Keyboard IME Status is skipped on purpose (Reference behaviour).
