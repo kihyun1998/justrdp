@@ -21,7 +21,8 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 ## Design model
 
 - **These outputs are the host's whole view of a live session**:
-  `Frame(FrameUpdate)` · `Cursor(CursorEvent)` · `WriteBytes` · `DisplayControlReady` ·
+  `Frame(FrameUpdate)` · `Cursor(CursorEvent)` · `WriteBytes` · `Deactivated` ·
+  `Reactivated` · `DisplayControlReady` ·
   `ShutdownDenied` · `SaveSessionInfo` · `KeyboardIndicators` · `PlaySound` · `ChannelData` ·
   `ChannelMessageDropped` · `DynamicChannelOpened` · `DynamicChannelData` ·
   `DynamicChannelClosed` (the live list is `SessionOutput` in `session.rs`). Anything the
@@ -37,6 +38,21 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 - **Reactivation is in-scope for this machine** (`Phase::Reactivating`): a resize
   round-trips through capability exchange while the session's caches survive,
   because caches belong to the connection rather than the share.
+- **A Deactivation stops input and the share-bound requests, not channels** (#442). `[MS-RDPBCGR]`
+  3.2.5.5.1: after Deactivate All *"the client MUST disable its graphics and input protocol
+  handlers"*. From the moment the session leaves the active phase (a Deactivate All, or a Demand
+  Active that arrives while active) until the reactivation's Font Map, `encode_input` returns
+  nothing, Shutdown Request returns nothing, and Refresh Rect / Suppress / Resume are refused with
+  `OutputControlError::NotActive`; a refused suppress or resume leaves the remembered one alone.
+  Input is dropped, not queued: the desktop it would reach may have a new size. Static and dynamic
+  channel sends and the Display Control resize go on, being neither input nor share-bound. The host
+  hears `Deactivated` once and `Reactivated` once per Deactivation, the second right after the
+  full-screen re-emit; re-sending the keyboard Synchronize then is the host's. These were the
+  maintainer's calls in #442's triage (drop rather than queue, refuse rather than send, the two
+  outputs); the window's edges are derived. FreeRDP's input module does not gate on this
+  (`libfreerdp/core/input.c` at `c722db9c` checks only that the session has not ended). Measured:
+  a Shift tap sent on `Deactivated` during a Display Control resize is dropped
+  (`display_control_resize_against_real_vm`).
 - **Surface commands paint like bitmap updates** (#150): each Set Surface Bits command decodes
   into the framebuffer and emits one `Frame`, at the bitmap's own size (2.2.9.2.1 says
   `destRight`/`destBottom` SHOULD be ignored). Stream Surface Bits, which is never invited, is

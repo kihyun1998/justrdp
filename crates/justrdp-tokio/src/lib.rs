@@ -826,6 +826,11 @@ pub async fn run_session_with_input(
                     // run_session_with_commands, which is also the only way to send the request.
                     tracing::debug!(target: "rdp_shutdown_denied", "shutdown request denied");
                 }
+                SessionOutput::Deactivated | SessionOutput::Reactivated => {
+                    // No event sink here. The machine drops the input this entry point sends
+                    // during a Deactivation, and already emitted the `rdp_deactivate_all` /
+                    // `rdp_font_map` records.
+                }
                 SessionOutput::DisplayControlReady => {
                     // This entry point predates resize commands; hosts that want resize use
                     // run_session_with_commands, which surfaces the event.
@@ -906,6 +911,8 @@ pub async fn run_session_with_input(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionCommand {
     /// Encode and send a batch of input events (the [`run_session_with_input`] semantics).
+    /// Dropped during a Deactivation ([`SessionEvent::Deactivated`] until
+    /// [`SessionEvent::Reactivated`]).
     Input(Vec<InputEvent>),
     /// Request a client-initiated desktop resize via the Display Control channel
     /// (MS-RDPEDISP): the size, scale factors and orientation in the [`ResizeRequest`]. Valid
@@ -920,7 +927,7 @@ pub enum SessionCommand {
     /// the session ending with its usual attribution. Windows Server 2019 refuses
     /// unconditionally (measured — `docs/map/territory/session-loop-dispatch.md`), so this is a
     /// request, never a teardown: a host that needs the session *gone* still has to end it from
-    /// inside.
+    /// inside. Dropped during a Deactivation, when neither answer follows.
     Shutdown,
     /// Ask the server to redraw these areas — the Refresh Rect PDU (MS-RDPBCGR 2.2.11.2,
     /// issue #438), as [`justrdp::SessionStateMachine::request_refresh_rect`]. The redrawn
@@ -977,6 +984,12 @@ pub enum SessionCommand {
 /// which are owned `String`s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
+    /// A Deactivation began ([`justrdp::SessionOutput::Deactivated`]): input sent until
+    /// [`SessionEvent::Reactivated`] is dropped, and the share-bound commands are refused.
+    Deactivated,
+    /// The Deactivation ended ([`justrdp::SessionOutput::Reactivated`]). The host re-sends its
+    /// keyboard Synchronize here if it wants the server's lock state to match its own.
+    Reactivated,
     /// The Display Control dynamic channel is open and the server's caps arrived:
     /// [`SessionCommand::Resize`] is valid from now on.
     DisplayControlReady,
@@ -1042,7 +1055,8 @@ pub enum SessionEvent {
 /// never deadlock on the session (issue #8's cancel-safety criterion). Dropping the returned
 /// future remains equally safe — the machine is pure and the socket is caller-owned.
 ///
-/// `on_event` receives session milestones ([`SessionEvent::DisplayControlReady`],
+/// `on_event` receives session milestones ([`SessionEvent::Deactivated`],
+/// [`SessionEvent::Reactivated`], [`SessionEvent::DisplayControlReady`],
 /// [`SessionEvent::ShutdownDenied`], [`SessionEvent::SaveSessionInfo`],
 /// [`SessionEvent::KeyboardIndicators`], [`SessionEvent::PlaySound`],
 /// [`SessionEvent::ChannelData`], [`SessionEvent::ChannelMessageDropped`],
@@ -1073,6 +1087,8 @@ pub async fn run_session_with_commands(
                         .await
                         .map_err(SessionFailure::Io)?;
                 }
+                SessionOutput::Deactivated => on_event(SessionEvent::Deactivated),
+                SessionOutput::Reactivated => on_event(SessionEvent::Reactivated),
                 SessionOutput::DisplayControlReady => {
                     tracing::debug!(target: "rdp_displaycontrol_caps", "display control ready");
                     on_event(SessionEvent::DisplayControlReady);
@@ -11742,6 +11758,9 @@ mod tests {
             let cancel = CancellationToken::new();
             let ready_seen = Arc::new(AtomicBool::new(false));
             let resized_seen = Arc::new(AtomicBool::new(false));
+            // The Deactivation the resize opens (#442), in the order the host heard it.
+            let window: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::default();
+            let window_in_event = window.clone();
 
             let ready_in_event = ready_seen.clone();
             let on_event = move |event: SessionEvent| {
@@ -11753,6 +11772,17 @@ mod tests {
                 match event {
                     SessionEvent::DisplayControlReady => {}
                     SessionEvent::SaveSessionInfo(_) => return,
+                    // A Shift tap sent inside the window: the machine must drop it.
+                    SessionEvent::Deactivated => {
+                        window_in_event.lock().unwrap().push("deactivated");
+                        tx.try_send(SessionCommand::Input(tap(0x10)))
+                            .expect("queue the input sent during the Deactivation");
+                        return;
+                    }
+                    SessionEvent::Reactivated => {
+                        window_in_event.lock().unwrap().push("reactivated");
+                        return;
+                    }
                     other => panic!("unexpected session event during resize: {other:?}"),
                 }
                 eprintln!(
@@ -11805,6 +11835,15 @@ mod tests {
             assert!(
                 resized_seen.load(Ordering::SeqCst),
                 "no full-screen frame at the new size"
+            );
+            assert_eq!(
+                *window.lock().unwrap(),
+                ["deactivated", "reactivated"],
+                "the host hears one Deactivation, opened and closed"
+            );
+            assert!(
+                logs_contain("input dropped during a Deactivation"),
+                "the Shift tap sent inside the Deactivation went out"
             );
             let fb = machine.framebuffer();
             assert_eq!(

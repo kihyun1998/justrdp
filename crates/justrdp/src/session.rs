@@ -111,6 +111,14 @@ fn note_paint_budget(update: &'static str, declared: usize, painted: usize) {
 /// One effect of feeding bytes to the machine, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionOutput {
+    /// A Deactivation began: the session left the active state, on the server's Deactivate All
+    /// or on a Demand Active that arrived while active. Until [`SessionOutput::Reactivated`],
+    /// input is dropped and the share-bound requests are refused or empty
+    /// (`[MS-RDPBCGR]` 3.2.5.5.1).
+    Deactivated,
+    /// The Deactivation ended: the reactivation's Font Map made the session active again, on
+    /// the newly negotiated capabilities. Follows the full-screen [`SessionOutput::Frame`].
+    Reactivated,
     /// Fresh pixels for the host's frame sink.
     Frame(FrameUpdate),
     /// A cursor change for the host's cursor sink (issue #41).
@@ -336,6 +344,9 @@ impl core::error::Error for ResizeError {}
 /// unaffected).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputControlError {
+    /// The session is in a Deactivation ([`SessionOutput::Deactivated`]); ask again after
+    /// [`SessionOutput::Reactivated`].
+    NotActive,
     /// The server's General capability set did not announce the PDU
     /// ([`SessionConfig::server_refresh_rect`], [`SessionConfig::server_suppress_output`]).
     NotSupported,
@@ -360,6 +371,12 @@ impl core::fmt::Display for OutputControlError {
                 f,
                 "the server's General capability set did not announce this PDU"
             ),
+            OutputControlError::NotActive => {
+                write!(
+                    f,
+                    "the session is in a Deactivation; ask again once reactivated"
+                )
+            }
             OutputControlError::NoAreas => write!(f, "a Refresh Rect needs at least one area"),
             OutputControlError::TooManyAreas { count } => {
                 write!(f, "{count} areas exceed the 255 a Refresh Rect can carry")
@@ -964,6 +981,7 @@ impl SessionStateMachine {
                 // The server is resetting the session (most commonly a resize). Wait for the
                 // next Demand Active; graphics stop in the meantime.
                 tracing::debug!(target: "rdp_deactivate_all", "DeactivateAll received");
+                self.leave_active(outputs);
                 self.phase = Phase::Deactivated;
                 Ok(())
             }
@@ -1066,6 +1084,7 @@ impl SessionStateMachine {
                 // Reactivation complete: re-emit the full screen so the host repaints
                 // (content restarts black; the server repaints everything next).
                 outputs.push(SessionOutput::Frame(self.framebuffer.full_frame()));
+                outputs.push(SessionOutput::Reactivated);
                 Ok(())
             }
             share::PDU_TYPE2_POINTER if self.phase == Phase::Active => {
@@ -1334,6 +1353,7 @@ impl SessionStateMachine {
         outputs: &mut Vec<SessionOutput>,
     ) -> Result<(), SessionError> {
         let demand = capability::DemandActive::decode(cur).map_err(SessionError::Decode)?;
+        self.leave_active(outputs);
         self.config.share_id = header.share_id;
         let general = demand.general();
         self.config.server_refresh_rect = general.is_some_and(|g| g.refresh_rect_support != 0);
@@ -1412,10 +1432,20 @@ impl SessionStateMachine {
     /// a stale coordinate from a pre-resize host event must not land outside the new desktop.
     ///
     /// The adapter writes the returned frames to the socket in order. Pure function of the
-    /// machine's negotiated state: no I/O, no phase change (servers accept input during
-    /// reactivation; they simply ignore what no longer applies).
+    /// machine's negotiated state: no I/O, no phase change. During a Deactivation
+    /// ([`SessionOutput::Deactivated`] until [`SessionOutput::Reactivated`]) the events are
+    /// dropped and nothing is returned: `[MS-RDPBCGR]` 3.2.5.5.1 has the client disable its
+    /// input handlers.
     pub fn encode_input(&self, events: &[InputEvent]) -> Vec<Vec<u8>> {
         if events.is_empty() {
+            return Vec::new();
+        }
+        if self.phase != Phase::Active {
+            tracing::debug!(
+                target: "rdp_deactivation",
+                events = events.len(),
+                "input dropped during a Deactivation"
+            );
             return Vec::new();
         }
         let (max_x, max_y) = (
@@ -1625,7 +1655,9 @@ impl SessionStateMachine {
     /// Ask the server to end this session — the Shutdown Request PDU (`[MS-RDPBCGR]` 2.2.2.1).
     ///
     /// The returned frames go to the socket verbatim. The PDU is **bodyless**: its Share Data
-    /// header is the whole thing, which is why this takes no arguments and cannot fail.
+    /// header is the whole thing, which is why this takes no arguments and cannot fail. During a
+    /// Deactivation nothing is returned, so neither a refusal nor a grant follows: ask again after
+    /// [`SessionOutput::Reactivated`].
     ///
     /// What it is *not* is session control. The server decides, and may refuse — Windows Server
     /// 2019 refuses **unconditionally**, measured against the test VM with nothing open and
@@ -1635,8 +1667,15 @@ impl SessionStateMachine {
     /// session *gone* cannot rely on this, and one that wants to ask politely — and to know it was
     /// refused rather than ignored — now can.
     ///
-    /// Valid whenever the session is live; there is no capability to negotiate first.
+    /// Valid whenever the session is active; there is no capability to negotiate first.
     pub fn request_shutdown(&self) -> Vec<Vec<u8>> {
+        if self.phase != Phase::Active {
+            tracing::debug!(
+                target: "rdp_deactivation",
+                "shutdown request dropped during a Deactivation"
+            );
+            return Vec::new();
+        }
         vec![self.wrap_io(&share::encode_share_data(
             self.config.user_channel_id,
             self.config.share_id,
@@ -1650,12 +1689,15 @@ impl SessionStateMachine {
     /// the coordinates of [`FrameUpdate`]. The redrawn pixels arrive as ordinary graphics
     /// updates. The returned frames go to the socket verbatim.
     ///
-    /// Refused when the server did not announce the PDU, and for an empty list, more than 255
-    /// areas, or an area that is empty or reaches past the desktop.
+    /// Refused during a Deactivation, when the server did not announce the PDU, and for an empty
+    /// list, more than 255 areas, or an area that is empty or reaches past the desktop.
     pub fn request_refresh_rect(
         &self,
         areas: &[FrameUpdate],
     ) -> Result<Vec<Vec<u8>>, OutputControlError> {
+        if self.phase != Phase::Active {
+            return Err(OutputControlError::NotActive);
+        }
         if !self.config.server_refresh_rect {
             return Err(OutputControlError::NotSupported);
         }
@@ -1678,10 +1720,14 @@ impl SessionStateMachine {
     }
 
     /// Ask the server to stop sending display updates — the Suppress Output PDU
-    /// (`[MS-RDPBCGR]` 2.2.11.3) with `SUPPRESS_DISPLAY_UPDATES`. Refused when the server did not
-    /// announce the PDU. The returned frames go to the socket verbatim; they are empty while the
-    /// last Suppress Output this machine sent already suppressed output.
+    /// (`[MS-RDPBCGR]` 2.2.11.3) with `SUPPRESS_DISPLAY_UPDATES`. Refused during a Deactivation
+    /// and when the server did not announce the PDU. The returned frames go to the socket
+    /// verbatim; they are empty while the last Suppress Output this machine sent already
+    /// suppressed output.
     pub fn request_suppress_output(&mut self) -> Result<Vec<Vec<u8>>, OutputControlError> {
+        if self.phase != Phase::Active {
+            return Err(OutputControlError::NotActive);
+        }
         if self.output_suppressed && self.config.server_suppress_output {
             return Ok(Vec::new());
         }
@@ -1691,9 +1737,13 @@ impl SessionStateMachine {
     }
 
     /// Ask the server to send display updates again — the Suppress Output PDU with
-    /// `ALLOW_DISPLAY_UPDATES` and the whole current desktop as `desktopRect`. Refused when the
-    /// server did not announce the PDU. The returned frames go to the socket verbatim.
+    /// `ALLOW_DISPLAY_UPDATES` and the whole current desktop as `desktopRect`. Refused during a
+    /// Deactivation and when the server did not announce the PDU. The returned frames go to the
+    /// socket verbatim.
     pub fn request_resume_output(&mut self) -> Result<Vec<Vec<u8>>, OutputControlError> {
+        if self.phase != Phase::Active {
+            return Err(OutputControlError::NotActive);
+        }
         let (width, height) = self.config.desktop_size;
         let desktop = FrameUpdate {
             x: 0,
@@ -1740,6 +1790,13 @@ impl SessionStateMachine {
             right: (right - 1) as u16,
             bottom: (bottom - 1) as u16,
         })
+    }
+
+    /// Leave the active state for a Deactivation, telling the host once per Deactivation.
+    fn leave_active(&mut self, outputs: &mut Vec<SessionOutput>) {
+        if self.phase == Phase::Active {
+            outputs.push(SessionOutput::Deactivated);
+        }
     }
 
     /// One Share Data PDU on the I/O channel, as a frame for the socket.
@@ -2563,6 +2620,7 @@ mod tests {
                 }),
             ],
         );
+        font_map(&mut sm);
         let resume = sm.request_resume_output().expect("now announced");
         assert_eq!(
             &resume[0][resume[0].len() - 8..],
@@ -2585,6 +2643,7 @@ mod tests {
                 ..Default::default()
             })],
         );
+        font_map(&mut sm);
         assert_eq!(sm.request_suppress_output(), Ok(Vec::new()));
 
         // A Demand Active with no General set announces nothing.
@@ -2600,6 +2659,7 @@ mod tests {
                 drawing_flags: 0,
             })],
         );
+        font_map(&mut sm);
         assert_eq!(
             sm.request_suppress_output(),
             Err(OutputControlError::NotSupported)
@@ -2929,14 +2989,33 @@ mod tests {
 
     /// DeactivateAll, then a Demand Active carrying `sets`.
     fn reactivate(sm: &mut SessionStateMachine, sets: Vec<CapabilitySet>) {
+        assert_eq!(deactivate_all(sm), vec![SessionOutput::Deactivated]);
+        let outputs = demand_active(sm, sets);
+        assert_eq!(outputs.len(), 5, "Confirm Active + the finalization batch");
+    }
+
+    /// Feed the server's DeactivateAll.
+    fn deactivate_all(sm: &mut SessionStateMachine) -> Vec<SessionOutput> {
         let deactivate = server_io_frame(&share::encode_share_control(
             share::PDU_TYPE_DEACTIVATE_ALL,
             1002,
             SHARE,
             &[],
         ));
-        assert!(sm.process_bytes(&deactivate).unwrap().is_empty());
+        sm.process_bytes(&deactivate).unwrap()
+    }
 
+    /// Feed the reactivation's Font Map.
+    fn font_map(sm: &mut SessionStateMachine) -> Vec<SessionOutput> {
+        sm.process_bytes(&server_data_pdu(
+            share::PDU_TYPE2_FONT_MAP,
+            &[0, 0, 0, 0, 3, 0, 4, 0],
+        ))
+        .unwrap()
+    }
+
+    /// Feed a Demand Active carrying `sets`.
+    fn demand_active(sm: &mut SessionStateMachine, sets: Vec<CapabilitySet>) -> Vec<SessionOutput> {
         let mut caps = Vec::new();
         for set in &sets {
             set.encode(&mut caps);
@@ -2955,8 +3034,163 @@ mod tests {
             SHARE + 1,
             &body,
         ));
-        let outputs = sm.process_bytes(&demand).unwrap();
-        assert_eq!(outputs.len(), 5, "Confirm Active + the finalization batch");
+        sm.process_bytes(&demand).unwrap()
+    }
+
+    /// The General set [`output_control_machine`]'s server announced, so a reactivation keeps
+    /// Refresh Rect and Suppress Output.
+    fn general_with_output_control() -> CapabilitySet {
+        CapabilitySet::General(capability::GeneralCapabilitySet {
+            refresh_rect_support: 1,
+            suppress_output_support: 1,
+            ..Default::default()
+        })
+    }
+
+    fn key_press() -> Vec<InputEvent> {
+        vec![InputEvent::ScanCode {
+            code: 0x1E,
+            release: false,
+            extended: false,
+            extended1: false,
+        }]
+    }
+
+    /// `[MS-RDPBCGR]` 3.2.5.5.1: after DeactivateAll the client MUST disable its input
+    /// handlers. Input is dropped and the share-bound requests are refused or empty in both
+    /// phases of the window; channel sends are not share-bound and still go out.
+    #[test]
+    fn the_deactivation_window_drops_input_and_refuses_share_bound_requests() {
+        let mut sm = output_control_machine();
+        assert!(
+            !sm.encode_input(&key_press()).is_empty(),
+            "input before the window"
+        );
+
+        let check_window = |sm: &mut SessionStateMachine, phase: &str| {
+            assert!(sm.encode_input(&key_press()).is_empty(), "input, {phase}");
+            assert!(sm.request_shutdown().is_empty(), "shutdown, {phase}");
+            let area = FrameUpdate {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            };
+            assert_eq!(
+                sm.request_refresh_rect(&[area]),
+                Err(OutputControlError::NotActive),
+                "{phase}"
+            );
+            assert_eq!(
+                sm.request_suppress_output(),
+                Err(OutputControlError::NotActive),
+                "{phase}"
+            );
+            assert_eq!(
+                sm.request_resume_output(),
+                Err(OutputControlError::NotActive),
+                "{phase}"
+            );
+            assert!(
+                !sm.send_channel(CLIPRDR, b"x").unwrap().is_empty(),
+                "a channel send, {phase}"
+            );
+        };
+
+        assert_eq!(deactivate_all(&mut sm), vec![SessionOutput::Deactivated]);
+        check_window(&mut sm, "deactivated");
+        assert_eq!(
+            demand_active(&mut sm, vec![general_with_output_control()]).len(),
+            5
+        );
+        check_window(&mut sm, "reactivating");
+
+        let outputs = font_map(&mut sm);
+        assert_eq!(
+            outputs.last(),
+            Some(&SessionOutput::Reactivated),
+            "{outputs:?}"
+        );
+        assert!(
+            !sm.encode_input(&key_press()).is_empty(),
+            "input after the window"
+        );
+        assert!(!sm.request_shutdown().is_empty());
+        assert!(sm.request_suppress_output().is_ok());
+    }
+
+    /// A Demand Active while active (no DeactivateAll first) opens the window too, and the host
+    /// still sees exactly one Deactivated before the Reactivated.
+    #[test]
+    fn a_demand_active_while_active_opens_the_window() {
+        let mut sm = output_control_machine();
+        let outputs = demand_active(&mut sm, vec![general_with_output_control()]);
+        assert_eq!(
+            outputs.first(),
+            Some(&SessionOutput::Deactivated),
+            "{outputs:?}"
+        );
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| **o == SessionOutput::Deactivated)
+                .count(),
+            1
+        );
+        assert!(sm.encode_input(&key_press()).is_empty());
+        assert_eq!(font_map(&mut sm).last(), Some(&SessionOutput::Reactivated));
+        assert!(!sm.encode_input(&key_press()).is_empty());
+    }
+
+    /// A DeactivateAll inside the window says nothing new: one Deactivated, one Reactivated.
+    #[test]
+    fn a_deactivate_all_inside_the_window_emits_nothing_new() {
+        let mut sm = output_control_machine();
+        let mut seen = deactivate_all(&mut sm);
+        seen.extend(demand_active(&mut sm, vec![general_with_output_control()]));
+        seen.extend(deactivate_all(&mut sm));
+        seen.extend(demand_active(&mut sm, vec![general_with_output_control()]));
+        seen.extend(font_map(&mut sm));
+        let signals: Vec<_> = seen
+            .into_iter()
+            .filter(|o| matches!(o, SessionOutput::Deactivated | SessionOutput::Reactivated))
+            .collect();
+        assert_eq!(
+            signals,
+            vec![SessionOutput::Deactivated, SessionOutput::Reactivated]
+        );
+    }
+
+    /// A suppress or resume refused in the window leaves the remembered suppress alone.
+    #[test]
+    fn a_request_refused_in_the_window_keeps_the_remembered_suppress() {
+        let mut sm = output_control_machine();
+        assert_eq!(sm.request_suppress_output().unwrap().len(), 1);
+        deactivate_all(&mut sm);
+        // Refused even though a suppress would have been a no-op: the window comes first.
+        assert_eq!(
+            sm.request_suppress_output(),
+            Err(OutputControlError::NotActive)
+        );
+        assert_eq!(
+            sm.request_resume_output(),
+            Err(OutputControlError::NotActive)
+        );
+        demand_active(&mut sm, vec![general_with_output_control()]);
+        font_map(&mut sm);
+        // Still suppressed: a suppress sends nothing, a resume goes out.
+        assert_eq!(sm.request_suppress_output(), Ok(Vec::new()));
+        assert_eq!(sm.request_resume_output().unwrap().len(), 1);
+
+        // And the other way: a suppress refused in the window does not count as sent.
+        deactivate_all(&mut sm);
+        assert_eq!(
+            sm.request_suppress_output(),
+            Err(OutputControlError::NotActive)
+        );
+        demand_active(&mut sm, vec![general_with_output_control()]);
+        font_map(&mut sm);
+        assert_eq!(sm.request_suppress_output().unwrap().len(), 1);
     }
 
     fn server_data_pdu(pdu_type2: u8, body: &[u8]) -> Vec<u8> {
@@ -3531,7 +3765,10 @@ mod tests {
             SHARE,
             &[],
         ));
-        assert!(sm.process_bytes(&deactivate).unwrap().is_empty());
+        assert_eq!(
+            sm.process_bytes(&deactivate).unwrap(),
+            vec![SessionOutput::Deactivated]
+        );
 
         // Demand Active with a new 8×4 desktop.
         let sets = vec![CapabilitySet::Bitmap(capability::BitmapCapabilitySet {
@@ -3582,8 +3819,8 @@ mod tests {
         // …which re-emits the full (new-size) screen.
         let font_map = server_data_pdu(share::PDU_TYPE2_FONT_MAP, &[0, 0, 0, 0, 3, 0, 4, 0]);
         let outputs = sm.process_bytes(&font_map).unwrap();
-        let [SessionOutput::Frame(frame)] = outputs.as_slice() else {
-            panic!("expected the full-screen re-emit, got {outputs:?}");
+        let [SessionOutput::Frame(frame), SessionOutput::Reactivated] = outputs.as_slice() else {
+            panic!("expected the full-screen re-emit, then Reactivated, got {outputs:?}");
         };
         assert_eq!((frame.x, frame.y, frame.width, frame.height), (0, 0, 8, 4));
 
@@ -4938,7 +5175,10 @@ mod tests {
             SHARE,
             &[],
         ));
-        assert!(sm.process_bytes(&deactivate).unwrap().is_empty());
+        assert_eq!(
+            sm.process_bytes(&deactivate).unwrap(),
+            vec![SessionOutput::Deactivated]
+        );
         assert!(
             sm.request_resize(ResizeRequest::new(1024, 768)).is_ok(),
             "resize survives deactivation"
