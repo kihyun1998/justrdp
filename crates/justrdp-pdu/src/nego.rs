@@ -43,42 +43,58 @@ impl core::ops::BitOr for SecurityProtocol {
 
 /// `TYPE_RDP_NEG_REQ` — the type byte of an `RDP_NEG_REQ`.
 const TYPE_RDP_NEG_REQ: u8 = 0x01;
+/// `TYPE_RDP_CORRELATION_INFO` — the type byte of an `RDP_NEG_CORRELATION_INFO`.
+const TYPE_RDP_CORRELATION_INFO: u8 = 0x06;
+/// `RDP_NEG_REQ` flag `CORRELATION_INFO_PRESENT` (2.2.1.1.1): an `RDP_NEG_CORRELATION_INFO`
+/// follows the request.
+pub const CORRELATION_INFO_PRESENT: u8 = 0x08;
 
 /// An `RDP_NEG_REQ` (MS-RDPBCGR 2.2.1.1.1): the client's advertised security protocols, carried
-/// in the X.224 Connection Request variable part. Always 8 bytes on the wire.
+/// in the X.224 Connection Request variable part, followed by an `RDP_NEG_CORRELATION_INFO`
+/// (2.2.1.1.2) when a correlation id is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NegRequest {
     /// Protocols the client supports (`requestedProtocols`).
     pub requested_protocols: SecurityProtocol,
     /// `RDP_NEG_REQ` flags (e.g. restricted-admin); 0 for a plain request.
+    /// [`CORRELATION_INFO_PRESENT`] is set from [`Self::correlation_id`], whatever this holds.
     pub flags: u8,
+    /// The `correlationId` of the `RDP_NEG_CORRELATION_INFO` that follows the request.
+    pub correlation_id: Option<[u8; 16]>,
 }
 
 impl NegRequest {
     /// Size of an `RDP_NEG_REQ` on the wire (fixed by the spec).
     pub const ENCODED_LEN: usize = 8;
+    /// Size of an `RDP_NEG_CORRELATION_INFO` on the wire (fixed by the spec).
+    pub const CORRELATION_INFO_LEN: usize = 36;
 
-    /// A plain request advertising `protocols` with no flags set.
+    /// A plain request advertising `protocols` with no flags set and no correlation id.
     pub fn new(protocols: SecurityProtocol) -> Self {
         Self {
             requested_protocols: protocols,
             flags: 0,
+            correlation_id: None,
         }
     }
 
-    /// Encode to the fixed 8-byte wire form.
-    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
-        let [p0, p1, p2, p3] = self.requested_protocols.bits().to_le_bytes();
-        [
-            TYPE_RDP_NEG_REQ,
-            self.flags,
-            0x08,
-            0x00, // length = 8, little-endian
-            p0,
-            p1,
-            p2,
-            p3, // requestedProtocols, little-endian
-        ]
+    /// Encode the request, and the correlation info after it when a correlation id is set.
+    pub fn encode(&self) -> Vec<u8> {
+        let flags = match self.correlation_id {
+            Some(_) => self.flags | CORRELATION_INFO_PRESENT,
+            None => self.flags & !CORRELATION_INFO_PRESENT,
+        };
+        let mut out = Vec::with_capacity(Self::ENCODED_LEN + Self::CORRELATION_INFO_LEN);
+        out.extend_from_slice(&[TYPE_RDP_NEG_REQ, flags]);
+        out.extend_from_slice(&(Self::ENCODED_LEN as u16).to_le_bytes());
+        out.extend_from_slice(&self.requested_protocols.bits().to_le_bytes());
+        if let Some(id) = self.correlation_id {
+            out.extend_from_slice(&[TYPE_RDP_CORRELATION_INFO, 0x00]);
+            out.extend_from_slice(&(Self::CORRELATION_INFO_LEN as u16).to_le_bytes());
+            out.extend_from_slice(&id);
+            out.extend_from_slice(&[0; 16]); // reserved
+        }
+        out
     }
 }
 
@@ -180,6 +196,46 @@ mod tests {
         let truncated = [0x02, 0x00, 0x08, 0x00, 0x02];
         let err = NegResponse::decode(&truncated).unwrap_err();
         assert!(matches!(err, DecodeError::NotEnoughBytes { .. }));
+    }
+
+    /// `CORRELATION_INFO_PRESENT` and the 36-byte `RDP_NEG_CORRELATION_INFO` (2.2.1.1.2) go out
+    /// together: the flag in the request, the structure right after it.
+    #[test]
+    fn a_correlation_id_sets_the_flag_and_follows_the_request() {
+        let id = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xF0, 0x01,
+        ];
+        let req = NegRequest {
+            correlation_id: Some(id),
+            ..NegRequest::new(SecurityProtocol::HYBRID_EX)
+        };
+        let mut expected = vec![
+            0x01, // TYPE_RDP_NEG_REQ
+            0x08, // flags: CORRELATION_INFO_PRESENT
+            0x08, 0x00, // length = 8
+            0x08, 0x00, 0x00, 0x00, // requestedProtocols = HYBRID_EX
+            0x06, // TYPE_RDP_CORRELATION_INFO
+            0x00, // flags
+            0x24, 0x00, // length = 36
+        ];
+        expected.extend_from_slice(&id);
+        expected.extend_from_slice(&[0; 16]); // reserved
+        assert_eq!(req.encode(), expected);
+    }
+
+    /// `CORRELATION_INFO_PRESENT` set by hand without a correlation id is not sent: 2.2.1.1
+    /// forbids the flag without the structure.
+    #[test]
+    fn the_correlation_flag_without_an_id_is_cleared() {
+        let req = NegRequest {
+            flags: CORRELATION_INFO_PRESENT | 0x01,
+            ..NegRequest::new(SecurityProtocol::HYBRID)
+        };
+        assert_eq!(
+            req.encode(),
+            [0x01, 0x01, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]

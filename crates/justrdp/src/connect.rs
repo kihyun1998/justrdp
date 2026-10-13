@@ -23,6 +23,10 @@ use justrdp_pdu::{finalization, gcc, license, mcs, share, tpkt, x224};
 pub struct ConnectConfig {
     /// Protocols to advertise in the X.224 security negotiation.
     pub requested: SecurityProtocol,
+    /// The `correlationId` to send in the X.224 Connection Request's `RDP_NEG_CORRELATION_INFO`
+    /// (`[MS-RDPBCGR]` 2.2.1.1.2), which a server or broker records for diagnostics. `None`
+    /// sends none. The values 2.2.1.1.2 rules out are refused by [`crate::advertise`].
+    pub correlation_id: Option<[u8; 16]>,
     /// The Client Core Data exactly as it should appear in GCC. Nothing in this struct is
     /// defaulted, derived, or overridden by the machine (except `server_selected_protocol`).
     pub core: gcc::ClientCoreData,
@@ -506,9 +510,14 @@ impl ConnectStateMachine {
                     target: "rdp_x224",
                     step = "request",
                     requested = format_args!("{:#x}", self.config.requested.bits()),
+                    correlation_id = self.config.correlation_id.is_some(),
                     "X.224 Connection Request sent"
                 );
-                let neg = NegRequest::new(self.config.requested).encode();
+                let neg = NegRequest {
+                    correlation_id: self.config.correlation_id,
+                    ..NegRequest::new(self.config.requested)
+                }
+                .encode();
                 let tpdu = x224::encode_connection_request(&neg);
                 vec![Action::WriteBytes(tpkt::encode(&tpdu))]
             }
@@ -1381,6 +1390,7 @@ pub(crate) mod tests {
     fn config_with_flags(flags: ClientEarlyCapabilityFlags) -> ConnectConfig {
         ConnectConfig {
             requested: requested(),
+            correlation_id: None,
             core: justrdp_pdu::gcc::ClientCoreData {
                 version: RDP_VERSION_10_12,
                 desktop_width: 1280,
@@ -1501,6 +1511,36 @@ pub(crate) mod tests {
             ])]
         );
         assert_eq!(sm.stage(), "x224-negotiate");
+    }
+
+    /// A configured correlation id rides the Connection Request: `CORRELATION_INFO_PRESENT`
+    /// in the request's flags and the 36-byte `RDP_NEG_CORRELATION_INFO` after it, both counted
+    /// in the X.224 length indicator and the TPKT length.
+    #[test]
+    fn a_correlation_id_rides_the_connection_request() {
+        let id = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xF0, 0x01,
+        ];
+        let mut sm = ConnectStateMachine::new(ConnectConfig {
+            correlation_id: Some(id),
+            ..config()
+        })
+        .unwrap();
+        sm.start();
+        let mut expected = vec![
+            0x03, 0x00, 0x00, 0x37, // TPKT: length = 19 + 36 = 55
+            0x32, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00, // X.224 CR: LI = 14 + 36 = 50
+            0x01, 0x08, 0x08, 0x00, 0x0B, 0x00, 0x00,
+            0x00, // RDP_NEG_REQ, CORRELATION_INFO_PRESENT
+            0x06, 0x00, 0x24, 0x00, // RDP_NEG_CORRELATION_INFO: type, flags, length = 36
+        ];
+        expected.extend_from_slice(&id);
+        expected.extend_from_slice(&[0; 16]);
+        assert_eq!(
+            sm.process(Event::Connected),
+            vec![Action::WriteBytes(expected)]
+        );
     }
 
     /// Wrap an 8-byte RDP negotiation structure in an X.224 Connection Confirm + TPKT, as a

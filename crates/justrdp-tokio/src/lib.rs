@@ -1495,6 +1495,7 @@ mod tests {
             requested: SecurityProtocol::SSL
                 | SecurityProtocol::HYBRID
                 | SecurityProtocol::HYBRID_EX,
+            correlation_id: None,
             capabilities: justrdp_pdu::capability::default_client_capabilities(&core),
             core,
             security: gcc::ClientSecurityData::default(),
@@ -12170,6 +12171,67 @@ mod tests {
             };
             assert!(covers(desktop, &run.after_resume), "{run:?}");
             assert!(covers(REFRESHED, &run.after_refresh), "{run:?}");
+        })
+        .await
+    }
+
+    /// Real-VM acceptance (issue #441): a Connection Request carrying an
+    /// `RDP_NEG_CORRELATION_INFO` is accepted — the server still selects a protocol, the connect
+    /// reaches session-active and the desktop paints.
+    #[tokio::test]
+    #[traced_test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_correlation_id_in_the_connection_request_is_accepted_by_the_real_vm() {
+        with_vm_session(|vm| async move {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let mut config = test_config();
+            config.correlation_id = Some([
+                0x4A, 0x55, 0x53, 0x54, 0x52, 0x44, 0x50, 0x2D, 0x34, 0x34, 0x31, 0x2D, 0x63, 0x6F,
+                0x72, 0x72,
+            ]);
+            let requested = config.requested;
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            assert!(requested.contains(outcome.mcs.selected));
+            assert!(logs_contain("correlation_id=true"));
+
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, session_capabilities),
+                outcome.activation.leftover,
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+            let frames = Arc::new(AtomicUsize::new(0));
+            let frames_in_sink = frames.clone();
+            let (_tx, mut rx) = tokio::sync::mpsc::channel::<SessionCommand>(1);
+            let cancel = CancellationToken::new();
+            let stop = cancel.clone();
+            let driver = tokio::spawn(async move {
+                let painted = vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await;
+                stop.cancel();
+                painted
+            });
+            tokio::time::timeout(
+                Duration::from_secs(90),
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    |_, _| {
+                        frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    },
+                    |_| {},
+                    |_| {},
+                    &mut rx,
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("the session loop should return on cancel, not hang")
+            .expect("the cancelled session ends cleanly");
+            let painted = driver.await.expect("the driver finished");
+            assert!(painted.is_ok(), "{painted:?}");
         })
         .await
     }

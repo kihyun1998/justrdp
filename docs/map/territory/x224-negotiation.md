@@ -4,11 +4,13 @@
 
 The first protocol exchange after the TCP socket opens: the client sends an X.224
 Connection Request carrying an RDP Negotiation Request (requested security
-protocols, plus the optional cookie / routing token), and the server answers with a
+protocols), optionally followed by a correlation id (#441), and the server answers with a
 Connection Confirm carrying either a Negotiation Response (the *selected* protocol
 — TLS, HYBRID, HYBRID_EX) or a Negotiation Failure code. Everything downstream —
 which transport wraps the socket, whether NLA runs at all, whether an Early User
-Authorization Result PDU arrives — is decided here, by one byte the server picks.
+Authorization Result PDU arrives — is decided here, by one byte the server picks. The
+request's other optional fields, a load-balancing cookie or routing token, are not sent; they
+belong to server redirection (#24).
 
 ## Governing decisions
 
@@ -39,11 +41,20 @@ deciding the exchange itself.
   build was scoped (2026-06-08) is a modern Windows Server with NLA enforced, and the test VM
   refuses a TLS-only connect (`HYBRID_REQUIRED_BY_SERVER`). Standard RDP Security (RC4) is not
   supported at all.
+- **A correlation id is the host's, and the flag and the structure travel together** (#441).
+  `ConnectConfig::correlation_id` puts a 16-byte id in an `RDP_NEG_CORRELATION_INFO` after the
+  request (2.2.1.1.2), which a server or broker records for diagnostics. 2.2.1.1 makes
+  `CORRELATION_INFO_PRESENT` and the structure a pair, so `NegRequest::encode` sets the flag from
+  the id and clears it without one, whatever `flags` holds. The ids 2.2.1.1.2 says SHOULD NOT be
+  sent (a first byte of 0x00 or 0xF4, or any 0x0D byte) are refused by `advertise::check`: the
+  spec only advises against them, but FreeRDP's server fails a Connection Request carrying one.
+  The same id is meant to reach RD Gateway and UDP transports (#23, #16).
 
 ## Code
 
 - `justrdp-pdu/src/nego.rs` — `NegRequest`, `NegResponse`, `NegFailureCode`,
-  `SecurityProtocol`
+  `SecurityProtocol`, `CORRELATION_INFO_PRESENT` (#441)
+- `justrdp/src/advertise.rs` — `ConnectConfigError::CorrelationId` (#441)
 - `justrdp-pdu/src/x224.rs` — `encode_connection_request`,
   `decode_connection_confirm`, `encode_data`, `decode_data`
 - `justrdp/src/connect.rs` — `ConnectStateMachine`, `Stage`, `Action::StartTls`,
@@ -57,9 +68,21 @@ and the server selects `0x8` (HYBRID_EX), on 5 of 5 connects; both are recorded 
 (`step="request"`, `step="selected"`) and asserted in order by
 `connect_reaches_session_active_against_real_vm`. One WS2019 box.
 
-**No implementation comparison.** This repo keeps no verified external-fact store (see the hub's *what the
-map cannot answer*), so no FreeRDP / IronRDP behaviour is recorded here with a
-pinned citation. The modules cite `[MS-RDPBCGR]` section numbers inline, which is a
+**Correlation info: this VM accepts it, and checks none of it** (#441, 2026-10-13). A request
+carrying a spec-valid `RDP_NEG_CORRELATION_INFO` reaches session-active and paints the desktop
+(`a_correlation_id_in_the_connection_request_is_accepted_by_the_real_vm`). So did three malformed
+ones, each tried once by mutating the encoder: a length of 0x23, the flag with no structure after
+it, and an id starting with 0x0D. That test therefore proves the server tolerates the field, not
+that the encoding is right; the bytes rest on 2.2.1.1.2 and agree with IronRDP's `CorrelationInfo`
+(master). The pinned `ironrdp-pdu` 0.9.0 oracle cannot check them: its `ConnectionRequest`
+decoder refuses any request with `CORRELATION_INFO_PRESENT` (a `TODO(#111)` in its `nego.rs`). The refusal of 0x00 / 0xF4 / 0x0D
+rests on FreeRDP's server (`nego_process_correlation_info`, `libfreerdp/core/nego.c` at
+`18513805`), which fails the request on each, not on anything this VM does. Whether the VM
+records the id is not observed: nothing here reads its event log.
+
+**No implementation comparison for the security selection.** This repo keeps no verified
+external-fact store (see the hub's *what the map cannot answer*), so apart from the correlation
+info above, no FreeRDP / IronRDP behaviour is recorded here with a pinned citation. The modules cite `[MS-RDPBCGR]` section numbers inline, which is a
 *spec* pin — the implementation comparison this project's tie-breaker table relies
 on has never been written down for this territory.
 
