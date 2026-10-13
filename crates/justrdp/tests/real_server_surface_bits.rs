@@ -24,6 +24,8 @@ fn machine() -> SessionStateMachine {
             desktop_size: (1280, 800),
             capabilities: capability::default_client_capabilities(&core),
             server_input_flags: capability::INPUT_FLAG_SCANCODES,
+            server_refresh_rect: false,
+            server_suppress_output: false,
             drdynvc_channel_id: None,
             static_channels: Vec::new(),
             dynamic_channels: Vec::new(),

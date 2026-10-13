@@ -922,6 +922,19 @@ pub enum SessionCommand {
     /// request, never a teardown: a host that needs the session *gone* still has to end it from
     /// inside.
     Shutdown,
+    /// Ask the server to redraw these areas — the Refresh Rect PDU (MS-RDPBCGR 2.2.11.2,
+    /// issue #438), as [`justrdp::SessionStateMachine::request_refresh_rect`]. The redrawn
+    /// pixels arrive as ordinary frame updates. A request the machine refuses
+    /// ([`justrdp::OutputControlError`]) is logged and dropped — the session keeps running.
+    RefreshRect(Vec<justrdp::FrameUpdate>),
+    /// Ask the server to stop sending display updates — the Suppress Output PDU (MS-RDPBCGR
+    /// 2.2.11.3), as [`justrdp::SessionStateMachine::request_suppress_output`]. Refused the
+    /// same way as [`Self::RefreshRect`].
+    SuppressOutput,
+    /// Ask the server to send display updates again, for the whole desktop, as
+    /// [`justrdp::SessionStateMachine::request_resume_output`]. Refused the same way as
+    /// [`Self::RefreshRect`].
+    ResumeOutput,
     /// Send one message on a host static channel (issue #307), chunked by the machine. A
     /// channel the machine refuses ([`justrdp::ChannelSendError`]) is logged and dropped — the
     /// session keeps running.
@@ -1147,6 +1160,42 @@ pub async fn run_session_with_commands(
                         tracing::info!("shutdown requested");
                         for frame in machine.request_shutdown() {
                             write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
+                        }
+                    }
+                    Some(SessionCommand::RefreshRect(areas)) => {
+                        let count = areas.len();
+                        match machine.request_refresh_rect(&areas) {
+                            Ok(frames) => {
+                                tracing::info!(count, "refresh rect requested");
+                                for frame in frames {
+                                    write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
+                                }
+                            }
+                            // Not fatal: the session is unaffected.
+                            Err(e) => tracing::warn!(count, error = %e, "refresh rect refused"),
+                        }
+                    }
+                    Some(
+                        command @ (SessionCommand::SuppressOutput | SessionCommand::ResumeOutput),
+                    ) => {
+                        let suppress = command == SessionCommand::SuppressOutput;
+                        let requested = if suppress {
+                            machine.request_suppress_output()
+                        } else {
+                            machine.request_resume_output()
+                        };
+                        match requested {
+                            Ok(frames) if frames.is_empty() => {
+                                tracing::debug!("output already suppressed, nothing sent");
+                            }
+                            Ok(frames) => {
+                                tracing::info!(suppress, "suppress output requested");
+                                for frame in frames {
+                                    write_frame(stream, &frame).await.map_err(SessionFailure::Io)?;
+                                }
+                            }
+                            // Not fatal: the session is unaffected.
+                            Err(e) => tracing::warn!(suppress, error = %e, "suppress output refused"),
                         }
                     }
                     Some(SessionCommand::ChannelData { channel, data }) => {
@@ -8164,7 +8213,8 @@ mod tests {
     }
 
     /// Assemble the [`justrdp::SessionConfig`] from a connect outcome — including the server's
-    /// Input capability flags, which pick the input transport (fast-path vs slow-path).
+    /// Input capability flags, which pick the input transport (fast-path vs slow-path), and its
+    /// General set's Refresh Rect / Suppress Output support.
     fn session_config_from(
         outcome: &ConnectOutcome,
         capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
@@ -8178,6 +8228,14 @@ mod tests {
                 _ => None,
             })
             .unwrap_or(0);
+        let general = outcome
+            .activation
+            .server_capabilities
+            .iter()
+            .find_map(|set| match set {
+                justrdp_pdu::capability::CapabilitySet::General(general) => Some(general),
+                _ => None,
+            });
         justrdp::SessionConfig {
             user_channel_id: outcome.mcs.user_channel_id,
             io_channel_id: outcome.mcs.io_channel_id,
@@ -8185,6 +8243,8 @@ mod tests {
             desktop_size: outcome.activation.desktop_size,
             capabilities,
             server_input_flags,
+            server_refresh_rect: general.is_some_and(|g| g.refresh_rect_support != 0),
+            server_suppress_output: general.is_some_and(|g| g.suppress_output_support != 0),
             drdynvc_channel_id: outcome
                 .mcs
                 .static_channels
@@ -9693,6 +9753,8 @@ mod tests {
                 desktop_size: (16, 8),
                 capabilities: Vec::new(),
                 server_input_flags: 0,
+                server_refresh_rect: false,
+                server_suppress_output: false,
                 drdynvc_channel_id: None,
                 static_channels: Vec::new(),
                 dynamic_channels: Vec::new(),
@@ -9747,6 +9809,8 @@ mod tests {
             desktop_size: (16, 8),
             capabilities: Vec::new(),
             server_input_flags: 0,
+            server_refresh_rect: false,
+            server_suppress_output: false,
             drdynvc_channel_id: None,
             static_channels: vec![justrdp::StaticChannel {
                 name: "cliprdr".to_string(),
@@ -9885,6 +9949,8 @@ mod tests {
                     },
                 )],
                 server_input_flags: 0,
+                server_refresh_rect: false,
+                server_suppress_output: false,
                 drdynvc_channel_id: None,
                 static_channels: Vec::new(),
                 dynamic_channels: Vec::new(),
@@ -9954,6 +10020,8 @@ mod tests {
                 desktop_size: (16, 8),
                 capabilities: Vec::new(),
                 server_input_flags: 0,
+                server_refresh_rect: false,
+                server_suppress_output: false,
                 drdynvc_channel_id: None,
                 static_channels: Vec::new(),
                 dynamic_channels: Vec::new(),
@@ -11890,6 +11958,218 @@ mod tests {
             // disconnect instead.
             let reason = ended.expect("the cancelled session ends cleanly");
             eprintln!("shutdown request → denied; session ended by cancel as {reason:?}");
+        })
+        .await
+    }
+
+    /// What [`output_control_on_the_vm`] saw.
+    #[derive(Debug)]
+    struct OutputControlRun {
+        /// Frames that arrived while output was suppressed and the Start menu was clicked open.
+        while_suppressed: usize,
+        /// The rectangles that arrived within 10 s of resuming output.
+        after_resume: Vec<FrameUpdate>,
+        /// The desktop the session ran at.
+        desktop: (u16, u16),
+        /// The rectangles that arrived within 10 s of the Refresh Rect.
+        after_refresh: Vec<FrameUpdate>,
+    }
+
+    /// The area [`output_control_on_the_vm`] asks the server to redraw.
+    const REFRESHED: FrameUpdate = FrameUpdate {
+        x: 0,
+        y: 0,
+        width: 256,
+        height: 256,
+    };
+
+    /// Connect with `config`, prove the shell answers a Start click, then suppress output,
+    /// click Start again, resume, close the menu, and ask for [`REFRESHED`] to be redrawn.
+    async fn output_control_on_the_vm(vm: vm::Vm, config: ConnectConfig) -> OutputControlRun {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let session_capabilities = config.capabilities.clone();
+        let outcome = vm.connect(config).await;
+        let desktop = outcome.activation.desktop_size;
+        let session_config = session_config_from(&outcome, session_capabilities);
+        assert!(
+            session_config.server_refresh_rect && session_config.server_suppress_output,
+            "the server's General set announced neither or only one of Refresh Rect / Suppress \
+             Output: {session_config:?}"
+        );
+        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        let mut stream = outcome.stream;
+
+        let frames = Arc::new(AtomicUsize::new(0));
+        let rects: Arc<Mutex<Vec<FrameUpdate>>> = Arc::default();
+        let (frames_in_sink, rects_in_sink) = (frames.clone(), rects.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SessionCommand>(8);
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+
+        let driver = tokio::spawn(async move {
+            let send = |command| {
+                let tx = tx.clone();
+                async move { tx.send(command).await.expect("the session loop is running") }
+            };
+            let (x, y) = (24u16, desktop.1.saturating_sub(20));
+            let click = SessionCommand::Input(
+                [
+                    justrdp_pdu::input::PTRFLAGS_MOVE,
+                    justrdp_pdu::input::PTRFLAGS_DOWN | justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                    justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                ]
+                .into_iter()
+                .map(|flags| InputEvent::Mouse {
+                    flags,
+                    wheel_units: 0,
+                    x,
+                    y,
+                })
+                .collect(),
+            );
+            let esc = SessionCommand::Input(tap(0x1B));
+            vm::await_desktop(&frames, vm::DESKTOP_DEADLINE)
+                .await
+                .expect("the desktop paints");
+
+            // The shell is up: a Start click repaints. Without this, a click that drew nothing
+            // while suppressed would prove nothing.
+            let mut shell_up = false;
+            for _ in 0..6 {
+                let before = frames.load(Ordering::SeqCst);
+                send(click.clone()).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if frames.load(Ordering::SeqCst) > before {
+                    shell_up = true;
+                    break;
+                }
+            }
+            assert!(
+                shell_up,
+                "the Start button never drew — the shell is not up"
+            );
+            send(esc.clone()).await;
+            vm::await_desktop(&frames, vm::MENU_DEADLINE)
+                .await
+                .expect("the desktop settles once the menu closes");
+
+            send(SessionCommand::SuppressOutput).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let before = frames.load(Ordering::SeqCst);
+            send(click.clone()).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let while_suppressed = frames.load(Ordering::SeqCst) - before;
+
+            let before = rects.lock().unwrap().len();
+            send(SessionCommand::ResumeOutput).await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let after_resume = rects.lock().unwrap()[before..].to_vec();
+
+            send(esc).await;
+            vm::await_desktop(&frames, vm::MENU_DEADLINE)
+                .await
+                .expect("the desktop settles once the menu closes");
+            let before = rects.lock().unwrap().len();
+            send(SessionCommand::RefreshRect(vec![REFRESHED])).await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let after_refresh = rects.lock().unwrap()[before..].to_vec();
+
+            stop.cancel();
+            OutputControlRun {
+                while_suppressed,
+                after_resume,
+                after_refresh,
+                desktop,
+            }
+        });
+
+        let ended = tokio::time::timeout(
+            Duration::from_secs(180),
+            run_session_with_commands(
+                &mut stream,
+                &mut machine,
+                |frame, _| {
+                    frames_in_sink.fetch_add(1, Ordering::SeqCst);
+                    rects_in_sink.lock().unwrap().push(*frame);
+                },
+                |_| {},
+                |_| {},
+                &mut rx,
+                &cancel,
+            ),
+        )
+        .await
+        .expect("the session loop should return on cancel, not hang");
+        let run = driver.await.expect("the driver finished");
+        ended.expect("the cancelled session ends cleanly");
+        eprintln!(
+            "output control: {} frames while suppressed, {} after resume, {} rects after refresh: \
+             {:?}",
+            run.while_suppressed,
+            run.after_resume.len(),
+            run.after_refresh.len(),
+            run.after_refresh
+        );
+        run
+    }
+
+    /// Every pixel of `area` lies in one of `rects`.
+    fn covers(area: FrameUpdate, rects: &[FrameUpdate]) -> bool {
+        (area.y..area.y + area.height).all(|y| {
+            (area.x..area.x + area.width).all(|x| {
+                rects.iter().any(|r| {
+                    (r.x..r.x.saturating_add(r.width)).contains(&x)
+                        && (r.y..r.y.saturating_add(r.height)).contains(&y)
+                })
+            })
+        })
+    }
+
+    /// Real-VM acceptance (issue #438): with output suppressed the server sends nothing even
+    /// while the Start menu opens; resuming brings frames back, and a Refresh Rect brings back
+    /// the whole area it names. Legacy graphics (no EGFX), which this VM paints in NSCodec
+    /// surface bits.
+    ///
+    /// The resume assertion tells a resume from a second suppress only because the machine
+    /// sends no repeated suppress: this server resumes output on one
+    /// (`docs/map/territory/session-loop-dispatch.md`).
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn suppress_resume_and_refresh_rect_drive_legacy_graphics_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            let run = output_control_on_the_vm(vm, legacy_graphics_config()).await;
+            assert_eq!(run.while_suppressed, 0, "{run:?}");
+            let desktop = FrameUpdate {
+                x: 0,
+                y: 0,
+                width: run.desktop.0,
+                height: run.desktop.1,
+            };
+            assert!(covers(desktop, &run.after_resume), "{run:?}");
+            assert!(covers(REFRESHED, &run.after_refresh), "{run:?}");
+        })
+        .await
+    }
+
+    /// [`suppress_resume_and_refresh_rect_drive_legacy_graphics_on_the_real_vm`] over the
+    /// Graphics Pipeline (EGFX).
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn suppress_resume_and_refresh_rect_drive_egfx_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            let run = output_control_on_the_vm(vm, test_config()).await;
+            assert_eq!(run.while_suppressed, 0, "{run:?}");
+            let desktop = FrameUpdate {
+                x: 0,
+                y: 0,
+                width: run.desktop.0,
+                height: run.desktop.1,
+            };
+            assert!(covers(desktop, &run.after_resume), "{run:?}");
+            assert!(covers(REFRESHED, &run.after_refresh), "{run:?}");
         })
         .await
     }

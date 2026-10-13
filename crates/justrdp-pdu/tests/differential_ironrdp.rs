@@ -438,3 +438,69 @@ fn our_send_data_request_decodes_in_ironrdp_with_the_client_info_payload() {
         other => panic!("expected SendDataRequest, got {other:?}"),
     }
 }
+
+// ─────────────────────── Refresh Rect / Suppress Output (2.2.11, #438) ───────────────────────
+
+mod output_control {
+    use ironrdp_pdu::decode as ironrdp_decode;
+    use ironrdp_pdu::encode_vec as ironrdp_encode_vec;
+    use ironrdp_pdu::geometry::InclusiveRectangle as IronRect;
+    use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+    use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
+    use justrdp_pdu::output_control::{InclusiveRect, encode_refresh_rect, encode_suppress_output};
+
+    fn iron(r: InclusiveRect) -> IronRect {
+        IronRect {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        }
+    }
+
+    const A: InclusiveRect = InclusiveRect {
+        left: 10,
+        top: 20,
+        right: 309,
+        bottom: 219,
+    };
+    const B: InclusiveRect = InclusiveRect {
+        left: 0x0102,
+        top: 0x0304,
+        right: 0x0506,
+        bottom: 0x0708,
+    };
+
+    #[test]
+    fn ironrdp_decodes_our_refresh_rect() {
+        let ours = encode_refresh_rect(&[A, B]).unwrap();
+        let theirs: RefreshRectanglePdu = ironrdp_decode(&ours).expect("ironrdp decodes it");
+        assert_eq!(theirs.areas_to_refresh, vec![iron(A), iron(B)]);
+    }
+
+    #[test]
+    fn ironrdp_decodes_our_suppress_and_allow() {
+        let suppress: SuppressOutputPdu =
+            ironrdp_decode(&encode_suppress_output(None)).expect("ironrdp decodes suppress");
+        assert_eq!(suppress.desktop_rect, None);
+        let allow: SuppressOutputPdu =
+            ironrdp_decode(&encode_suppress_output(Some(A))).expect("ironrdp decodes allow");
+        assert_eq!(allow.desktop_rect, Some(iron(A)));
+    }
+
+    #[test]
+    fn our_bytes_equal_ironrdps_encoder() {
+        let theirs = ironrdp_encode_vec(&RefreshRectanglePdu {
+            areas_to_refresh: vec![iron(A), iron(B)],
+        })
+        .unwrap();
+        assert_eq!(encode_refresh_rect(&[A, B]).unwrap(), theirs);
+        for desktop in [None, Some(A)] {
+            let theirs = ironrdp_encode_vec(&SuppressOutputPdu {
+                desktop_rect: desktop.map(iron),
+            })
+            .unwrap();
+            assert_eq!(encode_suppress_output(desktop), theirs, "{desktop:?}");
+        }
+    }
+}

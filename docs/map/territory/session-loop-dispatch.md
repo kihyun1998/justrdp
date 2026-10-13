@@ -66,6 +66,21 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   ID that was never granted is skipped with an `rdp_svc` record. Inside `drdynvc`, a channel
   the host registered surfaces as the three `DynamicChannel*` outputs (#385, ADR-0018). See
   [Virtual channels](virtual-channels.md) for the reassembly rules and whose call each was.
+- **The host can ask for a redraw or a pause; the server's General set says whether it may**
+  (#438). Refresh Rect and Suppress Output are client-to-server only. `refreshRectSupport` and
+  `suppressOutputSupport` are server-only fields (2.2.7.1.1; the client's own copy is ignored), so
+  the gate is the server's Demand Active, carried in `SessionConfig` and replaced at every
+  reactivation. Areas come in `FrameUpdate` coordinates and go out as inclusive rectangles; resume
+  covers the whole current desktop. When to send either is the host's.
+- **The machine remembers the last Suppress Output it sent, and a repeated suppress sends nothing**
+  (#438, the maintainer's call). The spec makes `allowDisplayUpdates` a value, but this server
+  treats a suppress that arrives while output is already suppressed as a resume (see Reference
+  behaviour), so a host that suppresses twice would otherwise turn output back on. Resume always
+  goes out: it is idempotent here, and suppress then resume is the full-refresh workaround the
+  spec gives for RDP 8.0/8.1 servers whose Refresh Rect is broken (product note on 2.2.11.2).
+  The remembered state is kept across a reactivation. On this server a resize cannot reactivate a
+  suppressed session (see Reference behaviour); whether another server-initiated reactivation ends
+  suppression is unmeasured.
 
 ## Code
 
@@ -85,6 +100,10 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   `PDU_TYPE2_SAVE_SESSION_INFO`, `PDU_TYPE2_SET_KEYBOARD_INDICATORS`, `PDU_TYPE2_PLAY_SOUND`
 - `justrdp-pdu/src/session_info.rs` — `SaveSessionInfo`
 - `justrdp-pdu/src/sound.rs` — `PlaySound` (#354)
+- `justrdp-pdu/src/output_control.rs` — `InclusiveRect`, `encode_refresh_rect`,
+  `encode_suppress_output` (#438)
+- `justrdp/src/session.rs` — `request_refresh_rect`, `request_suppress_output`,
+  `request_resume_output`, `OutputControlError` (#438)
 
 ## Reference behaviour
 
@@ -112,6 +131,19 @@ is a bare `return TRUE`. IronRDP's `ActiveStage::graceful_shutdown` is therefore
 send-side reference. **The MCS Disconnect Provider Ultimatum that follows a grant is
 deliberately not written**: this VM never grants, so it would be machinery with no server to
 prove it against.
+
+**Suppress Output and Refresh Rect: honoured, and a repeated suppress resumes** (#438,
+2026-10-13, WS2019, legacy NSCodec and EGFX sessions). The server announces both in its General
+set. With output suppressed a Start click draws nothing for 25 s. A second
+`SUPPRESS_DISPLAY_UPDATES` turns output back on with a full repaint (274 frames, the count a resume
+brings), and a third suppresses again; a resume while output runs changes nothing. A resume
+repaints the whole desktop, in both session kinds. A Refresh Rect for 0,0–255,255 brings back
+exactly the sixteen 64×64 tiles that cover it, in both session kinds, and it does so while output
+is suppressed too (two runs). A Display Control resize sent while output is suppressed is not
+carried out until output resumes: the desktop changed size 260 frames after the resume, and
+until then nothing arrived, not even the frame the machine emits when a reactivation completes.
+Measured with throwaway probes and by mutating the adapter's command handler
+(`suppress_resume_and_refresh_rect_drive_*`).
 
 ## Cross-cutting invariants
 
@@ -161,4 +193,5 @@ prove it against.
 - Auto-reconnect on transient disconnect is unbuilt: `classify`
   distinguishes the cases, and nothing acts on the distinction. When to reconnect is the
   host's reconnect strategy; the cookie it needs shipped in #306.
-- Refresh Rect, Suppress Output, IME Status and Status Info have no arm: epic #426.
+- IME Status (#439) and Status Info (#440) have no arm: epic #426. Refresh Rect and Suppress
+  Output are sent since #438.
