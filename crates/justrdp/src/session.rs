@@ -22,8 +22,8 @@ use justrdp_pdu::input::InputEvent;
 use justrdp_pdu::pointer::PointerUpdate;
 use justrdp_pdu::surface_commands::{self, SurfaceBits, SurfaceCommand};
 use justrdp_pdu::{
-    displaycontrol, dvc, fastpath, finalization, input, mcs, pointer, session_info, share, sound,
-    svc, tpkt, update, x224,
+    displaycontrol, dvc, fastpath, finalization, input, mcs, output_control, pointer, session_info,
+    share, sound, svc, tpkt, update, x224,
 };
 
 /// Everything the session machine needs from the completed connect sequence: channel
@@ -48,6 +48,14 @@ pub struct SessionConfig {
     /// fast-path when the server advertised `INPUT_FLAG_FASTPATH_INPUT`/`INPUT2`, the
     /// slow-path Input Event PDU otherwise.
     pub server_input_flags: u16,
+    /// The server announced the Refresh Rect PDU: a non-zero `refreshRectSupport` in its Demand
+    /// Active General capability set (`[MS-RDPBCGR]` 2.2.7.1.1). Gates
+    /// [`SessionStateMachine::request_refresh_rect`]; a reactivation replaces it.
+    pub server_refresh_rect: bool,
+    /// The server announced the Suppress Output PDU: a non-zero `suppressOutputSupport` in its
+    /// Demand Active General capability set. Gates [`SessionStateMachine::request_suppress_output`]
+    /// and [`SessionStateMachine::request_resume_output`]; a reactivation replaces it.
+    pub server_suppress_output: bool,
     /// The MCS channel ID the server granted for the `drdynvc` static channel
     /// ([`crate::McsConnectResult::static_channels`], entry named `"drdynvc"`), or `None` if
     /// the channel was not requested/granted — dynamic channels (Display Control resize,
@@ -322,6 +330,49 @@ impl core::fmt::Display for ResizeError {
 
 impl core::error::Error for ResizeError {}
 
+/// Why [`SessionStateMachine::request_refresh_rect`],
+/// [`SessionStateMachine::request_suppress_output`] or
+/// [`SessionStateMachine::request_resume_output`] was refused (the session itself is
+/// unaffected).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputControlError {
+    /// The server's General capability set did not announce the PDU
+    /// ([`SessionConfig::server_refresh_rect`], [`SessionConfig::server_suppress_output`]).
+    NotSupported,
+    /// A Refresh Rect with no areas.
+    NoAreas,
+    /// More areas than `numberOfAreas` (one byte) can count.
+    TooManyAreas {
+        /// How many areas were asked for.
+        count: usize,
+    },
+    /// An area that is empty or reaches past the desktop.
+    InvalidArea {
+        /// The refused area.
+        area: FrameUpdate,
+    },
+}
+
+impl core::fmt::Display for OutputControlError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            OutputControlError::NotSupported => write!(
+                f,
+                "the server's General capability set did not announce this PDU"
+            ),
+            OutputControlError::NoAreas => write!(f, "a Refresh Rect needs at least one area"),
+            OutputControlError::TooManyAreas { count } => {
+                write!(f, "{count} areas exceed the 255 a Refresh Rect can carry")
+            }
+            OutputControlError::InvalidArea { area } => {
+                write!(f, "area {area:?} is empty or reaches past the desktop")
+            }
+        }
+    }
+}
+
+impl core::error::Error for OutputControlError {}
+
 /// Why [`SessionStateMachine::send_channel`] or
 /// [`SessionStateMachine::set_channel_message_cap`] was refused (the session itself is
 /// unaffected). Only `send_channel` can return [`ChannelSendError::SuspendedQueueFull`].
@@ -516,6 +567,8 @@ pub struct SessionStateMachine {
     /// Whether the Confirm Active advertised NSCodec, so Set Surface Bits may carry
     /// [`capability::CODEC_ID_NSCODEC`].
     nscodec_advertised: bool,
+    /// The last Suppress Output this machine sent was `SUPPRESS_DISPLAY_UPDATES`.
+    output_suppressed: bool,
 }
 
 impl SessionStateMachine {
@@ -591,6 +644,7 @@ impl SessionStateMachine {
             drdynvc,
             channels,
             suspended: None,
+            output_suppressed: false,
             held_bytes: 0,
             surface_commands,
             nscodec_advertised,
@@ -1281,6 +1335,10 @@ impl SessionStateMachine {
     ) -> Result<(), SessionError> {
         let demand = capability::DemandActive::decode(cur).map_err(SessionError::Decode)?;
         self.config.share_id = header.share_id;
+        let general = demand.general();
+        self.config.server_refresh_rect = general.is_some_and(|g| g.refresh_rect_support != 0);
+        self.config.server_suppress_output =
+            general.is_some_and(|g| g.suppress_output_support != 0);
         let (width, height) = demand
             .bitmap()
             .map(|b| (b.desktop_width, b.desktop_height))
@@ -1586,6 +1644,113 @@ impl SessionStateMachine {
             share::PDU_TYPE2_SHUTDOWN_REQUEST,
             &[],
         ))]
+    }
+
+    /// Ask the server to redraw `areas` — the Refresh Rect PDU (`[MS-RDPBCGR]` 2.2.11.2), in
+    /// the coordinates of [`FrameUpdate`]. The redrawn pixels arrive as ordinary graphics
+    /// updates. The returned frames go to the socket verbatim.
+    ///
+    /// Refused when the server did not announce the PDU, and for an empty list, more than 255
+    /// areas, or an area that is empty or reaches past the desktop.
+    pub fn request_refresh_rect(
+        &self,
+        areas: &[FrameUpdate],
+    ) -> Result<Vec<Vec<u8>>, OutputControlError> {
+        if !self.config.server_refresh_rect {
+            return Err(OutputControlError::NotSupported);
+        }
+        if areas.is_empty() {
+            return Err(OutputControlError::NoAreas);
+        }
+        let too_many = OutputControlError::TooManyAreas { count: areas.len() };
+        if areas.len() > usize::from(u8::MAX) {
+            return Err(too_many);
+        }
+        let rects = areas
+            .iter()
+            .map(|&area| {
+                self.inclusive(area)
+                    .ok_or(OutputControlError::InvalidArea { area })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let body = output_control::encode_refresh_rect(&rects).ok_or(too_many)?;
+        Ok(vec![self.send_data(share::PDU_TYPE2_REFRESH_RECT, &body)])
+    }
+
+    /// Ask the server to stop sending display updates — the Suppress Output PDU
+    /// (`[MS-RDPBCGR]` 2.2.11.3) with `SUPPRESS_DISPLAY_UPDATES`. Refused when the server did not
+    /// announce the PDU. The returned frames go to the socket verbatim; they are empty while the
+    /// last Suppress Output this machine sent already suppressed output.
+    pub fn request_suppress_output(&mut self) -> Result<Vec<Vec<u8>>, OutputControlError> {
+        if self.output_suppressed && self.config.server_suppress_output {
+            return Ok(Vec::new());
+        }
+        let frames = self.suppress_output(None)?;
+        self.output_suppressed = true;
+        Ok(frames)
+    }
+
+    /// Ask the server to send display updates again — the Suppress Output PDU with
+    /// `ALLOW_DISPLAY_UPDATES` and the whole current desktop as `desktopRect`. Refused when the
+    /// server did not announce the PDU. The returned frames go to the socket verbatim.
+    pub fn request_resume_output(&mut self) -> Result<Vec<Vec<u8>>, OutputControlError> {
+        let (width, height) = self.config.desktop_size;
+        let desktop = FrameUpdate {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let rect = self
+            .inclusive(desktop)
+            .ok_or(OutputControlError::InvalidArea { area: desktop })?;
+        let frames = self.suppress_output(Some(rect))?;
+        self.output_suppressed = false;
+        Ok(frames)
+    }
+
+    fn suppress_output(
+        &self,
+        desktop: Option<output_control::InclusiveRect>,
+    ) -> Result<Vec<Vec<u8>>, OutputControlError> {
+        if !self.config.server_suppress_output {
+            return Err(OutputControlError::NotSupported);
+        }
+        let body = output_control::encode_suppress_output(desktop);
+        Ok(vec![
+            self.send_data(share::PDU_TYPE2_SUPPRESS_OUTPUT, &body),
+        ])
+    }
+
+    /// `area` as an Inclusive Rectangle, or `None` when it is empty or reaches past the desktop.
+    fn inclusive(&self, area: FrameUpdate) -> Option<output_control::InclusiveRect> {
+        let (width, height) = self.config.desktop_size;
+        let right = u32::from(area.x) + u32::from(area.width);
+        let bottom = u32::from(area.y) + u32::from(area.height);
+        if area.width == 0
+            || area.height == 0
+            || right > u32::from(width)
+            || bottom > u32::from(height)
+        {
+            return None;
+        }
+        Some(output_control::InclusiveRect {
+            left: area.x,
+            top: area.y,
+            right: (right - 1) as u16,
+            bottom: (bottom - 1) as u16,
+        })
+    }
+
+    /// One Share Data PDU on the I/O channel, as a frame for the socket.
+    fn send_data(&self, pdu_type2: u8, body: &[u8]) -> Vec<u8> {
+        self.wrap_io(&share::encode_share_data(
+            self.config.user_channel_id,
+            self.config.share_id,
+            share::STREAM_MED,
+            pdu_type2,
+            body,
+        ))
     }
 
     /// Encode a client-initiated resize as a Display Control Monitor Layout PDU
@@ -2142,6 +2307,8 @@ mod tests {
             capabilities: capability::default_client_capabilities(&test_core()),
             server_input_flags: capability::INPUT_FLAG_SCANCODES
                 | capability::INPUT_FLAG_FASTPATH_INPUT2,
+            server_refresh_rect: false,
+            server_suppress_output: false,
             drdynvc_channel_id: Some(DRDYNVC),
             static_channels: [
                 ("cliprdr", CLIPRDR, 0),
@@ -2202,6 +2369,240 @@ mod tests {
                 0x12, 0x00, 0x17, 0x00, 0xee, 0x03, 0xea, 0x03, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00,
                 0x24, 0x00, 0x00, 0x00,
             ]
+        );
+    }
+
+    /// A machine with [`request_shutdown_encodes_the_frame_the_vm_answered`]'s addressing and a
+    /// server that announced both Refresh Rect and Suppress Output.
+    fn output_control_machine() -> SessionStateMachine {
+        SessionStateMachine::new(
+            SessionConfig {
+                user_channel_id: 1006,
+                io_channel_id: 1003,
+                share_id: 0x0001_03EA,
+                server_refresh_rect: true,
+                server_suppress_output: true,
+                ..config()
+            },
+            Vec::new(),
+        )
+        .expect("the test desktop size is within MAX_DESKTOP_DIM")
+    }
+
+    fn area(x: u16, y: u16, width: u16, height: u16) -> FrameUpdate {
+        FrameUpdate {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// The shutdown frame's headers with `pduType2` 0x21 and a 12-byte body: one area at (1,2),
+    /// 3×4, on the wire as the inclusive rectangle 1,2 – 3,5.
+    #[test]
+    fn request_refresh_rect_encodes_inclusive_areas() {
+        let frames = output_control_machine()
+            .request_refresh_rect(&[area(1, 2, 3, 4)])
+            .expect("the server announced Refresh Rect");
+        assert_eq!(
+            frames,
+            vec![vec![
+                0x03, 0x00, 0x00, 0x2c, 0x02, 0xf0, 0x80, 0x64, 0x00, 0x05, 0x03, 0xeb, 0x70, 0x1e,
+                0x1e, 0x00, 0x17, 0x00, 0xee, 0x03, 0xea, 0x03, 0x01, 0x00, 0x00, 0x02, 0x0c, 0x00,
+                0x21, 0x00, 0x00, 0x00, // Data header, pduType2 0x21
+                0x01, 0x00, 0x00, 0x00, // numberOfAreas 1, pad
+                0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x05, 0x00, // 1,2 – 3,5
+            ]]
+        );
+    }
+
+    /// Suppress carries no rectangle; resume carries the whole 16×8 desktop, 0,0 – 15,7.
+    #[test]
+    fn suppress_and_resume_output_encode_the_desktop_only_on_resume() {
+        let mut sm = output_control_machine();
+        assert_eq!(
+            sm.request_suppress_output()
+                .expect("the server announced Suppress Output"),
+            vec![vec![
+                0x03, 0x00, 0x00, 0x24, 0x02, 0xf0, 0x80, 0x64, 0x00, 0x05, 0x03, 0xeb, 0x70, 0x16,
+                0x16, 0x00, 0x17, 0x00, 0xee, 0x03, 0xea, 0x03, 0x01, 0x00, 0x00, 0x02, 0x04, 0x00,
+                0x23, 0x00, 0x00, 0x00, // Data header, pduType2 0x23
+                0x00, 0x00, 0x00, 0x00, // SUPPRESS_DISPLAY_UPDATES, pad
+            ]]
+        );
+        assert_eq!(
+            sm.request_resume_output()
+                .expect("the server announced Suppress Output"),
+            vec![vec![
+                0x03, 0x00, 0x00, 0x2c, 0x02, 0xf0, 0x80, 0x64, 0x00, 0x05, 0x03, 0xeb, 0x70, 0x1e,
+                0x1e, 0x00, 0x17, 0x00, 0xee, 0x03, 0xea, 0x03, 0x01, 0x00, 0x00, 0x02, 0x0c, 0x00,
+                0x23, 0x00, 0x00, 0x00, // Data header, pduType2 0x23
+                0x01, 0x00, 0x00, 0x00, // ALLOW_DISPLAY_UPDATES, pad
+                0x00, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x07, 0x00, // 0,0 – 15,7
+            ]]
+        );
+    }
+
+    /// A repeated suppress sends nothing; a resume always goes out
+    /// (`docs/map/territory/session-loop-dispatch.md`).
+    #[test]
+    fn a_repeated_suppress_sends_nothing_and_a_resume_always_goes_out() {
+        let mut sm = output_control_machine();
+        let suppress = sm.request_suppress_output().unwrap();
+        assert_eq!(suppress.len(), 1);
+        assert_eq!(sm.request_suppress_output(), Ok(Vec::new()));
+        let resume = sm.request_resume_output().unwrap();
+        assert_eq!(resume.len(), 1);
+        assert_eq!(sm.request_resume_output(), Ok(resume));
+        assert_eq!(sm.request_suppress_output(), Ok(suppress));
+    }
+
+    /// `refreshRectSupport` / `suppressOutputSupport` are the server's to set (2.2.7.1.1); each
+    /// request is refused on its own flag alone.
+    #[test]
+    fn output_control_is_refused_when_the_server_did_not_announce_it() {
+        let mut only_suppress = SessionStateMachine::new(
+            SessionConfig {
+                server_refresh_rect: false,
+                server_suppress_output: true,
+                ..config()
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            only_suppress.request_refresh_rect(&[area(0, 0, 1, 1)]),
+            Err(OutputControlError::NotSupported)
+        );
+        assert!(only_suppress.request_suppress_output().is_ok());
+
+        let mut only_refresh = SessionStateMachine::new(
+            SessionConfig {
+                server_refresh_rect: true,
+                server_suppress_output: false,
+                ..config()
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            only_refresh
+                .request_refresh_rect(&[area(0, 0, 1, 1)])
+                .is_ok()
+        );
+        assert_eq!(
+            only_refresh.request_suppress_output(),
+            Err(OutputControlError::NotSupported)
+        );
+        assert_eq!(
+            only_refresh.request_resume_output(),
+            Err(OutputControlError::NotSupported)
+        );
+    }
+
+    #[test]
+    fn refresh_rect_refuses_what_it_cannot_put_on_the_wire() {
+        let sm = output_control_machine(); // 16×8 desktop
+        assert_eq!(
+            sm.request_refresh_rect(&[]),
+            Err(OutputControlError::NoAreas)
+        );
+        assert_eq!(
+            sm.request_refresh_rect(&[area(0, 0, 1, 1); 256]),
+            Err(OutputControlError::TooManyAreas { count: 256 })
+        );
+        assert!(sm.request_refresh_rect(&[area(0, 0, 1, 1); 255]).is_ok());
+        // The count is refused before any area is read.
+        let mut many = vec![area(0, 0, 1, 1); 255];
+        many.push(area(0, 0, 0, 0));
+        assert_eq!(
+            sm.request_refresh_rect(&many),
+            Err(OutputControlError::TooManyAreas { count: 256 })
+        );
+        for bad in [
+            area(0, 0, 0, 1),  // empty
+            area(0, 0, 1, 0),  // empty
+            area(15, 0, 2, 1), // one column past the right edge
+            area(0, 7, 1, 2),  // one row past the bottom edge
+            area(u16::MAX, 0, 2, 1),
+        ] {
+            assert_eq!(
+                sm.request_refresh_rect(&[area(0, 0, 1, 1), bad]),
+                Err(OutputControlError::InvalidArea { area: bad }),
+                "{bad:?}"
+            );
+        }
+        assert!(sm.request_refresh_rect(&[area(0, 0, 16, 8)]).is_ok());
+    }
+
+    /// A reactivation's Demand Active replaces the server's announcement and the desktop the
+    /// resume rectangle covers: the 8×4 desktop below announces Suppress Output and not
+    /// Refresh Rect, where the connect-time server announced neither.
+    #[test]
+    fn reactivation_replaces_the_server_announcement_and_the_desktop() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        assert_eq!(
+            sm.request_suppress_output(),
+            Err(OutputControlError::NotSupported)
+        );
+        reactivate(
+            &mut sm,
+            vec![
+                CapabilitySet::General(capability::GeneralCapabilitySet {
+                    refresh_rect_support: 0,
+                    suppress_output_support: 1,
+                    ..Default::default()
+                }),
+                CapabilitySet::Bitmap(capability::BitmapCapabilitySet {
+                    preferred_bits_per_pixel: 24,
+                    desktop_width: 8,
+                    desktop_height: 4,
+                    desktop_resize_flag: 1,
+                    drawing_flags: 0,
+                }),
+            ],
+        );
+        let resume = sm.request_resume_output().expect("now announced");
+        assert_eq!(
+            &resume[0][resume[0].len() - 8..],
+            &[0, 0, 0, 0, 7, 0, 3, 0],
+            "0,0 – 7,3"
+        );
+        assert_eq!(
+            sm.request_refresh_rect(&[area(0, 0, 1, 1)]),
+            Err(OutputControlError::NotSupported)
+        );
+
+        // The last suppress sent is remembered across a reactivation that keeps the support.
+        let mut sm = output_control_machine();
+        assert_eq!(sm.request_suppress_output().unwrap().len(), 1);
+        reactivate(
+            &mut sm,
+            vec![CapabilitySet::General(capability::GeneralCapabilitySet {
+                refresh_rect_support: 1,
+                suppress_output_support: 1,
+                ..Default::default()
+            })],
+        );
+        assert_eq!(sm.request_suppress_output(), Ok(Vec::new()));
+
+        // A Demand Active with no General set announces nothing.
+        let mut sm = output_control_machine();
+        assert!(sm.request_suppress_output().is_ok());
+        reactivate(
+            &mut sm,
+            vec![CapabilitySet::Bitmap(capability::BitmapCapabilitySet {
+                preferred_bits_per_pixel: 24,
+                desktop_width: 8,
+                desktop_height: 4,
+                desktop_resize_flag: 1,
+                drawing_flags: 0,
+            })],
+        );
+        assert_eq!(
+            sm.request_suppress_output(),
+            Err(OutputControlError::NotSupported)
         );
     }
 
@@ -2513,6 +2914,21 @@ mod tests {
     fn reactivating() -> SessionStateMachine {
         let mut sm = SessionStateMachine::new(config(), Vec::new())
             .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        reactivate(
+            &mut sm,
+            vec![CapabilitySet::Bitmap(capability::BitmapCapabilitySet {
+                preferred_bits_per_pixel: 24,
+                desktop_width: 8,
+                desktop_height: 4,
+                desktop_resize_flag: 1,
+                drawing_flags: 0,
+            })],
+        );
+        sm
+    }
+
+    /// DeactivateAll, then a Demand Active carrying `sets`.
+    fn reactivate(sm: &mut SessionStateMachine, sets: Vec<CapabilitySet>) {
         let deactivate = server_io_frame(&share::encode_share_control(
             share::PDU_TYPE_DEACTIVATE_ALL,
             1002,
@@ -2521,13 +2937,6 @@ mod tests {
         ));
         assert!(sm.process_bytes(&deactivate).unwrap().is_empty());
 
-        let sets = vec![CapabilitySet::Bitmap(capability::BitmapCapabilitySet {
-            preferred_bits_per_pixel: 24,
-            desktop_width: 8,
-            desktop_height: 4,
-            desktop_resize_flag: 1,
-            drawing_flags: 0,
-        })];
         let mut caps = Vec::new();
         for set in &sets {
             set.encode(&mut caps);
@@ -2548,7 +2957,6 @@ mod tests {
         ));
         let outputs = sm.process_bytes(&demand).unwrap();
         assert_eq!(outputs.len(), 5, "Confirm Active + the finalization batch");
-        sm
     }
 
     fn server_data_pdu(pdu_type2: u8, body: &[u8]) -> Vec<u8> {

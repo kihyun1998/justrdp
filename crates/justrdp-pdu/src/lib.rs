@@ -29,6 +29,7 @@ pub mod input;
 pub mod license;
 pub mod mcs;
 pub mod nego;
+pub mod output_control;
 pub mod per;
 pub mod pointer;
 pub mod rdpdr;

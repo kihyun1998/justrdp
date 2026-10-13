@@ -51,6 +51,10 @@ pub const PDU_TYPE2_PLAY_SOUND: u8 = 0x22;
 pub const PDU_TYPE2_SET_ERROR_INFO: u8 = 0x2F;
 /// `pduType2`: Input Event PDU (client → server, the slow-path input fallback).
 pub const PDU_TYPE2_INPUT: u8 = 0x1C;
+/// `pduType2`: Refresh Rect PDU (client → server, areas to redraw; 2.2.11.2).
+pub const PDU_TYPE2_REFRESH_RECT: u8 = 0x21;
+/// `pduType2`: Suppress Output PDU (client → server, display updates off or on; 2.2.11.3).
+pub const PDU_TYPE2_SUPPRESS_OUTPUT: u8 = 0x23;
 /// `pduType2`: Shutdown Request PDU (client → server) — *"please end this session"*.
 /// `[MS-RDPBCGR]` 2.2.2.1: the Share Data header **is** the PDU; there is no body.
 pub const PDU_TYPE2_SHUTDOWN_REQUEST: u8 = 0x24;

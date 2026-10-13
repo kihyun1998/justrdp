@@ -65,6 +65,8 @@ and NLA to [`sspi`](https://github.com/Devolutions/sspi-rs).
   RemoteFX, RemoteFX Progressive, ClearCodec and NSCodec, compressed with zgfx
 - Pointer shapes and the pointer cache
 - Output as a `FrameUpdate`: a dirty rectangle plus RGBA8888 pixels
+- Asking the server to redraw a region or to pause and resume graphics (Refresh Rect, Suppress
+  Output)
 
 **Input and channels**
 - Keyboard (scancodes), mouse and lock-key sync, sent fast-path when the server supports it
@@ -119,7 +121,7 @@ let reason = run_session(
 ```
 
 `run_session_with_input` adds an input channel, and `run_session_with_commands` adds resize,
-virtual channel writes and cancellation.
+redraw and pause requests, virtual channel writes and cancellation.
 
 ## Design
 
