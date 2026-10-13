@@ -1,6 +1,7 @@
 //! What the connect layer may advertise: the allow-lists [`check`] holds a [`ConnectConfig`]
 //! against before the connection starts (ADR-0016 Decision 3). The config still reaches the
-//! wire verbatim; an advertisement the core cannot honour is refused instead of sent.
+//! wire verbatim; an advertisement the core cannot honour is refused instead of sent, and so
+//! is a correlation id `[MS-RDPBCGR]` 2.2.1.1.2 rules out.
 //!
 //! Every list here names what the core handles, so it grows as the core implements more.
 
@@ -104,6 +105,9 @@ pub enum ConnectConfigError {
         /// `capabilitySetType`.
         set_type: u16,
     },
+    /// A `correlationId` whose first byte is 0x00 or 0xF4, or with a 0x0D byte
+    /// (`[MS-RDPBCGR]` 2.2.1.1.2).
+    CorrelationId([u8; 16]),
 }
 
 impl core::fmt::Display for ConnectConfigError {
@@ -137,6 +141,10 @@ impl core::fmt::Display for ConnectConfigError {
                     "capability set {set_type:#06x} cannot be read, so it cannot be judged"
                 )
             }
+            Self::CorrelationId(id) => write!(
+                f,
+                "correlationId {id:02x?} starts with 0x00 or 0xF4 or holds a 0x0D byte"
+            ),
         }
     }
 }
@@ -145,6 +153,11 @@ impl core::error::Error for ConnectConfigError {}
 
 /// Refuse the first advertisement in `config` the core cannot honour.
 pub fn check(config: &ConnectConfig) -> Result<(), ConnectConfigError> {
+    if let Some(id) = config.correlation_id
+        && (matches!(id[0], 0x00 | 0xF4) || id.contains(&0x0D))
+    {
+        return Err(ConnectConfigError::CorrelationId(id));
+    }
     let early = config.core.early_capability_flags.bits() & !HONOURED_EARLY_CAPABILITY_FLAGS.bits();
     if early != 0 {
         return Err(ConnectConfigError::EarlyCapabilityFlags(
@@ -280,6 +293,42 @@ mod tests {
         GlyphCacheCapabilitySet, OffscreenCacheCapabilitySet, OrderCapabilitySet,
         SoundCapabilitySet, VirtualChannelCapabilitySet,
     };
+
+    /// 2.2.1.1.2: the first byte of a `correlationId` SHOULD NOT be 0x00 or 0xF4 and no byte
+    /// SHOULD be 0x0D. FreeRDP's server fails a Connection Request carrying one.
+    #[test]
+    fn correlation_ids_the_spec_rules_out_are_refused() {
+        let good = [0x11; 16];
+        let mut ruled_out = Vec::new();
+        for first in [0x00, 0xF4] {
+            let mut id = good;
+            id[0] = first;
+            ruled_out.push(id);
+        }
+        for at in [0, 7, 15] {
+            let mut id = good;
+            id[at] = 0x0D;
+            ruled_out.push(id);
+        }
+        for id in ruled_out {
+            let mut config = config();
+            config.correlation_id = Some(id);
+            assert_eq!(
+                check(&config),
+                Err(ConnectConfigError::CorrelationId(id)),
+                "{id:02x?}"
+            );
+        }
+        // Only the first byte is held to 0x00 / 0xF4.
+        let mut fine = good;
+        fine[1] = 0xF4;
+        fine[2] = 0x00;
+        for id in [good, fine] {
+            let mut config = config();
+            config.correlation_id = Some(id);
+            assert_eq!(check(&config), Ok(()), "{id:02x?}");
+        }
+    }
 
     /// Issue #357: the shipped defaults — `ClientCoreData::default`, the default capability
     /// sets, and the Client Info flags the adapter's tests send — advertise nothing refused.
