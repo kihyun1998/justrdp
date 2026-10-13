@@ -27,6 +27,16 @@ are seven, entered in order:
 **Session**:
 A live RDP session after activation, lasting until disconnect or a fatal error.
 
+**Deactivation**:
+The stretch of a Session from the server's Deactivate All until the capability exchange and
+activation it starts complete again, during which input and share-bound requests are not sent.
+_Avoid_: pause, suspension (a server suspending virtual channel traffic is a different thing)
+
+**Reactivation**:
+The end of a Deactivation: the Session is live again on the newly negotiated capabilities, most
+often a new desktop size.
+_Avoid_: reconnect (a new Connection, not the same Session)
+
 ### Shape of the library
 
 **Sans-IO Core**:
