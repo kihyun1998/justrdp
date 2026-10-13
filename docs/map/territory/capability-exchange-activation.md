@@ -83,6 +83,16 @@ Deactivation–Reactivation, which is how a resize actually happens.
   server-to-client traffic (2.2.1.3.2 points only at client input events), so it is honoured.
   `DYNAMIC_TIME_ZONE` is refused on a different ground than #352 gave: it invites no server
   PDU, but it promises Client Info fields the encoder does not write.
+- **`STATUSINFO` stays refused, and the Status Info PDU belongs to server redirection (#24) — the
+  maintainer's call** (#440, 2026-10-13). Its status codes (2.2.5.2) are broker and VM-pool
+  progress: finding, loading and redirecting to a destination (0x401–0x404), a VM loading, waking
+  or starting (0x501–0x505). The spec does not place the PDU in the sequence, and 0x404 belongs to
+  the window before Demand Active where, as #24 describes it, a broker sends the Redirection PDU
+  instead. Measured: with the flag forced on, the standalone WS2019 VM sent no Status Info at any
+  stage (one run, with every skipped data PDU printed). FreeRDP's handler decodes it into a
+  callback with no connection-state check, unlike its IME Status handler. If one ever arrives
+  during licensing, the connect fails today, because the licensing step accepts nothing without
+  `SEC_LICENSE_PKT`; that window is #24's too.
 - **The defaults advertise NSCodec over Set Surface Bits, with a Multifragment Update set**
   (#150). Adding them to `default_client_capabilities` was the maintainer's call, made on
   the build plan's *"advertise everything we can handle"* (since superseded by ADR-0016) and
