@@ -38,6 +38,16 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 - **Reactivation is in-scope for this machine** (`Phase::Reactivating`): a resize
   round-trips through capability exchange while the session's caches survive,
   because caches belong to the connection rather than the share.
+- **A reactivation replaces every server announcement the session acts on** (#438, #443): the
+  share ID, the desktop size, the General set's `refreshRectSupport` / `suppressOutputSupport`,
+  and the Input set's `inputFlags`, which pick the input transport. A Demand Active without the
+  set announces nothing: no Refresh Rect, no Suppress Output, `inputFlags` 0 (slow-path), the
+  rule the adapter applies at connect. FreeRDP re-derives its input settings from the Input set
+  of every Demand Active it reads (`rdp_read_input_capability_set`, `libfreerdp/core/capabilities.c`).
+  Measured on the WS2019 VM: `inputFlags` is `0x0375` at connect and after a Display Control
+  resize reactivation (one run, #443's triage), so the transport switch is proven at unit level
+  only (`reactivation_replaces_the_server_input_flags`). The other Input-set bits (Unicode,
+  MouseX, horizontal wheel) are the host's to honour and stay unread by the core.
 - **A Deactivation stops input and the share-bound requests, not channels** (#442). `[MS-RDPBCGR]`
   3.2.5.5.1: after Deactivate All *"the client MUST disable its graphics and input protocol
   handlers"*. From the moment the session leaves the active phase (a Deactivate All, or a Demand

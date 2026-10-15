@@ -46,7 +46,8 @@ pub struct SessionConfig {
     /// The server's `inputFlags` from its Demand Active Input capability set
     /// ([`crate::ActivationResult::server_capabilities`]). Selects the input transport:
     /// fast-path when the server advertised `INPUT_FLAG_FASTPATH_INPUT`/`INPUT2`, the
-    /// slow-path Input Event PDU otherwise.
+    /// slow-path Input Event PDU otherwise. A reactivation replaces it; a Demand Active with no
+    /// Input set leaves 0.
     pub server_input_flags: u16,
     /// The server announced the Refresh Rect PDU: a non-zero `refreshRectSupport` in its Demand
     /// Active General capability set (`[MS-RDPBCGR]` 2.2.7.1.1). Gates
@@ -1359,6 +1360,7 @@ impl SessionStateMachine {
         self.config.server_refresh_rect = general.is_some_and(|g| g.refresh_rect_support != 0);
         self.config.server_suppress_output =
             general.is_some_and(|g| g.suppress_output_support != 0);
+        self.config.server_input_flags = demand.input().map_or(0, |i| i.input_flags);
         let (width, height) = demand
             .bitmap()
             .map(|b| (b.desktop_width, b.desktop_height))
@@ -2663,6 +2665,47 @@ mod tests {
         assert_eq!(
             sm.request_suppress_output(),
             Err(OutputControlError::NotSupported)
+        );
+    }
+
+    /// A reactivation's Demand Active replaces the server's input flags, so the input transport
+    /// follows the new Input set: fast-path → slow-path, slow-path → fast-path, and a Demand
+    /// Active with no Input set selects slow-path.
+    #[test]
+    fn reactivation_replaces_the_server_input_flags() {
+        let input_set = |input_flags| {
+            CapabilitySet::Input(capability::InputCapabilitySet {
+                input_flags,
+                ..Default::default()
+            })
+        };
+        // The slow-path Input Event PDU rides a TPKT frame; a fast-path input PDU does not.
+        let slowpath = |sm: &SessionStateMachine| {
+            let frames = sm.encode_input(&key_press());
+            assert_eq!(frames.len(), 1);
+            frames[0][0] == 0x03
+        };
+
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        assert!(!slowpath(&sm), "connect-time flags select fast-path");
+        reactivate(&mut sm, vec![input_set(capability::INPUT_FLAG_SCANCODES)]);
+        font_map(&mut sm);
+        assert!(slowpath(&sm), "the new Input set has no fast-path flag");
+
+        reactivate(
+            &mut sm,
+            vec![input_set(
+                capability::INPUT_FLAG_SCANCODES | capability::INPUT_FLAG_FASTPATH_INPUT,
+            )],
+        );
+        font_map(&mut sm);
+        assert!(!slowpath(&sm), "the new Input set advertises fast-path");
+
+        reactivate(&mut sm, vec![general_with_output_control()]);
+        font_map(&mut sm);
+        assert!(
+            slowpath(&sm),
+            "a Demand Active with no Input set selects slow-path"
         );
     }
 
