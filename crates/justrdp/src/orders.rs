@@ -47,8 +47,8 @@ enum Skip {
 }
 
 /// The connection's drawing-order state: the primary order history, the bitmap caches and which
-/// blits were advertised. A Deactivation–Reactivation keeps the caches and resets the history
-/// ([`Self::reset_history`]).
+/// blits were advertised, and the rects of a Frame Marker pair still open. A
+/// Deactivation–Reactivation keeps the caches and resets the rest ([`Self::reactivate`]).
 #[derive(Debug)]
 pub(crate) struct Orders {
     history: OrderHistory,
@@ -57,7 +57,15 @@ pub(crate) struct Orders {
     scrblt: bool,
     memblt: bool,
     mem3blt: bool,
+    /// A `TS_FRAME_START` arrived and its `TS_FRAME_END` has not.
+    in_frame: bool,
+    /// The rects painted since that start, in paint order, at most [`MAX_HELD_RECTS`].
+    held: Vec<FrameUpdate>,
 }
+
+/// Above this many held rects a frame collapses to their bounding box, as the Graphics
+/// Pipeline's frames do (`egfx`'s `MAX_DIRTY_RECTS`).
+const MAX_HELD_RECTS: usize = 64;
 
 impl Orders {
     /// The order state the advertised capability sets describe.
@@ -84,15 +92,64 @@ impl Orders {
             scrblt: support.is_some_and(|s| s[capability::ORDER_NEG_SCRBLT_INDEX] != 0),
             memblt: support.is_some_and(|s| s[capability::ORDER_NEG_MEMBLT_INDEX] != 0),
             mem3blt: support.is_some_and(|s| s[capability::ORDER_NEG_MEM3BLT_INDEX] != 0),
+            in_frame: false,
+            held: Vec::new(),
         }
     }
 
-    /// Forget the primary order history (a Deactivation–Reactivation).
-    pub(crate) fn reset_history(&mut self) {
+    /// Forget the primary order history and any frame in flight (a Deactivation–Reactivation).
+    pub(crate) fn reactivate(&mut self) {
         self.history = OrderHistory::default();
+        self.in_frame = false;
+        self.held.clear();
     }
 
-    /// Apply one Orders Update, pushing a [`FrameUpdate`] for each order that painted.
+    /// Hand the rects one order painted to the host now, or hold them for the frame's end.
+    fn deliver(&mut self, painted: &mut Vec<FrameUpdate>, frames: &mut Vec<FrameUpdate>) {
+        if !self.in_frame {
+            frames.append(painted);
+            return;
+        }
+        self.held.append(painted);
+        if self.held.len() > MAX_HELD_RECTS {
+            let left = self.held.iter().map(|r| r.x).min().unwrap_or(0);
+            let top = self.held.iter().map(|r| r.y).min().unwrap_or(0);
+            let right = self.held.iter().map(|r| r.x + r.width).max().unwrap_or(0);
+            let bottom = self.held.iter().map(|r| r.y + r.height).max().unwrap_or(0);
+            self.held.clear();
+            self.held.push(FrameUpdate {
+                x: left,
+                y: top,
+                width: right - left,
+                height: bottom - top,
+            });
+        }
+    }
+
+    /// A Frame Marker: start holding, or release what was held.
+    fn frame_marker(&mut self, action: u32, frames: &mut Vec<FrameUpdate>) {
+        match action {
+            orders::TS_FRAME_START => {
+                if self.in_frame {
+                    tracing::debug!(target: "rdp_orders", "a frame start inside a frame, continued");
+                }
+                self.in_frame = true;
+            }
+            orders::TS_FRAME_END if self.in_frame => {
+                self.in_frame = false;
+                frames.append(&mut self.held);
+            }
+            orders::TS_FRAME_END => {
+                tracing::debug!(target: "rdp_orders", "a frame end with no start, ignored");
+            }
+            action => {
+                tracing::debug!(target: "rdp_orders", action, "a Frame Marker action neither starts nor ends, ignored");
+            }
+        }
+    }
+
+    /// Apply one Orders Update, pushing a [`FrameUpdate`] for each order that painted, or, for
+    /// an order inside a Frame Marker pair, when the pair ends.
     /// `bits_per_pixel` is the session's color depth, `budget` the decoded bytes this update may
     /// buy. Malformed bytes are an error; anything well formed is applied or skipped.
     pub(crate) fn apply(
@@ -106,6 +163,7 @@ impl Orders {
     ) -> Result<(), crate::SessionError> {
         let mut cur = ReadCursor::new(update.order_data, "orderData");
         let mut over_budget = 0usize;
+        let mut painted = Vec::new();
         for index in 0..update.number_orders {
             let order = match orders::decode_order(&mut cur, &mut self.history) {
                 Ok(order) => order,
@@ -127,7 +185,7 @@ impl Orders {
                     self.cache_bitmap(&order, palette, bits_per_pixel, &mut budget)
                 }
                 DrawingOrder::ScrBlt { order, clip } => {
-                    self.scrblt(&order, clip, framebuffer, &mut budget, frames)
+                    self.scrblt(&order, clip, framebuffer, &mut budget, &mut painted)
                 }
                 DrawingOrder::MemBlt { order, clip } => self.blt(
                     self.memblt,
@@ -138,7 +196,7 @@ impl Orders {
                     palette,
                     bits_per_pixel,
                     &mut budget,
-                    frames,
+                    &mut painted,
                 ),
                 DrawingOrder::Mem3Blt { order, clip } => self.blt(
                     self.mem3blt,
@@ -149,8 +207,12 @@ impl Orders {
                     palette,
                     bits_per_pixel,
                     &mut budget,
-                    frames,
+                    &mut painted,
                 ),
+                DrawingOrder::FrameMarker { action } => {
+                    self.frame_marker(action, frames);
+                    Ok(())
+                }
                 DrawingOrder::SkippedSecondary { order_type } => {
                     tracing::debug!(
                         target: "rdp_orders",
@@ -160,6 +222,7 @@ impl Orders {
                     Ok(())
                 }
             };
+            self.deliver(&mut painted, frames);
             match outcome {
                 Ok(()) => {}
                 Err(NotApplied::Skipped(Skip::OverBudget)) => over_budget += 1,
@@ -821,6 +884,132 @@ pub(crate) mod tests {
         assert_eq!(frames, [frame(4, 1, 2, 1)]);
         assert_eq!(pixel(&fb, 4, 1), [4, 0, 0x40, 0xFF]);
         assert_eq!(pixel(&fb, 3, 1), [3, 1, 0x40, 0xFF]);
+    }
+
+    /// A Frame Marker of `action`.
+    pub(crate) fn frame_marker(action: u32) -> Vec<u8> {
+        let mut order = vec![justrdp_pdu::orders::TS_ALTSEC_FRAME_MARKER << 2 | TS_SECONDARY];
+        order.extend_from_slice(&action.to_le_bytes());
+        order
+    }
+
+    /// What a Frame Marker pair brackets reaches the host at the end, in paint order, across
+    /// updates; outside a frame each order's rect goes out at once (#462).
+    #[test]
+    fn a_frame_marker_pair_holds_its_frames_until_the_end() {
+        use justrdp_pdu::orders::{TS_FRAME_END, TS_FRAME_START};
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(8, 2).unwrap();
+        let held = run(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_bitmap(0, 0, &[&[RED]]),
+                memblt((0, 0), [0, 0, 1, 1], SRCCOPY, [0, 0]),
+                frame_marker(TS_FRAME_START),
+                memblt((0, 0), [1, 0, 1, 1], SRCCOPY, [0, 0]),
+            ],
+        );
+        assert_eq!(held, [frame(0, 0, 1, 1)], "only the unbracketed one");
+        assert_eq!(
+            pixel(&fb, 1, 0),
+            rgba(RED),
+            "the framebuffer is painted at once"
+        );
+        let released = run(
+            &mut orders,
+            &mut fb,
+            &[
+                memblt((0, 0), [2, 0, 1, 1], SRCCOPY, [0, 0]),
+                frame_marker(TS_FRAME_END),
+                memblt((0, 0), [3, 0, 1, 1], SRCCOPY, [0, 0]),
+            ],
+        );
+        assert_eq!(
+            released,
+            [frame(1, 0, 1, 1), frame(2, 0, 1, 1), frame(3, 0, 1, 1)]
+        );
+    }
+
+    /// An end with no start changes nothing, and a second start continues the frame
+    /// (ADR-0009 §2); an unknown action is ignored.
+    #[test]
+    fn unmatched_frame_markers_are_tolerated() {
+        use justrdp_pdu::orders::{TS_FRAME_END, TS_FRAME_START};
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(8, 1).unwrap();
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_bitmap(0, 0, &[&[RED]]),
+                frame_marker(TS_FRAME_END),
+                memblt((0, 0), [0, 0, 1, 1], SRCCOPY, [0, 0]),
+                frame_marker(7),
+                frame_marker(TS_FRAME_START),
+                memblt((0, 0), [1, 0, 1, 1], SRCCOPY, [0, 0]),
+                frame_marker(TS_FRAME_START),
+                memblt((0, 0), [2, 0, 1, 1], SRCCOPY, [0, 0]),
+            ],
+        );
+        assert_eq!(frames, [frame(0, 0, 1, 1)]);
+        let frames = run(&mut orders, &mut fb, &[frame_marker(TS_FRAME_END)]);
+        assert_eq!(frames, [frame(1, 0, 1, 1), frame(2, 0, 1, 1)]);
+    }
+
+    /// Past 64 held rects a frame collapses to their bounding box and goes on holding, as
+    /// EGFX's does: what reaches the host stays within 64 rects and still covers every one.
+    #[test]
+    fn a_frame_past_64_rects_collapses_to_their_bounds() {
+        use justrdp_pdu::orders::{TS_FRAME_END, TS_FRAME_START};
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(80, 4).unwrap();
+        let mut parts = vec![cache_bitmap(0, 0, &[&[RED]]), frame_marker(TS_FRAME_START)];
+        for x in 0..70 {
+            parts.push(memblt((0, 0), [x + 3, 1, 1, 1], SRCCOPY, [0, 0]));
+        }
+        parts.push(frame_marker(TS_FRAME_END));
+        let frames = run(&mut orders, &mut fb, &parts);
+        assert!(frames.len() <= MAX_HELD_RECTS, "{} rects", frames.len());
+        assert_eq!(frames[0], frame(3, 1, 65, 1), "the first 65 as one box");
+        for x in 3..73u16 {
+            assert!(
+                frames
+                    .iter()
+                    .any(|r| (r.x..r.x + r.width).contains(&x) && r.y == 1),
+                "column {x} is covered"
+            );
+        }
+    }
+
+    /// A reactivation drops a frame in flight; its pixels are in the framebuffer, which the
+    /// reactivation hands the host whole.
+    #[test]
+    fn a_reactivation_drops_the_frame_in_flight() {
+        use justrdp_pdu::orders::{TS_FRAME_END, TS_FRAME_START};
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(4, 1).unwrap();
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_bitmap(0, 0, &[&[RED]]),
+                frame_marker(TS_FRAME_START),
+                memblt((0, 0), [0, 0, 1, 1], SRCCOPY, [0, 0]),
+            ],
+        );
+        orders.reactivate();
+        // The next pair releases only what it brackets.
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                frame_marker(TS_FRAME_START),
+                memblt((0, 0), [1, 0, 1, 1], SRCCOPY, [0, 0]),
+                frame_marker(TS_FRAME_END),
+            ],
+        );
+        assert_eq!(frames, [frame(1, 0, 1, 1)]);
     }
 
     /// A miss or an index outside the caches is skipped, and the update goes on.

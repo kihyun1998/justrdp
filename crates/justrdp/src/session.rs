@@ -1500,7 +1500,7 @@ impl SessionStateMachine {
     ) -> Result<(), SessionError> {
         let demand = capability::DemandActive::decode(cur).map_err(SessionError::Decode)?;
         self.leave_active(outputs);
-        self.orders.reset_history();
+        self.orders.reactivate();
         self.config.share_id = header.share_id;
         self.config.server = ServerAnnouncement::from_capabilities(&demand.capability_sets);
         let (width, height) = demand

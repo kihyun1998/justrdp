@@ -105,6 +105,13 @@ pub const ORDER_NEGOTIATE_SUPPORT: u16 = 0x0002;
 /// `orderFlags`: zero bounds deltas supported (MUST be set).
 pub const ORDER_ZERO_BOUNDS_DELTAS_SUPPORT: u16 = 0x0008;
 
+/// `orderFlags`: `orderSupportExFlags` holds valid data (`ORDERFLAGS_EXTRA_FLAGS`).
+pub const ORDER_FLAGS_EXTRA_FLAGS: u16 = 0x0080;
+/// `orderSupportExFlags`: Cache Bitmap (Revision 3) is supported.
+pub const ORDERFLAGS_EX_CACHE_BITMAP_REV3_SUPPORT: u16 = 0x0002;
+/// `orderSupportExFlags`: the Frame Marker alternate secondary order is supported.
+pub const ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT: u16 = 0x0004;
+
 /// `orderSupport` index of the ScrBlt primary drawing order (`TS_NEG_SCRBLT_INDEX`).
 pub const ORDER_NEG_SCRBLT_INDEX: usize = 0x02;
 /// `orderSupport` index of the MemBlt primary drawing order (`TS_NEG_MEMBLT_INDEX`).
@@ -246,6 +253,9 @@ pub struct OrderCapabilitySet {
     pub order_flags: u16,
     /// `orderSupport[32]` — one byte per order type.
     pub order_support: [u8; 32],
+    /// `orderSupportExFlags` (`ORDERFLAGS_EX_*`), read by the server only under
+    /// [`ORDER_FLAGS_EXTRA_FLAGS`].
+    pub order_support_ex_flags: u16,
     /// `desktopSaveSize` — save-bitmap buffer size (0: unsupported).
     pub desktop_save_size: u32,
 }
@@ -255,6 +265,7 @@ impl Default for OrderCapabilitySet {
         Self {
             order_flags: ORDER_NEGOTIATE_SUPPORT | ORDER_ZERO_BOUNDS_DELTAS_SUPPORT,
             order_support: [0; 32],
+            order_support_ex_flags: 0,
             desktop_save_size: 0,
         }
     }
@@ -272,7 +283,7 @@ impl OrderCapabilitySet {
         out.extend_from_slice(&self.order_flags.to_le_bytes());
         out.extend_from_slice(&self.order_support);
         out.extend_from_slice(&0u16.to_le_bytes()); // textFlags (ignored)
-        out.extend_from_slice(&0u16.to_le_bytes()); // orderSupportExFlags
+        out.extend_from_slice(&self.order_support_ex_flags.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes()); // pad4octetsB
         out.extend_from_slice(&self.desktop_save_size.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // pad2octetsC
@@ -293,13 +304,14 @@ impl OrderCapabilitySet {
         let mut order_support = [0u8; 32];
         order_support.copy_from_slice(cur.read_slice(32)?);
         cur.read_u16_le()?; // textFlags
-        cur.read_u16_le()?; // orderSupportExFlags
+        let order_support_ex_flags = cur.read_u16_le()?;
         cur.read_u32_le()?; // pad4octetsB
         let desktop_save_size = cur.read_u32_le()?;
         // Remaining pads/code page may be truncated; nothing read from them.
         Ok(Self {
             order_flags,
             order_support,
+            order_support_ex_flags,
             desktop_save_size,
         })
     }
@@ -1079,6 +1091,22 @@ pub fn default_client_capabilities(core: &crate::gcc::ClientCoreData) -> Vec<Cap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `orderSupportExFlags` survives a round trip (#462).
+    #[test]
+    fn order_support_ex_flags_round_trip() {
+        let set = CapabilitySet::Order(OrderCapabilitySet {
+            order_flags: ORDER_NEGOTIATE_SUPPORT
+                | ORDER_ZERO_BOUNDS_DELTAS_SUPPORT
+                | ORDER_FLAGS_EXTRA_FLAGS,
+            order_support_ex_flags: ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT,
+            ..Default::default()
+        });
+        let mut out = Vec::new();
+        set.encode(&mut out);
+        let mut cur = ReadCursor::new(&out, "order set");
+        assert_eq!(CapabilitySet::decode(&mut cur).unwrap(), set);
+    }
     use proptest::prelude::*;
 
     proptest! {

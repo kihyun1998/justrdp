@@ -8198,6 +8198,9 @@ mod tests {
                                 "CacheBitmapRev2 cache {} compressed {} {} bpp",
                                 order.cache_id, order.compressed, order.bits_per_pixel
                             ),
+                            Ok(DrawingOrder::FrameMarker { action }) => {
+                                format!("FrameMarker {action}")
+                            }
                             Ok(DrawingOrder::SkippedSecondary { order_type }) => {
                                 format!("secondary {order_type:#04x}")
                             }
@@ -8459,6 +8462,113 @@ mod tests {
             ])
             .await;
         }
+    }
+
+    /// Issue #462: with Frame Marker advertised, the VM brackets its orders in frames; the
+    /// session hands the host each frame at its end, fewer rects than it blits, and the desktop
+    /// it paints, after the logon and the Start menu, is what a Refresh Rect redraw paints.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn frame_markers_bracket_what_a_redraw_paints_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            use justrdp_pdu::capability::{self, CapabilitySet};
+
+            let mut config = legacy_orders_config(&[
+                capability::ORDER_NEG_SCRBLT_INDEX,
+                capability::ORDER_NEG_MEMBLT_INDEX,
+                capability::ORDER_NEG_MEM3BLT_INDEX,
+            ]);
+            for set in &mut config.capabilities {
+                if let CapabilitySet::Order(o) = set {
+                    o.order_flags |= capability::ORDER_FLAGS_EXTRA_FLAGS;
+                    o.order_support_ex_flags =
+                        capability::ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT;
+                }
+            }
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let machine = SessionStateMachine::new(
+                session_config_from(&outcome, session_capabilities),
+                outcome.activation.leftover.clone(),
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut drive = OrderDrive {
+                machine,
+                stream: outcome.stream,
+                census: OrderCensus::default(),
+                frames: 0,
+            };
+            drive.census.feed(&outcome.activation.leftover);
+            let first = drive
+                .machine
+                .process_bytes(&[])
+                .expect("leftover bytes process");
+            drive.handle(first).await;
+            drive.settle("the logon", true).await;
+            drive.click_start().await;
+            drive.settle("the Start click", true).await;
+
+            let painted = drive.machine.framebuffer().pixels().to_vec();
+            let (width, height) = (
+                drive.machine.framebuffer().width(),
+                drive.machine.framebuffer().height(),
+            );
+            let blits = drive.census.count("MemBlt")
+                + drive.census.count("Mem3Blt")
+                + drive.census.count("ScrBlt");
+            let frames = drive.frames;
+            let refresh = drive
+                .machine
+                .request_refresh_rect(&[FrameUpdate {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }])
+                .expect("the VM announces Refresh Rect");
+            for frame in refresh {
+                drive
+                    .stream
+                    .write_all(&frame)
+                    .await
+                    .expect("write to the VM");
+            }
+            drive.settle("the Refresh Rect", true).await;
+            let redrawn = drive.machine.framebuffer().pixels().to_vec();
+            drive.keys(None, &[0x1B]).await;
+            drive.settle("Esc", false).await;
+
+            drive.census.print("#462");
+            eprintln!("#462: {blits} blits reached the host as {frames} frame updates");
+            assert_eq!(
+                drive.census.count("stopped"),
+                0,
+                "an order the session cannot decode arrived"
+            );
+            assert!(
+                drive.census.count("FrameMarker 0") > 0,
+                "no frame started: {:?}",
+                drive.census.orders
+            );
+            assert_eq!(
+                drive.census.count("FrameMarker 0"),
+                drive.census.count("FrameMarker 1"),
+                "every frame that started ended"
+            );
+            assert!(
+                frames > 0 && frames < blits,
+                "{blits} blits as {frames} frame updates"
+            );
+            let differing = painted
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(redrawn.as_chunks::<4>().0)
+                .filter(|(a, b)| a[..3] != b[..3])
+                .count();
+            assert_eq!(differing, 0, "pixels differ from the redraw");
+        })
+        .await
     }
 
     /// Issue #461: with ScrBlt advertised beside MemBlt and Mem3Blt and a LAN experience, the VM

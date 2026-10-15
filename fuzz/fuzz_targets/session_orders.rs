@@ -1,8 +1,8 @@
 #![no_main]
-//! Fuzz the session's drawing-order path (#460, #461): fast-path Orders Updates through
+//! Fuzz the session's drawing-order path (#460, #461, #462): fast-path Orders Updates through
 //! `SessionStateMachine::process_bytes` with ScrBlt, MemBlt and Mem3Blt advertised over Revision 2
-//! caches, so the cache fills, the ROPs, the blits and the copies within the framebuffer are
-//! reached. Sibling of `orders`'s `orders_never_panic` proptest.
+//! caches, so the cache fills, the ROPs, the blits, the copies within the framebuffer and the
+//! frames Frame Markers hold are reached. Sibling of `orders`'s `orders_never_panic` proptest.
 //!
 //! The input is split on its first byte: that many updates of equal share, each prefixed by a
 //! cache fill of a 4x4 bitmap into cache 0 entry 0 so a MemBlt has something to hit. A 64x48
@@ -42,6 +42,8 @@ fuzz_target!(|input: &[u8]| {
             o.order_support[capability::ORDER_NEG_SCRBLT_INDEX] = 1;
             o.order_support[capability::ORDER_NEG_MEMBLT_INDEX] = 1;
             o.order_support[capability::ORDER_NEG_MEM3BLT_INDEX] = 1;
+            o.order_flags |= capability::ORDER_FLAGS_EXTRA_FLAGS;
+            o.order_support_ex_flags = capability::ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT;
         }
     }
     capabilities.push(CapabilitySet::BitmapCacheRev2(
