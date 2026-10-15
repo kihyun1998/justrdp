@@ -81,8 +81,9 @@ pub const HONOURED_SOUND_FLAGS: u16 = capability::SOUND_FLAG_BEEPS;
 /// The Surface Commands set's `cmdFlags` the core honours.
 pub const HONOURED_SURFACE_COMMANDS: u32 = capability::SURFCMDS_SET_SURFACE_BITS;
 
-/// The `orderSupport` entries the session paints: MemBlt and Mem3Blt (`crate::orders`).
-pub const HONOURED_ORDERS: [usize; 2] = [
+/// The `orderSupport` entries the session paints: ScrBlt, MemBlt and Mem3Blt (`crate::orders`).
+pub const HONOURED_ORDERS: [usize; 3] = [
+    capability::ORDER_NEG_SCRBLT_INDEX,
     capability::ORDER_NEG_MEMBLT_INDEX,
     capability::ORDER_NEG_MEM3BLT_INDEX,
 ];
@@ -252,7 +253,9 @@ fn check_orders(sets: &[CapabilitySet]) -> Result<(), ConnectConfigError> {
             "a client advertises one bitmap cache revision, not both",
         );
     }
-    let blts = support.is_some_and(|s| HONOURED_ORDERS.iter().all(|&index| s[index] != 0));
+    let blts = support.is_some_and(|s| {
+        s[capability::ORDER_NEG_MEMBLT_INDEX] != 0 && s[capability::ORDER_NEG_MEM3BLT_INDEX] != 0
+    });
     if rev2.is_some_and(|c| c.cells.iter().any(|cell| cell.entries != 0)) && !blts {
         return refuse(
             capability::CAPSET_BITMAP_CACHE_REV2,
@@ -295,7 +298,7 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
         {
             refuse(
                 capability::CAPSET_ORDER,
-                "orderSupport enables a drawing order other than MemBlt and Mem3Blt",
+                "orderSupport enables a drawing order other than ScrBlt, MemBlt and Mem3Blt",
             )
         }
         CapabilitySet::Order(o) if o.order_flags & !HONOURED_ORDER_FLAGS != 0 => refuse(
@@ -808,6 +811,23 @@ mod tests {
     #[test]
     fn memblt_and_mem3blt_from_a_rev2_cache_pass() {
         assert_eq!(check(&orders_config()), Ok(()));
+        // ScrBlt with them (#461), and ScrBlt alone, which needs no cache.
+        let mut config = orders_config();
+        for set in &mut config.capabilities {
+            if let CapabilitySet::Order(o) = set {
+                o.order_support[capability::ORDER_NEG_SCRBLT_INDEX] = 1;
+            }
+        }
+        assert_eq!(check(&config), Ok(()));
+        let mut scrblt = OrderCapabilitySet::default();
+        scrblt.order_support[capability::ORDER_NEG_SCRBLT_INDEX] = 1;
+        let mut config = crate::connect::tests::config();
+        for set in &mut config.capabilities {
+            if let CapabilitySet::Order(o) = set {
+                *o = scrblt.clone();
+            }
+        }
+        assert_eq!(check(&config), Ok(()));
         let mut config = orders_config();
         for set in &mut config.capabilities {
             if let CapabilitySet::BitmapCacheRev2(c) = set {
@@ -829,10 +849,10 @@ mod tests {
         type Edit = fn(&mut CapabilitySet);
         let cases: [(&str, Edit, u16); 8] = [
             (
-                "ScrBlt",
+                "OpaqueRect",
                 |set| {
                     if let CapabilitySet::Order(o) = set {
-                        o.order_support[0x02] = 1;
+                        o.order_support[0x0A] = 1;
                     }
                 },
                 capability::CAPSET_ORDER,

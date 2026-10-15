@@ -1,5 +1,6 @@
 //! Drawing orders in the session (`[MS-RDPEGDI]` 3.2.5.1): the Revision 2 bitmap caches the
-//! Cache Bitmap orders fill, and MemBlt and Mem3Blt painting from them into the framebuffer.
+//! Cache Bitmap orders fill, MemBlt and Mem3Blt painting from them into the framebuffer, and
+//! ScrBlt copying within it.
 //!
 //! Orders are decoded one at a time against the connection's [`OrderHistory`]. An order of a
 //! type the history cannot decode ends the update (it has no length to skip by); every order up
@@ -12,8 +13,8 @@ use justrdp_codecs::rop::{self, Pattern};
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::orders::{
-    self, BITMAPCACHE_WAITING_LIST_INDEX, CacheBitmapRev2, Clip, DrawingOrder, Mem3Blt, MemBlt,
-    OrderError, OrderHistory, OrdersUpdate,
+    self, BITMAPCACHE_WAITING_LIST_INDEX, Bounds, CacheBitmapRev2, Clip, DrawingOrder, Mem3Blt,
+    MemBlt, OrderError, OrderHistory, OrdersUpdate, ScrBlt,
 };
 
 /// ROP3 SRCCOPY: the source, unchanged.
@@ -53,6 +54,7 @@ pub(crate) struct Orders {
     history: OrderHistory,
     /// Each advertised Revision 2 cache, its entries followed by one waiting-list entry.
     caches: Vec<Vec<Option<CachedBitmap>>>,
+    scrblt: bool,
     memblt: bool,
     mem3blt: bool,
 }
@@ -79,6 +81,7 @@ impl Orders {
         Self {
             history: OrderHistory::default(),
             caches,
+            scrblt: support.is_some_and(|s| s[capability::ORDER_NEG_SCRBLT_INDEX] != 0),
             memblt: support.is_some_and(|s| s[capability::ORDER_NEG_MEMBLT_INDEX] != 0),
             mem3blt: support.is_some_and(|s| s[capability::ORDER_NEG_MEM3BLT_INDEX] != 0),
         }
@@ -122,6 +125,9 @@ impl Orders {
             let outcome = match order {
                 DrawingOrder::CacheBitmapRev2(order) => {
                     self.cache_bitmap(&order, palette, bits_per_pixel, &mut budget)
+                }
+                DrawingOrder::ScrBlt { order, clip } => {
+                    self.scrblt(&order, clip, framebuffer, &mut budget, frames)
                 }
                 DrawingOrder::MemBlt { order, clip } => self.blt(
                     self.memblt,
@@ -266,69 +272,178 @@ impl Orders {
             .slot(cache_id, order.cache_index)?
             .as_ref()
             .ok_or(NotApplied::Skipped(Skip::CacheMiss))?;
-        // The destination, clipped to the framebuffer, the bounds and the source bitmap.
-        let mut left = i32::from(order.left);
-        let mut top = i32::from(order.top);
-        let mut right = left + i32::from(order.width);
-        let mut bottom = top + i32::from(order.height);
-        let shift_x = i32::from(order.x_src) - left;
-        let shift_y = i32::from(order.y_src) - top;
-        left = left.max(0).max(-shift_x);
-        top = top.max(0).max(-shift_y);
-        right = right
-            .min(i32::from(framebuffer.width()))
-            .min(i32::from(bitmap.width) - shift_x);
-        bottom = bottom
-            .min(i32::from(framebuffer.height()))
-            .min(i32::from(bitmap.height) - shift_y);
-        if let Some(bounds) = clip {
-            left = left.max(i32::from(bounds.left));
-            top = top.max(i32::from(bounds.top));
-            right = right.min(i32::from(bounds.right) + 1);
-            bottom = bottom.min(i32::from(bounds.bottom) + 1);
-        }
-        if left >= right || top >= bottom {
+        let Some(area) = clip_blt(
+            [order.left, order.top, order.width, order.height],
+            [order.x_src, order.y_src],
+            (bitmap.width, bitmap.height),
+            framebuffer,
+            clip,
+        ) else {
             return Ok(());
-        }
-        let (width, height) = ((right - left) as usize, (bottom - top) as usize);
-        if !charge(budget, width * height * 4) {
+        };
+        if !charge(budget, area.width * area.height * 4) {
             return Err(NotApplied::Skipped(Skip::OverBudget));
         }
-        let source_stride = usize::from(bitmap.width) * 4;
-        let target_stride = usize::from(framebuffer.width()) * 4;
-        let mut block = vec![0u8; width * height * 4];
-        for row in 0..height {
-            let y = top as usize + row;
-            let source_row = (y as i32 + shift_y) as usize * source_stride;
-            let source_start = source_row + (left + shift_x) as usize * 4;
-            let source = &bitmap.rgba[source_start..source_start + width * 4];
-            let out = &mut block[row * width * 4..(row + 1) * width * 4];
-            if order.rop == SRCCOPY {
-                out.copy_from_slice(source);
-                continue;
-            }
-            let target_start = y * target_stride + left as usize * 4;
-            let target = &framebuffer.pixels()[target_start..target_start + width * 4];
-            for column in 0..width {
-                let at = column * 4;
-                let p = pattern.map_or(0, |p| p.pixel(left + column as i32, y as i32));
-                let s = word(&source[at..at + 4]);
-                let d = word(&target[at..at + 4]);
-                out[at..at + 4].copy_from_slice(&rop::rop3(order.rop, p, s, d).to_le_bytes());
-            }
-        }
-        if let Some(frame) = framebuffer.blit(
-            left as u16,
-            top as u16,
-            width as u16,
-            height as u16,
-            &block,
-            width,
-        ) {
-            frames.push(frame);
-        }
+        let block = compose(
+            &area,
+            &bitmap.rgba,
+            usize::from(bitmap.width),
+            order.rop,
+            pattern,
+            framebuffer,
+        );
+        frames.extend(area.blit(framebuffer, &block));
         Ok(())
     }
+
+    /// Paint a ScrBlt: a copy within the framebuffer, read whole before anything is written.
+    fn scrblt(
+        &self,
+        order: &ScrBlt,
+        clip: Clip,
+        framebuffer: &mut Framebuffer,
+        budget: &mut usize,
+        frames: &mut Vec<FrameUpdate>,
+    ) -> Result<(), NotApplied> {
+        if !self.scrblt {
+            tracing::warn!(
+                target: "rdp_orders",
+                rop = order.rop,
+                "a drawing order this client did not advertise, painted anyway"
+            );
+        }
+        let clip = match clip {
+            Clip::None => None,
+            Clip::Bounds(bounds) => Some(bounds),
+            Clip::Unknown => return Err(NotApplied::Skipped(Skip::UnknownClip)),
+        };
+        let Some(area) = clip_blt(
+            [order.left, order.top, order.width, order.height],
+            [order.x_src, order.y_src],
+            (framebuffer.width(), framebuffer.height()),
+            framebuffer,
+            clip,
+        ) else {
+            return Ok(());
+        };
+        // The source copy and the destination block.
+        if !charge(budget, area.width * area.height * 4 * 2) {
+            return Err(NotApplied::Skipped(Skip::OverBudget));
+        }
+        let stride = usize::from(framebuffer.width()) * 4;
+        let mut source = Vec::with_capacity(area.width * area.height * 4);
+        for row in 0..area.height {
+            let start = (area.top + area.shift_y) as usize * stride
+                + row * stride
+                + (area.left + area.shift_x) as usize * 4;
+            source.extend_from_slice(&framebuffer.pixels()[start..start + area.width * 4]);
+        }
+        let copied = Area {
+            shift_x: -area.left,
+            shift_y: -area.top,
+            ..area
+        };
+        let block = compose(&copied, &source, area.width, order.rop, None, framebuffer);
+        frames.extend(area.blit(framebuffer, &block));
+        Ok(())
+    }
+}
+
+/// A blit's destination after clipping, and the offset from it to the source.
+#[derive(Debug, Clone, Copy)]
+struct Area {
+    left: i32,
+    top: i32,
+    width: usize,
+    height: usize,
+    shift_x: i32,
+    shift_y: i32,
+}
+
+impl Area {
+    fn blit(&self, framebuffer: &mut Framebuffer, block: &[u8]) -> Option<FrameUpdate> {
+        framebuffer.blit(
+            self.left as u16,
+            self.top as u16,
+            self.width as u16,
+            self.height as u16,
+            block,
+            self.width,
+        )
+    }
+}
+
+/// The part of `dest` (left, top, width, height) that lies on the framebuffer, inside the
+/// inclusive `clip`, and over a source of `source` size read from `src`; `None` when empty.
+fn clip_blt(
+    dest: [i16; 4],
+    src: [i16; 2],
+    source: (u16, u16),
+    framebuffer: &Framebuffer,
+    clip: Option<Bounds>,
+) -> Option<Area> {
+    let [left, top, width, height] = dest.map(i32::from);
+    let shift_x = i32::from(src[0]) - left;
+    let shift_y = i32::from(src[1]) - top;
+    let mut l = left.max(0).max(-shift_x);
+    let mut t = top.max(0).max(-shift_y);
+    let mut r = (left + width)
+        .min(i32::from(framebuffer.width()))
+        .min(i32::from(source.0) - shift_x);
+    let mut b = (top + height)
+        .min(i32::from(framebuffer.height()))
+        .min(i32::from(source.1) - shift_y);
+    if let Some(bounds) = clip {
+        l = l.max(i32::from(bounds.left));
+        t = t.max(i32::from(bounds.top));
+        r = r.min(i32::from(bounds.right) + 1);
+        b = b.min(i32::from(bounds.bottom) + 1);
+    }
+    (l < r && t < b).then(|| Area {
+        left: l,
+        top: t,
+        width: (r - l) as usize,
+        height: (b - t) as usize,
+        shift_x,
+        shift_y,
+    })
+}
+
+/// The pixels `area` receives: `source` (RGBA, `source_width` wide) through `rop`, with the
+/// pattern and the framebuffer's current pixels as the other two inputs.
+fn compose(
+    area: &Area,
+    source: &[u8],
+    source_width: usize,
+    rop: u8,
+    pattern: Option<Pattern>,
+    framebuffer: &Framebuffer,
+) -> Vec<u8> {
+    let (width, height) = (area.width, area.height);
+    let source_stride = source_width * 4;
+    let target_stride = usize::from(framebuffer.width()) * 4;
+    let mut block = vec![0u8; width * height * 4];
+    for row in 0..height {
+        let y = area.top as usize + row;
+        let source_start = (y as i32 + area.shift_y) as usize * source_stride
+            + (area.left + area.shift_x) as usize * 4;
+        let source = &source[source_start..source_start + width * 4];
+        let out = &mut block[row * width * 4..(row + 1) * width * 4];
+        if rop == SRCCOPY {
+            out.copy_from_slice(source);
+            continue;
+        }
+        let target_start = y * target_stride + area.left as usize * 4;
+        let target = &framebuffer.pixels()[target_start..target_start + width * 4];
+        for column in 0..width {
+            let at = column * 4;
+            let p = pattern.map_or(0, |p| p.pixel(area.left + column as i32, y as i32));
+            let s = word(&source[at..at + 4]);
+            let d = word(&target[at..at + 4]);
+            out[at..at + 4].copy_from_slice(&rop::rop3(rop, p, s, d).to_le_bytes());
+        }
+    }
+    block
 }
 
 /// Why an order was not applied: skipped, or failed on malformed data.
@@ -402,6 +517,7 @@ pub(crate) mod tests {
     /// The capability sets with MemBlt (and Mem3Blt) over three Revision 2 caches of `entries`.
     pub(crate) fn capabilities(entries: u32, mem3blt: bool) -> Vec<CapabilitySet> {
         let mut order = OrderCapabilitySet::default();
+        order.order_support[capability::ORDER_NEG_SCRBLT_INDEX] = 1;
         order.order_support[capability::ORDER_NEG_MEMBLT_INDEX] = 1;
         order.order_support[capability::ORDER_NEG_MEM3BLT_INDEX] = u8::from(mem3blt);
         vec![
@@ -588,6 +704,123 @@ pub(crate) mod tests {
         assert_eq!(frames, [frame(1, 0, 1, 1), frame(6, 3, 2, 1)]);
         assert_eq!(pixel(&fb, 1, 0), rgba(GREEN));
         assert_eq!(pixel(&fb, 7, 3), rgba(GREEN));
+    }
+
+    /// A ScrBlt with every field and absolute coordinates.
+    pub(crate) fn scrblt(dest: [i16; 4], rop: u8, src: [i16; 2]) -> Vec<u8> {
+        let mut order = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            justrdp_pdu::orders::TS_ENC_SCRBLT_ORDER,
+            0x7F,
+        ];
+        for value in dest {
+            order.extend_from_slice(&value.to_le_bytes());
+        }
+        order.push(rop);
+        for value in src {
+            order.extend_from_slice(&value.to_le_bytes());
+        }
+        order
+    }
+
+    /// A framebuffer whose every pixel is distinct: red is x, green is y.
+    fn gradient(width: u16, height: u16) -> Framebuffer {
+        let mut fb = Framebuffer::new(width, height).unwrap();
+        let mut rgba = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[x as u8, y as u8, 0x40, 0xFF]);
+            }
+        }
+        fb.blit(0, 0, width, height, &rgba, usize::from(width));
+        fb
+    }
+
+    /// The reference ScrBlt: the source copied out whole, then written, clipped to the
+    /// framebuffer on both sides.
+    fn copy_through_a_buffer(fb: &Framebuffer, dest: [i16; 4], src: [i16; 2]) -> Vec<u8> {
+        let (w, h) = (i32::from(fb.width()), i32::from(fb.height()));
+        let before = fb.pixels().to_vec();
+        let mut after = before.clone();
+        for dy in 0..i32::from(dest[3]) {
+            for dx in 0..i32::from(dest[2]) {
+                let (x, y) = (i32::from(dest[0]) + dx, i32::from(dest[1]) + dy);
+                let (sx, sy) = (i32::from(src[0]) + dx, i32::from(src[1]) + dy);
+                if (0..w).contains(&x)
+                    && (0..h).contains(&y)
+                    && (0..w).contains(&sx)
+                    && (0..h).contains(&sy)
+                {
+                    let to = ((y * w + x) * 4) as usize;
+                    let from = ((sy * w + sx) * 4) as usize;
+                    after[to..to + 4].copy_from_slice(&before[from..from + 4]);
+                }
+            }
+        }
+        after
+    }
+
+    /// Source and destination overlap in all four directions, and the copy reads as if the
+    /// whole source was taken first.
+    #[test]
+    fn scrblt_overlapping_copies_match_a_copy_through_a_buffer() {
+        for (dest, src) in [
+            ([3, 2, 8, 5], [1, 2]), // right
+            ([1, 2, 8, 5], [3, 2]), // left
+            ([2, 3, 8, 5], [2, 1]), // down
+            ([2, 1, 8, 5], [2, 3]), // up
+            ([3, 3, 8, 5], [1, 1]), // down and right
+        ] {
+            let mut fb = gradient(16, 10);
+            let expected = copy_through_a_buffer(&fb, dest, src);
+            let mut orders = Orders::new(&capabilities(4, true));
+            let frames = run(&mut orders, &mut fb, &[scrblt(dest, SRCCOPY, src)]);
+            assert_eq!(fb.pixels(), &expected[..], "dest {dest:?} src {src:?}");
+            assert_eq!(frames.len(), 1);
+        }
+    }
+
+    /// A source partly outside the framebuffer shrinks the destination to what exists, and
+    /// one wholly outside paints nothing.
+    #[test]
+    fn scrblt_sources_outside_the_framebuffer_are_clipped() {
+        let mut fb = gradient(16, 10);
+        let expected = copy_through_a_buffer(&fb, [0, 0, 8, 8], [12, 6]);
+        let mut orders = Orders::new(&capabilities(4, true));
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                scrblt([0, 0, 8, 8], SRCCOPY, [12, 6]),
+                scrblt([0, 0, 4, 4], SRCCOPY, [-9, 40]),
+            ],
+        );
+        assert_eq!(frames, [frame(0, 0, 4, 4)]);
+        assert_eq!(fb.pixels(), &expected[..]);
+    }
+
+    /// A ScrBlt ROP reads the destination before the copy writes it; bounds clip it.
+    #[test]
+    fn scrblt_rops_read_the_destination_and_bounds_clip() {
+        let mut fb = gradient(8, 2);
+        let mut orders = Orders::new(&capabilities(4, true));
+        // SRCINVERT of a pixel onto itself clears it.
+        run(&mut orders, &mut fb, &[scrblt([0, 0, 2, 1], 0x66, [0, 0])]);
+        assert_eq!(pixel(&fb, 0, 0), BLACK);
+        assert_eq!(pixel(&fb, 1, 0), BLACK);
+        assert_eq!(pixel(&fb, 2, 0), [2, 0, 0x40, 0xFF]);
+        let unbounded = scrblt([0, 1, 8, 1], SRCCOPY, [0, 0]);
+        let mut bounded = vec![unbounded[0] | TS_BOUNDS];
+        bounded.extend_from_slice(&unbounded[1..3]);
+        bounded.push(0x0F);
+        for edge in [4i16, 0, 5, 1] {
+            bounded.extend_from_slice(&edge.to_le_bytes());
+        }
+        bounded.extend_from_slice(&unbounded[3..]);
+        let frames = run(&mut orders, &mut fb, &[bounded]);
+        assert_eq!(frames, [frame(4, 1, 2, 1)]);
+        assert_eq!(pixel(&fb, 4, 1), [4, 0, 0x40, 0xFF]);
+        assert_eq!(pixel(&fb, 3, 1), [3, 1, 0x40, 0xFF]);
     }
 
     /// A miss or an index outside the caches is skipped, and the update goes on.

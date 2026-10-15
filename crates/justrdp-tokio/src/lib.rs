@@ -8088,6 +8088,161 @@ mod tests {
         with_vm_session(|vm| compressed_updates_paint_the_desktop(vm, 1, "454-mppc")).await
     }
 
+    /// A legacy-graphics config with drawing orders on: no Surface Commands, Bitmap Codecs or
+    /// Revision 1 set; `orders` in `orderSupport`; a Revision 2 cache of 120, 120 and 2553
+    /// entries; 16 bpp in the Bitmap set and `highColorDepth`.
+    fn legacy_orders_config(orders: &[usize]) -> ConnectConfig {
+        use justrdp_pdu::capability::{self, CapabilitySet};
+        let mut config = legacy_graphics_config();
+        config.core.high_color_depth = gcc::HIGH_COLOR_DEPTH_16BPP;
+        config.capabilities.retain(|set| {
+            !matches!(
+                set,
+                CapabilitySet::SurfaceCommands(_)
+                    | CapabilitySet::BitmapCodecs(_)
+                    | CapabilitySet::BitmapCache(_)
+            )
+        });
+        for set in &mut config.capabilities {
+            match set {
+                CapabilitySet::Order(o) => {
+                    for &index in orders {
+                        o.order_support[index] = 1;
+                    }
+                }
+                CapabilitySet::Bitmap(b) => b.preferred_bits_per_pixel = 16,
+                _ => {}
+            }
+        }
+        config.capabilities.push(CapabilitySet::BitmapCacheRev2(
+            capability::BitmapCacheRev2CapabilitySet {
+                cache_flags: 0,
+                cells: [120, 120, 2553]
+                    .map(|entries| capability::BitmapCacheCellInfo {
+                        entries,
+                        persistent: false,
+                    })
+                    .to_vec(),
+            },
+        ));
+        config
+    }
+
+    /// A census of a session's server bytes, decoded apart from the session: fast-path updates
+    /// by code, and every drawing order by kind.
+    #[derive(Default)]
+    struct OrderCensus {
+        inbox: Vec<u8>,
+        history: justrdp_pdu::orders::OrderHistory,
+        fragment: Vec<u8>,
+        updates: std::collections::BTreeMap<u8, usize>,
+        orders: std::collections::BTreeMap<String, usize>,
+        slow_path_frames: usize,
+        /// Every ScrBlt's `[left, top, width, height]` and `[nXSrc, nYSrc]`.
+        scrblts: Vec<([i16; 4], [i16; 2])>,
+    }
+
+    impl OrderCensus {
+        fn feed(&mut self, bytes: &[u8]) {
+            use justrdp_pdu::cursor::ReadCursor;
+            use justrdp_pdu::fastpath;
+            use justrdp_pdu::orders::{self, DrawingOrder, OrdersUpdate};
+            self.inbox.extend_from_slice(bytes);
+            while let Some(&first) = self.inbox.first() {
+                let len = if fastpath::is_fastpath(first) {
+                    fastpath::frame_len(&self.inbox)
+                } else {
+                    justrdp_pdu::tpkt::frame_len(&self.inbox)
+                };
+                let Ok(len) = len else { break };
+                if self.inbox.len() < len {
+                    break;
+                }
+                let frame: Vec<u8> = self.inbox.drain(..len).collect();
+                if !fastpath::is_fastpath(first) {
+                    self.slow_path_frames += 1;
+                    continue;
+                }
+                for section in fastpath::decode_updates(&frame).expect("fast-path frame") {
+                    *self.updates.entry(section.code).or_default() += 1;
+                    if section.code != fastpath::FP_UPDATE_ORDERS {
+                        continue;
+                    }
+                    self.fragment.extend_from_slice(section.data);
+                    if !matches!(
+                        section.fragmentation,
+                        fastpath::FP_FRAGMENT_SINGLE | fastpath::FP_FRAGMENT_LAST
+                    ) {
+                        continue;
+                    }
+                    let body = std::mem::take(&mut self.fragment);
+                    let mut cur = ReadCursor::new(&body, "census orders");
+                    let update = OrdersUpdate::decode_fast_path(&mut cur).expect("orders");
+                    let mut cur = ReadCursor::new(update.order_data, "census order data");
+                    for _ in 0..update.number_orders {
+                        let name = match orders::decode_order(&mut cur, &mut self.history) {
+                            Ok(DrawingOrder::ScrBlt { order, .. }) => {
+                                self.scrblts.push((
+                                    [order.left, order.top, order.width, order.height],
+                                    [order.x_src, order.y_src],
+                                ));
+                                format!("ScrBlt rop {:#04x}", order.rop)
+                            }
+                            Ok(DrawingOrder::MemBlt { order, .. }) => {
+                                format!("MemBlt rop {:#04x}", order.rop)
+                            }
+                            Ok(DrawingOrder::Mem3Blt { order, .. }) => {
+                                format!("Mem3Blt rop {:#04x}", order.blt.rop)
+                            }
+                            Ok(DrawingOrder::CacheBitmapRev2(order)) => format!(
+                                "CacheBitmapRev2 cache {} compressed {} {} bpp",
+                                order.cache_id, order.compressed, order.bits_per_pixel
+                            ),
+                            Ok(DrawingOrder::SkippedSecondary { order_type }) => {
+                                format!("secondary {order_type:#04x}")
+                            }
+                            Err(error) => {
+                                *self.orders.entry(format!("stopped: {error}")).or_default() += 1;
+                                break;
+                            }
+                        };
+                        *self.orders.entry(name).or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        /// How many orders of a kind whose census name starts with `prefix` arrived.
+        fn count(&self, prefix: &str) -> usize {
+            self.orders
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .map(|(_, count)| count)
+                .sum()
+        }
+
+        fn print(&self, tag: &str) {
+            eprintln!(
+                "{tag}: fast-path updates by code {:?}, {} slow-path frames",
+                self.updates, self.slow_path_frames
+            );
+            for (name, count) in &self.orders {
+                eprintln!("{tag}:   {count:>6}  {name}");
+            }
+        }
+    }
+
+    /// Write `ppm` of the framebuffer's RGB to the temp directory and return its path.
+    fn dump_ppm(fb: &justrdp::Framebuffer, name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(name);
+        let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+        for px in fb.pixels().as_chunks::<4>().0 {
+            ppm.extend_from_slice(&px[..3]);
+        }
+        std::fs::write(&path, ppm).expect("write the visual dump");
+        path
+    }
+
     /// Issue #460: advertising MemBlt and Mem3Blt over a Revision 2 bitmap cache at 16 bpp,
     /// with no Surface Commands to fall back on, the VM paints the desktop in drawing orders and
     /// the session paints every pixel from the cache. `JUSTRDP_SESSION_CAPTURE_FILE` records the
@@ -8096,42 +8251,13 @@ mod tests {
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn memblt_orders_paint_the_desktop_on_the_real_vm() {
         with_vm_session(|vm| async move {
-            use justrdp_pdu::capability::{self, CapabilitySet};
-            use justrdp_pdu::cursor::ReadCursor;
+            use justrdp_pdu::capability;
             use justrdp_pdu::fastpath;
-            use justrdp_pdu::orders::{self, DrawingOrder, OrderHistory, OrdersUpdate};
 
-            let mut config = legacy_graphics_config();
-            config.core.high_color_depth = gcc::HIGH_COLOR_DEPTH_16BPP;
-            config.capabilities.retain(|set| {
-                !matches!(
-                    set,
-                    CapabilitySet::SurfaceCommands(_)
-                        | CapabilitySet::BitmapCodecs(_)
-                        | CapabilitySet::BitmapCache(_)
-                )
-            });
-            for set in &mut config.capabilities {
-                match set {
-                    CapabilitySet::Order(o) => {
-                        o.order_support[capability::ORDER_NEG_MEMBLT_INDEX] = 1;
-                        o.order_support[capability::ORDER_NEG_MEM3BLT_INDEX] = 1;
-                    }
-                    CapabilitySet::Bitmap(b) => b.preferred_bits_per_pixel = 16,
-                    _ => {}
-                }
-            }
-            config.capabilities.push(CapabilitySet::BitmapCacheRev2(
-                capability::BitmapCacheRev2CapabilitySet {
-                    cache_flags: 0,
-                    cells: [120, 120, 2553]
-                        .map(|entries| capability::BitmapCacheCellInfo {
-                            entries,
-                            persistent: false,
-                        })
-                        .to_vec(),
-                },
-            ));
+            let config = legacy_orders_config(&[
+                capability::ORDER_NEG_MEMBLT_INDEX,
+                capability::ORDER_NEG_MEM3BLT_INDEX,
+            ]);
             let session_capabilities = config.capabilities.clone();
             let outcome = vm.connect(config).await;
             let server_bpp = justrdp::ServerAnnouncement::from_capabilities(
@@ -8144,17 +8270,12 @@ mod tests {
             )
             .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;
-            let mut inbox = outcome.activation.leftover;
+            let mut census = OrderCensus::default();
+            census.feed(&outcome.activation.leftover);
             let mut readbuf = [0u8; 16 * 1024];
             let (width, height) = outcome.activation.desktop_size;
             let (width, height) = (usize::from(width), usize::from(height));
             let mut painted = vec![false; width * height];
-            // A census of the same stream, decoded apart from the session.
-            let mut updates = std::collections::BTreeMap::<u8, usize>::new();
-            let mut census = std::collections::BTreeMap::<String, usize>::new();
-            let mut history = OrderHistory::default();
-            let mut fragment = Vec::new();
-            let mut slow_path_frames = 0usize;
             let mut frames = 0usize;
             let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
             let mut fed = 0usize;
@@ -8175,65 +8296,10 @@ mod tests {
                         _ => {}
                     }
                 }
-                while let Some(&first) = inbox.first() {
-                    let len = if fastpath::is_fastpath(first) {
-                        fastpath::frame_len(&inbox)
-                    } else {
-                        justrdp_pdu::tpkt::frame_len(&inbox)
-                    };
-                    let Ok(len) = len else { break };
-                    if inbox.len() < len {
-                        break;
-                    }
-                    let frame: Vec<u8> = inbox.drain(..len).collect();
-                    if !fastpath::is_fastpath(first) {
-                        slow_path_frames += 1;
-                        continue;
-                    }
-                    for section in fastpath::decode_updates(&frame).expect("fast-path frame") {
-                        *updates.entry(section.code).or_default() += 1;
-                        if section.code != fastpath::FP_UPDATE_ORDERS {
-                            continue;
-                        }
-                        fragment.extend_from_slice(section.data);
-                        if !matches!(
-                            section.fragmentation,
-                            fastpath::FP_FRAGMENT_SINGLE | fastpath::FP_FRAGMENT_LAST
-                        ) {
-                            continue;
-                        }
-                        let body = std::mem::take(&mut fragment);
-                        let mut cur = ReadCursor::new(&body, "census orders");
-                        let update = OrdersUpdate::decode_fast_path(&mut cur).expect("orders");
-                        let mut cur = ReadCursor::new(update.order_data, "census order data");
-                        for _ in 0..update.number_orders {
-                            let name = match orders::decode_order(&mut cur, &mut history) {
-                                Ok(DrawingOrder::MemBlt { order, .. }) => {
-                                    format!("MemBlt rop {:#04x}", order.rop)
-                                }
-                                Ok(DrawingOrder::Mem3Blt { order, .. }) => {
-                                    format!("Mem3Blt rop {:#04x}", order.blt.rop)
-                                }
-                                Ok(DrawingOrder::CacheBitmapRev2(order)) => format!(
-                                    "CacheBitmapRev2 cache {} compressed {} {} bpp",
-                                    order.cache_id, order.compressed, order.bits_per_pixel
-                                ),
-                                Ok(DrawingOrder::SkippedSecondary { order_type }) => {
-                                    format!("secondary {order_type:#04x}")
-                                }
-                                Err(error) => {
-                                    *census.entry(format!("stopped: {error}")).or_default() += 1;
-                                    break;
-                                }
-                            };
-                            *census.entry(name).or_default() += 1;
-                        }
-                    }
-                }
                 match tokio::time::timeout_at(deadline, stream.read(&mut readbuf)).await {
-                    Ok(Ok(0)) => panic!("the server closed the session: {updates:?} {census:?}"),
+                    Ok(Ok(0)) => panic!("the server closed the session: {:?}", census.orders),
                     Ok(Ok(n)) => {
-                        inbox.extend_from_slice(&readbuf[..n]);
+                        census.feed(&readbuf[..n]);
                         fed += n;
                         pending = feed_session(&mut machine, &readbuf[..n])
                             .expect("every drawing order decodes");
@@ -8245,31 +8311,31 @@ mod tests {
 
             let covered = painted.iter().filter(|&&p| p).count();
             eprintln!(
-                "#460: server bpp {server_bpp}, fast-path updates by code {updates:?}, {slow_path_frames} slow-path frames, frames={frames}, painted {covered} of {} pixels, {fed} session bytes fed",
+                "#460: server bpp {server_bpp}, frames={frames}, painted {covered} of {} pixels, {fed} session bytes fed",
                 width * height
             );
-            for (name, count) in &census {
-                eprintln!("#460:   {count:>6}  {name}");
-            }
+            census.print("#460");
             assert!(
-                updates.get(&fastpath::FP_UPDATE_ORDERS).copied().unwrap_or(0) > 0,
-                "no Orders update arrived at {server_bpp} bpp: {updates:?}"
+                census
+                    .updates
+                    .get(&fastpath::FP_UPDATE_ORDERS)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0,
+                "no Orders update arrived at {server_bpp} bpp: {:?}",
+                census.updates
             );
-            assert!(
-                !census.keys().any(|name| name.starts_with("stopped")),
-                "an order the session cannot decode arrived: {census:?}"
-            );
+            assert_eq!(census.count("stopped"), 0, "an order the session cannot decode arrived");
             assert_eq!(
-                updates.get(&fastpath::FP_UPDATE_BITMAP),
+                census.updates.get(&fastpath::FP_UPDATE_BITMAP),
                 None,
                 "the desktop arrived as bitmap updates, not orders"
             );
-            let blits: usize = census
-                .iter()
-                .filter(|(name, _)| name.starts_with("MemBlt") || name.starts_with("Mem3Blt"))
-                .map(|(_, count)| count)
-                .sum();
-            assert_eq!(frames, blits, "every frame is one blit's");
+            assert_eq!(
+                frames,
+                census.count("MemBlt") + census.count("Mem3Blt"),
+                "every frame is one blit's"
+            );
             assert_eq!(covered, width * height, "every pixel of the desktop is painted");
             let fb = machine.framebuffer();
             let mut distinct = std::collections::HashSet::new();
@@ -8284,13 +8350,238 @@ mod tests {
                 "framebuffer is near-monochrome ({} colors) — the cache path is likely broken",
                 distinct.len()
             );
-            let path = std::env::temp_dir().join("justrdp-460-memblt.ppm");
-            let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
-            for px in fb.pixels().as_chunks::<4>().0 {
-                ppm.extend_from_slice(&px[..3]);
-            }
-            std::fs::write(&path, ppm).expect("write the visual dump");
+            let path = dump_ppm(fb, "justrdp-460-memblt.ppm");
             eprintln!("visual dump for confirmation: {}", path.display());
+        })
+        .await
+    }
+
+    /// A session with drawing orders, driven by keystrokes and read until it goes quiet.
+    struct OrderDrive {
+        machine: SessionStateMachine,
+        stream: tokio_rustls::client::TlsStream<TcpStream>,
+        census: OrderCensus,
+        frames: usize,
+    }
+
+    impl OrderDrive {
+        /// Read until no byte has arrived for 2 s, or for 45 s at most; with `need_frame`,
+        /// not before something has painted.
+        async fn settle(&mut self, step: &str, need_frame: bool) {
+            let start = tokio::time::Instant::now();
+            let frames_before = self.frames;
+            let mut readbuf = [0u8; 16 * 1024];
+            loop {
+                match tokio::time::timeout(Duration::from_secs(2), self.stream.read(&mut readbuf))
+                    .await
+                {
+                    Ok(Ok(0)) => panic!("the server closed the session: {:?}", self.census.orders),
+                    Ok(Ok(n)) => {
+                        self.census.feed(&readbuf[..n]);
+                        let outputs = feed_session(&mut self.machine, &readbuf[..n])
+                            .expect("every drawing order decodes");
+                        self.handle(outputs).await;
+                    }
+                    Ok(Err(e)) => panic!("read failed: {e}"),
+                    Err(_) if !need_frame || self.frames > frames_before => return,
+                    Err(_) => {}
+                }
+                if start.elapsed() > Duration::from_secs(45) {
+                    self.census.print("#461");
+                    let path = dump_ppm(self.machine.framebuffer(), "justrdp-461-stuck.ppm");
+                    panic!(
+                        "after {step}: no quiet 2 s, or no frame, within 45 s ({})",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        async fn handle(&mut self, outputs: Vec<justrdp::SessionOutput>) {
+            for output in outputs {
+                match output {
+                    justrdp::SessionOutput::Frame(_) => self.frames += 1,
+                    justrdp::SessionOutput::WriteBytes(bytes) => {
+                        self.stream
+                            .write_all(&bytes)
+                            .await
+                            .expect("write to the VM");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        async fn send(&mut self, events: &[InputEvent]) {
+            for frame in self.machine.encode_input(events) {
+                self.stream
+                    .write_all(&frame)
+                    .await
+                    .expect("write to the VM");
+            }
+        }
+
+        /// Press and release each Windows VK in turn, holding `modifier` around them if any.
+        async fn keys(&mut self, modifier: Option<u16>, vks: &[u16]) {
+            let scancode = |vk: u16| {
+                justrdp::input::scancode_from_windows_vk(vk)
+                    .unwrap_or_else(|| panic!("VK {vk:#04x} should map to a set-1 scancode"))
+            };
+            if let Some(m) = modifier {
+                self.send(&[scancode(m).press()]).await;
+            }
+            for &vk in vks {
+                self.send(&tap(vk)).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            if let Some(m) = modifier {
+                self.send(&[scancode(m).release()]).await;
+            }
+        }
+
+        /// Click the Start button, as `vm::start_menu_run` does.
+        async fn click_start(&mut self) {
+            use justrdp_pdu::input::{PTRFLAGS_BUTTON1, PTRFLAGS_DOWN, PTRFLAGS_MOVE};
+            let (x, y) = (
+                24u16,
+                self.machine.framebuffer().height().saturating_sub(20),
+            );
+            let mouse = |flags| InputEvent::Mouse {
+                flags,
+                wheel_units: 0,
+                x,
+                y,
+            };
+            self.send(&[
+                mouse(PTRFLAGS_MOVE),
+                mouse(PTRFLAGS_DOWN | PTRFLAGS_BUTTON1),
+                mouse(PTRFLAGS_BUTTON1),
+            ])
+            .await;
+        }
+    }
+
+    /// Issue #461: with ScrBlt advertised beside MemBlt and Mem3Blt and a LAN experience, the VM
+    /// slides the Start menu open in ScrBlts whose source and destination overlap, and what the
+    /// session painted is what the server paints when asked to redraw the whole desktop from
+    /// scratch (a Refresh Rect).
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn scrblt_slides_the_start_menu_as_a_redraw_paints_it_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            use justrdp_pdu::capability;
+
+            let mut config = legacy_orders_config(&[
+                capability::ORDER_NEG_SCRBLT_INDEX,
+                capability::ORDER_NEG_MEMBLT_INDEX,
+                capability::ORDER_NEG_MEM3BLT_INDEX,
+            ]);
+            // A LAN experience, as FreeRDP's `/network:lan` census had: this server reads the
+            // connection type, not `performanceFlags`, and animates menus only on a fast link.
+            config.core.early_capability_flags = config.core.early_capability_flags
+                | gcc::ClientEarlyCapabilityFlags::VALID_CONNECTION_TYPE;
+            config.core.connection_type = 0x06;
+            config.client_info.performance_flags = 0;
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let machine = SessionStateMachine::new(
+                session_config_from(&outcome, session_capabilities),
+                outcome.activation.leftover.clone(),
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut drive = OrderDrive {
+                machine,
+                stream: outcome.stream,
+                census: OrderCensus::default(),
+                frames: 0,
+            };
+            drive.census.feed(&outcome.activation.leftover);
+            let first = drive
+                .machine
+                .process_bytes(&[])
+                .expect("leftover bytes process");
+            drive.handle(first).await;
+            drive.settle("the logon", true).await;
+
+            let before = drive.census.scrblts.len();
+            drive.click_start().await;
+            drive.settle("the Start click", true).await;
+            let slide = drive.census.scrblts[before..].to_vec();
+            // Whether a copy's source and destination overlap: what makes the copy order matter.
+            let overlapping = slide
+                .iter()
+                .filter(|([x, y, w, h], [sx, sy])| (x - sx).abs() < *w && (y - sy).abs() < *h)
+                .count();
+
+            let painted = drive.machine.framebuffer().pixels().to_vec();
+            let (width, height) = (
+                drive.machine.framebuffer().width(),
+                drive.machine.framebuffer().height(),
+            );
+            let desktop = FrameUpdate {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            let refresh = drive
+                .machine
+                .request_refresh_rect(&[desktop])
+                .expect("the VM announces Refresh Rect");
+            for frame in refresh {
+                drive
+                    .stream
+                    .write_all(&frame)
+                    .await
+                    .expect("write to the VM");
+            }
+            drive.settle("the Refresh Rect", true).await;
+            let redrawn = drive.machine.framebuffer().pixels().to_vec();
+            drive.keys(None, &[0x1B]).await;
+            drive.settle("Esc", false).await;
+
+            drive.census.print("#461");
+            eprintln!("#461: the slide's ScrBlts {slide:?}, {overlapping} overlapping");
+            let painted_path = {
+                let mut fb = justrdp::Framebuffer::new(width, height).expect("desktop size");
+                fb.blit(0, 0, width, height, &painted, usize::from(width));
+                dump_ppm(&fb, "justrdp-461-slid.ppm")
+            };
+            let redrawn_path = dump_ppm(drive.machine.framebuffer(), "justrdp-461-redrawn.ppm");
+            eprintln!(
+                "visual dumps: {} and {}",
+                painted_path.display(),
+                redrawn_path.display()
+            );
+            assert_eq!(
+                drive.census.count("stopped"),
+                0,
+                "an order the session cannot decode arrived"
+            );
+            assert!(
+                overlapping > 0,
+                "no ScrBlt of the slide overlapped its source: {slide:?}"
+            );
+            let differing: Vec<usize> = painted
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(redrawn.as_chunks::<4>().0)
+                .enumerate()
+                .filter(|(_, (a, b))| a[..3] != b[..3])
+                .map(|(i, _)| i)
+                .collect();
+            if let (Some(first), Some(last)) = (differing.first(), differing.last()) {
+                let w = usize::from(width);
+                panic!(
+                    "{} pixels differ from the redraw, rows {}..={}, first at ({}, {})",
+                    differing.len(),
+                    first / w,
+                    last / w,
+                    first % w,
+                    first / w
+                );
+            }
         })
         .await
     }

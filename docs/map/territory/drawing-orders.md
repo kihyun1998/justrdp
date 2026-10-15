@@ -8,7 +8,8 @@ the server fills. What is built is the bitmap cache path and nothing else, becau
 test VM sends: Cache Bitmap (Revision 2) fills a Revision 2 bitmap cache, and MemBlt and Mem3Blt
 blit from it with a ROP3, Mem3Blt through an 8×8 brush. `justrdp-pdu::orders` holds the wire
 format, `justrdp-codecs::rop` the raster operations and brushes, and `justrdp::orders` the caches
-and the paint. Epic #22 (the bitmap cache half is #28's); #460 is the first slice.
+and the paint. ScrBlt copies within the framebuffer (#461). Epic #22 (the bitmap cache half is
+#28's); #460 is the first slice.
 
 ## Governing decisions
 
@@ -49,9 +50,16 @@ and the paint. Epic #22 (the bitmap cache half is #28's); #460 is the first slic
 - **`nYSrc` is a top-down row of the cached bitmap.** The spec's formula
   (`ActualYSrc = (SourceBitmapHeight − nHeight) − nYSrc`) addresses bottom-up storage; the cache
   stores top-down RGBA, so it uses the field as sent, as FreeRDP's `gdi_memblt` does.
+- **ScrBlt reads its whole source before it writes.** Its source is the framebuffer it paints, and
+  a moved or scrolled window overlaps it, so the source rectangle is copied out first; the copy
+  then goes through the same clipping and composition as MemBlt (`clip_blt`, `compose`), the
+  source being the framebuffer.
+- **A source past the edge shrinks the destination.** MemBlt and ScrBlt both clip the destination
+  to where the source exists. FreeRDP's `adjust_src_coordinates` instead moves an overhanging
+  source back inside and copies from there; nothing in this server's traffic reaches the case.
 - **ROP3 is one evaluator.** An index is its own truth table, so `rop3` covers all 256 bitwise
   over RGBA words, alpha forced opaque. MemBlt's ROP must not read the pattern (2.2.2.2.1.1.2.9);
-  if one does, the pattern is black.
+  if one does, the pattern is black. ScrBlt has no brush either, and the same holds for it.
 - **Every session decodes Orders Updates, advertised or not.** Before #460 an Orders Update fell
   to the dispatch's catch-all unread; now a malformed one is a `SessionError` even in a session
   that advertised no order (ADR-0009 §3(a): a tolerated order with a malformed body is still a
@@ -68,18 +76,21 @@ and the paint. Epic #22 (the bitmap cache half is #28's); #460 is the first slic
 ## Code
 
 - `justrdp-pdu/src/orders.rs` — `decode_order`, `OrderHistory`, `OrdersUpdate`, `DrawingOrder`,
-  `Clip`, `MemBlt`, `Mem3Blt`, `Brush`, `CacheBitmapRev2`, `OrderError`
+  `Clip`, `ScrBlt`, `MemBlt`, `Mem3Blt`, `Brush`, `CacheBitmapRev2`, `OrderError`
 - `justrdp-pdu/src/capability.rs` — `BitmapCacheRev2CapabilitySet`, `BitmapCacheCellInfo`,
-  `ORDER_NEG_MEMBLT_INDEX`, `ORDER_NEG_MEM3BLT_INDEX`, `BITMAP_CACHE_REV2_MAX_ENTRIES`
+  `ORDER_NEG_SCRBLT_INDEX`, `ORDER_NEG_MEMBLT_INDEX`, `ORDER_NEG_MEM3BLT_INDEX`,
+  `BITMAP_CACHE_REV2_MAX_ENTRIES`
 - `justrdp-codecs/src/rop.rs` — `rop3`, `uses_pattern`, `Pattern`, `pattern_rows`,
   `HATCH_PATTERNS`
-- `justrdp/src/orders.rs` — `Orders`, `order_color`
+- `justrdp/src/orders.rs` — `Orders`, `clip_blt`, `compose`, `order_color`
 - `justrdp/src/advertise.rs` — `HONOURED_ORDERS`, `HONOURED_ORDER_FLAGS`,
   `HONOURED_BITMAP_CACHE_REV2_FLAGS`, `check_orders`
 - `justrdp/src/session.rs` — `apply_orders`, `on_demand_active`, `ServerAnnouncement`,
   `decode_bitmap`, `charge`
 - `justrdp/tests/real_server_memblt.rs` — `a_real_desktop_painted_in_memblt_orders_replays`
-- `justrdp-tokio/src/lib.rs` — `memblt_orders_paint_the_desktop_on_the_real_vm`
+- `justrdp-tokio/src/lib.rs` — `memblt_orders_paint_the_desktop_on_the_real_vm`,
+  `scrblt_slides_the_start_menu_as_a_redraw_paints_it_on_the_real_vm`, `OrderCensus`,
+  `legacy_orders_config`
 - `fuzz/fuzz_targets/orders.rs`, `fuzz/fuzz_targets/session_orders.rs`
 
 ## Reference behaviour
@@ -99,6 +110,22 @@ no waiting list, 16 bpp, no Surface Commands. The server sent only compressed 16
 (Revision 2) into cache 2 and SRCCOPY MemBlt, on the fast path; the fixture
 (`justrdp/tests/fixtures/session/memblt.bin`) holds 39 Orders updates and 1,495 MemBlt, and its
 replay equals the live framebuffer.
+
+**ScrBlt against a redraw (#461).** Advertising ScrBlt beside MemBlt and Mem3Blt:
+
+- **This server sends ScrBlt only for a LAN experience, and then for menu animation.** With
+  `VALID_CONNECTION_TYPE` and LAN, opening the Start menu slid it up in 7 SRCCOPY ScrBlts of about
+  648×624, each 1–4 rows from its source, so every one overlaps it; the same in two runs. Without
+  the connection type (`performanceFlags` 0x7, which this server honours then) no menu animates.
+  A Notepad window moved with the keyboard, and Notepad text scrolled by typing past its last
+  line, were painted in MemBlt in four runs out of five; the fifth brought 2 ScrBlt whose
+  geometry was not recorded. FreeRDP's 159 were in a LAN session with a person moving windows
+  and scrolling Explorer, so which of those actions sent them is not known.
+- **The framebuffer after the slide equals, byte for byte, the one the server paints for a
+  Refresh Rect of the whole desktop.** It is the server's own redraw, so it is the oracle rather
+  than a capture, and no fixture was committed. Copying the overlap in place bottom-up makes
+  109,040 pixels differ, so the comparison sees a wrong copy order. The slide copies upward
+  only; the other three directions rest on the unit test.
 
 **Two readings settled by the tie-break, neither reachable from this VM's traffic:**
 
@@ -140,8 +167,8 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 
 - **Every order the census saw none of** is unbuilt: DstBlt, PatBlt, OpaqueRect, LineTo, the
   Multi* orders, polygons, ellipses, SaveBitmap, the glyph orders, Cache Color Table, Cache Brush,
-  Cache Bitmap revisions 1 and 3, and every alternate secondary order. ScrBlt (#461) and Frame
-  Marker (#462) are sliced.
+  Cache Bitmap revisions 1 and 3, and every alternate secondary order. Frame Marker (#462) is
+  sliced.
 - **24 and 32 bpp** order sessions are unproven (#463); the defaults do not advertise orders.
 - **8 bpp** is refused: MemBlt's color table index needs the Color Table Cache.
 - **Persistent bitmap caching** (keys, the Persistent Key List PDU) is refused at the

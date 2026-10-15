@@ -1,6 +1,6 @@
 //! Drawing orders (`[MS-RDPEGDI]` 2.2.2): the Orders Update on both transports, the primary
-//! order field encoding with its history, and the orders the bitmap cache path needs: MemBlt,
-//! Mem3Blt and Cache Bitmap (Revision 2). Decode only: orders flow server → client.
+//! order field encoding with its history, ScrBlt, and the orders the bitmap cache path needs:
+//! MemBlt, Mem3Blt and Cache Bitmap (Revision 2). Decode only: orders flow server → client.
 //!
 //! A primary order carries no length. Its field-flag width depends on its type, so an order of a
 //! type this module does not decode leaves the rest of the update unreadable:
@@ -29,6 +29,8 @@ pub const TS_ZERO_FIELD_BYTE_BIT1: u8 = 0x80;
 
 /// `orderType` (primary): PatBlt, the type both ends start from.
 pub const TS_ENC_PATBLT_ORDER: u8 = 0x01;
+/// `orderType` (primary): ScrBlt.
+pub const TS_ENC_SCRBLT_ORDER: u8 = 0x02;
 /// `orderType` (primary): MemBlt.
 pub const TS_ENC_MEMBLT_ORDER: u8 = 0x0D;
 /// `orderType` (primary): Mem3Blt.
@@ -185,6 +187,26 @@ pub struct MemBlt {
     pub cache_index: u16,
 }
 
+/// The fields of a ScrBlt order (2.2.2.2.1.1.2.7), as the history holds them: a copy within
+/// the primary drawing surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScrBlt {
+    /// `nLeftRect`.
+    pub left: i16,
+    /// `nTopRect`.
+    pub top: i16,
+    /// `nWidth`.
+    pub width: i16,
+    /// `nHeight`.
+    pub height: i16,
+    /// `bRop`: the ROP3 index.
+    pub rop: u8,
+    /// `nXSrc`.
+    pub x_src: i16,
+    /// `nYSrc`.
+    pub y_src: i16,
+}
+
 /// An 8×8 brush (2.2.2.2.1.1.2.3 `BrushOrgX` … `BrushExtra`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Brush {
@@ -239,6 +261,13 @@ pub struct CacheBitmapRev2<'a> {
 /// One decoded drawing order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawingOrder<'a> {
+    /// ScrBlt.
+    ScrBlt {
+        /// The order.
+        order: ScrBlt,
+        /// Its clip.
+        clip: Clip,
+    },
     /// MemBlt.
     MemBlt {
         /// The order.
@@ -272,6 +301,7 @@ pub struct OrderHistory {
     /// False once an order of an undecoded type may have moved the rectangle; true again when
     /// a `bounds` field gives all four edges absolutely.
     bounds_known: bool,
+    scrblt: ScrBlt,
     memblt: MemBlt,
     mem3blt: Mem3Blt,
 }
@@ -283,6 +313,7 @@ impl Default for OrderHistory {
             order_type: TS_ENC_PATBLT_ORDER,
             bounds: Bounds::default(),
             bounds_known: true,
+            scrblt: ScrBlt::default(),
             memblt: MemBlt::default(),
             mem3blt: Mem3Blt::default(),
         }
@@ -293,6 +324,7 @@ impl Default for OrderHistory {
 /// decoded here.
 fn field_bytes(order_type: u8) -> Option<usize> {
     match order_type {
+        TS_ENC_SCRBLT_ORDER => Some(1),
         TS_ENC_MEMBLT_ORDER => Some(2),
         TS_ENC_MEM3BLT_ORDER => Some(3),
         _ => None,
@@ -361,6 +393,20 @@ fn decode_primary<'a>(
     let delta = control & TS_DELTA_COORDINATES != 0;
     let mut fields = Fields { cur, fields, delta };
     Ok(match order_type {
+        TS_ENC_SCRBLT_ORDER => {
+            let order = &mut history.scrblt;
+            fields.coord(0x01, &mut order.left)?;
+            fields.coord(0x02, &mut order.top)?;
+            fields.coord(0x04, &mut order.width)?;
+            fields.coord(0x08, &mut order.height)?;
+            fields.u8(0x10, &mut order.rop)?;
+            fields.coord(0x20, &mut order.x_src)?;
+            fields.coord(0x40, &mut order.y_src)?;
+            DrawingOrder::ScrBlt {
+                order: *order,
+                clip,
+            }
+        }
         TS_ENC_MEMBLT_ORDER => {
             let order = &mut history.memblt;
             fields.u16(0x0001, &mut order.cache_id)?;
@@ -690,6 +736,47 @@ mod tests {
                 },
                 clip: Clip::None
             })
+        );
+    }
+
+    /// ScrBlt's seven fields fit one field-flag byte, and carry over like MemBlt's.
+    #[test]
+    fn scrblt_fields_carry_over_between_orders() {
+        let mut bytes = vec![TS_STANDARD | TS_TYPE_CHANGE, TS_ENC_SCRBLT_ORDER, 0x7F];
+        for value in [10i16, 20, 64, 32] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.push(0xCC);
+        for value in [12i16, 25] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        // Then only nYSrc, as a delta.
+        bytes.extend_from_slice(&[TS_STANDARD | TS_DELTA_COORDINATES, 0x40, (-5i8) as u8]);
+        let mut history = OrderHistory::default();
+        let expected = ScrBlt {
+            left: 10,
+            top: 20,
+            width: 64,
+            height: 32,
+            rop: 0xCC,
+            x_src: 12,
+            y_src: 25,
+        };
+        assert_eq!(
+            decode_all(&bytes, &mut history),
+            [
+                Ok(DrawingOrder::ScrBlt {
+                    order: expected,
+                    clip: Clip::None
+                }),
+                Ok(DrawingOrder::ScrBlt {
+                    order: ScrBlt {
+                        y_src: 20,
+                        ..expected
+                    },
+                    clip: Clip::None
+                }),
+            ]
         );
     }
 
