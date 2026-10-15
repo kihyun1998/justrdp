@@ -95,6 +95,7 @@ pub mod capture;
 pub mod clearcodec;
 pub mod color;
 pub mod g711;
+pub mod mppc;
 pub mod nscodec;
 pub mod pcm;
 pub mod planar;

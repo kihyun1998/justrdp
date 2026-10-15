@@ -67,6 +67,25 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   rather than erroring and the event payload are derived. Relative mouse has no `InputEvent`
   yet. Measured: the WS2019 VM announces `0x0375`, all three flags, so nothing the VM suite
   sends is dropped.
+- **One bulk decompression context per connection, fed before anything can skip a PDU** (#454).
+  `[MS-RDPBCGR]` 3.1.8.1 keeps one history per direction; FreeRDP holds one `rdpBulk` and both
+  `fastpath.c` and `rdp.c` decompress through it. So `Bulk` sits in the session, and every
+  fast-path update and every Share Data PDU goes through it first, including those a Deactivation
+  then drops, because their bytes are history the next copy may reach into. Fast-path passes
+  every update's `compressionFlags`; slow-path decompresses `compressedLength - 18` bytes. Without
+  `PACKET_COMPRESSED` the payload is plain whatever the type nibble says (#253), and
+  `PACKET_FLUSHED` / `PACKET_AT_FRONT` still reach an existing history (3.1.8.3; FreeRDP's slow
+  path skips them, the spec does not). MPPC 8K and 64K decompress; any other type is
+  `BulkError::UnsupportedType`, and a type change within a connection is `TypeChanged`. The
+  connect machine refuses a compressed finalization reply: the history lives in the session.
+  No static channel is decompressed, because `VCCAPS_COMPR_SC` is never advertised.
+  Proof follows ADR-0003's order with the oracle tier empty (`ironrdp-graphics` has no MPPC, and
+  `ironrdp-bulk` would be a new ironrdp crate against ADR-0011): `[MS-RDPBCGR]` 3.1.8.2.3's
+  example hand-encoded from the 3.1.8.4 bit tables at both levels, and a WS2019 capture
+  (`tests/fixtures/session/mppc-64k.bin`) whose replay equals the live, looked-at framebuffer.
+  Measured on that VM (FreeRDP `/dump:record`, #427): the server compresses fast-path output with
+  exactly the advertised type, and at type 0 (8K) compresses nothing, so MPPC-8K has no
+  real-server proof.
 - **A Deactivation stops input and the share-bound requests, not channels** (#442). `[MS-RDPBCGR]`
   3.2.5.5.1: after Deactivate All *"the client MUST disable its graphics and input protocol
   handlers"*. From the moment the session leaves the active phase (a Deactivate All, or a Demand
@@ -135,7 +154,10 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   `note_paint_budget` (#367)
 - `justrdp/src/disconnect.rs` — `classify`, `DisconnectClass`, `DisconnectReason`,
   `ServerDisconnectCause`
-- `justrdp-pdu/src/fastpath.rs` — `is_fastpath`, `frame_len`, `decode_updates`
+- `justrdp-pdu/src/fastpath.rs` — `is_fastpath`, `frame_len`, `decode_updates`, `FastPathUpdate`
+- `justrdp/src/bulk.rs` — `Bulk`, `BulkError`, `PACKET_COMPR_TYPE_8K`, `PACKET_COMPR_TYPE_64K`
+  (#454)
+- `justrdp-codecs/src/mppc.rs` — `Mppc`, `MppcLevel`, `MppcError` (#454)
 - `justrdp-pdu/src/surface_commands.rs` — `decode_all`, `SurfaceCommand`, `SurfaceBits`,
   `BitmapDataEx`, `FrameMarker` (#150)
 - `justrdp-pdu/src/share.rs`, `justrdp-pdu/src/update.rs` — `ShareDataHeader`,

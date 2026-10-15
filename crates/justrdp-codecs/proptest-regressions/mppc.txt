@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 99f84f1bdc0748fe4bd83ef959e607c8b0b3299ef83136f3093095233edbde20 # shrinks to rdp5 = false, packets = [(32, [0, 0, 128, 192, 60, 46, 0, 48, 0, 184, 108, 22, 0, 0, 84, 151, 128, 35, 80, 0, 15, 59, 0, 56, 39, 0, 0, 184, 19, 136, 0])]

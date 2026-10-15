@@ -1237,6 +1237,16 @@ impl ConnectStateMachine {
             share::PDU_TYPE_DATA => {
                 let data =
                     share::ShareDataHeader::decode(&mut cur).map_err(ConnectError::Decode)?;
+                // The bulk decompression context lives in the session; a finalization reply
+                // has no history to decompress against.
+                if data.compressed_type & share::PACKET_COMPRESSED != 0 {
+                    return Err(ConnectError::Decode(
+                        justrdp_pdu::DecodeError::InvalidField {
+                            field: "TS_SHAREDATAHEADER.compressedType",
+                            reason: "bulk-compressed Share Data PDU before the session",
+                        },
+                    ));
+                }
                 match data.pdu_type2 {
                     share::PDU_TYPE2_FONT_MAP => {
                         let map = finalization::FontMap::decode(&mut cur)
@@ -2929,9 +2939,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Issue #253, on the connect leg: the Share Data header check lives in the decoder both
-    /// legs share, so a compressed Font Map fails the connect instead of reaching
-    /// session-active. The body is a valid Font Map, so without the check it would.
+    /// Issue #253, on the connect leg: the bulk history lives in the session (#454), so a
+    /// compressed Font Map fails the connect instead of reaching session-active. The body is a
+    /// valid Font Map, so without the check it would.
     #[test]
     fn a_compressed_finalization_reply_is_a_typed_error() {
         let mut sm = finalizing();

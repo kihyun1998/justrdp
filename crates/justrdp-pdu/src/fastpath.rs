@@ -83,6 +83,10 @@ pub struct FastPathUpdate<'a> {
     pub code: u8,
     /// `fragmentation` (`FP_FRAGMENT_*`).
     pub fragmentation: u8,
+    /// `compressionFlags` (`[MS-RDPBCGR]` 2.2.9.1.2.1): the bulk compression type nibble plus
+    /// `PACKET_*` flags, or 0 when the update header carries none. [`Self::data`] is still
+    /// compressed; the session decompresses it.
+    pub compression_flags: u8,
     /// The update bytes (the body of, e.g., a `TS_UPDATE_BITMAP_DATA` once reassembled).
     pub data: &'a [u8],
 }
@@ -101,23 +105,17 @@ pub fn decode_updates(frame: &[u8]) -> Result<Vec<FastPathUpdate<'_>>, DecodeErr
         let code = update_header & 0x0F;
         let fragmentation = update_header >> 4 & 0x03;
         let compression = update_header >> 6 & 0x03;
-        if compression & 0x02 != 0 {
-            // compressionFlags byte present (FASTPATH_OUTPUT_COMPRESSION_USED).
-            let flags = cur.read_u8()?;
-            if flags & 0x20 != 0 {
-                // PACKET_COMPRESSED: bulk (MPPC) compression — never negotiated by this
-                // client (General capset compressionTypes = 0), so a compressed update means
-                // the server ignored the negotiation.
-                return Err(DecodeError::InvalidField {
-                    field: "TS_FP_UPDATE.compressionFlags",
-                    reason: "bulk-compressed update was never negotiated",
-                });
-            }
-        }
+        // FASTPATH_OUTPUT_COMPRESSION_USED: a compressionFlags byte follows.
+        let compression_flags = if compression & 0x02 != 0 {
+            cur.read_u8()?
+        } else {
+            0
+        };
         let size = cur.read_u16_le()? as usize;
         updates.push(FastPathUpdate {
             code,
             fragmentation,
+            compression_flags,
             data: cur.read_slice(size)?,
         });
     }
@@ -249,12 +247,18 @@ mod tests {
     }
 
     #[test]
-    fn compressed_updates_are_rejected() {
-        // updateHeader with compression bit + compressionFlags PACKET_COMPRESSED.
-        let pdu = [0x00, 0x08, 0x81, 0x20, 0x01, 0x00, 0xFF];
-        assert!(matches!(
-            decode_updates(&pdu),
-            Err(DecodeError::InvalidField { .. })
-        ));
+    fn a_compressed_update_carries_its_flags_and_its_compressed_bytes() {
+        // updateHeader with FASTPATH_OUTPUT_COMPRESSION_USED, compressionFlags 0x21
+        // (PACKET_COMPRESSED | 64K), size 1, one compressed byte.
+        let pdu = [0x00, 0x07, 0x81, 0x21, 0x01, 0x00, 0xFF];
+        let updates = decode_updates(&pdu).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].code, 1);
+        assert_eq!(updates[0].compression_flags, 0x21);
+        assert_eq!(updates[0].data, &[0xFF]);
+        // Without the header bit there is no flags byte.
+        let plain = decode_updates(&[0x00, 0x06, 0x01, 0x01, 0x00, 0xFF]).unwrap();
+        assert_eq!(plain[0].compression_flags, 0);
+        assert_eq!(plain[0].data, &[0xFF]);
     }
 }

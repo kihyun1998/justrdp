@@ -49,7 +49,10 @@ wrote, unapplied.
   header: `compressed_type` is **enforced** (`ShareDataHeader::decode` refuses
   `PACKET_COMPRESSED`, and only that bit — the spec makes a lone `PACKET_FLUSHED` a plain
   payload), and `compressed_length` is **recorded** (it describes a payload the decoder never
-  admits). **`stream_id` is still an instance**, left out of #253 by the maintainer's call: it
+  admits). **#454 then gave both fields a reader**: with MPPC advertisable, `decode` no longer
+  refuses; the session decompresses on `compressed_type` through its bulk context and sizes the
+  payload from `compressed_length`, and the connect machine refuses a compressed finalization
+  reply itself. **`stream_id` is still an instance**, left out of #253 by the maintainer's call: it
   is not an attack vector, and enforcing it is a tolerance question the real server's `0x02`
   does not settle.
 - [MCS, GCC & channel setup](../territory/mcs-gcc-channel-setup.md) —

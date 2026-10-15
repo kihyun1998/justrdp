@@ -38,6 +38,8 @@ pub const HONOURED_CLIENT_INFO_FLAGS: ClientInfoFlags = ClientInfoFlags::from_bi
         | ClientInfoFlags::PASSWORD_IS_SC_PIN.bits()
         | ClientInfoFlags::NO_AUDIO_PLAYBACK.bits()
         | ClientInfoFlags::USING_SAVED_CREDS.bits()
+        | ClientInfoFlags::COMPRESSION.bits()
+        | ClientInfoFlags::COMPRESSION_TYPE_64K.bits()
         | ClientInfoFlags::AUDIO_CAPTURE.bits()
         | ClientInfoFlags::VIDEO_DISABLE.bits(),
 );
@@ -350,12 +352,10 @@ mod tests {
     #[test]
     fn the_machine_refuses_an_unhonourable_config() {
         let mut config = config();
-        config.client_info.flags = ClientInfoFlags::MOUSE | ClientInfoFlags::COMPRESSION;
+        config.client_info.flags = ClientInfoFlags::MOUSE | ClientInfoFlags::RAIL;
         assert_eq!(
             crate::ConnectStateMachine::new(config).err(),
-            Some(ConnectConfigError::ClientInfoFlags(
-                ClientInfoFlags::COMPRESSION
-            ))
+            Some(ConnectConfigError::ClientInfoFlags(ClientInfoFlags::RAIL))
         );
     }
 
@@ -472,9 +472,13 @@ mod tests {
                 "Client Info flag {bit:#010x}"
             );
         }
+        // The compression types past 64K: the type mask's upper three bits.
+        let past_64k = ClientInfoFlags::from_bits(
+            ClientInfoFlags::COMPRESSION_TYPE_MASK.bits()
+                & !ClientInfoFlags::COMPRESSION_TYPE_64K.bits(),
+        );
         for flag in [
-            ClientInfoFlags::COMPRESSION,
-            ClientInfoFlags::COMPRESSION_TYPE_MASK,
+            past_64k,
             ClientInfoFlags::RAIL,
             ClientInfoFlags::HIDEF_RAIL_SUPPORTED,
         ] {
@@ -482,6 +486,28 @@ mod tests {
             assert_eq!(
                 check(&config),
                 Err(ConnectConfigError::ClientInfoFlags(flag))
+            );
+        }
+    }
+
+    /// Bulk compression up to MPPC 64K is the host's to advertise (#454); NCRUSH (2), XCRUSH
+    /// (3) and every higher type stay refused until a decompressor exists for them.
+    #[test]
+    fn mppc_compression_passes_and_higher_types_are_refused() {
+        let mut config = config();
+        for ty in [0u32, 1] {
+            config.client_info.flags = ClientInfoFlags::MOUSE
+                | ClientInfoFlags::COMPRESSION
+                | ClientInfoFlags::from_bits(ty << 9);
+            assert_eq!(check(&config), Ok(()), "type {ty}");
+        }
+        for ty in [2u32, 3, 4, 15] {
+            config.client_info.flags = ClientInfoFlags::MOUSE
+                | ClientInfoFlags::COMPRESSION
+                | ClientInfoFlags::from_bits(ty << 9);
+            assert!(
+                matches!(check(&config), Err(ConnectConfigError::ClientInfoFlags(_))),
+                "type {ty}"
             );
         }
     }

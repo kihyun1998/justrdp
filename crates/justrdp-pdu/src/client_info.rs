@@ -72,6 +72,9 @@ impl ClientInfoFlags {
     /// `CompressionTypeMask` — the highest bulk compression package the client supports, read
     /// with [`Self::COMPRESSION`].
     pub const COMPRESSION_TYPE_MASK: Self = Self(0x0000_1E00);
+    /// `PACKET_COMPR_TYPE_64K` (1) in [`Self::COMPRESSION_TYPE_MASK`]: MPPC with a 64 KB
+    /// history. Type 0 (8K) is the mask left clear.
+    pub const COMPRESSION_TYPE_64K: Self = Self(0x0000_0200);
     /// `INFO_REMOTECONSOLEAUDIO` — audio plays on the server, not redirected.
     pub const REMOTE_CONSOLE_AUDIO: Self = Self(0x0000_2000);
     /// `INFO_FORCE_ENCRYPTED_CS_PDU` — all client-to-server traffic is encrypted.
