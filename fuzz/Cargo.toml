@@ -352,3 +352,11 @@ path = "fuzz_targets/mppc.rs"
 test = false
 doc = false
 bench = false
+
+# xcrush (#456): RDP 6.1 bulk decompression, chained over MPPC 64K.
+[[bin]]
+name = "xcrush"
+path = "fuzz_targets/xcrush.rs"
+test = false
+doc = false
+bench = false

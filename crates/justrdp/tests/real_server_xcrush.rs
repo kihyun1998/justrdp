@@ -1,0 +1,90 @@
+//! What a real server sends under XCRUSH (RDP 6.1) bulk compression, replayed through the session
+//! machine.
+//!
+//! A capture proves **acceptance**: every compressed update this server sent decompresses against
+//! the shared history and the desktop it paints is the one the live session drew. It cannot prove
+//! the decompressor rejects what it should; the unit tests in `xcrush.rs`, `mppc.rs` and
+//! `bulk.rs` hold that half.
+
+use justrdp::{SessionConfig, SessionOutput, SessionStateMachine};
+use justrdp_pdu::{capability, fastpath, gcc};
+
+const XCRUSH: &[u8] = include_bytes!("fixtures/session/xcrush.bin");
+
+/// The session the capture was taken in: a 1280×800 desktop, the default capability sets.
+fn machine() -> SessionStateMachine {
+    let core = gcc::ClientCoreData {
+        desktop_width: 1280,
+        desktop_height: 800,
+        ..Default::default()
+    };
+    SessionStateMachine::new(
+        SessionConfig {
+            user_channel_id: 1007,
+            io_channel_id: 1003,
+            share_id: 0x0001_03EA,
+            desktop_size: (1280, 800),
+            capabilities: capability::default_client_capabilities(&core),
+            server: justrdp::ServerAnnouncement {
+                input_flags: capability::INPUT_FLAG_SCANCODES,
+                ..Default::default()
+            },
+            drdynvc_channel_id: None,
+            static_channels: Vec::new(),
+            dynamic_channels: Vec::new(),
+            egfx: Default::default(),
+        },
+        Vec::new(),
+    )
+    .expect("1280x800 is within MAX_DESKTOP_DIM")
+}
+
+/// FNV-1a over the framebuffer's RGB bytes, the form of the live session's PPM dump.
+fn fnv1a_rgb(rgba: &[u8]) -> u64 {
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|px| &px[..3])
+        .fold(0xcbf2_9ce4_8422_2325, |hash, &b| {
+            (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
+/// Issue #456. One logon's desktop, captured 2026-10-15 from the WS2019 VM advertising XCRUSH.
+#[test]
+fn a_real_desktop_sent_xcrush_compressed_replays() {
+    let mut sm = machine();
+    let mut rest = XCRUSH;
+    let mut flags = std::collections::BTreeMap::<u8, usize>::new();
+    let mut covered = 0u64;
+    while !rest.is_empty() {
+        let len = fastpath::frame_len(rest).expect("a complete fast-path PDU");
+        let (pdu, tail) = rest.split_at(len);
+        rest = tail;
+        for update in fastpath::decode_updates(pdu).expect("a fast-path PDU") {
+            *flags.entry(update.compression_flags).or_default() += 1;
+        }
+        for output in sm
+            .process_bytes(pdu)
+            .expect("every update this server sent decompresses and decodes")
+        {
+            if let SessionOutput::Frame(frame) = output {
+                covered += u64::from(frame.width) * u64::from(frame.height);
+            }
+        }
+    }
+    // Uncompressed, and PACKET_COMPRESSED | PACKET_COMPR_TYPE_RDP61.
+    assert_eq!(
+        flags.into_iter().collect::<Vec<_>>(),
+        [(0x00, 124), (0x23, 34)]
+    );
+    assert!(
+        covered >= 1280 * 800,
+        "the whole desktop is painted: {covered}"
+    );
+    assert_eq!(
+        fnv1a_rgb(sm.framebuffer().pixels()),
+        0x5edd_6969_7849_d892,
+        "the live session's framebuffer, as dumped and looked at when the fixture was taken"
+    );
+}

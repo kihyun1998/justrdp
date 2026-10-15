@@ -8085,126 +8085,129 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn mppc_compressed_updates_paint_the_desktop_on_the_real_vm() {
-        with_vm_session(|vm| async move {
-            use justrdp_pdu::client_info::ClientInfoFlags;
-            use justrdp_pdu::fastpath;
+        with_vm_session(|vm| compressed_updates_paint_the_desktop(vm, 1, "454-mppc")).await
+    }
 
-            let mut config = legacy_graphics_config();
-            config.client_info.flags = config.client_info.flags
-                | ClientInfoFlags::COMPRESSION
-                | ClientInfoFlags::COMPRESSION_TYPE_64K;
-            let session_capabilities = config.capabilities.clone();
-            let outcome = vm.connect(config).await;
-            let mut machine = SessionStateMachine::new(
-                session_config_from(&outcome, session_capabilities),
-                outcome.activation.leftover.clone(),
-            )
-            .expect("the test desktop size is within MAX_DESKTOP_DIM");
-            let mut stream = outcome.stream;
-            let mut inbox = outcome.activation.leftover;
-            let mut readbuf = [0u8; 16 * 1024];
-            // compressionFlags of every fast-path update, and Share Data compressedType bytes.
-            let mut flags = std::collections::BTreeMap::<u8, usize>::new();
-            let (width, height) = outcome.activation.desktop_size;
-            let (width, height) = (usize::from(width), usize::from(height));
-            let mut painted = vec![false; width * height];
-            let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
-            let mut fed = 0usize;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                for output in pending.drain(..) {
-                    match output {
-                        justrdp::SessionOutput::Frame(frame) => {
-                            for y in usize::from(frame.y)..usize::from(frame.y + frame.height) {
-                                let row = y * width + usize::from(frame.x);
-                                painted[row..row + usize::from(frame.width)].fill(true);
-                            }
-                        }
-                        justrdp::SessionOutput::WriteBytes(bytes) => {
-                            stream.write_all(&bytes).await.expect("write to the VM");
-                        }
-                        _ => {}
-                    }
-                }
-                while let Some(&first) = inbox.first() {
-                    let len = if fastpath::is_fastpath(first) {
-                        fastpath::frame_len(&inbox)
-                    } else {
-                        justrdp_pdu::tpkt::frame_len(&inbox)
-                    };
-                    let Ok(len) = len else { break };
-                    if inbox.len() < len {
-                        break;
-                    }
-                    let frame: Vec<u8> = inbox.drain(..len).collect();
-                    if fastpath::is_fastpath(first) {
-                        for section in fastpath::decode_updates(&frame).expect("fast-path frame") {
-                            *flags.entry(section.compression_flags).or_default() += 1;
+    /// Issue #456: the same, advertising XCRUSH (RDP 6.1).
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn xcrush_compressed_updates_paint_the_desktop_on_the_real_vm() {
+        with_vm_session(|vm| compressed_updates_paint_the_desktop(vm, 3, "456-xcrush")).await
+    }
+
+    /// Connect a legacy-graphics session advertising bulk compression type `ty`, read the desktop
+    /// for 10 s, and assert that updates of that type arrived and every pixel was painted. Dumps
+    /// the framebuffer to `justrdp-{tag}.ppm` in the temp directory.
+    async fn compressed_updates_paint_the_desktop(vm: vm::Vm, ty: u8, tag: &'static str) {
+        use justrdp_pdu::client_info::ClientInfoFlags;
+        use justrdp_pdu::fastpath;
+
+        let mut config = legacy_graphics_config();
+        config.client_info.flags = config.client_info.flags
+            | ClientInfoFlags::COMPRESSION
+            | ClientInfoFlags::from_bits(u32::from(ty) << 9);
+        let session_capabilities = config.capabilities.clone();
+        let outcome = vm.connect(config).await;
+        let mut machine = SessionStateMachine::new(
+            session_config_from(&outcome, session_capabilities),
+            outcome.activation.leftover.clone(),
+        )
+        .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        let mut stream = outcome.stream;
+        let mut inbox = outcome.activation.leftover;
+        let mut readbuf = [0u8; 16 * 1024];
+        // compressionFlags of every fast-path update.
+        let mut flags = std::collections::BTreeMap::<u8, usize>::new();
+        let (width, height) = outcome.activation.desktop_size;
+        let (width, height) = (usize::from(width), usize::from(height));
+        let mut painted = vec![false; width * height];
+        let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
+        let mut fed = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            for output in pending.drain(..) {
+                match output {
+                    justrdp::SessionOutput::Frame(frame) => {
+                        for y in usize::from(frame.y)..usize::from(frame.y + frame.height) {
+                            let row = y * width + usize::from(frame.x);
+                            painted[row..row + usize::from(frame.width)].fill(true);
                         }
                     }
-                }
-                match tokio::time::timeout_at(deadline, stream.read(&mut readbuf)).await {
-                    Ok(Ok(0)) => panic!("the server closed the session: {flags:?}"),
-                    Ok(Ok(n)) => {
-                        inbox.extend_from_slice(&readbuf[..n]);
-                        fed += n;
-                        pending = feed_session(&mut machine, &readbuf[..n])
-                            .expect("every compressed update decompresses and decodes");
+                    justrdp::SessionOutput::WriteBytes(bytes) => {
+                        stream.write_all(&bytes).await.expect("write to the VM");
                     }
-                    Ok(Err(e)) => panic!("read failed: {e}"),
-                    Err(_) => break,
+                    _ => {}
                 }
             }
-
-            let compressed_64k: usize = flags
-                .iter()
-                .filter(|&(f, _)| f & 0x20 != 0 && f & 0x0F == 1)
-                .map(|(_, n)| n)
-                .sum();
-            let covered = painted.iter().filter(|&&p| p).count();
-            eprintln!(
-                "#454: fast-path compressionFlags {flags:?}, painted {covered} of {} pixels, {fed} session bytes fed",
-                width * height
-            );
-            assert!(
-                compressed_64k > 0,
-                "no MPPC-64K compressed update arrived: {flags:?}"
-            );
-            assert_eq!(
-                covered,
-                width * height,
-                "every pixel of the desktop is painted"
-            );
-            let fb = machine.framebuffer();
-            let mut distinct = std::collections::HashSet::new();
-            for px in fb.pixels().as_chunks::<4>().0 {
-                distinct.insert([px[0], px[1], px[2]]);
-                if distinct.len() > 16 {
+            while let Some(&first) = inbox.first() {
+                let len = if fastpath::is_fastpath(first) {
+                    fastpath::frame_len(&inbox)
+                } else {
+                    justrdp_pdu::tpkt::frame_len(&inbox)
+                };
+                let Ok(len) = len else { break };
+                if inbox.len() < len {
                     break;
                 }
+                let frame: Vec<u8> = inbox.drain(..len).collect();
+                if fastpath::is_fastpath(first) {
+                    for section in fastpath::decode_updates(&frame).expect("fast-path frame") {
+                        *flags.entry(section.compression_flags).or_default() += 1;
+                    }
+                }
             }
-            assert!(
-                distinct.len() > 16,
-                "framebuffer is near-monochrome ({} colors) — decompression likely broken",
-                distinct.len()
-            );
-            let path = std::env::temp_dir().join("justrdp-454-mppc.ppm");
-            let mut ppm = format!(
-                "P6
-{} {}
-255
-",
-                fb.width(),
-                fb.height()
-            )
-            .into_bytes();
-            for px in fb.pixels().as_chunks::<4>().0 {
-                ppm.extend_from_slice(&px[..3]);
+            match tokio::time::timeout_at(deadline, stream.read(&mut readbuf)).await {
+                Ok(Ok(0)) => panic!("the server closed the session: {flags:?}"),
+                Ok(Ok(n)) => {
+                    inbox.extend_from_slice(&readbuf[..n]);
+                    fed += n;
+                    pending = feed_session(&mut machine, &readbuf[..n])
+                        .expect("every compressed update decompresses and decodes");
+                }
+                Ok(Err(e)) => panic!("read failed: {e}"),
+                Err(_) => break,
             }
-            std::fs::write(&path, ppm).expect("write the visual dump");
-            eprintln!("visual dump for confirmation: {}", path.display());
-        })
-        .await
+        }
+
+        let compressed: usize = flags
+            .iter()
+            .filter(|&(f, _)| f & 0x20 != 0 && f & 0x0F == ty)
+            .map(|(_, n)| n)
+            .sum();
+        let covered = painted.iter().filter(|&&p| p).count();
+        eprintln!(
+            "#{tag}: fast-path compressionFlags {flags:?}, painted {covered} of {} pixels, {fed} session bytes fed",
+            width * height
+        );
+        assert!(
+            compressed > 0,
+            "no type-{ty} compressed update arrived: {flags:?}"
+        );
+        assert_eq!(
+            covered,
+            width * height,
+            "every pixel of the desktop is painted"
+        );
+        let fb = machine.framebuffer();
+        let mut distinct = std::collections::HashSet::new();
+        for px in fb.pixels().as_chunks::<4>().0 {
+            distinct.insert([px[0], px[1], px[2]]);
+            if distinct.len() > 16 {
+                break;
+            }
+        }
+        assert!(
+            distinct.len() > 16,
+            "framebuffer is near-monochrome ({} colors) — decompression likely broken",
+            distinct.len()
+        );
+        let path = std::env::temp_dir().join(format!("justrdp-{tag}.ppm"));
+        let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+        for px in fb.pixels().as_chunks::<4>().0 {
+            ppm.extend_from_slice(&px[..3]);
+        }
+        std::fs::write(&path, ppm).expect("write the visual dump");
+        eprintln!("visual dump for confirmation: {}", path.display());
     }
 
     /// Caller policy for a *legacy-graphics* session: do NOT advertise

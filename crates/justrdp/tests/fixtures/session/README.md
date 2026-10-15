@@ -92,3 +92,33 @@ What the client advertised: the defaults as for `nscodec-surface-bits.bin`, plus
 `PACKET_FLUSHED` (none arrived), MPPC-8K (the server compresses nothing at type 0), compressed
 slow-path Share Data (none arrived), and NCRUSH / XCRUSH. The first three rest on the unit tests in
 `mppc.rs`, `bulk.rs` and `session.rs`.
+
+## `xcrush.bin`
+
+152 fast-path PDUs, 57 299 bytes: one logon's desktop sent XCRUSH (RDP 6.1) bulk-compressed.
+Captured 2026-10-15 for **#456** by `xcrush_compressed_updates_paint_the_desktop_on_the_real_vm`,
+carved like `mppc-64k.bin` (the first 59 306 bytes, fast-path PDUs only; the carve asserted that
+the dropped Share Data, three Save Session Info PDUs, carried no `PACKET_*` flag). The raw capture
+was deleted. What the client advertised: the defaults plus Client Info `COMPRESSION` with
+`CompressionTypeMask` 3.
+
+| Fast-path `compressionFlags` | Updates | | XCRUSH (L1, L2) flags | Updates |
+|---|---|---|---|---|
+| `0x00` | 124 | | `(0x11, 0x21)` `L1_INNER \| L1_COMPRESSED`, level-2 64K | 20 |
+| `0x23` (`PACKET_COMPRESSED`, RDP 6.1) | 34 | | `(0x12, 0x21)` `L1_INNER \| L1_NO_COMPRESSION` | 6 |
+| | | | `(0x11, 0x00)` level-2 ran but passed through | 5 |
+| | | | `(0x11, 0x61)` level-2 `PACKET_AT_FRONT` | 2 |
+| | | | `(0x11, 0xe1)` level-2 `PACKET_FLUSHED \| PACKET_AT_FRONT` | 1 |
+
+### What it pins that an argument could not
+
+- **Both levels match the server.** `real_server_xcrush.rs` asserts that the replay equals the live
+  framebuffer that was dumped and looked at; a copy with memmove semantics instead of byte by byte
+  breaks it.
+
+### What it cannot see
+
+`L1_PACKET_AT_FRONT` and a level-2 `PACKET_FLUSHED` without `PACKET_COMPRESSED` never arrived, so
+the replay is identical under either reading of each (measured: zero-filling on
+`L1_PACKET_AT_FRONT`, and FreeRDP's compressed-only level-2 gate, both still pass). Those two
+rules rest on the unit tests in `xcrush.rs` alone.
