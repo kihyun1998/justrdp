@@ -81,6 +81,24 @@ pub const HONOURED_SOUND_FLAGS: u16 = capability::SOUND_FLAG_BEEPS;
 /// The Surface Commands set's `cmdFlags` the core honours.
 pub const HONOURED_SURFACE_COMMANDS: u32 = capability::SURFCMDS_SET_SURFACE_BITS;
 
+/// The `orderSupport` entries the session paints: MemBlt and Mem3Blt (`crate::orders`).
+pub const HONOURED_ORDERS: [usize; 2] = [
+    capability::ORDER_NEG_MEMBLT_INDEX,
+    capability::ORDER_NEG_MEM3BLT_INDEX,
+];
+
+/// The Order set's `orderFlags` the core honours: the two the spec makes mandatory, the brush
+/// restriction, and the flag saying `orderSupportExFlags` is valid (it is sent as 0). Not
+/// `COLORINDEXSUPPORT`, which makes order colours palette indices at any depth.
+pub const HONOURED_ORDER_FLAGS: u16 = capability::ORDER_NEGOTIATE_SUPPORT
+    | capability::ORDER_ZERO_BOUNDS_DELTAS_SUPPORT
+    | 0x0040 // SOLIDPATTERNBRUSHONLY
+    | 0x0080; // ORDERFLAGS_EXTRA_FLAGS
+
+/// The Revision 2 Bitmap Cache `CacheFlags` the core honours: the waiting list, which the cache
+/// keeps as one extra entry per cache. Not persistent keys, which need a key store.
+pub const HONOURED_BITMAP_CACHE_REV2_FLAGS: u16 = capability::ALLOW_CACHE_WAITING_LIST_FLAG;
+
 /// The largest Multifragment Update `MaxRequestSize` the core honours: the session's fast-path
 /// reassembly cap at its floor, which no desktop size lowers.
 pub const HONOURED_MAX_REQUEST_SIZE: u32 = (1 << 20) + (64 << 10);
@@ -210,6 +228,47 @@ pub fn check(config: &ConnectConfig) -> Result<(), ConnectConfigError> {
             "surface commands require FASTPATH_OUTPUT_SUPPORTED in the General set (2.2.7.2.9)",
         );
     }
+    check_orders(&config.capabilities)
+}
+
+/// The rules between the drawing-order sets: what one set promises another must back.
+fn check_orders(sets: &[CapabilitySet]) -> Result<(), ConnectConfigError> {
+    let support = sets.iter().find_map(|set| match set {
+        CapabilitySet::Order(o) => Some(o.order_support),
+        _ => None,
+    });
+    let orders = support.is_some_and(|s| s.iter().any(|&order| order != 0));
+    let rev2 = sets.iter().find_map(|set| match set {
+        CapabilitySet::BitmapCacheRev2(c) => Some(c),
+        _ => None,
+    });
+    if rev2.is_some()
+        && sets
+            .iter()
+            .any(|set| matches!(set, CapabilitySet::BitmapCache(_)))
+    {
+        return refuse(
+            capability::CAPSET_BITMAP_CACHE_REV2,
+            "a client advertises one bitmap cache revision, not both",
+        );
+    }
+    let blts = support.is_some_and(|s| HONOURED_ORDERS.iter().all(|&index| s[index] != 0));
+    if rev2.is_some_and(|c| c.cells.iter().any(|cell| cell.entries != 0)) && !blts {
+        return refuse(
+            capability::CAPSET_BITMAP_CACHE_REV2,
+            "receiving Cache Bitmap (Revision 2) requires MemBlt and Mem3Blt (2.2.7.1.4.2)",
+        );
+    }
+    let depth = sets.iter().find_map(|set| match set {
+        CapabilitySet::Bitmap(b) => Some(b.preferred_bits_per_pixel),
+        _ => None,
+    });
+    if orders && depth.is_some_and(|bpp| bpp <= 8) {
+        return refuse(
+            capability::CAPSET_ORDER,
+            "orders at 8 bpp take their colours from the Color Table Cache, which is not kept",
+        );
+    }
     Ok(())
 }
 
@@ -228,10 +287,42 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
             capability::CAPSET_BITMAP,
             "drawingFlags outside the honoured set",
         ),
-        CapabilitySet::Order(o) if o.order_support.iter().any(|&order| order != 0) => refuse(
+        CapabilitySet::Order(o)
+            if o.order_support
+                .iter()
+                .enumerate()
+                .any(|(index, &order)| order != 0 && !HONOURED_ORDERS.contains(&index)) =>
+        {
+            refuse(
+                capability::CAPSET_ORDER,
+                "orderSupport enables a drawing order other than MemBlt and Mem3Blt",
+            )
+        }
+        CapabilitySet::Order(o) if o.order_flags & !HONOURED_ORDER_FLAGS != 0 => refuse(
             capability::CAPSET_ORDER,
-            "orderSupport enables drawing orders, which the session skips",
+            "orderFlags outside the honoured set",
         ),
+        CapabilitySet::BitmapCacheRev2(c)
+            if c.cache_flags & !HONOURED_BITMAP_CACHE_REV2_FLAGS != 0 =>
+        {
+            refuse(
+                capability::CAPSET_BITMAP_CACHE_REV2,
+                "CacheFlags outside the waiting list: persistent keys are not kept",
+            )
+        }
+        CapabilitySet::BitmapCacheRev2(c)
+            if c.cells.len() > capability::BITMAP_CACHE_REV2_MAX_CELLS
+                || c.cells.iter().any(|cell| cell.persistent)
+                || c.cells
+                    .iter()
+                    .zip(capability::BITMAP_CACHE_REV2_MAX_ENTRIES)
+                    .any(|(cell, max)| cell.entries > max) =>
+        {
+            refuse(
+                capability::CAPSET_BITMAP_CACHE_REV2,
+                "more than five caches, a persistent cache, or more entries than 2.2.7.1.4.2 allows",
+            )
+        }
         CapabilitySet::BitmapCache(c) if c.caches.iter().any(|&(entries, _)| entries != 0) => {
             refuse(
                 capability::CAPSET_BITMAP_CACHE,
@@ -681,10 +772,156 @@ mod tests {
         }
     }
 
+    /// The default sets with drawing orders on (#460): MemBlt and Mem3Blt, a Revision 2 cache
+    /// laid out as `[MS-RDPEGDI]` 3.1.1.1.1's default at 16 bpp in place of the Revision 1 set.
+    pub(crate) fn with_orders(capabilities: &mut Vec<CapabilitySet>) {
+        capabilities.retain(|set| !matches!(set, CapabilitySet::BitmapCache(_)));
+        for set in capabilities.iter_mut() {
+            match set {
+                CapabilitySet::Order(o) => {
+                    o.order_support[capability::ORDER_NEG_MEMBLT_INDEX] = 1;
+                    o.order_support[capability::ORDER_NEG_MEM3BLT_INDEX] = 1;
+                }
+                CapabilitySet::Bitmap(b) => b.preferred_bits_per_pixel = 16,
+                _ => {}
+            }
+        }
+        capabilities.push(CapabilitySet::BitmapCacheRev2(
+            capability::BitmapCacheRev2CapabilitySet {
+                cache_flags: 0,
+                cells: [120, 120, 2553]
+                    .map(|entries| capability::BitmapCacheCellInfo {
+                        entries,
+                        persistent: false,
+                    })
+                    .to_vec(),
+            },
+        ));
+    }
+
+    fn orders_config() -> ConnectConfig {
+        let mut config = config();
+        with_orders(&mut config.capabilities);
+        config
+    }
+
+    #[test]
+    fn memblt_and_mem3blt_from_a_rev2_cache_pass() {
+        assert_eq!(check(&orders_config()), Ok(()));
+        let mut config = orders_config();
+        for set in &mut config.capabilities {
+            if let CapabilitySet::BitmapCacheRev2(c) = set {
+                c.cache_flags = capability::ALLOW_CACHE_WAITING_LIST_FLAG;
+                c.cells = capability::BITMAP_CACHE_REV2_MAX_ENTRIES
+                    .map(|entries| capability::BitmapCacheCellInfo {
+                        entries,
+                        persistent: false,
+                    })
+                    .to_vec();
+            }
+        }
+        assert_eq!(check(&config), Ok(()));
+    }
+
+    /// Each way an order advertisement promises what the session does not keep is refused.
+    #[test]
+    fn order_advertisements_past_what_the_session_keeps_are_refused() {
+        type Edit = fn(&mut CapabilitySet);
+        let cases: [(&str, Edit, u16); 8] = [
+            (
+                "ScrBlt",
+                |set| {
+                    if let CapabilitySet::Order(o) = set {
+                        o.order_support[0x02] = 1;
+                    }
+                },
+                capability::CAPSET_ORDER,
+            ),
+            (
+                "COLORINDEXSUPPORT",
+                |set| {
+                    if let CapabilitySet::Order(o) = set {
+                        o.order_flags |= 0x0020;
+                    }
+                },
+                capability::CAPSET_ORDER,
+            ),
+            (
+                "no Mem3Blt",
+                |set| {
+                    if let CapabilitySet::Order(o) = set {
+                        o.order_support[capability::ORDER_NEG_MEM3BLT_INDEX] = 0;
+                    }
+                },
+                capability::CAPSET_BITMAP_CACHE_REV2,
+            ),
+            (
+                "persistent keys",
+                |set| {
+                    if let CapabilitySet::BitmapCacheRev2(c) = set {
+                        c.cache_flags |= capability::PERSISTENT_KEYS_EXPECTED_FLAG;
+                    }
+                },
+                capability::CAPSET_BITMAP_CACHE_REV2,
+            ),
+            (
+                "a persistent cell",
+                |set| {
+                    if let CapabilitySet::BitmapCacheRev2(c) = set {
+                        c.cells[2].persistent = true;
+                    }
+                },
+                capability::CAPSET_BITMAP_CACHE_REV2,
+            ),
+            (
+                "too many entries",
+                |set| {
+                    if let CapabilitySet::BitmapCacheRev2(c) = set {
+                        c.cells[0].entries = 601;
+                    }
+                },
+                capability::CAPSET_BITMAP_CACHE_REV2,
+            ),
+            (
+                "six caches",
+                |set| {
+                    if let CapabilitySet::BitmapCacheRev2(c) = set {
+                        c.cells
+                            .resize(6, capability::BitmapCacheCellInfo::default());
+                    }
+                },
+                capability::CAPSET_BITMAP_CACHE_REV2,
+            ),
+            (
+                "8 bpp",
+                |set| {
+                    if let CapabilitySet::Bitmap(b) = set {
+                        b.preferred_bits_per_pixel = 8;
+                    }
+                },
+                capability::CAPSET_ORDER,
+            ),
+        ];
+        for (name, edit, set_type) in cases {
+            let mut config = orders_config();
+            config.capabilities.iter_mut().for_each(edit);
+            assert_eq!(refused_type(check(&config)), Some(set_type), "{name}");
+        }
+        let mut both = orders_config();
+        both.capabilities.push(CapabilitySet::BitmapCache(
+            BitmapCacheCapabilitySet::default(),
+        ));
+        assert_eq!(
+            refused_type(check(&both)),
+            Some(capability::CAPSET_BITMAP_CACHE_REV2),
+            "both revisions"
+        );
+    }
+
     /// A set the core cannot read cannot be judged, so it is refused.
     #[test]
     fn an_unreadable_capability_set_is_refused() {
-        for set_type in [0x0005, 0x001B, 0x0013, 0x001E] {
+        for set_type in [0x0005, 0x001B, 0x0012, 0x001E] {
             assert_eq!(
                 with_set(CapabilitySet::Unknown {
                     set_type,

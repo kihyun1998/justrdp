@@ -57,8 +57,8 @@ a recurrence test.
 - **Only `.md` files in this repo are nodes.** Issues, epics and source files are
   *text inside* notes, never nodes — so the graph cannot show you the hottest things
   in this repo (epics #10–#29, #45, #158) as first-class objects.
-- **The verified external-fact store covers 10 territories of 21** (re-derived in #386). `## Reference
-  behaviour` reads `**None.**` in the other **11** — derived by the `rg` command under
+- **The verified external-fact store covers 15 territories of 23** (re-derived in #460). `## Reference
+  behaviour` reads `**None.**` in the other **8** — derived by the `rg` command under
   *Conventions*, not counted by hand. ADR-0003's byte-exactness ranking and ADR-0009's
   receive-path posture both depend on exactly that comparison, so this remains the map's
   single largest finding; it is now a shrinking one rather than a total one.
@@ -119,6 +119,7 @@ Territories: [x224-negotiation](territory/x224-negotiation.md) ·
 [capability-exchange-activation](territory/capability-exchange-activation.md) ·
 [licensing](territory/licensing.md) ·
 [session-loop-dispatch](territory/session-loop-dispatch.md) ·
+[drawing-orders](territory/drawing-orders.md) ·
 [logon-session-info](territory/logon-session-info.md) ·
 [framebuffer-frame-delivery](territory/framebuffer-frame-delivery.md) ·
 [egfx-graphics-pipeline](territory/egfx-graphics-pipeline.md) ·
@@ -175,9 +176,10 @@ ls docs/map/territory/ docs/map/invariant/                                     #
 
 ## Coverage
 
-**Complete for what is built**, as of 2026-09-21: 19 territories covering the
-connect sequence, the session loop, the logon notifications, the graphics path, input,
-channels, the wire layer, the adapter, verification and the supply chain. Unbuilt protocol areas
-(clipboard, audio, redirection, drawing orders, RD Gateway, H.264, multi-monitor…)
+**Complete for what is built**, as of 2026-10-15: 23 territories covering the
+connect sequence, the session loop, the logon notifications, the graphics path and its drawing
+orders, input, channels and redirection, audio, the wire layer, the adapter, verification and the
+supply chain. Unbuilt protocol areas
+(RD Gateway, H.264, multi-monitor…)
 have **no territory** — they live as `epic` issues in the tracker (the roster), and a
 territory appears when the first slice lands.

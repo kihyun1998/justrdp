@@ -125,6 +125,19 @@ grep 'client_common_save_session_info' fr.log   # Logon Info, and whether a cook
   sets `SupportGraphicsPipeline` to TRUE whatever the switch's sign. For a legacy session omit
   `/gfx` and pass `/network:lan`, since an unset connection type autodetects and enables the
   pipeline too. The tell is `gdi_ResetGraphics` in the log, which only the pipeline calls.
+- **Drawing orders log under `com.freerdp.core.update`, not `core.rdp`** (#22, FreeRDP 3.32.1,
+  which apt had moved WSL to by 2026-10-15). Every received order is a DEBUG line
+  `Primary|Secondary|Alternate Secondary Drawing Order [0xNN] Name`, so the census filter is
+  `WLOG_FILTER=com.freerdp.core.update:DEBUG,com.freerdp.core.rdp:DEBUG`; a primary order logs
+  two lines (its name, then its ROP), so count one of them. For an order session also pass
+  `-nsc -rfx` (at 32 bpp the VM otherwise paints NSCodec Set Surface Bits) and
+  `/cache:bitmap:on`, without which the server sends no order at all. **At 24 and 32 bpp that
+  cache gets the connection reset** right after activation (#463); `/bpp:16` works.
+- **`wsl.exe` re-parses its arguments, so `$` inside them is expanded by the WSL shell first.** A
+  script written with `wsl -- bash -lc '… cat > f <<"EOF" … $tag …'` lost every `$` variable
+  and wrote its log to `.log`. Write the script on the Windows side and `cp` it from `/mnt/c`, and
+  quote `~` (`bash -lc '~/x.sh'`) when calling it from Git Bash, which otherwise expands it to
+  the Windows home.
 
 **What FreeRDP sends, not only what it receives** (#306). `/dump:record,file:<path>` writes every
 PDU **before TLS**, in both directions, as records of `u64` tick, `u8` direction, `u32` CRC,

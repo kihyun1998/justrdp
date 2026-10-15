@@ -68,6 +68,8 @@ about what we owe; both start at the same bytes.
   (#321): a format announced is a Format Data Request the server may send.
 - [MCS / GCC channel setup](../territory/mcs-gcc-channel-setup.md) — the early capability
   flags, where advertising `SUPPORT_DYN_VC_GFX_PROTOCOL` is what makes EGFX exist at all.
+- [Drawing orders](../territory/drawing-orders.md) — a Revision 2 bitmap cache obliges MemBlt
+  and Mem3Blt both (#460).
 
 ## What a violation looks like
 
@@ -148,6 +150,13 @@ rather than by capability:
   Commands and NSCodec without a Multifragment Update set made this VM close the session with Set
   Error Info `0x112F` before any surface bits, so the Multifragment set went into the defaults as a
   condition of the other two rather than as a feature of its own.
+
+- **#460** — the first drawing orders, and the obligation sat in the *other* set's text again.
+  The census showed MemBlt and Cache Bitmap (Revision 2) only, and the slice was filed as
+  exactly that; `[MS-RDPBCGR]` 2.2.7.1.4.2, the cache set's own section, says a client MUST
+  support MemBlt **and Mem3Blt** to receive Cache Bitmap (Revision 2). Zero Mem3Blt in the
+  census did not discharge it, so the slice took the brush path and `check_orders` refuses a
+  cache without both blits. Same shape as #296: the traffic seen is not the traffic owed.
 
 ## Where it will recur
 

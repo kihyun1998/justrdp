@@ -148,3 +148,40 @@ advertised: the defaults plus Client Info `COMPRESSION` with `CompressionTypeMas
 `PACKET_FLUSHED` (none arrived), and whether the slid-back history's second half is zeroed: no copy
 after a slide reached it, so leaving it unzeroed replays identically. Both rest on the unit tests in
 `ncrush.rs`.
+
+## `memblt.bin`
+
+172 fast-path PDUs, 150 925 bytes: one logon's desktop painted in drawing orders from a Revision 2
+bitmap cache. Captured 2026-10-15 for **#460** by `memblt_orders_paint_the_desktop_on_the_real_vm`
+through `JUSTRDP_SESSION_CAPTURE_FILE`, carved to the test's own session (the first 152 932 bytes,
+the count the test printed) and then to its **fast-path PDUs only**. The raw capture was deleted.
+The five dropped TPKT frames were three Save Session Info PDUs and two clipboard channel PDUs; none
+was an Orders Update, so no order the history depends on is missing.
+
+What the client advertised: the defaults without Surface Commands, Bitmap Codecs or the Revision 1
+set; `orderSupport` MemBlt and Mem3Blt; a Revision 2 set of three caches with 120, 120 and 2553
+entries, no waiting list, nothing persistent; 16 bpp in both the Bitmap set and `highColorDepth`.
+
+| What | Count |
+|---|---|
+| Orders updates (`FP_UPDATE_ORDERS`), all unfragmented | 39 |
+| Cache Bitmap (Revision 2), all compressed, 16 bpp, cache 2 | 188 |
+| MemBlt, all `SRCCOPY` | 1495 |
+| Mem3Blt, any other order, slow-path Orders updates | 0 |
+
+### What it pins that an argument could not
+
+- **The cache fills decode and the blits land.** `real_server_memblt.rs` asserts that the replay
+  equals the live framebuffer that was dumped and looked at (icons, taskbar, Korean text, clock).
+  Storing a fill bottom-up, or a field history that drifts by one order, changes it.
+
+### What it cannot see
+
+Every MemBlt used its source's full height, so reading `nYSrc` the spec's inverted way replays
+identically (measured by mutation); every ROP is SRCCOPY, so no destination or brush is read;
+nothing went to the waiting list or carried bounds. All of that rests on the unit tests in
+`justrdp-pdu`'s and `justrdp`'s `orders.rs`.
+
+### What it depends on
+
+**16 bpp.** At 24 and 32 bpp the same advertisement from FreeRDP got the connection reset (#463).

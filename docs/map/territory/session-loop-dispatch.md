@@ -287,6 +287,8 @@ Measured with throwaway probes and by mutating the adapter's command handler
 - [Framebuffer & frame delivery](framebuffer-frame-delivery.md) — every bitmap
   update lands there, and the frame-sink contract is shared.
 - [Bitmap codecs](bitmap-codecs.md) — slow-path bitmap updates route here by codec.
+- [Drawing orders](drawing-orders.md) — Orders Updates on both transports go to
+  `Orders::apply` within the update's paint budget, and a reactivation resets their history.
 - [EGFX graphics pipeline](egfx-graphics-pipeline.md) — EGFX traffic arrives as DVC
   data through this loop.
 - [Virtual channels](virtual-channels.md) — `drdynvc` framing and display control
@@ -306,9 +308,8 @@ Measured with throwaway probes and by mutating the adapter's command handler
 
 - ~~**Static channel 1004 traffic is dropped**, with no record of what is being
   dropped or when that stops being acceptable.~~ **Closed in #307.**
-- Drawing orders (epic #22), clipboard (#10), audio (#11/#12), device redirection
-  (#13) all dispatch through here and none exist — the dispatch table is a small
-  fraction of the protocol's surface.
+- Drawing orders dispatch through here on both transports since #460, the bitmap cache path
+  alone ([drawing orders](drawing-orders.md)); every other order is unbuilt (epic #22).
 - Auto-reconnect on transient disconnect is unbuilt: `classify`
   distinguishes the cases, and nothing acts on the distinction. When to reconnect is the
   host's reconnect strategy; the cookie it needs shipped in #306.

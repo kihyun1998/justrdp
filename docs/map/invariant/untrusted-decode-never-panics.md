@@ -54,6 +54,10 @@ property of the whole untrusted surface.
   #304, whose artifact was a captured fixture; the proptest and fuzz target came with #354.
 - [Input & platform scancode tables](../territory/input-scancodes.md) — `KeyboardIndicators`,
   the one server-to-client parser in `input`. Edge and both artifacts added by #354.
+- [Drawing orders](../territory/drawing-orders.md) — a primary order is decoded against state
+  the previous orders left, so the properties drive sequences, not single orders:
+  `orders_never_panic` in both `orders` modules, and the `orders` and `session_orders` fuzz
+  targets. Edge and artifacts added by #460.
   Edge added by #237; the code has carried both artifacts since #200.
 - [Verification harness](../territory/verification-harness.md) — the only territory
   that *enforces* rather than obeys it: proptest in the PR gate, cargo-fuzz nightly.
