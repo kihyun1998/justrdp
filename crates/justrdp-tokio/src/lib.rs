@@ -756,7 +756,8 @@ impl core::error::Error for SessionFailure {}
 /// Build the machine from the connect results:
 /// [`SessionStateMachine::new`] with a `SessionConfig` assembled from
 /// [`ConnectOutcome::mcs`] / [`ConnectOutcome::activation`] (including
-/// `activation.leftover`), then pass [`ConnectOutcome::stream`].
+/// `activation.leftover`, and `server` from [`justrdp::ServerAnnouncement::from_capabilities`]
+/// over `activation.server_capabilities`), then pass [`ConnectOutcome::stream`].
 ///
 /// Runs until the transport ends, returning the typed [`DisconnectReason`] (issue #42): the
 /// server's Set Error Info / MCS ultimatum attribution when one arrived before the close,
@@ -4272,10 +4273,10 @@ mod tests {
                 .id;
             let session_config = session_config_from(&outcome, session_capabilities);
             assert!(
-                session_config.server_input_flags & justrdp_pdu::capability::INPUT_FLAG_UNICODE
+                session_config.server.input_flags & justrdp_pdu::capability::INPUT_FLAG_UNICODE
                     != 0,
                 "this VM accepts Unicode input; flags={:#06x}",
-                session_config.server_input_flags
+                session_config.server.input_flags
             );
             let desktop = session_config.desktop_size;
             let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
@@ -8229,39 +8230,21 @@ mod tests {
         .await
     }
 
-    /// Assemble the [`justrdp::SessionConfig`] from a connect outcome — including the server's
-    /// Input capability flags, which pick the input transport (fast-path vs slow-path), and its
-    /// General set's Refresh Rect / Suppress Output support.
+    /// Assemble the [`justrdp::SessionConfig`] from a connect outcome, the server's part through
+    /// [`justrdp::ServerAnnouncement::from_capabilities`].
     fn session_config_from(
         outcome: &ConnectOutcome,
         capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
     ) -> justrdp::SessionConfig {
-        let server_input_flags = outcome
-            .activation
-            .server_capabilities
-            .iter()
-            .find_map(|set| match set {
-                justrdp_pdu::capability::CapabilitySet::Input(input) => Some(input.input_flags),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let general = outcome
-            .activation
-            .server_capabilities
-            .iter()
-            .find_map(|set| match set {
-                justrdp_pdu::capability::CapabilitySet::General(general) => Some(general),
-                _ => None,
-            });
         justrdp::SessionConfig {
             user_channel_id: outcome.mcs.user_channel_id,
             io_channel_id: outcome.mcs.io_channel_id,
             share_id: outcome.activation.share_id,
             desktop_size: outcome.activation.desktop_size,
             capabilities,
-            server_input_flags,
-            server_refresh_rect: general.is_some_and(|g| g.refresh_rect_support != 0),
-            server_suppress_output: general.is_some_and(|g| g.suppress_output_support != 0),
+            server: justrdp::ServerAnnouncement::from_capabilities(
+                &outcome.activation.server_capabilities,
+            ),
             drdynvc_channel_id: outcome
                 .mcs
                 .static_channels
@@ -9769,9 +9752,7 @@ mod tests {
                 share_id: 0x0001_03EA,
                 desktop_size: (16, 8),
                 capabilities: Vec::new(),
-                server_input_flags: 0,
-                server_refresh_rect: false,
-                server_suppress_output: false,
+                server: justrdp::ServerAnnouncement::default(),
                 drdynvc_channel_id: None,
                 static_channels: Vec::new(),
                 dynamic_channels: Vec::new(),
@@ -9825,9 +9806,7 @@ mod tests {
             share_id: 0x0001_03EA,
             desktop_size: (16, 8),
             capabilities: Vec::new(),
-            server_input_flags: 0,
-            server_refresh_rect: false,
-            server_suppress_output: false,
+            server: justrdp::ServerAnnouncement::default(),
             drdynvc_channel_id: None,
             static_channels: vec![justrdp::StaticChannel {
                 name: "cliprdr".to_string(),
@@ -9965,9 +9944,7 @@ mod tests {
                         pointer_cache_size: 20,
                     },
                 )],
-                server_input_flags: 0,
-                server_refresh_rect: false,
-                server_suppress_output: false,
+                server: justrdp::ServerAnnouncement::default(),
                 drdynvc_channel_id: None,
                 static_channels: Vec::new(),
                 dynamic_channels: Vec::new(),
@@ -10036,9 +10013,7 @@ mod tests {
                 share_id: 0x0001_03EA,
                 desktop_size: (16, 8),
                 capabilities: Vec::new(),
-                server_input_flags: 0,
-                server_refresh_rect: false,
-                server_suppress_output: false,
+                server: justrdp::ServerAnnouncement::default(),
                 drdynvc_channel_id: None,
                 static_channels: Vec::new(),
                 dynamic_channels: Vec::new(),
@@ -12034,7 +12009,7 @@ mod tests {
         let desktop = outcome.activation.desktop_size;
         let session_config = session_config_from(&outcome, session_capabilities);
         assert!(
-            session_config.server_refresh_rect && session_config.server_suppress_output,
+            session_config.server.refresh_rect && session_config.server.suppress_output,
             "the server's General set announced neither or only one of Refresh Rect / Suppress \
              Output: {session_config:?}"
         );
@@ -12534,12 +12509,12 @@ mod tests {
             let outcome = vm.connect(config).await;
             let session_config = session_config_from(&outcome, session_capabilities);
             assert!(
-                session_config.server_input_flags
+                session_config.server.input_flags
                     & (justrdp_pdu::capability::INPUT_FLAG_FASTPATH_INPUT
                         | justrdp_pdu::capability::INPUT_FLAG_FASTPATH_INPUT2)
                     != 0,
                 "this VM advertises fast-path input; flags={:#06x}",
-                session_config.server_input_flags
+                session_config.server.input_flags
             );
             let desktop = session_config.desktop_size;
             let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
@@ -12770,7 +12745,7 @@ mod tests {
         .await
     }
 
-    /// Real-VM test for the slow-path input fallback: force `server_input_flags` to
+    /// Real-VM test for the slow-path input fallback: force `server.input_flags` to
     /// scancodes-only so the machine wraps the same events in slow-path Input Event PDUs
     /// (TS_INPUT_PDU_DATA over the share/MCS stack), and verify the live server accepts them —
     /// graphics follow the input and the session survives.
@@ -12786,7 +12761,7 @@ mod tests {
             let outcome = vm.connect(config).await;
             let mut session_config = session_config_from(&outcome, session_capabilities);
             // The fallback seam under test: pretend the server never advertised fast-path input.
-            session_config.server_input_flags = justrdp_pdu::capability::INPUT_FLAG_SCANCODES;
+            session_config.server.input_flags = justrdp_pdu::capability::INPUT_FLAG_SCANCODES;
             let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
                 .expect("the test desktop size is within MAX_DESKTOP_DIM");
             let mut stream = outcome.stream;

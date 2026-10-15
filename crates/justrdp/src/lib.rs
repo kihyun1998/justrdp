@@ -57,8 +57,8 @@ pub use justrdp_pdu::session_info::{
 // `ResizeRequest` carries these (issue #356).
 pub use justrdp_pdu::displaycontrol::{DeviceScaleFactor, Orientation};
 pub use session::{
-    ChannelSendError, OutputControlError, ResizeError, ResizeRequest, SessionConfig, SessionError,
-    SessionOutput, SessionStateMachine,
+    ChannelSendError, OutputControlError, ResizeError, ResizeRequest, ServerAnnouncement,
+    SessionConfig, SessionError, SessionOutput, SessionStateMachine,
 };
 
 // The host dynamic channel seam's errors (ADR-0018).

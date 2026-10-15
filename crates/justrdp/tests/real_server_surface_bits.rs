@@ -23,9 +23,10 @@ fn machine() -> SessionStateMachine {
             share_id: 0x0001_03EA,
             desktop_size: (1280, 800),
             capabilities: capability::default_client_capabilities(&core),
-            server_input_flags: capability::INPUT_FLAG_SCANCODES,
-            server_refresh_rect: false,
-            server_suppress_output: false,
+            server: justrdp::ServerAnnouncement {
+                input_flags: capability::INPUT_FLAG_SCANCODES,
+                ..Default::default()
+            },
             drdynvc_channel_id: None,
             static_channels: Vec::new(),
             dynamic_channels: Vec::new(),

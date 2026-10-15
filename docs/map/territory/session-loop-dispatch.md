@@ -39,10 +39,14 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   round-trips through capability exchange while the session's caches survive,
   because caches belong to the connection rather than the share.
 - **A reactivation replaces every server announcement the session acts on** (#438, #443): the
-  share ID, the desktop size, the General set's `refreshRectSupport` / `suppressOutputSupport`,
-  and the Input set's `inputFlags`, which pick the input transport. A Demand Active without the
-  set announces nothing: no Refresh Rect, no Suppress Output, `inputFlags` 0 (slow-path), the
-  rule the adapter applies at connect. FreeRDP re-derives its input settings from the Input set
+  share ID, the desktop size, and the `ServerAnnouncement`: the General set's
+  `refreshRectSupport` / `suppressOutputSupport` and the Input set's `inputFlags`, which pick the
+  input transport. One rule reads it on both legs (#450): `ServerAnnouncement::from_capabilities`,
+  which the host calls at connect over `ActivationResult::server_capabilities` and the session
+  calls at reactivation. A Demand Active without the set announces nothing: no Refresh Rect, no
+  Suppress Output, `inputFlags` 0 (slow-path); a repeated set counts once, the first. The single
+  constructor was the maintainer's call in #450's triage, over a free helper beside loose fields
+  and over `SessionStateMachine::new` deriving them itself. FreeRDP re-derives its input settings from the Input set
   of every Demand Active it reads (`rdp_read_input_capability_set`, `libfreerdp/core/capabilities.c`).
   Measured on the WS2019 VM: `inputFlags` is `0x0375` at connect and after a Display Control
   resize reactivation (one run, #443's triage), so the transport switch is proven at unit level
@@ -110,7 +114,7 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 
 ## Code
 
-- `justrdp/src/session.rs` — `SessionStateMachine`, `SessionConfig`, `SessionOutput`,
+- `justrdp/src/session.rs` — `SessionStateMachine`, `SessionConfig`, `ServerAnnouncement`, `SessionOutput`,
   `SessionError`, `Phase`, `ResizeError`, `cursor_event_for`, `request_shutdown`,
   `apply_surface_bits` (#150), `PAINT_BUDGET_FRAMEBUFFERS`, `apply_bitmap_update`,
   `note_paint_budget` (#367)

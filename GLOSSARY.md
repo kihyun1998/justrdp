@@ -37,6 +37,12 @@ The end of a Deactivation: the Session is live again on the newly negotiated cap
 often a new desktop size.
 _Avoid_: reconnect (a new Connection, not the same Session)
 
+**Server Announcement**:
+What the server's Demand Active capability sets tell the Session it may do: the input transport
+(`inputFlags`) and whether Refresh Rect and Suppress Output are invited. Read by one rule at
+connect and at every Reactivation.
+_Avoid_: server capabilities (the full set list, most of which the Session never reads)
+
 ### Shape of the library
 
 **Sans-IO Core**:
