@@ -343,3 +343,12 @@ path = "fuzz_targets/input.rs"
 test = false
 doc = false
 bench = false
+
+# mppc (#454): RDP 4.0/5.0 bulk decompression, the decoder every compressed fast-path update
+# crosses.
+[[bin]]
+name = "mppc"
+path = "fuzz_targets/mppc.rs"
+test = false
+doc = false
+bench = false

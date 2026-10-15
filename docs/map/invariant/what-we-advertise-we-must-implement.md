@@ -102,8 +102,11 @@ rather than by capability:
   skipping it.
 - **#253** was the same fact one layer down: a Share Data header field whose "must be 0"
   rested on our never advertising compression, unverified at the boundary, where the DVC layer
-  rejected the identical violation. Closed — `ShareDataHeader::decode` now refuses
-  `PACKET_COMPRESSED`, the same answer fast-path and the SVC layer give.
+  rejected the identical violation. Closed — `ShareDataHeader::decode` refused
+  `PACKET_COMPRESSED`, the same answer fast-path and the SVC layer gave. **#454** turned the
+  refusal into an obligation discharged: the host may advertise MPPC 8K/64K, the session
+  decompresses both, and every higher type stays refused at the advertisement (`advertise.rs`)
+  and as `BulkError::UnsupportedType` on the wire.
 - **#287** — the drdynvc capabilities version, one layer below #271 and the same shape: answered
   as 3, whose only obligation is decompressing Cmd 6/7, while those commands were skipped. It had
   been raised from 1 to 3 on a recorded server refusal of 1 that a 2026-09-15 control run no

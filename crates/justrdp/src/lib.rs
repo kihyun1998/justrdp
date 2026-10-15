@@ -18,6 +18,7 @@
 pub mod advertise;
 pub mod audin;
 mod auto_reconnect;
+pub mod bulk;
 pub mod cliprdr;
 pub mod connect;
 pub mod cursor;

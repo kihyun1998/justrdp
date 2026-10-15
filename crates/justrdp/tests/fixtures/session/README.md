@@ -56,3 +56,39 @@ tests in `surface_commands.rs` and `session.rs`.
 **The VM's *Limit maximum color depth* policy at 32 bpp**, set on 2026-10-01. Until then the server
 capped every non-EGFX session at 16 bpp and sent no Surface Bits at all, to justrdp or to FreeRDP
 3.31 (`+nsc /bpp:32`). A VM rebuilt without the policy reproduces none of this.
+
+## `mppc-64k.bin`
+
+171 fast-path PDUs, 64 983 bytes: one logon's desktop sent MPPC-64K bulk-compressed. Captured
+2026-10-15 for **#454** by `mppc_compressed_updates_paint_the_desktop_on_the_real_vm` through
+`JUSTRDP_SESSION_CAPTURE_FILE`, carved to the test's own session (the first 66 990 bytes, the
+count the test printed) and then to its **fast-path PDUs only**. The raw capture was deleted.
+
+The five TPKT frames were dropped for the same reason as above: three Save Session Info PDUs, one
+of which may hold an auto-reconnect cookie, and two TPKT frames that were not I/O-channel Share Data. Dropping them leaves
+the bulk history intact only because none carries a `PACKET_*` flag: the carve asserted that every
+dropped Share Data PDU had `compressedType` with no flag bit, since fast-path and slow-path share
+one history.
+
+What the client advertised: the defaults as for `nscodec-surface-bits.bin`, plus Client Info
+`COMPRESSION` with `CompressionTypeMask` 1 (64K).
+
+| `compressionFlags` | Updates |
+|---|---|
+| `0x00` (no flags) | 139 |
+| `0x21` (`PACKET_COMPRESSED`, 64K) | 33 |
+| `0x61` (plus `PACKET_AT_FRONT`) | 5 |
+
+### What it pins that an argument could not
+
+- **The decompression matches the server's history.** `real_server_mppc.rs` asserts that the
+  replay's framebuffer equals the live session's, hashed from the dump that was rendered and looked
+  at (icons, taskbar, clock). A wrong copy-offset range or a history that skips a PDU changes it.
+- **`ActivationResult::leftover` held nothing the history needs.** The capture starts after it, and
+  the replay still matches the live framebuffer.
+
+### What it cannot see
+
+`PACKET_FLUSHED` (none arrived), MPPC-8K (the server compresses nothing at type 0), compressed
+slow-path Share Data (none arrived), and NCRUSH / XCRUSH. The first three rest on the unit tests in
+`mppc.rs`, `bulk.rs` and `session.rs`.

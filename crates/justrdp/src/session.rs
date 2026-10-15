@@ -515,6 +515,8 @@ pub enum SessionError {
     Pointer(pointer_codec::PointerError),
     /// NSCodec bitmap data in a Set Surface Bits command failed to decode.
     Nscodec(nscodec::NscError),
+    /// A bulk-compressed update or Share Data PDU failed to decompress.
+    Bulk(crate::bulk::BulkError),
 }
 
 impl core::fmt::Display for SessionError {
@@ -531,6 +533,7 @@ impl core::fmt::Display for SessionError {
             SessionError::Color(e) => write!(f, "pixel conversion: {e}"),
             SessionError::Pointer(e) => write!(f, "pointer shape: {e}"),
             SessionError::Nscodec(e) => write!(f, "NSCodec surface bits: {e}"),
+            SessionError::Bulk(e) => write!(f, "bulk decompression: {e}"),
             SessionError::Framebuffer {
                 channel: Some(channel),
                 error,
@@ -591,6 +594,8 @@ pub struct SessionStateMachine {
     /// the update code in flight (fragments of one update are never interleaved with
     /// another's — MS-RDPBCGR 2.2.9.1.2.1).
     fragment: Option<(u8, Vec<u8>)>,
+    /// The connection's server-to-client bulk decompression context ([`crate::bulk`]).
+    bulk: crate::bulk::Bulk,
     /// The pointer cache (issue #41), sized from the Pointer capability set the caller
     /// advertised — Color/New shapes store into it, Cached re-selects from it. It survives
     /// deactivation–reactivation (the cache belongs to the connection, not the share).
@@ -684,6 +689,7 @@ impl SessionStateMachine {
             phase: Phase::Active,
             inbox: leftover,
             fragment: None,
+            bulk: crate::bulk::Bulk::default(),
             cursor_cache: vec![None; usize::from(cache_size)],
             error_info: None,
             ultimatum_reason: None,
@@ -777,6 +783,12 @@ impl SessionStateMachine {
         outputs: &mut Vec<SessionOutput>,
     ) -> Result<(), SessionError> {
         for section in fastpath::decode_updates(frame).map_err(SessionError::Decode)? {
+            // Before anything can skip the update: its bytes are part of the shared history.
+            let data = self
+                .bulk
+                .decompress(section.data, section.compression_flags)
+                .map_err(SessionError::Bulk)?
+                .to_vec();
             let starts = matches!(
                 section.fragmentation,
                 fastpath::FP_FRAGMENT_SINGLE | fastpath::FP_FRAGMENT_FIRST
@@ -790,9 +802,9 @@ impl SessionStateMachine {
                 ));
             }
             let complete: Option<(u8, Vec<u8>)> = match section.fragmentation {
-                fastpath::FP_FRAGMENT_SINGLE => Some((section.code, section.data.to_vec())),
+                fastpath::FP_FRAGMENT_SINGLE => Some((section.code, data)),
                 fastpath::FP_FRAGMENT_FIRST => {
-                    self.fragment = Some((section.code, section.data.to_vec()));
+                    self.fragment = Some((section.code, data));
                     None
                 }
                 fastpath::FP_FRAGMENT_NEXT | fastpath::FP_FRAGMENT_LAST => {
@@ -807,7 +819,7 @@ impl SessionStateMachine {
                                 * 4
                                 + (64 << 10))
                                 .max(crate::advertise::HONOURED_MAX_REQUEST_SIZE as usize);
-                            if buffer.len() + section.data.len() > cap {
+                            if buffer.len() + data.len() > cap {
                                 return Err(SessionError::Decode(
                                     justrdp_pdu::DecodeError::InvalidField {
                                         field: "TS_FP_UPDATE.fragmentation",
@@ -815,7 +827,7 @@ impl SessionStateMachine {
                                     },
                                 ));
                             }
-                            buffer.extend_from_slice(section.data);
+                            buffer.extend_from_slice(&data);
                         }
                         // A continuation without a matching FIRST: protocol desync.
                         _ => {
@@ -1028,13 +1040,51 @@ impl SessionStateMachine {
         }
     }
 
-    /// Handle a Share Data PDU.
+    /// Handle a Share Data PDU: decompress its body through the connection's bulk context,
+    /// then dispatch it.
     fn on_data_pdu(
         &mut self,
         cur: &mut ReadCursor<'_>,
         outputs: &mut Vec<SessionOutput>,
     ) -> Result<(), SessionError> {
         let data = share::ShareDataHeader::decode(cur).map_err(SessionError::Decode)?;
+        if data.compressed_type & share::PACKET_COMPRESSED == 0 {
+            // The body is plain; any PACKET_FLUSHED / PACKET_AT_FRONT still reach the history.
+            self.bulk
+                .decompress(&[], data.compressed_type)
+                .map_err(SessionError::Bulk)?;
+            return self.on_share_data(data, cur, outputs);
+        }
+        let len = usize::from(data.compressed_length)
+            .checked_sub(
+                share::ShareControlHeader::ENCODED_LEN + share::ShareDataHeader::ENCODED_LEN,
+            )
+            .ok_or(SessionError::Decode(
+                justrdp_pdu::DecodeError::InvalidField {
+                    field: "TS_SHAREDATAHEADER.compressedLength",
+                    reason: "shorter than the headers it counts",
+                },
+            ))?;
+        let src = cur.read_slice(len).map_err(SessionError::Decode)?;
+        let body = self
+            .bulk
+            .decompress(src, data.compressed_type)
+            .map_err(SessionError::Bulk)?
+            .to_vec();
+        self.on_share_data(
+            data,
+            &mut ReadCursor::new(&body, "decompressed share data"),
+            outputs,
+        )
+    }
+
+    /// Dispatch a Share Data PDU's (decompressed) body.
+    fn on_share_data(
+        &mut self,
+        data: share::ShareDataHeader,
+        cur: &mut ReadCursor<'_>,
+        outputs: &mut Vec<SessionOutput>,
+    ) -> Result<(), SessionError> {
         match data.pdu_type2 {
             share::PDU_TYPE2_UPDATE if self.phase == Phase::Active => {
                 let update_type = cur.read_u16_le().map_err(SessionError::Decode)?;
@@ -3598,31 +3648,142 @@ mod tests {
         );
     }
 
-    /// Issue #253. justrdp has no bulk decompressor, so a Share Data PDU flagged
-    /// `PACKET_COMPRESSED` is a typed error rather than its compressed bytes read as fields —
-    /// the answer fast-path and the SVC layer already give (ADR-0009 §1). The body is a valid
-    /// uncompressed bitmap update, so without the check this paints a frame.
+    /// Each byte as one MPPC literal (`[MS-RDPBCGR]` 3.1.8.4.1.1): below 0x80 as itself, above
+    /// as `10` and its low seven bits; MSB first, zero-padded.
+    fn mppc_literals(bytes: &[u8]) -> Vec<u8> {
+        let mut bits = String::new();
+        for &b in bytes {
+            if b < 0x80 {
+                bits.push_str(&format!("{b:08b}"));
+            } else {
+                bits.push_str(&format!("10{:07b}", b & 0x7F));
+            }
+        }
+        pack_bits(&bits)
+    }
+
+    /// One RDP 5.0 copy-tuple (3.1.8.4.2.2.1 / 3.1.8.4.2.2.2) for an offset in 64..=319 and a
+    /// length in 64..=127, the ranges [`bitmap_update_body`]'s 4x4 body falls in.
+    fn mppc5_copy(offset: usize, len: usize) -> Vec<u8> {
+        assert!((64..=319).contains(&offset) && (64..=127).contains(&len));
+        pack_bits(&format!("11110{:08b}111110{:06b}", offset - 64, len & 0x3F))
+    }
+
+    fn pack_bits(bits: &str) -> Vec<u8> {
+        bits.as_bytes()
+            .chunks(8)
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u8, |b, (i, bit)| b | (bit - b'0') << (7 - i))
+            })
+            .collect()
+    }
+
+    /// A slow-path Share Data PDU whose body is `compressed`, flagged `compressed_type`.
+    fn server_compressed_data_pdu(
+        pdu_type2: u8,
+        compressed_type: u8,
+        compressed: &[u8],
+    ) -> Vec<u8> {
+        let mut user_data =
+            share::encode_share_data(1002, SHARE, share::STREAM_MED, pdu_type2, compressed);
+        user_data[15] = compressed_type;
+        user_data[16..18].copy_from_slice(&((18 + compressed.len()) as u16).to_le_bytes());
+        server_io_frame(&user_data)
+    }
+
+    /// A fast-path PDU with one unfragmented update carrying `compression_flags`.
+    fn fastpath_compressed_update(code: u8, compression_flags: u8, data: &[u8]) -> Vec<u8> {
+        let mut body = vec![code | 0x80, compression_flags];
+        body.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        body.extend_from_slice(data);
+        // fpOutputHeader, then the two-byte length form, which counts itself and the header.
+        let total = 3 + body.len();
+        let mut pdu = vec![0x00, 0x80 | (total >> 8) as u8, total as u8];
+        pdu.extend_from_slice(&body);
+        pdu
+    }
+
+    const COMPRESSED_64K: u8 = 0x21;
+    const FIRST_64K: u8 = 0x80 | 0x40 | COMPRESSED_64K;
+
+    /// #454: a Share Data PDU flagged `PACKET_COMPRESSED` decompresses through the session's
+    /// bulk context and paints; a type the core does not decompress is a typed error.
     #[test]
-    fn a_compressed_share_data_pdu_is_a_typed_error() {
+    fn a_compressed_share_data_pdu_decompresses() {
         let body = bitmap_update_body(0, 0, 4, 4, [9, 8, 7]);
-        for compressed_type in [0x20, 0x21, 0xA1] {
-            let mut sm = SessionStateMachine::new(config(), Vec::new())
-                .expect("the test desktop size is within MAX_DESKTOP_DIM");
-            let frame =
-                server_data_pdu_compressed_type(share::PDU_TYPE2_UPDATE, compressed_type, &body);
-            assert!(
-                matches!(
-                    sm.process_bytes(&frame),
-                    Err(SessionError::Decode(
-                        justrdp_pdu::DecodeError::InvalidField {
-                            field: "TS_SHAREDATAHEADER.compressedType",
-                            ..
-                        }
-                    ))
-                ),
-                "compressedType {compressed_type:#04x} should be refused"
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let frame =
+            server_compressed_data_pdu(share::PDU_TYPE2_UPDATE, FIRST_64K, &mppc_literals(&body));
+        let outputs = sm.process_bytes(&frame).unwrap();
+        assert!(
+            matches!(outputs.as_slice(), [SessionOutput::Frame(_)]),
+            "{outputs:?}"
+        );
+
+        for (compressed_type, ty) in [(0x22, 2), (0x23, 3)] {
+            let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+            let frame = server_compressed_data_pdu(share::PDU_TYPE2_UPDATE, compressed_type, &[0]);
+            assert_eq!(
+                sm.process_bytes(&frame),
+                Err(SessionError::Bulk(crate::bulk::BulkError::UnsupportedType(
+                    ty
+                )))
             );
         }
+    }
+
+    /// A compressed fast-path update decompresses and paints, and a slow-path PDU after it
+    /// copies its bytes back out of the same history.
+    #[test]
+    fn fast_path_and_slow_path_share_one_history() {
+        let body = bitmap_update_body(0, 0, 4, 4, [9, 8, 7]);
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let first = fastpath_compressed_update(
+            fastpath::FP_UPDATE_BITMAP,
+            FIRST_64K,
+            &mppc_literals(&body),
+        );
+        assert!(matches!(
+            sm.process_bytes(&first).unwrap().as_slice(),
+            [SessionOutput::Frame(_)]
+        ));
+        let again = server_compressed_data_pdu(
+            share::PDU_TYPE2_UPDATE,
+            COMPRESSED_64K,
+            &mppc5_copy(body.len(), body.len()),
+        );
+        assert!(matches!(
+            sm.process_bytes(&again).unwrap().as_slice(),
+            [SessionOutput::Frame(_)]
+        ));
+    }
+
+    /// An update dropped during a Deactivation still enters the history: the copy after the
+    /// reactivation reaches back into it.
+    #[test]
+    fn a_compressed_update_skipped_during_a_deactivation_still_feeds_the_history() {
+        let body = bitmap_update_body(0, 0, 4, 4, [9, 8, 7]);
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        deactivate_all(&mut sm);
+        let skipped = fastpath_compressed_update(
+            fastpath::FP_UPDATE_BITMAP,
+            FIRST_64K,
+            &mppc_literals(&body),
+        );
+        assert_eq!(sm.process_bytes(&skipped).unwrap(), Vec::new());
+        demand_active(&mut sm, Vec::new());
+        font_map(&mut sm);
+        let copy = fastpath_compressed_update(
+            fastpath::FP_UPDATE_BITMAP,
+            COMPRESSED_64K,
+            &mppc5_copy(body.len(), body.len()),
+        );
+        assert!(matches!(
+            sm.process_bytes(&copy).unwrap().as_slice(),
+            [SessionOutput::Frame(_)]
+        ));
     }
 
     /// The other half of #253's predicate: without `PACKET_COMPRESSED` the payload is plain
