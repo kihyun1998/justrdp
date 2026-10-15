@@ -63,8 +63,7 @@ pub(crate) struct Orders {
     held: Vec<FrameUpdate>,
 }
 
-/// Above this many held rects a frame collapses to their bounding box, as the Graphics
-/// Pipeline's frames do (`egfx`'s `MAX_DIRTY_RECTS`).
+/// Above this many held rects a frame collapses to their bounding box.
 const MAX_HELD_RECTS: usize = 64;
 
 impl Orders {
@@ -104,6 +103,12 @@ impl Orders {
         self.held.clear();
     }
 
+    /// Drop the rects held for the frame in flight: the framebuffer they name was replaced. The
+    /// frame stays open, so its end still closes it.
+    pub(crate) fn discard_held(&mut self) {
+        self.held.clear();
+    }
+
     /// Hand the rects one order painted to the host now, or hold them for the frame's end.
     fn deliver(&mut self, painted: &mut Vec<FrameUpdate>, frames: &mut Vec<FrameUpdate>) {
         if !self.in_frame {
@@ -114,8 +119,18 @@ impl Orders {
         if self.held.len() > MAX_HELD_RECTS {
             let left = self.held.iter().map(|r| r.x).min().unwrap_or(0);
             let top = self.held.iter().map(|r| r.y).min().unwrap_or(0);
-            let right = self.held.iter().map(|r| r.x + r.width).max().unwrap_or(0);
-            let bottom = self.held.iter().map(|r| r.y + r.height).max().unwrap_or(0);
+            let right = self
+                .held
+                .iter()
+                .map(|r| r.x.saturating_add(r.width))
+                .max()
+                .unwrap_or(0);
+            let bottom = self
+                .held
+                .iter()
+                .map(|r| r.y.saturating_add(r.height))
+                .max()
+                .unwrap_or(0);
             self.held.clear();
             self.held.push(FrameUpdate {
                 x: left,

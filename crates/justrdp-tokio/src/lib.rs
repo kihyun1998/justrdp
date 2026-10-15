@@ -8365,6 +8365,8 @@ mod tests {
         stream: tokio_rustls::client::TlsStream<TcpStream>,
         census: OrderCensus,
         frames: usize,
+        /// Every rect handed to the host, in order.
+        delivered: Vec<FrameUpdate>,
     }
 
     impl OrderDrive {
@@ -8403,7 +8405,10 @@ mod tests {
         async fn handle(&mut self, outputs: Vec<justrdp::SessionOutput>) {
             for output in outputs {
                 match output {
-                    justrdp::SessionOutput::Frame(_) => self.frames += 1,
+                    justrdp::SessionOutput::Frame(frame) => {
+                        self.frames += 1;
+                        self.delivered.push(frame);
+                    }
                     justrdp::SessionOutput::WriteBytes(bytes) => {
                         self.stream
                             .write_all(&bytes)
@@ -8497,6 +8502,7 @@ mod tests {
                 stream: outcome.stream,
                 census: OrderCensus::default(),
                 frames: 0,
+                delivered: Vec::new(),
             };
             drive.census.feed(&outcome.activation.leftover);
             let first = drive
@@ -8505,6 +8511,8 @@ mod tests {
                 .expect("leftover bytes process");
             drive.handle(first).await;
             drive.settle("the logon", true).await;
+            let before_click = drive.machine.framebuffer().pixels().to_vec();
+            let delivered_before = drive.delivered.len();
             drive.click_start().await;
             drive.settle("the Start click", true).await;
 
@@ -8513,6 +8521,24 @@ mod tests {
                 drive.machine.framebuffer().width(),
                 drive.machine.framebuffer().height(),
             );
+            // Every pixel the click changed lies in a rect the host was handed: nothing painted
+            // is still held when the session goes quiet.
+            let handed = &drive.delivered[delivered_before..];
+            let unreported = before_click
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(painted.as_chunks::<4>().0)
+                .enumerate()
+                .filter(|(_, (a, b))| a[..3] != b[..3])
+                .filter(|(i, _)| {
+                    let x = (i % usize::from(width)) as u16;
+                    let y = (i / usize::from(width)) as u16;
+                    !handed.iter().any(|r| {
+                        (r.x..r.x + r.width).contains(&x) && (r.y..r.y + r.height).contains(&y)
+                    })
+                })
+                .count();
             let blits = drive.census.count("MemBlt")
                 + drive.census.count("Mem3Blt")
                 + drive.census.count("ScrBlt");
@@ -8559,6 +8585,10 @@ mod tests {
                 frames > 0 && frames < blits,
                 "{blits} blits as {frames} frame updates"
             );
+            assert_eq!(
+                unreported, 0,
+                "pixels the click changed that no frame update named"
+            );
             let differing = painted
                 .as_chunks::<4>()
                 .0
@@ -8604,6 +8634,7 @@ mod tests {
                 stream: outcome.stream,
                 census: OrderCensus::default(),
                 frames: 0,
+                delivered: Vec::new(),
             };
             drive.census.feed(&outcome.activation.leftover);
             let first = drive

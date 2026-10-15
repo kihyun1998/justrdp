@@ -68,9 +68,18 @@ host is handed as one frame (#462). Epic #22 (the bitmap cache half is
   bound. It accepts the stall the Graphics Pipeline already accepts, a start whose end never
   comes; it did not decide whether either should get a bound, nor the Surface Commands frame
   marker, a different message.
-- **Unmatched markers are tolerated** (ADR-0009 §2): a start inside a frame continues it, an end
-  with no start and an action that is neither are ignored, and a reactivation drops a frame in
-  flight, whose pixels the reactivation's full frame carries.
+- **Unmatched markers are tolerated**, in ADR-0009's posture; §2's enumeration names no
+  sequencing fault, so this is a reading of it rather than its text. A start inside a frame
+  continues it, and an end with no start and an action that is neither are ignored.
+- **A frame's held rects die with the framebuffer they name.** A reactivation drops the frame in
+  flight, whose pixels the reactivation's full frame carries; a Graphics Pipeline resize
+  (`OutputResized`) drops the held rects and leaves the frame open, so its end still closes it.
+  Before #462 no rect outlived the update that painted it, so the resize path had nothing to drop.
+- **Other paths do not wait for an order frame.** A bitmap update, Set Surface Bits or the
+  Graphics Pipeline painting while an order frame is open hands its rects over at once, ahead of
+  the order rects held for the end. No pixel is wrong, since a `FrameUpdate` names a region of
+  the framebuffer and carries none; the host is told in a different order than things were
+  painted. No server is known to mix them.
 - **ROP3 is one evaluator.** An index is its own truth table, so `rop3` covers all 256 bitwise
   over RGBA words, alpha forced opaque. MemBlt's ROP must not read the pattern (2.2.2.2.1.1.2.9);
   if one does, the pattern is black. ScrBlt has no brush either, and the same holds for it.
@@ -147,8 +156,11 @@ replay equals the live framebuffer.
 **Frame Markers (#462).** Advertising `ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT` (with
 `ORDERFLAGS_EXTRA_FLAGS`) beside ScrBlt, MemBlt and Mem3Blt, a logon and the Start menu came in
 38 started and 38 ended frames; 1,239 blits reached the host as 151 frame updates, and the
-desktop equalled a Refresh Rect redraw. Handing every rect over at once makes it 1,488 as 1,488
-on the same run, so the count sees the holding.
+desktop equalled a Refresh Rect redraw; every pixel the Start click changed lay in a rect the
+host was handed. Handing every rect over at once makes it 1,488 as 1,488 on the same run, so the
+count sees the holding; releasing nothing at the end leaves the logon unpainted for the host, and
+the run fails before its first assertion, at the wait for the desktop. The pixel comparison
+alone could see neither: holding never touches the framebuffer.
 
 **Two readings settled by the tie-break, neither reachable from this VM's traffic:**
 

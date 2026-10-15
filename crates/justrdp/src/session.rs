@@ -1806,6 +1806,7 @@ impl SessionStateMachine {
                             }
                         })?;
                         self.config.desktop_size = (width, height);
+                        self.orders.discard_held();
                     }
                 }
                 DvcEvent::HostOpened { name, channel } => {
@@ -5547,6 +5548,45 @@ mod tests {
             sm.framebuffer.pixels().len(),
             64 * 32 * 4,
             "the framebuffer should have been rebuilt at the size the server declared"
+        );
+    }
+
+    /// A Graphics Pipeline resize drops an order frame in flight: its held rects name a
+    /// framebuffer that no longer exists (#462).
+    #[test]
+    fn an_output_resize_drops_the_order_frame_in_flight() {
+        use justrdp_pdu::orders::{TS_FRAME_END, TS_FRAME_START};
+        let mut sm = with_open_dvc(8, justrdp_pdu::egfx::CHANNEL_NAME);
+        let fast = |orders: &[Vec<u8>]| {
+            fastpath::encode_pdu(&[(
+                fastpath::FP_UPDATE_ORDERS,
+                fastpath::FP_FRAGMENT_SINGLE,
+                &orders_body(orders),
+            )])
+        };
+        use crate::orders::tests::{frame_marker, scrblt};
+        let held = sm
+            .process_bytes(&fast(&[
+                frame_marker(TS_FRAME_START),
+                scrblt([12, 0, 2, 1], 0xCC, [0, 0]),
+            ]))
+            .unwrap();
+        assert!(held.is_empty(), "{held:?}");
+        for frame in server_egfx(
+            8,
+            justrdp_pdu::egfx::CMDID_RESET_GRAPHICS,
+            &reset_graphics_body(8, 4),
+        ) {
+            sm.process_bytes(&frame).expect("8x4 is within the cap");
+        }
+        let released = sm
+            .process_bytes(&fast(&[frame_marker(TS_FRAME_END)]))
+            .unwrap();
+        assert!(
+            !released
+                .iter()
+                .any(|o| matches!(o, SessionOutput::Frame(_))),
+            "a rect past the resized framebuffer reached the host: {released:?}"
         );
     }
 
