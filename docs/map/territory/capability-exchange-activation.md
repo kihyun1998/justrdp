@@ -69,7 +69,8 @@ Deactivation–Reactivation, which is how a resize actually happens.
   | Static channel `options` (2.2.1.3.4.1) | `INITIALIZED`, `ENCRYPT_*`, `PRI_*`, `SHOW_PROTOCOL`, `REMOTE_CONTROL_PERSISTENT` | `COMPRESS_RDP`, `COMPRESS` (compressed chunks, which the SVC layer refuses); undefined bits |
   | General | `extraFlags` `FASTPATH_OUTPUT`, `LONG_CREDENTIALS`, `AUTORECONNECT`, `ENC_SALTED_CHECKSUM`, `NO_BITMAP_COMPRESSION_HDR`; the server-only support bytes are ignored in the client's copy | any other `extraFlags` bit |
   | Bitmap | `drawingFlags` `0x02`/`0x04`/`0x08` (planar decodes CLL, subsampling and NA), `0x10` | any other `drawingFlags` bit |
-  | Order | `orderSupport` all zero | any order (drawing orders are skipped, #22) |
+  | Order (2.2.7.1.3) | `orderSupport` MemBlt and Mem3Blt (#460, [drawing orders](drawing-orders.md)); `orderFlags` `NEGOTIATEORDERSUPPORT`, `ZEROBOUNDSDELTASSUPPORT`, `SOLIDPATTERNBRUSHONLY`, `ORDERFLAGS_EXTRA_FLAGS` | any other order, which the session cannot decode; `COLORINDEXSUPPORT` (palette-index colours at any depth); any order at 8 bpp, whose MemBlt colours need the Color Table Cache |
+  | Bitmap Cache rev. 2 (2.2.7.1.4.2) | up to five caches within the per-cache maxima, `ALLOW_CACHE_WAITING_LIST_FLAG`, and only with MemBlt **and** Mem3Blt in `orderSupport`, which 2.2.7.1.4.2 makes a MUST for receiving Cache Bitmap (Revision 2) (#460) | `PERSISTENT_KEYS_EXPECTED_FLAG` and a persistent cell (no key store, #28); a cache without both blits; a rev. 1 set beside it |
   | Bitmap Cache rev. 1, Brush, Glyph Cache, Offscreen | every cache empty, `BRUSH_DEFAULT`, `GLYPH_SUPPORT_NONE`, level 0 | anything that invites cache, brush, glyph or offscreen orders |
   | Pointer, Input | all values (the pointer cache is sized from the set; input flags are client to server) | — |
   | Virtual Channel | `VCCAPS_COMPR_CS_8K` | `VCCAPS_COMPR_SC` (compressed channel data); undefined bits |
@@ -77,7 +78,7 @@ Deactivation–Reactivation, which is how a resize actually happens.
   | Multifragment Update (2.2.7.2.6) | `MaxRequestSize` up to `HONOURED_MAX_REQUEST_SIZE`, the session's fast-path reassembly cap at its floor (#150) | a larger one: the server may then send a reassembled update the session refuses |
   | Surface Commands (2.2.7.2.9) | `SETSURFACEBITS`, with `FASTPATH_OUTPUT` in the General set (#150) | `FRAMEMARKER` (the session drops Frame Markers); `STREAMSURFACEBITS` (2.2.9.2.2 makes its destination bounds meaningful where 2.2.9.2.1 says to ignore them, the session reads neither, and no capture holds one); any other bit; any command flag without `FASTPATH_OUTPUT`, which 2.2.7.2.9 makes a MUST |
   | Bitmap Codecs (2.2.7.2.10) | no codecs, or NSCodec at codec ID 1 with properties `TS_NSCODEC_CAPABILITYSET` allows (#150) | any other codec (Set Surface Bits decodes NSCodec alone); NSCodec at another ID, which 2.2.7.2.10.1.1 forbids |
-  | Any other set | — | refused unread: it cannot be judged. Bitmap Cache rev. 2, Large Pointer, Frame Acknowledge, Control, Share, Font and the rest wait for a reader |
+  | Any other set | — | refused unread: it cannot be judged. Large Pointer, Frame Acknowledge, Control, Share, Font and the rest wait for a reader |
 
   #352 had listed `RELATIVE_MOUSE` among the refused bits. The spec gives it no
   server-to-client traffic (2.2.1.3.2 points only at client input events), so it is honoured.
@@ -244,6 +245,8 @@ checked, identically on both legs.
   silence is what let the two legs disagree.
 - [Framebuffer & frame delivery](framebuffer-frame-delivery.md) — allocated from
   the negotiated size, and reallocated on reactivation.
+- [Drawing orders](drawing-orders.md) — the Order and Revision 2 rows decide which orders can
+  arrive, and `Orders::new` sizes the caches from the advertised Revision 2 set.
 - [Bitmap codecs](bitmap-codecs.md) — `BitmapCodecsCapabilitySet` decides which
   decoders can be reached at all (the VM's advertised set bounds what is provable).
 - [EGFX graphics pipeline](egfx-graphics-pipeline.md) — the two graphics paths this territory
@@ -257,7 +260,8 @@ checked, identically on both legs.
 - **Client-initiated resize via Deactivation–Reactivation is only half-built** — the
   inbound request handler is missing (IronRDP's `ironrdp-displaycontrol` pushes and does not
   pull); multi-monitor and DPI resize are epic #27.
-- Order capabilities are parsed but drawing orders are not implemented (epic #22),
-  so `OrderCapabilitySet` advertises a surface nothing consumes yet.
-- ADR-0009's tolerance is **not yet exercised for drawing orders**, stated in the
-  record itself.
+- Drawing orders are built for the bitmap cache path alone (#460, [drawing
+  orders](drawing-orders.md)); every other order stays refused at the advertisement.
+- ADR-0009's tolerance for drawing orders, which the record says is not yet exercised, is
+  exercised since #460: an order the client did not advertise is painted with a warning, and
+  one it cannot decode ends the update without ending the session.

@@ -303,6 +303,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "orders"
+path = "fuzz_targets/orders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_orders"
+path = "fuzz_targets/session_orders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "session_surface_bits"
 path = "fuzz_targets/session_surface_bits.rs"
 test = false

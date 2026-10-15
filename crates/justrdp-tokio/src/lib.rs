@@ -8088,6 +8088,213 @@ mod tests {
         with_vm_session(|vm| compressed_updates_paint_the_desktop(vm, 1, "454-mppc")).await
     }
 
+    /// Issue #460: advertising MemBlt and Mem3Blt over a Revision 2 bitmap cache at 16 bpp,
+    /// with no Surface Commands to fall back on, the VM paints the desktop in drawing orders and
+    /// the session paints every pixel from the cache. `JUSTRDP_SESSION_CAPTURE_FILE` records the
+    /// bytes a committed fixture is carved from.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn memblt_orders_paint_the_desktop_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            use justrdp_pdu::capability::{self, CapabilitySet};
+            use justrdp_pdu::cursor::ReadCursor;
+            use justrdp_pdu::fastpath;
+            use justrdp_pdu::orders::{self, DrawingOrder, OrderHistory, OrdersUpdate};
+
+            let mut config = legacy_graphics_config();
+            config.core.high_color_depth = gcc::HIGH_COLOR_DEPTH_16BPP;
+            config.capabilities.retain(|set| {
+                !matches!(
+                    set,
+                    CapabilitySet::SurfaceCommands(_)
+                        | CapabilitySet::BitmapCodecs(_)
+                        | CapabilitySet::BitmapCache(_)
+                )
+            });
+            for set in &mut config.capabilities {
+                match set {
+                    CapabilitySet::Order(o) => {
+                        o.order_support[capability::ORDER_NEG_MEMBLT_INDEX] = 1;
+                        o.order_support[capability::ORDER_NEG_MEM3BLT_INDEX] = 1;
+                    }
+                    CapabilitySet::Bitmap(b) => b.preferred_bits_per_pixel = 16,
+                    _ => {}
+                }
+            }
+            config.capabilities.push(CapabilitySet::BitmapCacheRev2(
+                capability::BitmapCacheRev2CapabilitySet {
+                    cache_flags: 0,
+                    cells: [120, 120, 2553]
+                        .map(|entries| capability::BitmapCacheCellInfo {
+                            entries,
+                            persistent: false,
+                        })
+                        .to_vec(),
+                },
+            ));
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let server_bpp = justrdp::ServerAnnouncement::from_capabilities(
+                &outcome.activation.server_capabilities,
+            )
+            .bits_per_pixel;
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, session_capabilities),
+                outcome.activation.leftover.clone(),
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+            let mut inbox = outcome.activation.leftover;
+            let mut readbuf = [0u8; 16 * 1024];
+            let (width, height) = outcome.activation.desktop_size;
+            let (width, height) = (usize::from(width), usize::from(height));
+            let mut painted = vec![false; width * height];
+            // A census of the same stream, decoded apart from the session.
+            let mut updates = std::collections::BTreeMap::<u8, usize>::new();
+            let mut census = std::collections::BTreeMap::<String, usize>::new();
+            let mut history = OrderHistory::default();
+            let mut fragment = Vec::new();
+            let mut slow_path_frames = 0usize;
+            let mut frames = 0usize;
+            let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
+            let mut fed = 0usize;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                for output in pending.drain(..) {
+                    match output {
+                        justrdp::SessionOutput::Frame(frame) => {
+                            frames += 1;
+                            for y in usize::from(frame.y)..usize::from(frame.y + frame.height) {
+                                let row = y * width + usize::from(frame.x);
+                                painted[row..row + usize::from(frame.width)].fill(true);
+                            }
+                        }
+                        justrdp::SessionOutput::WriteBytes(bytes) => {
+                            stream.write_all(&bytes).await.expect("write to the VM");
+                        }
+                        _ => {}
+                    }
+                }
+                while let Some(&first) = inbox.first() {
+                    let len = if fastpath::is_fastpath(first) {
+                        fastpath::frame_len(&inbox)
+                    } else {
+                        justrdp_pdu::tpkt::frame_len(&inbox)
+                    };
+                    let Ok(len) = len else { break };
+                    if inbox.len() < len {
+                        break;
+                    }
+                    let frame: Vec<u8> = inbox.drain(..len).collect();
+                    if !fastpath::is_fastpath(first) {
+                        slow_path_frames += 1;
+                        continue;
+                    }
+                    for section in fastpath::decode_updates(&frame).expect("fast-path frame") {
+                        *updates.entry(section.code).or_default() += 1;
+                        if section.code != fastpath::FP_UPDATE_ORDERS {
+                            continue;
+                        }
+                        fragment.extend_from_slice(section.data);
+                        if !matches!(
+                            section.fragmentation,
+                            fastpath::FP_FRAGMENT_SINGLE | fastpath::FP_FRAGMENT_LAST
+                        ) {
+                            continue;
+                        }
+                        let body = std::mem::take(&mut fragment);
+                        let mut cur = ReadCursor::new(&body, "census orders");
+                        let update = OrdersUpdate::decode_fast_path(&mut cur).expect("orders");
+                        let mut cur = ReadCursor::new(update.order_data, "census order data");
+                        for _ in 0..update.number_orders {
+                            let name = match orders::decode_order(&mut cur, &mut history) {
+                                Ok(DrawingOrder::MemBlt { order, .. }) => {
+                                    format!("MemBlt rop {:#04x}", order.rop)
+                                }
+                                Ok(DrawingOrder::Mem3Blt { order, .. }) => {
+                                    format!("Mem3Blt rop {:#04x}", order.blt.rop)
+                                }
+                                Ok(DrawingOrder::CacheBitmapRev2(order)) => format!(
+                                    "CacheBitmapRev2 cache {} compressed {} {} bpp",
+                                    order.cache_id, order.compressed, order.bits_per_pixel
+                                ),
+                                Ok(DrawingOrder::SkippedSecondary { order_type }) => {
+                                    format!("secondary {order_type:#04x}")
+                                }
+                                Err(error) => {
+                                    *census.entry(format!("stopped: {error}")).or_default() += 1;
+                                    break;
+                                }
+                            };
+                            *census.entry(name).or_default() += 1;
+                        }
+                    }
+                }
+                match tokio::time::timeout_at(deadline, stream.read(&mut readbuf)).await {
+                    Ok(Ok(0)) => panic!("the server closed the session: {updates:?} {census:?}"),
+                    Ok(Ok(n)) => {
+                        inbox.extend_from_slice(&readbuf[..n]);
+                        fed += n;
+                        pending = feed_session(&mut machine, &readbuf[..n])
+                            .expect("every drawing order decodes");
+                    }
+                    Ok(Err(e)) => panic!("read failed: {e}"),
+                    Err(_) => break,
+                }
+            }
+
+            let covered = painted.iter().filter(|&&p| p).count();
+            eprintln!(
+                "#460: server bpp {server_bpp}, fast-path updates by code {updates:?}, {slow_path_frames} slow-path frames, frames={frames}, painted {covered} of {} pixels, {fed} session bytes fed",
+                width * height
+            );
+            for (name, count) in &census {
+                eprintln!("#460:   {count:>6}  {name}");
+            }
+            assert!(
+                updates.get(&fastpath::FP_UPDATE_ORDERS).copied().unwrap_or(0) > 0,
+                "no Orders update arrived at {server_bpp} bpp: {updates:?}"
+            );
+            assert!(
+                !census.keys().any(|name| name.starts_with("stopped")),
+                "an order the session cannot decode arrived: {census:?}"
+            );
+            assert_eq!(
+                updates.get(&fastpath::FP_UPDATE_BITMAP),
+                None,
+                "the desktop arrived as bitmap updates, not orders"
+            );
+            let blits: usize = census
+                .iter()
+                .filter(|(name, _)| name.starts_with("MemBlt") || name.starts_with("Mem3Blt"))
+                .map(|(_, count)| count)
+                .sum();
+            assert_eq!(frames, blits, "every frame is one blit's");
+            assert_eq!(covered, width * height, "every pixel of the desktop is painted");
+            let fb = machine.framebuffer();
+            let mut distinct = std::collections::HashSet::new();
+            for px in fb.pixels().as_chunks::<4>().0 {
+                distinct.insert([px[0], px[1], px[2]]);
+                if distinct.len() > 16 {
+                    break;
+                }
+            }
+            assert!(
+                distinct.len() > 16,
+                "framebuffer is near-monochrome ({} colors) — the cache path is likely broken",
+                distinct.len()
+            );
+            let path = std::env::temp_dir().join("justrdp-460-memblt.ppm");
+            let mut ppm = format!("P6\n{} {}\n255\n", fb.width(), fb.height()).into_bytes();
+            for px in fb.pixels().as_chunks::<4>().0 {
+                ppm.extend_from_slice(&px[..3]);
+            }
+            std::fs::write(&path, ppm).expect("write the visual dump");
+            eprintln!("visual dump for confirmation: {}", path.display());
+        })
+        .await
+    }
+
     /// Issue #455: the same, advertising NCRUSH (RDP 6.0).
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]

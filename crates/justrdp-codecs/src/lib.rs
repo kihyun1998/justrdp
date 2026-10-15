@@ -103,6 +103,7 @@ pub mod planar;
 pub mod pointer;
 pub mod rfx;
 pub mod rle;
+pub mod rop;
 pub mod xcrush;
 pub mod zgfx;
 

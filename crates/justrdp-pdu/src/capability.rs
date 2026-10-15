@@ -2,8 +2,8 @@
 //! the second half of `capability-exchange`, after MCS/GCC.
 //!
 //! Typed structs cover the sets the connect sequence and the differential criteria actually
-//! consume (General, Bitmap, Order, Bitmap Cache, Pointer, Input, Brush, Glyph Cache, Offscreen
-//! Cache, Virtual Channel, Sound, Multifragment Update, Surface Commands, Bitmap Codecs);
+//! consume (General, Bitmap, Order, Bitmap Cache revisions 1 and 2, Pointer, Input, Brush, Glyph
+//! Cache, Offscreen Cache, Virtual Channel, Sound, Multifragment Update, Surface Commands, Bitmap Codecs);
 //! everything else round-trips as [`CapabilitySet::Unknown`] raw bytes, because the negotiation
 //! rule for unrecognized sets is "ignore, never reject" (MS-RDPBCGR 3.2.5.3.13).
 
@@ -30,6 +30,8 @@ pub const CAPSET_BRUSH: u16 = 0x000F;
 pub const CAPSET_GLYPH_CACHE: u16 = 0x0010;
 /// `capabilitySetType`: Offscreen Bitmap Cache.
 pub const CAPSET_OFFSCREEN_CACHE: u16 = 0x0011;
+/// `capabilitySetType`: Bitmap Cache (revision 2).
+pub const CAPSET_BITMAP_CACHE_REV2: u16 = 0x0013;
 /// `capabilitySetType`: Virtual Channel.
 pub const CAPSET_VIRTUAL_CHANNEL: u16 = 0x0014;
 /// `capabilitySetType`: Multifragment Update.
@@ -102,6 +104,21 @@ pub const SOUND_FLAG_BEEPS: u16 = 0x0001;
 pub const ORDER_NEGOTIATE_SUPPORT: u16 = 0x0002;
 /// `orderFlags`: zero bounds deltas supported (MUST be set).
 pub const ORDER_ZERO_BOUNDS_DELTAS_SUPPORT: u16 = 0x0008;
+
+/// `orderSupport` index of the MemBlt primary drawing order (`TS_NEG_MEMBLT_INDEX`).
+pub const ORDER_NEG_MEMBLT_INDEX: usize = 0x03;
+/// `orderSupport` index of the Mem3Blt primary drawing order (`TS_NEG_MEM3BLT_INDEX`).
+pub const ORDER_NEG_MEM3BLT_INDEX: usize = 0x04;
+
+/// `CacheFlags` (Bitmap Cache revision 2): the client sends a Persistent Key List PDU.
+pub const PERSISTENT_KEYS_EXPECTED_FLAG: u16 = 0x0001;
+/// `CacheFlags` (Bitmap Cache revision 2): the client supports a cache waiting list.
+pub const ALLOW_CACHE_WAITING_LIST_FLAG: u16 = 0x0002;
+/// The most bitmap caches a revision 2 set describes (`NumCellCaches`).
+pub const BITMAP_CACHE_REV2_MAX_CELLS: usize = 5;
+/// The most entries each revision 2 bitmap cache may hold, by cache ID (2.2.7.1.4.2).
+pub const BITMAP_CACHE_REV2_MAX_ENTRIES: [u32; BITMAP_CACHE_REV2_MAX_CELLS] =
+    [600, 600, 65536, 4096, 2048];
 
 /// General Capability Set (TS_GENERAL_CAPABILITYSET, 2.2.7.1.1).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -468,6 +485,65 @@ impl GlyphCacheCapabilitySet {
     }
 }
 
+/// One bitmap cache of a revision 2 set (TS_BITMAPCACHE_CELL_CACHE_INFO, 2.2.7.1.4.2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BitmapCacheCellInfo {
+    /// `NumEntries` (31 bits).
+    pub entries: u32,
+    /// `k`: the cache persists across connections, so every bitmap stored in it carries a key.
+    pub persistent: bool,
+}
+
+/// Revision 2 Bitmap Cache Capability Set (TS_BITMAPCACHE_CAPABILITYSET_REV2, 2.2.7.1.4.2).
+/// Client to server only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BitmapCacheRev2CapabilitySet {
+    /// `CacheFlags` ([`PERSISTENT_KEYS_EXPECTED_FLAG`], [`ALLOW_CACHE_WAITING_LIST_FLAG`]).
+    pub cache_flags: u16,
+    /// The caches in use, by cache ID; `NumCellCaches` is the length. Decoding refuses more
+    /// than [`BITMAP_CACHE_REV2_MAX_CELLS`]; encoding writes the first five.
+    pub cells: Vec<BitmapCacheCellInfo>,
+}
+
+impl BitmapCacheRev2CapabilitySet {
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let cells = &self.cells[..self.cells.len().min(BITMAP_CACHE_REV2_MAX_CELLS)];
+        out.extend_from_slice(&self.cache_flags.to_le_bytes());
+        out.push(0); // pad2
+        out.push(cells.len() as u8);
+        for index in 0..BITMAP_CACHE_REV2_MAX_CELLS {
+            let cell = cells.get(index).copied().unwrap_or_default();
+            let info = (cell.entries & 0x7FFF_FFFF) | (u32::from(cell.persistent) << 31);
+            out.extend_from_slice(&info.to_le_bytes());
+        }
+        out.extend_from_slice(&[0u8; 12]); // pad3
+    }
+
+    fn decode_body(cur: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+        let cache_flags = cur.read_u16_le()?;
+        cur.read_u8()?; // pad2
+        let count = usize::from(cur.read_u8()?);
+        if count > BITMAP_CACHE_REV2_MAX_CELLS {
+            return Err(DecodeError::InvalidField {
+                field: "TS_BITMAPCACHE_CAPABILITYSET_REV2.NumCellCaches",
+                reason: "more than 5 bitmap caches",
+            });
+        }
+        let mut cells = Vec::with_capacity(count);
+        for index in 0..BITMAP_CACHE_REV2_MAX_CELLS {
+            let info = cur.read_u32_le()?;
+            if index < count {
+                cells.push(BitmapCacheCellInfo {
+                    entries: info & 0x7FFF_FFFF,
+                    persistent: info & 0x8000_0000 != 0,
+                });
+            }
+        }
+        cur.read_slice(12)?; // pad3
+        Ok(Self { cache_flags, cells })
+    }
+}
+
 /// Offscreen Bitmap Cache Capability Set (TS_OFFSCREEN_CAPABILITYSET, 2.2.7.1.9).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OffscreenCacheCapabilitySet {
@@ -672,6 +748,8 @@ pub enum CapabilitySet {
     Order(OrderCapabilitySet),
     /// TS_BITMAPCACHE_CAPABILITYSET (revision 1).
     BitmapCache(BitmapCacheCapabilitySet),
+    /// TS_BITMAPCACHE_CAPABILITYSET_REV2.
+    BitmapCacheRev2(BitmapCacheRev2CapabilitySet),
     /// TS_POINTER_CAPABILITYSET.
     Pointer(PointerCapabilitySet),
     /// TS_INPUT_CAPABILITYSET.
@@ -721,6 +799,10 @@ impl CapabilitySet {
             CapabilitySet::BitmapCache(c) => {
                 c.encode_body(&mut body);
                 CAPSET_BITMAP_CACHE
+            }
+            CapabilitySet::BitmapCacheRev2(c) => {
+                c.encode_body(&mut body);
+                CAPSET_BITMAP_CACHE_REV2
             }
             CapabilitySet::Brush(c) => {
                 c.encode_body(&mut body);
@@ -804,6 +886,9 @@ impl CapabilitySet {
             CAPSET_BITMAP_CACHE => {
                 CapabilitySet::BitmapCache(BitmapCacheCapabilitySet::decode_body(&mut body_cur)?)
             }
+            CAPSET_BITMAP_CACHE_REV2 => CapabilitySet::BitmapCacheRev2(
+                BitmapCacheRev2CapabilitySet::decode_body(&mut body_cur)?,
+            ),
             CAPSET_BRUSH => CapabilitySet::Brush(BrushCapabilitySet::decode_body(&mut body_cur)?),
             CAPSET_GLYPH_CACHE => {
                 CapabilitySet::GlyphCache(GlyphCacheCapabilitySet::decode_body(&mut body_cur)?)

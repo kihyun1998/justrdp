@@ -28,6 +28,7 @@ mod egfx;
 pub mod framebuffer;
 pub mod input;
 pub mod license_crypto;
+mod orders;
 pub mod rdpdr;
 pub mod rdpsnd;
 pub mod session;

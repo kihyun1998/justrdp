@@ -4,11 +4,10 @@
 //! (Deactivation–Reactivation re-runs capability exchange in-session — a resize
 //! takes this path). Implemented so far: slow-path *and* fast-path output graphics (bitmap +
 //! palette updates, with fast-path fragment reassembly — slice-6) and outbound keyboard/mouse input
-//! (slice-7), and slow-path pointer updates. Orders are a later slice: an order update falls to the
-//! dispatch's catch-all with its cursor unread — **skipped, not decoded** (the phrase here said
-//! "decoded-and-skipped" until #252, and neither half was true of it). The robustness policy is
-//! unchanged (ADR-0009: unknown-but-well-formed never kills the session, malformed input does);
-//! what changed is the claim about *how* it is unknown.
+//! (slice-7), slow-path pointer updates, and the drawing orders the Revision 2 bitmap cache path
+//! needs — MemBlt, Mem3Blt and Cache Bitmap (Revision 2), on both transports (#460; the private
+//! `orders` module). The robustness policy is ADR-0009's: unknown-but-well-formed never kills the
+//! session, malformed input does.
 
 use crate::cursor::{CursorEvent, CursorImage};
 use crate::disconnect::{DisconnectReason, ServerDisconnectCause};
@@ -41,6 +40,10 @@ pub struct ServerAnnouncement {
     /// [`SessionStateMachine::request_suppress_output`] and
     /// [`SessionStateMachine::request_resume_output`].
     pub suppress_output: bool,
+    /// `preferredBitsPerPixel` from the Bitmap capability set, 0 without one: the session's
+    /// color depth, which decides how a drawing order's TS_COLOR reads (`[MS-RDPEGDI]`
+    /// 2.2.2.2.1.1.1.8).
+    pub bits_per_pixel: u16,
 }
 
 impl ServerAnnouncement {
@@ -56,10 +59,15 @@ impl ServerAnnouncement {
             CapabilitySet::General(general) => Some(general),
             _ => None,
         });
+        let bitmap = sets.iter().find_map(|set| match set {
+            CapabilitySet::Bitmap(bitmap) => Some(bitmap),
+            _ => None,
+        });
         Self {
             input_flags: input.map_or(0, |i| i.input_flags),
             refresh_rect: general.is_some_and(|g| g.refresh_rect_support != 0),
             suppress_output: general.is_some_and(|g| g.suppress_output_support != 0),
+            bits_per_pixel: bitmap.map_or(0, |b| b.preferred_bits_per_pixel),
         }
     }
 }
@@ -115,13 +123,39 @@ enum Painted {
 }
 
 /// Spend `cost` from `budget`, or leave it untouched and return `false` when it does not fit.
-fn charge(budget: &mut usize, cost: usize) -> bool {
+pub(crate) fn charge(budget: &mut usize, cost: usize) -> bool {
     match budget.checked_sub(cost) {
         Some(left) => {
             *budget = left;
             true
         }
         None => false,
+    }
+}
+
+/// Decode slow-path bitmap data (`[MS-RDPBCGR]` 2.2.9.1.1.3.1.2.2) to top-down RGBA: raw or
+/// interleaved RLE below 32 bpp, raw or RDP6 planar at 32, every layout bottom-up.
+pub(crate) fn decode_bitmap(
+    compressed: bool,
+    bits_per_pixel: u16,
+    data: &[u8],
+    width: usize,
+    height: usize,
+    palette: &Palette,
+) -> Result<Vec<u8>, crate::SessionError> {
+    use crate::SessionError;
+    match (compressed, bits_per_pixel) {
+        (false, bpp) => {
+            color::to_rgba(data, width, height, bpp, palette, true).map_err(SessionError::Color)
+        }
+        (true, 32) => {
+            let bgr = planar::decompress(data, width, height).map_err(SessionError::Planar)?;
+            color::to_rgba(&bgr, width, height, 24, palette, true).map_err(SessionError::Color)
+        }
+        (true, bpp) => {
+            let raw = rle::decompress(data, width, height, bpp).map_err(SessionError::Rle)?;
+            color::to_rgba(&raw, width, height, bpp, palette, true).map_err(SessionError::Color)
+        }
     }
 }
 
@@ -620,6 +654,8 @@ pub struct SessionStateMachine {
     nscodec_advertised: bool,
     /// The last Suppress Output this machine sent was `SUPPRESS_DISPLAY_UPDATES`.
     output_suppressed: bool,
+    /// The drawing-order history and the bitmap caches (#460).
+    orders: crate::orders::Orders,
 }
 
 impl SessionStateMachine {
@@ -671,6 +707,7 @@ impl SessionStateMachine {
                 if c.codecs.iter().any(|codec| codec.guid == capability::CODEC_GUID_NSCODEC
                     && codec.id == capability::CODEC_ID_NSCODEC))
         });
+        let orders = crate::orders::Orders::new(&config.capabilities);
         let channels = config
             .static_channels
             .iter()
@@ -700,6 +737,7 @@ impl SessionStateMachine {
             held_bytes: 0,
             surface_commands,
             nscodec_advertised,
+            orders,
         })
     }
 
@@ -902,7 +940,12 @@ impl SessionStateMachine {
                         }
                     }
                 }
-                // Synchronize, large pointers (capability never advertised), orders: skipped.
+                fastpath::FP_UPDATE_ORDERS => {
+                    let update = justrdp_pdu::orders::OrdersUpdate::decode_fast_path(&mut cur)
+                        .map_err(SessionError::Decode)?;
+                    self.apply_orders(update, outputs)?;
+                }
+                // Synchronize, large pointers (capability never advertised): skipped.
                 _ => {}
             }
         }
@@ -1101,9 +1144,12 @@ impl SessionStateMachine {
                             entries: palette.entries,
                         };
                     }
-                    // Synchronize updates are no-ops; orders cannot arrive (none advertised
-                    // in the Order capset) — an order update from a non-conforming server is
-                    // skipped, not fatal.
+                    update::UPDATETYPE_ORDERS => {
+                        let update = justrdp_pdu::orders::OrdersUpdate::decode_slow_path(cur)
+                            .map_err(SessionError::Decode)?;
+                        self.apply_orders(update, outputs)?;
+                    }
+                    // Synchronize updates are no-ops.
                     _ => {}
                 }
                 Ok(())
@@ -1353,6 +1399,38 @@ impl SessionStateMachine {
         Ok(())
     }
 
+    /// Apply one Orders Update on either transport, within one paint budget.
+    fn apply_orders(
+        &mut self,
+        update: justrdp_pdu::orders::OrdersUpdate<'_>,
+        outputs: &mut Vec<SessionOutput>,
+    ) -> Result<(), SessionError> {
+        let bits_per_pixel = match self.config.server.bits_per_pixel {
+            0 => self
+                .config
+                .capabilities
+                .iter()
+                .find_map(|set| match set {
+                    CapabilitySet::Bitmap(b) => Some(b.preferred_bits_per_pixel),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            bpp => bpp,
+        };
+        let mut frames = Vec::new();
+        let budget = self.paint_budget();
+        let result = self.orders.apply(
+            update,
+            &mut self.framebuffer,
+            &self.palette,
+            bits_per_pixel,
+            budget,
+            &mut frames,
+        );
+        outputs.extend(frames.into_iter().map(SessionOutput::Frame));
+        result
+    }
+
     /// The decoded bytes one graphics update may buy.
     fn paint_budget(&self) -> usize {
         usize::from(self.framebuffer.width())
@@ -1389,25 +1467,14 @@ impl SessionStateMachine {
         if !charge(budget, width * height * 4) {
             return Ok(Painted::OverBudget);
         }
-        // All slow-path bitmap layouts are bottom-up; the conversion flips to top-down RGBA.
-        let rgba = match (rect.compressed, rect.bits_per_pixel) {
-            (false, bpp) => color::to_rgba(&rect.data, width, height, bpp, &self.palette, true)
-                .map_err(SessionError::Color)?,
-            // Compressed 32-bpp slow-path data is RDP6 planar (MS-RDPBCGR
-            // 2.2.9.1.1.3.1.2.2); the decoder yields BGR24 in the same bottom-up layout.
-            (true, 32) => {
-                let bgr =
-                    planar::decompress(&rect.data, width, height).map_err(SessionError::Planar)?;
-                color::to_rgba(&bgr, width, height, 24, &self.palette, true)
-                    .map_err(SessionError::Color)?
-            }
-            (true, bpp) => {
-                let raw =
-                    rle::decompress(&rect.data, width, height, bpp).map_err(SessionError::Rle)?;
-                color::to_rgba(&raw, width, height, bpp, &self.palette, true)
-                    .map_err(SessionError::Color)?
-            }
-        };
+        let rgba = decode_bitmap(
+            rect.compressed,
+            rect.bits_per_pixel,
+            &rect.data,
+            width,
+            height,
+            &self.palette,
+        )?;
         // The carried bitmap may overhang the destination rectangle (legacy 4-pixel
         // alignment); the destination is inclusive, the overhang is right/bottom padding.
         let dest_w = rect.right.saturating_sub(rect.left).saturating_add(1);
@@ -1433,6 +1500,7 @@ impl SessionStateMachine {
     ) -> Result<(), SessionError> {
         let demand = capability::DemandActive::decode(cur).map_err(SessionError::Decode)?;
         self.leave_active(outputs);
+        self.orders.reset_history();
         self.config.share_id = header.share_id;
         self.config.server = ServerAnnouncement::from_capabilities(&demand.capability_sets);
         let (width, height) = demand
@@ -2803,6 +2871,7 @@ mod tests {
                 input_flags: 0x0375,
                 refresh_rect: true,
                 suppress_output: false,
+                bits_per_pixel: 0,
             }
         );
         assert_eq!(
@@ -2811,6 +2880,7 @@ mod tests {
                 input_flags: 0,
                 refresh_rect: true,
                 suppress_output: false,
+                bits_per_pixel: 0,
             },
             "no Input set: inputFlags 0"
         );
@@ -2820,6 +2890,7 @@ mod tests {
                 input_flags: 0x0375,
                 refresh_rect: false,
                 suppress_output: false,
+                bits_per_pixel: 0,
             },
             "no General set: neither PDU announced"
         );
@@ -3491,6 +3562,128 @@ mod tests {
         assert!(sm.encode_input(&key_press()).is_empty());
         assert_eq!(font_map(&mut sm).last(), Some(&SessionOutput::Reactivated));
         assert!(!sm.encode_input(&key_press()).is_empty());
+    }
+
+    /// The session config with drawing orders advertised (#460): the default sets, their Order
+    /// set replaced by MemBlt and Mem3Blt over Revision 2 caches.
+    fn orders_config() -> SessionConfig {
+        let mut config = config();
+        config
+            .capabilities
+            .retain(|set| !matches!(set, CapabilitySet::Order(_) | CapabilitySet::BitmapCache(_)));
+        config
+            .capabilities
+            .extend(crate::orders::tests::capabilities(4, true));
+        config.server.bits_per_pixel = 16;
+        config
+    }
+
+    /// One Orders Update body: `numberOrders` and the orders, on either transport.
+    fn orders_body(orders: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = (orders.len() as u16).to_le_bytes().to_vec();
+        body.extend(orders.concat());
+        body
+    }
+
+    fn red_at(x: i16) -> Vec<Vec<u8>> {
+        use crate::orders::tests::{RED, cache_bitmap, memblt};
+        vec![
+            cache_bitmap(0, 0, &[&[RED]]),
+            memblt((0, 0), [x, 0, 1, 1], 0xCC, [0, 0]),
+        ]
+    }
+
+    /// A slow-path Orders Update paints (#460).
+    #[test]
+    fn slow_path_orders_paint() {
+        let mut sm = SessionStateMachine::new(orders_config(), Vec::new()).unwrap();
+        let mut body = update::UPDATETYPE_ORDERS.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad2OctetsA
+        let orders = orders_body(&red_at(3));
+        body.extend_from_slice(&orders[..2]);
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad2OctetsB
+        body.extend_from_slice(&orders[2..]);
+        let outputs = sm
+            .process_bytes(&server_data_pdu(share::PDU_TYPE2_UPDATE, &body))
+            .unwrap();
+        let frame = FrameUpdate {
+            x: 3,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(outputs, [SessionOutput::Frame(frame)]);
+        assert_eq!(
+            frame_pixels(&sm, &frame),
+            crate::orders::tests::rgba(crate::orders::tests::RED)
+        );
+    }
+
+    /// A fast-path Orders Update paints (#460).
+    #[test]
+    fn fast_path_orders_paint() {
+        let mut sm = SessionStateMachine::new(orders_config(), Vec::new()).unwrap();
+        let pdu = fastpath::encode_pdu(&[(
+            fastpath::FP_UPDATE_ORDERS,
+            fastpath::FP_FRAGMENT_SINGLE,
+            &orders_body(&red_at(5)),
+        )]);
+        let outputs = sm.process_bytes(&pdu).unwrap();
+        assert!(
+            matches!(
+                outputs[..],
+                [SessionOutput::Frame(FrameUpdate { x: 5, .. })]
+            ),
+            "{outputs:?}"
+        );
+    }
+
+    /// A reactivation clears the primary order history, as FreeRDP's `update_reset_state` does,
+    /// so an order without TS_TYPE_CHANGE afterwards is a PatBlt again. The cache survives.
+    #[test]
+    fn a_reactivation_resets_the_order_history_and_keeps_the_cache() {
+        let mut sm = SessionStateMachine::new(orders_config(), Vec::new()).unwrap();
+        let fast = |orders: &[Vec<u8>]| {
+            fastpath::encode_pdu(&[(
+                fastpath::FP_UPDATE_ORDERS,
+                fastpath::FP_FRAGMENT_SINGLE,
+                &orders_body(orders),
+            )])
+        };
+        sm.process_bytes(&fast(&red_at(0))).unwrap();
+        // The same MemBlt again, as a delta order: no TS_TYPE_CHANGE, only nLeftRect.
+        let delta = vec![
+            justrdp_pdu::orders::TS_STANDARD
+                | justrdp_pdu::orders::TS_DELTA_COORDINATES
+                | justrdp_pdu::orders::TS_ZERO_FIELD_BYTE_BIT0,
+            0x02,
+            1,
+        ];
+        let outputs = sm
+            .process_bytes(&fast(std::slice::from_ref(&delta)))
+            .unwrap();
+        assert!(
+            matches!(
+                outputs[..],
+                [SessionOutput::Frame(FrameUpdate { x: 1, .. })]
+            ),
+            "{outputs:?}"
+        );
+        demand_active(&mut sm, vec![general_with_output_control()]);
+        font_map(&mut sm);
+        let outputs = sm
+            .process_bytes(&fast(std::slice::from_ref(&delta)))
+            .unwrap();
+        assert!(outputs.is_empty(), "a PatBlt after the reset: {outputs:?}");
+        let full = crate::orders::tests::memblt((0, 0), [2, 0, 1, 1], 0xCC, [0, 0]);
+        let outputs = sm.process_bytes(&fast(&[full])).unwrap();
+        assert!(
+            matches!(
+                outputs[..],
+                [SessionOutput::Frame(FrameUpdate { x: 2, .. })]
+            ),
+            "the cached bitmap is still there: {outputs:?}"
+        );
     }
 
     /// A DeactivateAll inside the window says nothing new: one Deactivated, one Reactivated.

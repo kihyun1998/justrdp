@@ -50,6 +50,10 @@ concluding anything is absent.
 - [Input & platform scancode tables](../territory/input-scancodes.md) — #305 recorded that the
   VM never sends Set Keyboard Indicators, after five justrdp runs; one FreeRDP session received
   one.
+- [Drawing orders](../territory/drawing-orders.md) — #22's census had to run through FreeRDP,
+  because justrdp refused every order advertisement, and it found the gate somewhere other than
+  where the epic looked: this server enters order mode on a bitmap cache advertisement, not on
+  `orderSupport`. "Orders are not observed" in the epic's text was the advertisement speaking.
 
 ## What a violation looks like
 
