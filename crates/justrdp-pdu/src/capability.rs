@@ -105,6 +105,8 @@ pub const ORDER_NEGOTIATE_SUPPORT: u16 = 0x0002;
 /// `orderFlags`: zero bounds deltas supported (MUST be set).
 pub const ORDER_ZERO_BOUNDS_DELTAS_SUPPORT: u16 = 0x0008;
 
+/// `orderSupport` index of the ScrBlt primary drawing order (`TS_NEG_SCRBLT_INDEX`).
+pub const ORDER_NEG_SCRBLT_INDEX: usize = 0x02;
 /// `orderSupport` index of the MemBlt primary drawing order (`TS_NEG_MEMBLT_INDEX`).
 pub const ORDER_NEG_MEMBLT_INDEX: usize = 0x03;
 /// `orderSupport` index of the Mem3Blt primary drawing order (`TS_NEG_MEM3BLT_INDEX`).
