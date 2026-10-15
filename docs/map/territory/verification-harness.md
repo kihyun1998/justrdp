@@ -133,6 +133,12 @@ grep 'client_common_save_session_info' fr.log   # Logon Info, and whether a cook
   `-nsc -rfx` (at 32 bpp the VM otherwise paints NSCodec Set Surface Bits) and
   `/cache:bitmap:on`, without which the server sends no order at all. **At 24 and 32 bpp that
   cache gets the connection reset** right after activation (#463); `/bpp:16` works.
+- **Notepad remembers where its window was**, in `HKCU\Software\Microsoft\Notepad`, for the
+  next logon too (#461). A test that moves its window moves every later test's: two runs that
+  moved it right and down left it opening off screen, and
+  `keyboard_and_mouse_input_drive_the_real_vm` failed with *"typing into Notepad painted no
+  frame"* until `reg delete HKCU\Software\Microsoft\Notepad /f`, run from the Start search, reset
+  it. Maximize instead of moving, or reset the key afterwards.
 - **`wsl.exe` re-parses its arguments, so `$` inside them is expanded by the WSL shell first.** A
   script written with `wsl -- bash -lc '… cat > f <<"EOF" … $tag …'` lost every `$` variable
   and wrote its log to `.log`. Write the script on the Windows side and `cp` it from `/mnt/c`, and

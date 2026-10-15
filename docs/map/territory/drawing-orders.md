@@ -59,7 +59,7 @@ and the paint. ScrBlt copies within the framebuffer (#461). Epic #22 (the bitmap
   source back inside and copies from there; nothing in this server's traffic reaches the case.
 - **ROP3 is one evaluator.** An index is its own truth table, so `rop3` covers all 256 bitwise
   over RGBA words, alpha forced opaque. MemBlt's ROP must not read the pattern (2.2.2.2.1.1.2.9);
-  if one does, the pattern is black.
+  if one does, the pattern is black. ScrBlt has no brush either, and the same holds for it.
 - **Every session decodes Orders Updates, advertised or not.** Before #460 an Orders Update fell
   to the dispatch's catch-all unread; now a malformed one is a `SessionError` even in a session
   that advertised no order (ADR-0009 §3(a): a tolerated order with a malformed body is still a
@@ -89,7 +89,7 @@ and the paint. ScrBlt copies within the framebuffer (#461). Epic #22 (the bitmap
   `decode_bitmap`, `charge`
 - `justrdp/tests/real_server_memblt.rs` — `a_real_desktop_painted_in_memblt_orders_replays`
 - `justrdp-tokio/src/lib.rs` — `memblt_orders_paint_the_desktop_on_the_real_vm`,
-  `scrblt_moves_a_window_as_a_redraw_paints_it_on_the_real_vm`, `OrderCensus`,
+  `scrblt_slides_the_start_menu_as_a_redraw_paints_it_on_the_real_vm`, `OrderCensus`,
   `legacy_orders_config`
 - `fuzz/fuzz_targets/orders.rs`, `fuzz/fuzz_targets/session_orders.rs`
 
@@ -111,12 +111,21 @@ no waiting list, 16 bpp, no Surface Commands. The server sent only compressed 16
 (`justrdp/tests/fixtures/session/memblt.bin`) holds 39 Orders updates and 1,495 MemBlt, and its
 replay equals the live framebuffer.
 
-**ScrBlt against a redraw (#461).** Advertising ScrBlt beside MemBlt and Mem3Blt, a Notepad
-window moved with the keyboard brought 2 SRCCOPY ScrBlt, and the framebuffer after the move
-equalled, byte for byte, the one the server painted for a Refresh Rect of the whole desktop.
-With ScrBlt painting nothing the same run differs in 121,725 pixels, so the comparison sees a
-broken copy. The redraw is the server's own answer, which makes it the oracle here rather than
-a capture: no fixture was committed.
+**ScrBlt against a redraw (#461).** Advertising ScrBlt beside MemBlt and Mem3Blt:
+
+- **This server sends ScrBlt only for a LAN experience, and then for menu animation.** With
+  `VALID_CONNECTION_TYPE` and LAN, opening the Start menu slid it up in 7 SRCCOPY ScrBlts of about
+  648×624, each 1–4 rows from its source, so every one overlaps it; the same in two runs. Without
+  the connection type (`performanceFlags` 0x7, which this server honours then) no menu animates.
+  A Notepad window moved with the keyboard, and Notepad text scrolled by typing past its last
+  line, were painted in MemBlt in four runs out of five; the fifth brought 2 ScrBlt whose
+  geometry was not recorded. FreeRDP's 159 were in a LAN session with a person moving windows
+  and scrolling Explorer, so which of those actions sent them is not known.
+- **The framebuffer after the slide equals, byte for byte, the one the server paints for a
+  Refresh Rect of the whole desktop.** It is the server's own redraw, so it is the oracle rather
+  than a capture, and no fixture was committed. Copying the overlap in place bottom-up makes
+  109,040 pixels differ, so the comparison sees a wrong copy order. The slide copies upward
+  only; the other three directions rest on the unit test.
 
 **Two readings settled by the tie-break, neither reachable from this VM's traffic:**
 

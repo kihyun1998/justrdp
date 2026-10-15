@@ -8138,6 +8138,8 @@ mod tests {
         updates: std::collections::BTreeMap<u8, usize>,
         orders: std::collections::BTreeMap<String, usize>,
         slow_path_frames: usize,
+        /// Every ScrBlt's `[left, top, width, height]` and `[nXSrc, nYSrc]`.
+        scrblts: Vec<([i16; 4], [i16; 2])>,
     }
 
     impl OrderCensus {
@@ -8180,6 +8182,10 @@ mod tests {
                     for _ in 0..update.number_orders {
                         let name = match orders::decode_order(&mut cur, &mut self.history) {
                             Ok(DrawingOrder::ScrBlt { order, .. }) => {
+                                self.scrblts.push((
+                                    [order.left, order.top, order.width, order.height],
+                                    [order.x_src, order.y_src],
+                                ));
                                 format!("ScrBlt rop {:#04x}", order.rop)
                             }
                             Ok(DrawingOrder::MemBlt { order, .. }) => {
@@ -8383,7 +8389,10 @@ mod tests {
                 if start.elapsed() > Duration::from_secs(45) {
                     self.census.print("#461");
                     let path = dump_ppm(self.machine.framebuffer(), "justrdp-461-stuck.ppm");
-                    panic!("nothing painted after {step} ({})", path.display());
+                    panic!(
+                        "after {step}: no quiet 2 s, or no frame, within 45 s ({})",
+                        path.display()
+                    );
                 }
             }
         }
@@ -8452,22 +8461,27 @@ mod tests {
         }
     }
 
-    /// Issue #461: with ScrBlt advertised beside MemBlt and Mem3Blt, moving a window makes the VM
-    /// copy within the framebuffer, and what the session painted is what the server paints when
-    /// asked to redraw the whole desktop from scratch (a Refresh Rect). The window is Notepad,
-    /// opened from the Start menu and moved with the keyboard (Alt+Space, M, arrows), so no window
-    /// coordinate is guessed.
+    /// Issue #461: with ScrBlt advertised beside MemBlt and Mem3Blt and a LAN experience, the VM
+    /// slides the Start menu open in ScrBlts whose source and destination overlap, and what the
+    /// session painted is what the server paints when asked to redraw the whole desktop from
+    /// scratch (a Refresh Rect).
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
-    async fn scrblt_moves_a_window_as_a_redraw_paints_it_on_the_real_vm() {
+    async fn scrblt_slides_the_start_menu_as_a_redraw_paints_it_on_the_real_vm() {
         with_vm_session(|vm| async move {
             use justrdp_pdu::capability;
 
-            let config = legacy_orders_config(&[
+            let mut config = legacy_orders_config(&[
                 capability::ORDER_NEG_SCRBLT_INDEX,
                 capability::ORDER_NEG_MEMBLT_INDEX,
                 capability::ORDER_NEG_MEM3BLT_INDEX,
             ]);
+            // A LAN experience, as FreeRDP's `/network:lan` census had: this server reads the
+            // connection type, not `performanceFlags`, and animates menus only on a fast link.
+            config.core.early_capability_flags = config.core.early_capability_flags
+                | gcc::ClientEarlyCapabilityFlags::VALID_CONNECTION_TYPE;
+            config.core.connection_type = 0x06;
+            config.client_info.performance_flags = 0;
             let session_capabilities = config.capabilities.clone();
             let outcome = vm.connect(config).await;
             let machine = SessionStateMachine::new(
@@ -8489,26 +8503,15 @@ mod tests {
             drive.handle(first).await;
             drive.settle("the logon", true).await;
 
-            // Start, "notepad", Enter.
+            let before = drive.census.scrblts.len();
             drive.click_start().await;
             drive.settle("the Start click", true).await;
-            drive
-                .keys(None, &[0x4E, 0x4F, 0x54, 0x45, 0x50, 0x41, 0x44])
-                .await;
-            drive.settle("typing notepad", true).await;
-            drive.keys(None, &[0x0D]).await;
-            drive.settle("Enter", true).await;
-            let before_move = drive.census.count("ScrBlt");
-            // Alt+Space, M, then 24 rights and 12 downs, then Enter.
-            drive.keys(Some(0x12), &[0x20]).await;
-            drive.settle("Alt+Space", true).await;
-            drive.keys(None, &[0x4D]).await;
-            drive.settle("M", false).await;
-            drive.keys(None, &[0x27; 24]).await;
-            drive.keys(None, &[0x28; 12]).await;
-            drive.keys(None, &[0x0D]).await;
-            drive.settle("the move", true).await;
-            let moved = drive.census.count("ScrBlt") - before_move;
+            let slide = drive.census.scrblts[before..].to_vec();
+            // Whether a copy's source and destination overlap: what makes the copy order matter.
+            let overlapping = slide
+                .iter()
+                .filter(|([x, y, w, h], [sx, sy])| (x - sx).abs() < *w && (y - sy).abs() < *h)
+                .count();
 
             let painted = drive.machine.framebuffer().pixels().to_vec();
             let (width, height) = (
@@ -8534,12 +8537,15 @@ mod tests {
             }
             drive.settle("the Refresh Rect", true).await;
             let redrawn = drive.machine.framebuffer().pixels().to_vec();
+            drive.keys(None, &[0x1B]).await;
+            drive.settle("Esc", false).await;
 
             drive.census.print("#461");
+            eprintln!("#461: the slide's ScrBlts {slide:?}, {overlapping} overlapping");
             let painted_path = {
                 let mut fb = justrdp::Framebuffer::new(width, height).expect("desktop size");
                 fb.blit(0, 0, width, height, &painted, usize::from(width));
-                dump_ppm(&fb, "justrdp-461-moved.ppm")
+                dump_ppm(&fb, "justrdp-461-slid.ppm")
             };
             let redrawn_path = dump_ppm(drive.machine.framebuffer(), "justrdp-461-redrawn.ppm");
             eprintln!(
@@ -8547,19 +8553,14 @@ mod tests {
                 painted_path.display(),
                 redrawn_path.display()
             );
-            // Close Notepad.
-            drive.keys(Some(0x12), &[0x73]).await;
-            drive.settle("Alt+F4", false).await;
-
             assert_eq!(
                 drive.census.count("stopped"),
                 0,
                 "an order the session cannot decode arrived"
             );
             assert!(
-                moved > 0,
-                "moving the window brought no ScrBlt: {:?}",
-                drive.census.orders
+                overlapping > 0,
+                "no ScrBlt of the slide overlapped its source: {slide:?}"
             );
             let differing: Vec<usize> = painted
                 .as_chunks::<4>()

@@ -6,8 +6,8 @@
 //! palette updates, with fast-path fragment reassembly — slice-6) and outbound keyboard/mouse input
 //! (slice-7), slow-path pointer updates, and the drawing orders the Revision 2 bitmap cache path
 //! needs — MemBlt, Mem3Blt and Cache Bitmap (Revision 2) — with ScrBlt, on both transports (#460,
-//! #461; the private `orders` module). The robustness policy is ADR-0009's: unknown-but-well-formed never kills the
-//! session, malformed input does.
+//! #461; the private `orders` module). The robustness policy is ADR-0009's: unknown-but-well-formed
+//! never kills the session, malformed input does.
 
 use crate::cursor::{CursorEvent, CursorImage};
 use crate::disconnect::{DisconnectReason, ServerDisconnectCause};
