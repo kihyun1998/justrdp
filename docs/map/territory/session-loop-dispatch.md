@@ -105,8 +105,24 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   (L1, L2) flags `(0x11, 0x21)` ×20, `(0x12, 0x21)` ×6, `(0x11, 0x00)` ×5, `(0x11, 0x61)` ×2,
   `(0x11, 0xe1)` ×1. No `L1_PACKET_AT_FRONT` and no level-2 flush without compression arrived, so
   the capture replays identically under either reading of both. Only the unit tests in
-  `xcrush.rs` hold them. `CompressionTypeMask` is a value: `advertise.rs` honours 0, 1 and 3
-  (`HONOURED_COMPRESSION_TYPES`), and NCRUSH (2, #455) stays refused although 3 shares its bit.
+  `xcrush.rs` hold them. `CompressionTypeMask` is a value: `advertise.rs` honours it through
+  `HONOURED_COMPRESSION_TYPES`, now 0 to 3.
+- **NCRUSH completes the set** (#455): `[MS-RDPEGDI]` 3.1.8.1, Huffman-coded literals, end of
+  stream, copy-offsets and lengths of match, read least significant bit first, over a 65,536-byte
+  history with a four-entry offset cache. The tables are transcribed from the spec (Tables 1-6),
+  and a test regenerates both codebooks from their lengths by the canonical Huffman algorithm the
+  spec names: Table 2 and Table 5 are the canonical codes with their bits reversed, all 293 and
+  32. The offset-cache rules are drawn only in the spec's flowcharts, so FreeRDP's `ncrush.c`
+  gives them: a new copy-offset enters at slot 0 and shifts the rest, and a hit swaps its slot
+  with slot 0. `PACKET_AT_FRONT` here slides the history back by half (3.1.8.1.3), unlike MPPC's
+  and XCRUSH's offset reset. A slide with no more than half a history written is an error, as
+  FreeRDP's `-1002`. Derived, not decided: `PACKET_FLUSHED` absorbs `PACKET_AT_FRONT` (FreeRDP
+  slides then flushes, reaching the same state when its slide succeeds), and a slide keeps the
+  offset cache (FreeRDP's behaviour; 3.1.8.1.1 empties it on (re)initialisation only).
+  Measured on the WS2019 VM (`tests/fixtures/session/ncrush.bin`): 27 `0x22` and 6 `0x62`
+  updates, so the server did slide. The replay catches a wrong slide source and a wrong cache
+  rule, but not an unzeroed second half, which no copy after a slide reached. No
+  `PACKET_FLUSHED` arrived.
 - **A Deactivation stops input and the share-bound requests, not channels** (#442). `[MS-RDPBCGR]`
   3.2.5.5.1: after Deactivate All *"the client MUST disable its graphics and input protocol
   handlers"*. From the moment the session leaves the active phase (a Deactivate All, or a Demand
@@ -177,10 +193,11 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   `ServerDisconnectCause`
 - `justrdp-pdu/src/fastpath.rs` — `is_fastpath`, `frame_len`, `decode_updates`, `FastPathUpdate`
 - `justrdp/src/bulk.rs` — `Bulk`, `BulkError`, `PACKET_COMPR_TYPE_8K`, `PACKET_COMPR_TYPE_64K`,
-  `PACKET_COMPR_TYPE_RDP61` (#456)
+  `PACKET_COMPR_TYPE_RDP6` (#455), `PACKET_COMPR_TYPE_RDP61` (#456)
   (#454)
 - `justrdp-codecs/src/mppc.rs` — `Mppc`, `MppcLevel`, `MppcError` (#454)
 - `justrdp-codecs/src/xcrush.rs` — `Xcrush`, `XcrushError`, `HISTORY_SIZE` (#456)
+- `justrdp-codecs/src/ncrush.rs` — `Ncrush`, `NcrushError` (#455)
 - `justrdp/src/advertise.rs` — `HONOURED_COMPRESSION_TYPES` (#456)
 - `justrdp-pdu/src/surface_commands.rs` — `decode_all`, `SurfaceCommand`, `SurfaceBits`,
   `BitmapDataEx`, `FrameMarker` (#150)

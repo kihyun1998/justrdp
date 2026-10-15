@@ -105,8 +105,9 @@ rather than by capability:
   rejected the identical violation. Closed — `ShareDataHeader::decode` refused
   `PACKET_COMPRESSED`, the same answer fast-path and the SVC layer gave. **#454** turned the
   refusal into an obligation discharged: the host may advertise MPPC 8K/64K, the session
-  decompresses both; #456 added XCRUSH (type 3). Every other type stays refused at the
-  advertisement (`advertise.rs`, a value check, since type 3 shares type 2's bit)
+  decompresses both; #456 added XCRUSH (type 3) and #455 NCRUSH (type 2). Every other type
+  stays refused at the advertisement (`advertise.rs`, a value check, since type 3 shares type
+  2's bit)
   and as `BulkError::UnsupportedType` on the wire.
 - **#287** — the drdynvc capabilities version, one layer below #271 and the same shape: answered
   as 3, whose only obligation is decompressing Cmd 6/7, while those commands were skipped. It had

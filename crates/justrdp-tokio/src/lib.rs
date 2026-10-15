@@ -8088,6 +8088,13 @@ mod tests {
         with_vm_session(|vm| compressed_updates_paint_the_desktop(vm, 1, "454-mppc")).await
     }
 
+    /// Issue #455: the same, advertising NCRUSH (RDP 6.0).
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn ncrush_compressed_updates_paint_the_desktop_on_the_real_vm() {
+        with_vm_session(|vm| compressed_updates_paint_the_desktop(vm, 2, "455-ncrush")).await
+    }
+
     /// Issue #456: the same, advertising XCRUSH (RDP 6.1).
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]

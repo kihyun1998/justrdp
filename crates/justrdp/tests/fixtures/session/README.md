@@ -122,3 +122,29 @@ was deleted. What the client advertised: the defaults plus Client Info `COMPRESS
 the replay is identical under either reading of each (measured: zero-filling on
 `L1_PACKET_AT_FRONT`, and FreeRDP's compressed-only level-2 gate, both still pass). Those two
 rules rest on the unit tests in `xcrush.rs` alone.
+
+## `ncrush.bin`
+
+164 fast-path PDUs, 52 214 bytes: one logon's desktop sent NCRUSH (RDP 6.0) bulk-compressed.
+Captured 2026-10-15 for **#455** by `ncrush_compressed_updates_paint_the_desktop_on_the_real_vm`,
+carved like `xcrush.bin` (the first 54 221 bytes, fast-path PDUs only; the dropped Share Data, three
+Save Session Info PDUs, carried no `PACKET_*` flag). The raw capture was deleted. What the client
+advertised: the defaults plus Client Info `COMPRESSION` with `CompressionTypeMask` 2.
+
+| `compressionFlags` | Updates |
+|---|---|
+| `0x00` | 136 |
+| `0x22` (`PACKET_COMPRESSED`, RDP 6.0) | 27 |
+| `0x62` (plus `PACKET_AT_FRONT`: the history slid back by half) | 6 |
+
+### What it pins that an argument could not
+
+- **The slide and the offset cache match the server.** `real_server_ncrush.rs` asserts that the
+  replay equals the live framebuffer that was dumped and looked at. Sliding from the wrong half,
+  not caching a new offset, or not swapping a cache hit to the front each break it.
+
+### What it cannot see
+
+`PACKET_FLUSHED` (none arrived), and whether the slid-back history's second half is zeroed: no copy
+after a slide reached it, so leaving it unzeroed replays identically. Both rest on the unit tests in
+`ncrush.rs`.

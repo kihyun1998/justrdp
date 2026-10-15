@@ -23,8 +23,8 @@ pub const HONOURED_EARLY_CAPABILITY_FLAGS: ClientEarlyCapabilityFlags =
     );
 
 /// The `CompressionTypeMask` values (Client Info `flags` bits 9-12, a value rather than bits)
-/// the session decompresses: MPPC 8K and 64K, XCRUSH.
-pub const HONOURED_COMPRESSION_TYPES: [u32; 3] = [0, 1, 3];
+/// the session decompresses: MPPC 8K and 64K, NCRUSH, XCRUSH.
+pub const HONOURED_COMPRESSION_TYPES: [u32; 4] = [0, 1, 2, 3];
 
 /// The Client Info `flags` the core honours, `CompressionTypeMask` aside
 /// ([`HONOURED_COMPRESSION_TYPES`]).
@@ -507,19 +507,19 @@ mod tests {
         }
     }
 
-    /// Bulk compression is the host's to advertise for the types the session decompresses:
-    /// MPPC 8K/64K (#454) and XCRUSH (#456). `CompressionTypeMask` is a value, so NCRUSH (2)
-    /// stays refused although XCRUSH (3) shares its bit.
+    /// Bulk compression is the host's to advertise for every type the session decompresses:
+    /// MPPC 8K/64K (#454), NCRUSH (#455) and XCRUSH (#456). `CompressionTypeMask` is a value,
+    /// so 4 and above stay refused.
     #[test]
     fn decompressed_compression_types_pass_and_the_others_are_refused() {
         let mut config = config();
-        for ty in [0u32, 1, 3] {
+        for ty in [0u32, 1, 2, 3] {
             config.client_info.flags = ClientInfoFlags::MOUSE
                 | ClientInfoFlags::COMPRESSION
                 | ClientInfoFlags::from_bits(ty << 9);
             assert_eq!(check(&config), Ok(()), "type {ty}");
         }
-        for ty in [2u32, 4, 15] {
+        for ty in [4u32, 8, 15] {
             config.client_info.flags = ClientInfoFlags::MOUSE
                 | ClientInfoFlags::COMPRESSION
                 | ClientInfoFlags::from_bits(ty << 9);
