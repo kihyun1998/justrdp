@@ -8469,6 +8469,280 @@ mod tests {
         }
     }
 
+    /// What one order-advertising session did in its first seconds (#463).
+    #[derive(Debug)]
+    struct OrderProbe {
+        server_bpp: u16,
+        closed: bool,
+        orders_updates: usize,
+        blits: usize,
+        frames: usize,
+        stopped: usize,
+    }
+
+    /// Connect with `config`, read for `seconds`, and report what arrived. A closed connection
+    /// is a result here, not a failure.
+    async fn probe_orders(vm: &vm::Vm, config: ConnectConfig, seconds: u64) -> OrderProbe {
+        use justrdp_pdu::fastpath;
+        let session_capabilities = config.capabilities.clone();
+        let outcome = vm.connect(config).await;
+        let server_bpp =
+            justrdp::ServerAnnouncement::from_capabilities(&outcome.activation.server_capabilities)
+                .bits_per_pixel;
+        let mut machine = SessionStateMachine::new(
+            session_config_from(&outcome, session_capabilities),
+            outcome.activation.leftover.clone(),
+        )
+        .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        let mut stream = outcome.stream;
+        let mut census = OrderCensus::default();
+        census.feed(&outcome.activation.leftover);
+        let mut frames = 0usize;
+        let mut closed = false;
+        let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
+        let mut readbuf = [0u8; 16 * 1024];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        loop {
+            for output in pending.drain(..) {
+                match output {
+                    justrdp::SessionOutput::Frame(_) => frames += 1,
+                    justrdp::SessionOutput::WriteBytes(bytes)
+                        if stream.write_all(&bytes).await.is_err() =>
+                    {
+                        closed = true;
+                    }
+                    _ => {}
+                }
+            }
+            match tokio::time::timeout_at(deadline, stream.read(&mut readbuf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => {
+                    closed = true;
+                    break;
+                }
+                Ok(Ok(n)) => {
+                    census.feed(&readbuf[..n]);
+                    pending = feed_session(&mut machine, &readbuf[..n])
+                        .expect("every drawing order decodes");
+                }
+                Err(_) => break,
+            }
+        }
+        OrderProbe {
+            server_bpp,
+            closed,
+            orders_updates: census
+                .updates
+                .get(&fastpath::FP_UPDATE_ORDERS)
+                .copied()
+                .unwrap_or(0),
+            blits: census.count("MemBlt") + census.count("Mem3Blt") + census.count("ScrBlt"),
+            frames,
+            stopped: census.count("stopped"),
+        }
+    }
+
+    /// [`legacy_orders_config`] with ScrBlt, MemBlt and Mem3Blt, asking for `bpp`: 16 in the
+    /// Bitmap set and `highColorDepth`, or 24 there with `WANT_32BPP_SESSION` for 32.
+    fn orders_at_depth(bpp: u16) -> ConnectConfig {
+        use justrdp_pdu::capability::{self, CapabilitySet};
+        let mut config = legacy_orders_config(&[
+            capability::ORDER_NEG_SCRBLT_INDEX,
+            capability::ORDER_NEG_MEMBLT_INDEX,
+            capability::ORDER_NEG_MEM3BLT_INDEX,
+        ]);
+        for set in &mut config.capabilities {
+            if let CapabilitySet::Bitmap(b) = set {
+                b.preferred_bits_per_pixel = bpp;
+            }
+        }
+        config.core.high_color_depth = match bpp {
+            16 => gcc::HIGH_COLOR_DEPTH_16BPP,
+            _ => gcc::HIGH_COLOR_DEPTH_24BPP,
+        };
+        if bpp == 32 {
+            config.core.early_capability_flags = config.core.early_capability_flags
+                | gcc::ClientEarlyCapabilityFlags::WANT_32_BPP_SESSION;
+        }
+        config
+    }
+
+    /// Issue #463: the bitmap-cache order advertisement at 32, 24 and 16 bpp, and three
+    /// variations of it at 32 bpp, each in its own connection to one Windows session. FreeRDP
+    /// 3.32.1 advertising a bitmap cache at 24 or 32 bpp gets the connection reset right after
+    /// activation; none of these does, and each gets orders.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn bitmap_cache_order_sessions_survive_every_depth_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            use justrdp_pdu::capability::{self, CapabilitySet};
+            let rev2 = |mut config: ConnectConfig, flags: u16, cells: &[u32]| {
+                for set in &mut config.capabilities {
+                    if let CapabilitySet::BitmapCacheRev2(c) = set {
+                        c.cache_flags = flags;
+                        c.cells = cells
+                            .iter()
+                            .map(|&entries| capability::BitmapCacheCellInfo {
+                                entries,
+                                persistent: false,
+                            })
+                            .collect();
+                    }
+                }
+                config
+            };
+            let freerdp_cells = [600, 600, 2048, 4096, 2048];
+            let mut frame_markers = rev2(
+                orders_at_depth(32),
+                capability::ALLOW_CACHE_WAITING_LIST_FLAG,
+                &freerdp_cells,
+            );
+            for set in &mut frame_markers.capabilities {
+                if let CapabilitySet::Order(o) = set {
+                    o.order_flags |= capability::ORDER_FLAGS_EXTRA_FLAGS;
+                    o.order_support_ex_flags =
+                        capability::ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT;
+                }
+            }
+            let variants = [
+                ("32 bpp", 32, orders_at_depth(32)),
+                (
+                    "32 bpp, waiting list",
+                    32,
+                    rev2(
+                        orders_at_depth(32),
+                        capability::ALLOW_CACHE_WAITING_LIST_FLAG,
+                        &[120, 120, 2553],
+                    ),
+                ),
+                (
+                    "32 bpp, FreeRDP's five cells, waiting list",
+                    32,
+                    rev2(
+                        orders_at_depth(32),
+                        capability::ALLOW_CACHE_WAITING_LIST_FLAG,
+                        &freerdp_cells,
+                    ),
+                ),
+                ("32 bpp, the same with Frame Marker", 32, frame_markers),
+                // The VM's colour-depth policy answers 24 with 32.
+                ("24 bpp", 32, orders_at_depth(24)),
+                ("16 bpp", 16, orders_at_depth(16)),
+            ];
+            for (name, depth, config) in variants {
+                let probe = probe_orders(&vm, config, 8).await;
+                eprintln!("#463: {name}: {probe:?}");
+                assert!(!probe.closed, "{name}: the server closed the connection");
+                assert_eq!(probe.server_bpp, depth, "{name}: the server's depth");
+                assert!(
+                    probe.orders_updates > 0 && probe.blits > 0 && probe.frames > 0,
+                    "{name}: no order painted"
+                );
+                assert_eq!(
+                    probe.stopped, 0,
+                    "{name}: an order the session cannot decode"
+                );
+            }
+        })
+        .await
+    }
+
+    /// Issue #463: a 32 bpp order session paints what the server paints when asked to redraw
+    /// the whole desktop. Its cached bitmaps are 32 bpp, which decode through RDP6 planar rather
+    /// than the interleaved RLE of 16 bpp.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn orders_at_32_bpp_paint_what_a_redraw_paints_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            let config = orders_at_depth(32);
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let machine = SessionStateMachine::new(
+                session_config_from(&outcome, session_capabilities),
+                outcome.activation.leftover.clone(),
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut drive = OrderDrive {
+                machine,
+                stream: outcome.stream,
+                census: OrderCensus::default(),
+                frames: 0,
+                delivered: Vec::new(),
+            };
+            drive.census.feed(&outcome.activation.leftover);
+            let first = drive
+                .machine
+                .process_bytes(&[])
+                .expect("leftover bytes process");
+            drive.handle(first).await;
+            drive.settle("the logon", true).await;
+            drive.click_start().await;
+            drive.settle("the Start click", true).await;
+            let painted = drive.machine.framebuffer().pixels().to_vec();
+            let (width, height) = (
+                drive.machine.framebuffer().width(),
+                drive.machine.framebuffer().height(),
+            );
+            let refresh = drive
+                .machine
+                .request_refresh_rect(&[FrameUpdate {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }])
+                .expect("the VM announces Refresh Rect");
+            for frame in refresh {
+                drive
+                    .stream
+                    .write_all(&frame)
+                    .await
+                    .expect("write to the VM");
+            }
+            drive.settle("the Refresh Rect", true).await;
+            let redrawn = drive.machine.framebuffer().pixels().to_vec();
+            drive.keys(None, &[0x1B]).await;
+            drive.settle("Esc", false).await;
+
+            drive.census.print("#463");
+            let path = dump_ppm(drive.machine.framebuffer(), "justrdp-463-32bpp.ppm");
+            eprintln!("visual dump for confirmation: {}", path.display());
+            assert_eq!(
+                drive.census.count("stopped"),
+                0,
+                "an order the session cannot decode arrived"
+            );
+            assert!(
+                drive
+                    .census
+                    .count("CacheBitmapRev2 cache 2 compressed true 32 bpp")
+                    > 0,
+                "no 32 bpp cache fill: {:?}",
+                drive.census.orders
+            );
+            let mut distinct = std::collections::HashSet::new();
+            for px in painted.as_chunks::<4>().0 {
+                distinct.insert([px[0], px[1], px[2]]);
+                if distinct.len() > 16 {
+                    break;
+                }
+            }
+            assert!(
+                distinct.len() > 16,
+                "near-monochrome: {} colours",
+                distinct.len()
+            );
+            let differing = painted
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(redrawn.as_chunks::<4>().0)
+                .filter(|(a, b)| a[..3] != b[..3])
+                .count();
+            assert_eq!(differing, 0, "pixels differ from the redraw");
+        })
+        .await
+    }
+
     /// Issue #462: with Frame Marker advertised, the VM brackets its orders in frames; the
     /// session hands the host each frame at its end, fewer rects than it blits, and the desktop
     /// it paints, after the logon and the Start menu, is what a Refresh Rect redraw paints.

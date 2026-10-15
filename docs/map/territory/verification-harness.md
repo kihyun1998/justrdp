@@ -132,7 +132,9 @@ grep 'client_common_save_session_info' fr.log   # Logon Info, and whether a cook
   two lines (its name, then its ROP), so count one of them. For an order session also pass
   `-nsc -rfx` (at 32 bpp the VM otherwise paints NSCodec Set Surface Bits) and
   `/cache:bitmap:on`, without which the server sends no order at all. **At 24 and 32 bpp that
-  cache gets the connection reset** right after activation (#463); `/bpp:16` works.
+  cache gets the connection reset** right after activation; `/bpp:16` works. justrdp's own
+  advertisement is not reset at 32 bpp (#463), so a 32 bpp order session needs justrdp, not
+  FreeRDP.
 - **Notepad remembers where its window was**, in `HKCU\Software\Microsoft\Notepad`, for the
   next logon too (#461). A test that moves its window moves every later test's: two runs that
   moved it right and down left it opening off screen, and

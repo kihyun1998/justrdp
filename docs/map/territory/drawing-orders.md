@@ -114,7 +114,9 @@ host is handed as one frame (#462). Epic #22 (the bitmap cache half is
 - `justrdp/tests/real_server_memblt.rs` — `a_real_desktop_painted_in_memblt_orders_replays`
 - `justrdp-tokio/src/lib.rs` — `memblt_orders_paint_the_desktop_on_the_real_vm`,
   `scrblt_slides_the_start_menu_as_a_redraw_paints_it_on_the_real_vm`,
-  `frame_markers_bracket_what_a_redraw_paints_on_the_real_vm`, `OrderCensus`,
+  `frame_markers_bracket_what_a_redraw_paints_on_the_real_vm`,
+  `bitmap_cache_order_sessions_survive_every_depth_on_the_real_vm`,
+  `orders_at_32_bpp_paint_what_a_redraw_paints_on_the_real_vm`, `orders_at_depth`, `OrderCensus`,
   `legacy_orders_config`
 - `fuzz/fuzz_targets/orders.rs`, `fuzz/fuzz_targets/session_orders.rs`
 
@@ -124,8 +126,9 @@ host is handed as one frame (#462). Epic #22 (the bitmap cache half is
 
 - **Orders are gated by the bitmap cache, not by `orderSupport`.** With orders advertised and no
   bitmap cache, the server painted in Surface Commands and sent no order.
-- **At 24 and 32 bpp a bitmap cache advertisement got the connection reset** 11 ms after
-  activation, after two Frame Markers, with no Set Error Info (#463). At 16 bpp it works.
+- **At 24 and 32 bpp FreeRDP's bitmap cache advertisement got the connection reset** 11 ms
+  after activation, after two Frame Markers, with no Set Error Info; at 16 bpp it works. Still
+  so on 2026-10-16. It is FreeRDP's, not the depth's: see #463 below.
 - **What a 68 s interactive 16 bpp session carried:** 21,096 MemBlt and 159 ScrBlt, all
   SRCCOPY; 16,388 Cache Bitmap (Revision 2); 1,294 Frame Markers; no other order, and no glyph
   order with `GLYPH_SUPPORT_FULL` advertised and text typed.
@@ -160,6 +163,25 @@ host was handed. Handing every rect over at once makes it 1,488 as 1,488 on the 
 count sees the holding; releasing nothing at the end leaves the logon unpainted for the host, and
 the run fails before its first assertion, at the wait for the desktop. The pixel comparison
 alone could see neither: holding never touches the framebuffer.
+
+**Order sessions at 32 bpp (#463).** justrdp's bitmap-cache order advertisement is not reset
+at any depth: 32 bpp, 24 bpp (which this VM's colour-depth policy answers with 32) and 16 bpp,
+and at 32 bpp with the waiting list, with FreeRDP's five cells (600, 600, 2048, 4096, 2048) and
+with Frame Marker, each in its own connection, 8 s each, orders arriving in every one. A
+throwaway build that lifted the advertisement check then added FreeRDP's other differences one
+at a time at 32 bpp, and none reset either: its whole `orderSupport` (MemBlt V2 indices,
+OpaqueRect, LineTo, Polyline and the rest), `COLORINDEXSUPPORT`, both together, Frame
+Acknowledge 2, Large Pointer, its five plain sets (Share, Font, Control, Color Cache, Window
+Activation), Surface Commands, and `drawingFlags` 0x0A. **What resets FreeRDP is not
+identified**: not one of those alone, so a combination of them or something FreeRDP sends after
+activation.
+
+A 32 bpp session caches 32 bpp bitmaps (compressed, so RDP6 planar), and its desktop equals a
+Refresh Rect redraw. That redraw goes through the same decoder, so it cannot see a decode fault;
+what can is a 32 bpp NSCodec session's desktop, an independent decoder: the two differ by at
+most 21 per channel everywhere but the Start button's highlight and the clock, NSCodec's own
+loss. Neither shows the "activate Windows" watermark, which every 16 bpp session paints; at
+32 bpp the server does not draw it.
 
 **Two readings settled by the tie-break, neither reachable from this VM's traffic:**
 
@@ -202,7 +224,9 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 - **Every order the census saw none of** is unbuilt: DstBlt, PatBlt, OpaqueRect, LineTo, the
   Multi* orders, polygons, ellipses, SaveBitmap, the glyph orders, Cache Color Table, Cache Brush,
   Cache Bitmap revisions 1 and 3, and every alternate secondary order but Frame Marker.
-- **24 and 32 bpp** order sessions are unproven (#463); the defaults do not advertise orders.
+- **The defaults do not advertise orders**, at any depth; that stays the host's choice (the
+  maintainer's call of 2026-10-16, made before #463's measurement for either outcome, and the
+  outcome was that 32 bpp order sessions work).
 - **8 bpp** is refused: MemBlt's color table index needs the Color Table Cache.
 - **Persistent bitmap caching** (keys, the Persistent Key List PDU) is refused at the
   advertisement and stays on #28.
