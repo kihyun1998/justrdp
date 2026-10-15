@@ -2,12 +2,15 @@
 //! shared by fast-path updates and slow-path Share Data PDUs, dispatched on the compression
 //! type nibble.
 
-use justrdp_codecs::mppc::{Mppc, MppcError, MppcLevel, PACKET_COMPRESSED};
+use justrdp_codecs::mppc::{Mppc, MppcError, MppcLevel, PACKET_COMPRESSED, PACKET_FLUSHED};
+use justrdp_codecs::xcrush::{Xcrush, XcrushError};
 
 /// `PACKET_COMPR_TYPE_8K`: MPPC with an 8 KB history (RDP 4.0).
 pub const PACKET_COMPR_TYPE_8K: u8 = 0;
 /// `PACKET_COMPR_TYPE_64K`: MPPC with a 64 KB history (RDP 5.0).
 pub const PACKET_COMPR_TYPE_64K: u8 = 1;
+/// `PACKET_COMPR_TYPE_RDP61`: XCRUSH, `[MS-RDPEGDI]` 3.1.8.2 (RDP 6.1).
+pub const PACKET_COMPR_TYPE_RDP61: u8 = 3;
 
 /// The flag bits (`PACKET_COMPRESSED`, `PACKET_AT_FRONT`, `PACKET_FLUSHED`).
 const FLAG_BITS: u8 = 0xE0;
@@ -19,13 +22,15 @@ pub enum BulkError {
     UnsupportedType(u8),
     /// The compression type differs from the one this connection's history was built for.
     TypeChanged {
-        /// The type of the connection's first flagged payload.
+        /// The type of the connection's first compressed payload.
         from: u8,
         /// The type now named.
         to: u8,
     },
     /// The MPPC decompressor refused the payload.
     Mppc(MppcError),
+    /// The XCRUSH decompressor refused the payload.
+    Xcrush(XcrushError),
 }
 
 impl core::fmt::Display for BulkError {
@@ -36,16 +41,43 @@ impl core::fmt::Display for BulkError {
                 write!(f, "bulk compression type changed from {from} to {to}")
             }
             Self::Mppc(e) => write!(f, "MPPC: {e}"),
+            Self::Xcrush(e) => write!(f, "XCRUSH: {e}"),
         }
     }
 }
 
 impl core::error::Error for BulkError {}
 
+/// The decompressor a connection's first compressed payload chose.
+#[derive(Debug)]
+enum Context {
+    Mppc(Mppc),
+    Xcrush(Box<Xcrush>),
+}
+
+impl Context {
+    /// The context for a supported type.
+    fn new(ty: u8) -> Self {
+        match ty {
+            PACKET_COMPR_TYPE_8K => Self::Mppc(Mppc::new(MppcLevel::Rdp4)),
+            PACKET_COMPR_TYPE_64K => Self::Mppc(Mppc::new(MppcLevel::Rdp5)),
+            _ => Self::Xcrush(Box::default()),
+        }
+    }
+
+    fn ty(&self) -> u8 {
+        match self {
+            Self::Mppc(mppc) if mppc.level() == MppcLevel::Rdp4 => PACKET_COMPR_TYPE_8K,
+            Self::Mppc(_) => PACKET_COMPR_TYPE_64K,
+            Self::Xcrush(_) => PACKET_COMPR_TYPE_RDP61,
+        }
+    }
+}
+
 /// One connection's server-to-client decompression context.
 #[derive(Debug, Default)]
 pub(crate) struct Bulk {
-    mppc: Option<Mppc>,
+    context: Option<Context>,
 }
 
 impl Bulk {
@@ -58,28 +90,42 @@ impl Bulk {
         compression: u8,
     ) -> Result<&'a [u8], BulkError> {
         if compression & PACKET_COMPRESSED == 0 {
-            if compression & FLAG_BITS != 0
-                && let Some(mppc) = self.mppc.as_mut()
-            {
-                mppc.decompress(src, compression).map_err(BulkError::Mppc)?;
+            if compression & FLAG_BITS != 0 {
+                match self.context.as_mut() {
+                    Some(Context::Mppc(mppc)) => {
+                        mppc.decompress(src, compression).map_err(BulkError::Mppc)?;
+                    }
+                    Some(Context::Xcrush(xcrush)) if compression & PACKET_FLUSHED != 0 => {
+                        xcrush.flush();
+                    }
+                    _ => {}
+                }
             }
             return Ok(src);
         }
         let ty = compression & 0x0F;
-        let level = match ty {
-            PACKET_COMPR_TYPE_8K => MppcLevel::Rdp4,
-            PACKET_COMPR_TYPE_64K => MppcLevel::Rdp5,
-            other => return Err(BulkError::UnsupportedType(other)),
-        };
-        let mppc = self.mppc.get_or_insert_with(|| Mppc::new(level));
-        if mppc.level() != level {
-            let from = match mppc.level() {
-                MppcLevel::Rdp4 => PACKET_COMPR_TYPE_8K,
-                MppcLevel::Rdp5 => PACKET_COMPR_TYPE_64K,
-            };
-            return Err(BulkError::TypeChanged { from, to: ty });
+        if !matches!(
+            ty,
+            PACKET_COMPR_TYPE_8K | PACKET_COMPR_TYPE_64K | PACKET_COMPR_TYPE_RDP61
+        ) {
+            return Err(BulkError::UnsupportedType(ty));
         }
-        mppc.decompress(src, compression).map_err(BulkError::Mppc)
+        let context = match &mut self.context {
+            Some(context) => context,
+            empty => empty.insert(Context::new(ty)),
+        };
+        if context.ty() != ty {
+            return Err(BulkError::TypeChanged {
+                from: context.ty(),
+                to: ty,
+            });
+        }
+        match context {
+            Context::Mppc(mppc) => mppc.decompress(src, compression).map_err(BulkError::Mppc),
+            Context::Xcrush(xcrush) => xcrush
+                .decompress(src, compression)
+                .map_err(BulkError::Xcrush),
+        }
     }
 }
 
@@ -130,12 +176,63 @@ mod tests {
                 Ok(&b"hi"[..])
             );
         }
-        for ty in [2, 3, 4] {
+        for ty in [2, 4, 15] {
             assert_eq!(
                 Bulk::default().decompress(&HI, ty | PACKET_COMPRESSED),
                 Err(BulkError::UnsupportedType(ty))
             );
         }
+    }
+
+    /// `[MS-RDPEGDI]` 4.7's first packet: level-1 literals "abcdefghij".
+    const XCRUSH_FIRST: [u8; 12] = [
+        0x16, 0x80, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a,
+    ];
+    const RDP61: u8 = 3;
+
+    #[test]
+    fn xcrush_type_decompresses() {
+        let mut bulk = Bulk::default();
+        assert_eq!(
+            bulk.decompress(&XCRUSH_FIRST, RDP61 | PACKET_COMPRESSED),
+            Ok(&b"abcdefghij"[..])
+        );
+    }
+
+    #[test]
+    fn an_uncompressed_flush_reaches_the_xcrush_history() {
+        let mut bulk = Bulk::default();
+        bulk.decompress(&XCRUSH_FIRST, RDP61 | PACKET_COMPRESSED)
+            .unwrap();
+        assert_eq!(
+            bulk.decompress(b"raw", RDP61 | justrdp_codecs::mppc::PACKET_FLUSHED),
+            Ok(&b"raw"[..])
+        );
+        // Level-1 match of 3 bytes from history offset 5: "fgh" unless the flush zeroed it.
+        let mut packet = vec![0x01, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00];
+        packet.extend_from_slice(&5u32.to_le_bytes());
+        assert_eq!(
+            bulk.decompress(&packet, RDP61 | PACKET_COMPRESSED),
+            Ok(&[0, 0, 0][..])
+        );
+    }
+
+    #[test]
+    fn the_type_may_not_change_between_mppc_and_xcrush() {
+        let mut bulk = Bulk::default();
+        bulk.decompress(&HI, PACKET_COMPR_TYPE_64K | PACKET_COMPRESSED)
+            .unwrap();
+        assert_eq!(
+            bulk.decompress(&XCRUSH_FIRST, RDP61 | PACKET_COMPRESSED),
+            Err(BulkError::TypeChanged { from: 1, to: 3 })
+        );
+        let mut bulk = Bulk::default();
+        bulk.decompress(&XCRUSH_FIRST, RDP61 | PACKET_COMPRESSED)
+            .unwrap();
+        assert_eq!(
+            bulk.decompress(&HI, PACKET_COMPR_TYPE_64K | PACKET_COMPRESSED),
+            Err(BulkError::TypeChanged { from: 3, to: 1 })
+        );
     }
 
     #[test]

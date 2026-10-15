@@ -86,6 +86,27 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   Measured on that VM (FreeRDP `/dump:record`, #427): the server compresses fast-path output with
   exactly the advertised type, and at type 0 (8K) compresses nothing, so MPPC-8K has no
   real-server proof.
+- **XCRUSH is the third type the bulk context dispatches** (#456): `[MS-RDPEGDI]` 3.1.8.2, a
+  level-1 match decoder over a 2,000,000-byte history chained after its own MPPC 64K (level-2,
+  separate from a type-1 context). Per packet: the outer `PACKET_FLUSHED` zeroes level 1, then
+  level-2 runs over everything after the two flag bytes when `L1_INNER_COMPRESSION` is set, then
+  level-1 copies matches by absolute history offset (byte by byte, so a match may read what the
+  same packet just wrote) between literals. An outer `PACKET_FLUSHED` on an uncompressed payload
+  reaches level 1 as well (`Xcrush::flush`). Two readings are derived, not decided, and fall to a
+  real-server capture that tells them apart:
+  - **`L1_PACKET_AT_FRONT` resets the offset and keeps the history.** The spec says both "a
+    simple reset of the history offset" (3.1.8.2.2.2's prose) and "reinitialized (by filling it
+    with zeros)" (its flag tables). FreeRDP resets the offset only and interoperates with
+    Windows with XCRUSH as its default.
+  - **`Level2ComprFlags` reach level-2 whenever `L1_INNER_COMPRESSION` is set,** a
+    `PACKET_FLUSHED` without `PACKET_COMPRESSED` included (3.1.8.2.3). FreeRDP calls its level-2
+    only when `PACKET_COMPRESSED` is set.
+  Measured on the WS2019 VM (`tests/fixtures/session/xcrush.bin`): 34 type-3 updates, their
+  (L1, L2) flags `(0x11, 0x21)` ×20, `(0x12, 0x21)` ×6, `(0x11, 0x00)` ×5, `(0x11, 0x61)` ×2,
+  `(0x11, 0xe1)` ×1. No `L1_PACKET_AT_FRONT` and no level-2 flush without compression arrived, so
+  the capture replays identically under either reading of both. Only the unit tests in
+  `xcrush.rs` hold them. `CompressionTypeMask` is a value: `advertise.rs` honours 0, 1 and 3
+  (`HONOURED_COMPRESSION_TYPES`), and NCRUSH (2, #455) stays refused although 3 shares its bit.
 - **A Deactivation stops input and the share-bound requests, not channels** (#442). `[MS-RDPBCGR]`
   3.2.5.5.1: after Deactivate All *"the client MUST disable its graphics and input protocol
   handlers"*. From the moment the session leaves the active phase (a Deactivate All, or a Demand
@@ -155,9 +176,12 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 - `justrdp/src/disconnect.rs` — `classify`, `DisconnectClass`, `DisconnectReason`,
   `ServerDisconnectCause`
 - `justrdp-pdu/src/fastpath.rs` — `is_fastpath`, `frame_len`, `decode_updates`, `FastPathUpdate`
-- `justrdp/src/bulk.rs` — `Bulk`, `BulkError`, `PACKET_COMPR_TYPE_8K`, `PACKET_COMPR_TYPE_64K`
+- `justrdp/src/bulk.rs` — `Bulk`, `BulkError`, `PACKET_COMPR_TYPE_8K`, `PACKET_COMPR_TYPE_64K`,
+  `PACKET_COMPR_TYPE_RDP61` (#456)
   (#454)
 - `justrdp-codecs/src/mppc.rs` — `Mppc`, `MppcLevel`, `MppcError` (#454)
+- `justrdp-codecs/src/xcrush.rs` — `Xcrush`, `XcrushError`, `HISTORY_SIZE` (#456)
+- `justrdp/src/advertise.rs` — `HONOURED_COMPRESSION_TYPES` (#456)
 - `justrdp-pdu/src/surface_commands.rs` — `decode_all`, `SurfaceCommand`, `SurfaceBits`,
   `BitmapDataEx`, `FrameMarker` (#150)
 - `justrdp-pdu/src/share.rs`, `justrdp-pdu/src/update.rs` — `ShareDataHeader`,

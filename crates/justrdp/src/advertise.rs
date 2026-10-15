@@ -22,7 +22,12 @@ pub const HONOURED_EARLY_CAPABILITY_FLAGS: ClientEarlyCapabilityFlags =
             | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN.bits(),
     );
 
-/// The Client Info `flags` the core honours.
+/// The `CompressionTypeMask` values (Client Info `flags` bits 9-12, a value rather than bits)
+/// the session decompresses: MPPC 8K and 64K, XCRUSH.
+pub const HONOURED_COMPRESSION_TYPES: [u32; 3] = [0, 1, 3];
+
+/// The Client Info `flags` the core honours, `CompressionTypeMask` aside
+/// ([`HONOURED_COMPRESSION_TYPES`]).
 pub const HONOURED_CLIENT_INFO_FLAGS: ClientInfoFlags = ClientInfoFlags::from_bits(
     ClientInfoFlags::MOUSE.bits()
         | ClientInfoFlags::DISABLE_CTRL_ALT_DEL.bits()
@@ -39,7 +44,6 @@ pub const HONOURED_CLIENT_INFO_FLAGS: ClientInfoFlags = ClientInfoFlags::from_bi
         | ClientInfoFlags::NO_AUDIO_PLAYBACK.bits()
         | ClientInfoFlags::USING_SAVED_CREDS.bits()
         | ClientInfoFlags::COMPRESSION.bits()
-        | ClientInfoFlags::COMPRESSION_TYPE_64K.bits()
         | ClientInfoFlags::AUDIO_CAPTURE.bits()
         | ClientInfoFlags::VIDEO_DISABLE.bits(),
 );
@@ -166,10 +170,17 @@ pub fn check(config: &ConnectConfig) -> Result<(), ConnectConfigError> {
             ClientEarlyCapabilityFlags::from_bits(early),
         ));
     }
-    let info = config.client_info.flags.bits() & !HONOURED_CLIENT_INFO_FLAGS.bits();
+    let type_mask = ClientInfoFlags::COMPRESSION_TYPE_MASK.bits();
+    let info = config.client_info.flags.bits() & !HONOURED_CLIENT_INFO_FLAGS.bits() & !type_mask;
     if info != 0 {
         return Err(ConnectConfigError::ClientInfoFlags(
             ClientInfoFlags::from_bits(info),
+        ));
+    }
+    let compression_type = config.client_info.flags.bits() & type_mask;
+    if !HONOURED_COMPRESSION_TYPES.contains(&(compression_type >> 9)) {
+        return Err(ConnectConfigError::ClientInfoFlags(
+            ClientInfoFlags::from_bits(compression_type),
         ));
     }
     for channel in &config.channels {
@@ -463,7 +474,13 @@ mod tests {
         let mut config = config();
         config.client_info.flags = HONOURED_CLIENT_INFO_FLAGS;
         assert_eq!(check(&config), Ok(()));
-        for bit in (0..32).map(|n| 1u32 << n) {
+        // The type mask's bits are a value, checked in
+        // `decompressed_compression_types_pass_and_the_others_are_refused`.
+        let type_mask = ClientInfoFlags::COMPRESSION_TYPE_MASK.bits();
+        for bit in (0..32)
+            .map(|n| 1u32 << n)
+            .filter(|bit| bit & type_mask == 0)
+        {
             config.client_info.flags = ClientInfoFlags::from_bits(bit);
             let honoured = HONOURED_CLIENT_INFO_FLAGS.bits() & bit != 0;
             assert_eq!(
@@ -490,18 +507,19 @@ mod tests {
         }
     }
 
-    /// Bulk compression up to MPPC 64K is the host's to advertise (#454); NCRUSH (2), XCRUSH
-    /// (3) and every higher type stay refused until a decompressor exists for them.
+    /// Bulk compression is the host's to advertise for the types the session decompresses:
+    /// MPPC 8K/64K (#454) and XCRUSH (#456). `CompressionTypeMask` is a value, so NCRUSH (2)
+    /// stays refused although XCRUSH (3) shares its bit.
     #[test]
-    fn mppc_compression_passes_and_higher_types_are_refused() {
+    fn decompressed_compression_types_pass_and_the_others_are_refused() {
         let mut config = config();
-        for ty in [0u32, 1] {
+        for ty in [0u32, 1, 3] {
             config.client_info.flags = ClientInfoFlags::MOUSE
                 | ClientInfoFlags::COMPRESSION
                 | ClientInfoFlags::from_bits(ty << 9);
             assert_eq!(check(&config), Ok(()), "type {ty}");
         }
-        for ty in [2u32, 3, 4, 15] {
+        for ty in [2u32, 4, 15] {
             config.client_info.flags = ClientInfoFlags::MOUSE
                 | ClientInfoFlags::COMPRESSION
                 | ClientInfoFlags::from_bits(ty << 9);

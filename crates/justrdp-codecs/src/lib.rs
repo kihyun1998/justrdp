@@ -102,6 +102,7 @@ pub mod planar;
 pub mod pointer;
 pub mod rfx;
 pub mod rle;
+pub mod xcrush;
 pub mod zgfx;
 
 #[cfg(test)]
