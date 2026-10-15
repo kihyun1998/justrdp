@@ -94,7 +94,11 @@ pub const HONOURED_ORDERS: [usize; 3] = [
 pub const HONOURED_ORDER_FLAGS: u16 = capability::ORDER_NEGOTIATE_SUPPORT
     | capability::ORDER_ZERO_BOUNDS_DELTAS_SUPPORT
     | 0x0040 // SOLIDPATTERNBRUSHONLY
-    | 0x0080; // ORDERFLAGS_EXTRA_FLAGS
+    | capability::ORDER_FLAGS_EXTRA_FLAGS;
+
+/// The Order set's `orderSupportExFlags` the core honours: Frame Marker (#462). Not Cache Bitmap
+/// (Revision 3), which the session does not decode.
+pub const HONOURED_ORDER_EX_FLAGS: u16 = capability::ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT;
 
 /// The Revision 2 Bitmap Cache `CacheFlags` the core honours: the waiting list, which the cache
 /// keeps as one extra entry per cache. Not persistent keys, which need a key store.
@@ -305,6 +309,12 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
             capability::CAPSET_ORDER,
             "orderFlags outside the honoured set",
         ),
+        CapabilitySet::Order(o) if o.order_support_ex_flags & !HONOURED_ORDER_EX_FLAGS != 0 => {
+            refuse(
+                capability::CAPSET_ORDER,
+                "orderSupportExFlags outside Frame Marker",
+            )
+        }
         CapabilitySet::BitmapCacheRev2(c)
             if c.cache_flags & !HONOURED_BITMAP_CACHE_REV2_FLAGS != 0 =>
         {
@@ -811,6 +821,15 @@ mod tests {
     #[test]
     fn memblt_and_mem3blt_from_a_rev2_cache_pass() {
         assert_eq!(check(&orders_config()), Ok(()));
+        // Frame Marker with them (#462).
+        let mut config = orders_config();
+        for set in &mut config.capabilities {
+            if let CapabilitySet::Order(o) = set {
+                o.order_flags |= capability::ORDER_FLAGS_EXTRA_FLAGS;
+                o.order_support_ex_flags = capability::ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT;
+            }
+        }
+        assert_eq!(check(&config), Ok(()));
         // ScrBlt with them (#461), and ScrBlt alone, which needs no cache.
         let mut config = orders_config();
         for set in &mut config.capabilities {
@@ -847,7 +866,18 @@ mod tests {
     #[test]
     fn order_advertisements_past_what_the_session_keeps_are_refused() {
         type Edit = fn(&mut CapabilitySet);
-        let cases: [(&str, Edit, u16); 8] = [
+        let cases: [(&str, Edit, u16); 9] = [
+            (
+                "Cache Bitmap (Revision 3)",
+                |set| {
+                    if let CapabilitySet::Order(o) = set {
+                        o.order_flags |= capability::ORDER_FLAGS_EXTRA_FLAGS;
+                        o.order_support_ex_flags =
+                            capability::ORDERFLAGS_EX_CACHE_BITMAP_REV3_SUPPORT;
+                    }
+                },
+                capability::CAPSET_ORDER,
+            ),
             (
                 "OpaqueRect",
                 |set| {

@@ -1,6 +1,7 @@
 //! Drawing orders (`[MS-RDPEGDI]` 2.2.2): the Orders Update on both transports, the primary
-//! order field encoding with its history, ScrBlt, and the orders the bitmap cache path needs:
-//! MemBlt, Mem3Blt and Cache Bitmap (Revision 2). Decode only: orders flow server → client.
+//! order field encoding with its history, ScrBlt, Frame Marker, and the orders the bitmap cache
+//! path needs: MemBlt, Mem3Blt and Cache Bitmap (Revision 2). Decode only: orders flow server →
+//! client.
 //!
 //! A primary order carries no length. Its field-flag width depends on its type, so an order of a
 //! type this module does not decode leaves the rest of the update unreadable:
@@ -35,6 +36,13 @@ pub const TS_ENC_SCRBLT_ORDER: u8 = 0x02;
 pub const TS_ENC_MEMBLT_ORDER: u8 = 0x0D;
 /// `orderType` (primary): Mem3Blt.
 pub const TS_ENC_MEM3BLT_ORDER: u8 = 0x0E;
+
+/// `orderType` (alternate secondary): Frame Marker.
+pub const TS_ALTSEC_FRAME_MARKER: u8 = 0x0D;
+/// Frame Marker `action`: a logical frame starts.
+pub const TS_FRAME_START: u32 = 0x0000_0000;
+/// Frame Marker `action`: a logical frame ends.
+pub const TS_FRAME_END: u32 = 0x0000_0001;
 
 /// `orderType` (secondary): Cache Bitmap (Revision 2), uncompressed.
 pub const TS_CACHE_BITMAP_UNCOMPRESSED_REV2: u8 = 0x04;
@@ -284,6 +292,11 @@ pub enum DrawingOrder<'a> {
     },
     /// Cache Bitmap (Revision 2).
     CacheBitmapRev2(CacheBitmapRev2<'a>),
+    /// Frame Marker (2.2.2.2.1.3.7): the start or end of a logical frame.
+    FrameMarker {
+        /// `action`: [`TS_FRAME_START`], [`TS_FRAME_END`], or a value neither names.
+        action: u32,
+    },
     /// A secondary order of a type not decoded here, skipped by its length.
     SkippedSecondary {
         /// Its `orderType`.
@@ -340,10 +353,15 @@ pub fn decode_order<'a>(
     match control & (TS_STANDARD | TS_SECONDARY) {
         TS_STANDARD => decode_primary(control, cur, history),
         0x03 => decode_secondary(cur),
-        TS_SECONDARY => Err(OrderError::Unsupported {
-            class: OrderClass::AlternateSecondary,
-            order_type: control >> 2,
-        }),
+        TS_SECONDARY => match control >> 2 {
+            TS_ALTSEC_FRAME_MARKER => Ok(DrawingOrder::FrameMarker {
+                action: cur.read_u32_le()?,
+            }),
+            order_type => Err(OrderError::Unsupported {
+                class: OrderClass::AlternateSecondary,
+                order_type,
+            }),
+        },
         _ => Err(DecodeError::InvalidField {
             field: "DRAWING_ORDER.controlFlags",
             reason: "neither TS_STANDARD nor TS_SECONDARY",
@@ -977,14 +995,40 @@ mod tests {
         assert!(matches!(orders[1], Ok(DrawingOrder::MemBlt { .. })));
     }
 
+    /// A Frame Marker is an alternate secondary order with a 4-byte action and no length
+    /// field; the orders after it decode.
+    #[test]
+    fn frame_markers_decode_and_the_update_goes_on() {
+        let mut bytes = vec![TS_ALTSEC_FRAME_MARKER << 2 | TS_SECONDARY];
+        bytes.extend_from_slice(&TS_FRAME_START.to_le_bytes());
+        bytes.extend_from_slice(&[TS_STANDARD | TS_TYPE_CHANGE, TS_ENC_MEMBLT_ORDER, 0, 0]);
+        bytes.push(TS_ALTSEC_FRAME_MARKER << 2 | TS_SECONDARY);
+        bytes.extend_from_slice(&TS_FRAME_END.to_le_bytes());
+        let mut history = OrderHistory::default();
+        let orders = decode_all(&bytes, &mut history);
+        assert_eq!(
+            orders[0],
+            Ok(DrawingOrder::FrameMarker {
+                action: TS_FRAME_START
+            })
+        );
+        assert!(matches!(orders[1], Ok(DrawingOrder::MemBlt { .. })));
+        assert_eq!(
+            orders[2],
+            Ok(DrawingOrder::FrameMarker {
+                action: TS_FRAME_END
+            })
+        );
+    }
+
     #[test]
     fn alternate_secondary_orders_stop_the_update() {
         let mut history = OrderHistory::default();
         assert_eq!(
-            decode_all(&[0x0D << 2 | TS_SECONDARY], &mut history),
+            decode_all(&[0x0A << 2 | TS_SECONDARY], &mut history),
             [Err(OrderError::Unsupported {
                 class: OrderClass::AlternateSecondary,
-                order_type: 0x0D
+                order_type: 0x0A
             })]
         );
     }
