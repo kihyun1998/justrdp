@@ -875,6 +875,14 @@ impl DemandActive {
         })
     }
 
+    /// Find the server's Input set — the carrier of `inputFlags`.
+    pub fn input(&self) -> Option<&InputCapabilitySet> {
+        self.capability_sets.iter().find_map(|c| match c {
+            CapabilitySet::Input(i) => Some(i),
+            _ => None,
+        })
+    }
+
     /// Find the server's Bitmap set — the carrier of the negotiated desktop size.
     pub fn bitmap(&self) -> Option<&BitmapCapabilitySet> {
         self.capability_sets.iter().find_map(|c| match c {
