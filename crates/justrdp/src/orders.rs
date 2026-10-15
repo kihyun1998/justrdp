@@ -6,9 +6,9 @@
 //! to it has already been applied.
 
 use crate::framebuffer::{FrameUpdate, Framebuffer};
+use crate::session::{charge, decode_bitmap};
 use justrdp_codecs::color::{self, Palette};
 use justrdp_codecs::rop::{self, Pattern};
-use justrdp_codecs::{planar, rle};
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::orders::{
@@ -45,9 +45,9 @@ enum Skip {
     OverBudget,
 }
 
-/// The connection's drawing-order state. It survives Deactivation–Reactivation except for the
-/// history, which [`Self::reset_history`] clears the way FreeRDP's `update_reset_state` does at
-/// each finalization (the spec is silent).
+/// The connection's drawing-order state: the primary order history, the bitmap caches and which
+/// blits were advertised. A Deactivation–Reactivation keeps the caches and resets the history
+/// ([`Self::reset_history`]).
 #[derive(Debug)]
 pub(crate) struct Orders {
     history: OrderHistory,
@@ -156,15 +156,14 @@ impl Orders {
             };
             match outcome {
                 Ok(()) => {}
-                Err(OrderOutcome::Skipped(Skip::OverBudget)) => over_budget += 1,
-                Err(OrderOutcome::Skipped(reason)) => {
+                Err(NotApplied::Skipped(Skip::OverBudget)) => over_budget += 1,
+                Err(NotApplied::Skipped(reason)) => {
                     tracing::debug!(target: "rdp_orders", ?reason, "drawing order skipped");
                 }
-                Err(OrderOutcome::Failed(error)) => return Err(error),
+                Err(NotApplied::Failed(error)) => return Err(error),
             }
         }
         if over_budget > 0 {
-            // The bitmap path's record (#367; ADR-0009 §3(b)), once per update.
             tracing::warn!(
                 target: "rdp_paint_budget",
                 update = "TS_UPDATE_ORDERS",
@@ -184,17 +183,17 @@ impl Orders {
         palette: &Palette,
         bits_per_pixel: u16,
         budget: &mut usize,
-    ) -> Result<(), OrderOutcome> {
+    ) -> Result<(), NotApplied> {
         let tile = 16usize << order.cache_id;
         let slot = self.slot(u16::from(order.cache_id), order.cache_index)?;
         let (width, height) = (usize::from(order.width), usize::from(order.height));
         if width > tile || height > tile {
             *slot = None;
-            return Err(OrderOutcome::Skipped(Skip::OversizedBitmap));
+            return Err(NotApplied::Skipped(Skip::OversizedBitmap));
         }
         if !charge(budget, width * height * 4) {
             *slot = None;
-            return Err(OrderOutcome::Skipped(Skip::OverBudget));
+            return Err(NotApplied::Skipped(Skip::OverBudget));
         }
         // The order names 16 bpp for a 15 bpp session too.
         let bpp = match (order.bits_per_pixel, bits_per_pixel) {
@@ -202,7 +201,7 @@ impl Orders {
             (bpp, _) => bpp,
         };
         let rgba = decode_bitmap(order.compressed, bpp, order.data, width, height, palette)
-            .map_err(OrderOutcome::Failed)?;
+            .map_err(NotApplied::Failed)?;
         *slot = Some(CachedBitmap {
             width: order.width,
             height: order.height,
@@ -213,22 +212,18 @@ impl Orders {
 
     /// The cache entry `(cache_id, index)` names: the waiting-list entry past the cache's
     /// last for [`BITMAPCACHE_WAITING_LIST_INDEX`].
-    fn slot(
-        &mut self,
-        cache_id: u16,
-        index: u16,
-    ) -> Result<&mut Option<CachedBitmap>, OrderOutcome> {
+    fn slot(&mut self, cache_id: u16, index: u16) -> Result<&mut Option<CachedBitmap>, NotApplied> {
         let cache = self
             .caches
             .get_mut(usize::from(cache_id))
-            .ok_or(OrderOutcome::Skipped(Skip::CacheOutOfRange))?;
+            .ok_or(NotApplied::Skipped(Skip::CacheOutOfRange))?;
         let last = cache.len() - 1;
         let index = if index == BITMAPCACHE_WAITING_LIST_INDEX {
             last
         } else if usize::from(index) < last {
             usize::from(index)
         } else {
-            return Err(OrderOutcome::Skipped(Skip::CacheOutOfRange));
+            return Err(NotApplied::Skipped(Skip::CacheOutOfRange));
         };
         Ok(&mut cache[index])
     }
@@ -246,19 +241,18 @@ impl Orders {
         bits_per_pixel: u16,
         budget: &mut usize,
         frames: &mut Vec<FrameUpdate>,
-    ) -> Result<(), OrderOutcome> {
+    ) -> Result<(), NotApplied> {
         if !advertised {
-            // 3.2.5.1.1.1 says SHOULD ignore; ADR-0009 §2 decided accept-and-log for orders.
             tracing::warn!(
                 target: "rdp_orders",
                 rop = order.rop,
-                "a drawing order this client did not advertise, painted anyway (ADR-0009)"
+                "a drawing order this client did not advertise, painted anyway"
             );
         }
         let clip = match clip {
             Clip::None => None,
             Clip::Bounds(bounds) => Some(bounds),
-            Clip::Unknown => return Err(OrderOutcome::Skipped(Skip::UnknownClip)),
+            Clip::Unknown => return Err(NotApplied::Skipped(Skip::UnknownClip)),
         };
         let pattern = match mem3blt {
             Some(order) if rop::uses_pattern(order.blt.rop) => {
@@ -266,13 +260,12 @@ impl Orders {
             }
             _ => None,
         };
-        // The color table entry in the high byte is for 8 bpp palettes; the session's palette
-        // is the one Palette updates set.
+        // The low byte is the cache; the high byte, a color table entry, is not read.
         let cache_id = order.cache_id & 0x00FF;
         let bitmap = self
             .slot(cache_id, order.cache_index)?
             .as_ref()
-            .ok_or(OrderOutcome::Skipped(Skip::CacheMiss))?;
+            .ok_or(NotApplied::Skipped(Skip::CacheMiss))?;
         // The destination, clipped to the framebuffer, the bounds and the source bitmap.
         let mut left = i32::from(order.left);
         let mut top = i32::from(order.top);
@@ -299,7 +292,7 @@ impl Orders {
         }
         let (width, height) = ((right - left) as usize, (bottom - top) as usize);
         if !charge(budget, width * height * 4) {
-            return Err(OrderOutcome::Skipped(Skip::OverBudget));
+            return Err(NotApplied::Skipped(Skip::OverBudget));
         }
         let source_stride = usize::from(bitmap.width) * 4;
         let target_stride = usize::from(framebuffer.width()) * 4;
@@ -338,8 +331,8 @@ impl Orders {
     }
 }
 
-/// An order that was not applied: skipped as 3.2.5.1.1.1 says, or failed on malformed data.
-enum OrderOutcome {
+/// Why an order was not applied: skipped, or failed on malformed data.
+enum NotApplied {
     Skipped(Skip),
     Failed(crate::SessionError),
 }
@@ -348,23 +341,8 @@ fn word(pixel: &[u8]) -> u32 {
     u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]])
 }
 
-/// Spend `cost` from `budget`, or leave it untouched and return `false` when it does not fit.
-fn charge(budget: &mut usize, cost: usize) -> bool {
-    match budget.checked_sub(cost) {
-        Some(left) => {
-            *budget = left;
-            true
-        }
-        None => false,
-    }
-}
-
 /// A Mem3Blt's brush, ready to paint.
-fn pattern(
-    order: &Mem3Blt,
-    palette: &Palette,
-    bits_per_pixel: u16,
-) -> Result<Pattern, OrderOutcome> {
+fn pattern(order: &Mem3Blt, palette: &Palette, bits_per_pixel: u16) -> Result<Pattern, NotApplied> {
     let brush = &order.brush;
     let fore = order_color(order.fore_color, palette, bits_per_pixel)?;
     let back = order_color(order.back_color, palette, bits_per_pixel)?;
@@ -372,9 +350,9 @@ fn pattern(
         rop::BS_SOLID => return Ok(Pattern::Solid(fore)),
         rop::BS_HATCHED => *rop::HATCH_PATTERNS
             .get(usize::from(brush.hatch))
-            .ok_or(OrderOutcome::Skipped(Skip::UnsupportedBrush))?,
+            .ok_or(NotApplied::Skipped(Skip::UnsupportedBrush))?,
         rop::BS_PATTERN => rop::pattern_rows(brush.hatch, &brush.extra),
-        _ => return Err(OrderOutcome::Skipped(Skip::UnsupportedBrush)),
+        _ => return Err(NotApplied::Skipped(Skip::UnsupportedBrush)),
     };
     Ok(Pattern::Mono {
         rows,
@@ -388,41 +366,15 @@ fn pattern(
 /// A TS_COLOR as an RGBA8888 word. Below 15 bpp the first byte is a palette index; at 15 and
 /// 16 bpp the first two bytes are the pixel, as FreeRDP's `gdi_decode_color` reads them; above,
 /// the bytes are red, green, blue.
-fn order_color(value: u32, palette: &Palette, bits_per_pixel: u16) -> Result<u32, OrderOutcome> {
+fn order_color(value: u32, palette: &Palette, bits_per_pixel: u16) -> Result<u32, NotApplied> {
     let bytes = value.to_le_bytes();
     let rgba = match bits_per_pixel {
         8 => color::to_rgba(&bytes[..1], 1, 1, 8, palette, false),
         15 | 16 => color::to_rgba(&bytes[..2], 1, 1, bits_per_pixel, palette, false),
         _ => return Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0xFF])),
     }
-    .map_err(|error| OrderOutcome::Failed(crate::SessionError::Color(error)))?;
+    .map_err(|error| NotApplied::Failed(crate::SessionError::Color(error)))?;
     Ok(word(&rgba))
-}
-
-/// Decode slow-path bitmap data (`[MS-RDPBCGR]` 2.2.9.1.1.3.1.2.2) to top-down RGBA: raw or
-/// interleaved RLE below 32 bpp, raw or RDP6 planar at 32, every layout bottom-up.
-pub(crate) fn decode_bitmap(
-    compressed: bool,
-    bits_per_pixel: u16,
-    data: &[u8],
-    width: usize,
-    height: usize,
-    palette: &Palette,
-) -> Result<Vec<u8>, crate::SessionError> {
-    use crate::SessionError;
-    match (compressed, bits_per_pixel) {
-        (false, bpp) => {
-            color::to_rgba(data, width, height, bpp, palette, true).map_err(SessionError::Color)
-        }
-        (true, 32) => {
-            let bgr = planar::decompress(data, width, height).map_err(SessionError::Planar)?;
-            color::to_rgba(&bgr, width, height, 24, palette, true).map_err(SessionError::Color)
-        }
-        (true, bpp) => {
-            let raw = rle::decompress(data, width, height, bpp).map_err(SessionError::Rle)?;
-            color::to_rgba(&raw, width, height, bpp, palette, true).map_err(SessionError::Color)
-        }
-    }
 }
 
 #[cfg(test)]

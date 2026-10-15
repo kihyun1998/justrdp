@@ -123,13 +123,39 @@ enum Painted {
 }
 
 /// Spend `cost` from `budget`, or leave it untouched and return `false` when it does not fit.
-fn charge(budget: &mut usize, cost: usize) -> bool {
+pub(crate) fn charge(budget: &mut usize, cost: usize) -> bool {
     match budget.checked_sub(cost) {
         Some(left) => {
             *budget = left;
             true
         }
         None => false,
+    }
+}
+
+/// Decode slow-path bitmap data (`[MS-RDPBCGR]` 2.2.9.1.1.3.1.2.2) to top-down RGBA: raw or
+/// interleaved RLE below 32 bpp, raw or RDP6 planar at 32, every layout bottom-up.
+pub(crate) fn decode_bitmap(
+    compressed: bool,
+    bits_per_pixel: u16,
+    data: &[u8],
+    width: usize,
+    height: usize,
+    palette: &Palette,
+) -> Result<Vec<u8>, crate::SessionError> {
+    use crate::SessionError;
+    match (compressed, bits_per_pixel) {
+        (false, bpp) => {
+            color::to_rgba(data, width, height, bpp, palette, true).map_err(SessionError::Color)
+        }
+        (true, 32) => {
+            let bgr = planar::decompress(data, width, height).map_err(SessionError::Planar)?;
+            color::to_rgba(&bgr, width, height, 24, palette, true).map_err(SessionError::Color)
+        }
+        (true, bpp) => {
+            let raw = rle::decompress(data, width, height, bpp).map_err(SessionError::Rle)?;
+            color::to_rgba(&raw, width, height, bpp, palette, true).map_err(SessionError::Color)
+        }
     }
 }
 
@@ -1441,7 +1467,7 @@ impl SessionStateMachine {
         if !charge(budget, width * height * 4) {
             return Ok(Painted::OverBudget);
         }
-        let rgba = crate::orders::decode_bitmap(
+        let rgba = decode_bitmap(
             rect.compressed,
             rect.bits_per_pixel,
             &rect.data,

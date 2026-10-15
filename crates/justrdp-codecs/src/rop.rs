@@ -50,16 +50,6 @@ pub fn uses_pattern(rop: u8) -> bool {
     rop >> 4 != rop & 0x0F
 }
 
-/// Whether the result of `rop` depends on the source.
-pub fn uses_source(rop: u8) -> bool {
-    (rop >> 2) & 0x33 != rop & 0x33
-}
-
-/// Whether the result of `rop` depends on the destination.
-pub fn uses_dest(rop: u8) -> bool {
-    (rop >> 1) & 0x55 != rop & 0x55
-}
-
 /// The rows of a [`BS_PATTERN`] brush, top row first: `BrushExtra` holds the top seven in
 /// reverse order and `BrushHatch` the bottom one (2.2.2.2.1.1.2.3).
 pub fn pattern_rows(hatch: u8, extra: &[u8; 7]) -> [u8; 8] {
@@ -156,12 +146,9 @@ mod tests {
     }
 
     #[test]
-    fn dependence_on_each_input() {
-        assert!(!uses_pattern(0xCC) && uses_source(0xCC) && !uses_dest(0xCC));
-        assert!(uses_pattern(0xF0) && !uses_source(0xF0) && !uses_dest(0xF0));
-        assert!(!uses_pattern(0x66) && uses_source(0x66) && uses_dest(0x66));
-        assert!(uses_pattern(0xB8) && uses_source(0xB8) && uses_dest(0xB8));
-        assert!(!uses_pattern(0x00) && !uses_source(0x00) && !uses_dest(0x00));
+    fn dependence_on_the_pattern() {
+        assert!(!uses_pattern(0xCC) && uses_pattern(0xF0) && uses_pattern(0xB8));
+        assert!(!uses_pattern(0x66) && !uses_pattern(0x00));
     }
 
     /// 2.2.2.2.1.1.2.3's example: a 45-degree line sloping down left to right.

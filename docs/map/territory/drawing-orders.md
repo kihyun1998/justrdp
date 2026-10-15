@@ -52,6 +52,15 @@ and the paint. Epic #22 (the bitmap cache half is #28's); #460 is the first slic
 - **ROP3 is one evaluator.** An index is its own truth table, so `rop3` covers all 256 bitwise
   over RGBA words, alpha forced opaque. MemBlt's ROP must not read the pattern (2.2.2.2.1.1.2.9);
   if one does, the pattern is black.
+- **Every session decodes Orders Updates, advertised or not.** Before #460 an Orders Update fell
+  to the dispatch's catch-all unread; now a malformed one is a `SessionError` even in a session
+  that advertised no order (ADR-0009 §3(a): a tolerated order with a malformed body is still a
+  typed error). With no Revision 2 set every blit misses, so an unadvertised MemBlt paints only
+  in a config `check` never saw.
+- **The colour depth is the server's.** `ServerAnnouncement::bits_per_pixel` comes from its
+  Demand Active, the client's Bitmap set only when that is 0. `check_orders` refuses orders at
+  8 bpp on the client's side; a server that answers 8 bpp anyway gets palette-index colours from
+  the session palette.
 - **Advertising the Revision 2 cache requires MemBlt *and* Mem3Blt.** `[MS-RDPBCGR]`
   2.2.7.1.4.2: a client MUST support both to receive Cache Bitmap (Revision 2). The census saw no
   Mem3Blt, but the obligation is the advertisement's, so the brush path is built.
@@ -64,10 +73,11 @@ and the paint. Epic #22 (the bitmap cache half is #28's); #460 is the first slic
   `ORDER_NEG_MEMBLT_INDEX`, `ORDER_NEG_MEM3BLT_INDEX`, `BITMAP_CACHE_REV2_MAX_ENTRIES`
 - `justrdp-codecs/src/rop.rs` — `rop3`, `uses_pattern`, `Pattern`, `pattern_rows`,
   `HATCH_PATTERNS`
-- `justrdp/src/orders.rs` — `Orders`, `decode_bitmap`, `order_color`
+- `justrdp/src/orders.rs` — `Orders`, `order_color`
 - `justrdp/src/advertise.rs` — `HONOURED_ORDERS`, `HONOURED_ORDER_FLAGS`,
   `HONOURED_BITMAP_CACHE_REV2_FLAGS`, `check_orders`
-- `justrdp/src/session.rs` — `apply_orders`, `on_demand_active`, `ServerAnnouncement`
+- `justrdp/src/session.rs` — `apply_orders`, `on_demand_active`, `ServerAnnouncement`,
+  `decode_bitmap`, `charge`
 - `justrdp/tests/real_server_memblt.rs` — `a_real_desktop_painted_in_memblt_orders_replays`
 - `justrdp-tokio/src/lib.rs` — `memblt_orders_paint_the_desktop_on_the_real_vm`
 - `fuzz/fuzz_targets/orders.rs`, `fuzz/fuzz_targets/session_orders.rs`

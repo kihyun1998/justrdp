@@ -8259,6 +8259,17 @@ mod tests {
                 !census.keys().any(|name| name.starts_with("stopped")),
                 "an order the session cannot decode arrived: {census:?}"
             );
+            assert_eq!(
+                updates.get(&fastpath::FP_UPDATE_BITMAP),
+                None,
+                "the desktop arrived as bitmap updates, not orders"
+            );
+            let blits: usize = census
+                .iter()
+                .filter(|(name, _)| name.starts_with("MemBlt") || name.starts_with("Mem3Blt"))
+                .map(|(_, count)| count)
+                .sum();
+            assert_eq!(frames, blits, "every frame is one blit's");
             assert_eq!(covered, width * height, "every pixel of the desktop is painted");
             let fb = machine.framebuffer();
             let mut distinct = std::collections::HashSet::new();
