@@ -913,7 +913,8 @@ pub async fn run_session_with_input(
 pub enum SessionCommand {
     /// Encode and send a batch of input events (the [`run_session_with_input`] semantics).
     /// Dropped during a Deactivation ([`SessionEvent::Deactivated`] until
-    /// [`SessionEvent::Reactivated`]).
+    /// [`SessionEvent::Reactivated`]); an event the server's announcement does not invite is
+    /// dropped on its own ([`justrdp::SessionStateMachine::encode_input`]).
     Input(Vec<InputEvent>),
     /// Request a client-initiated desktop resize via the Display Control channel
     /// (MS-RDPEDISP): the size, scale factors and orientation in the [`ResizeRequest`]. Valid
@@ -988,9 +989,11 @@ pub enum SessionEvent {
     /// A Deactivation began ([`justrdp::SessionOutput::Deactivated`]): input sent until
     /// [`SessionEvent::Reactivated`] is dropped, and the share-bound commands are refused.
     Deactivated,
-    /// The Deactivation ended ([`justrdp::SessionOutput::Reactivated`]). The host re-sends its
-    /// keyboard Synchronize here if it wants the server's lock state to match its own.
-    Reactivated,
+    /// The Deactivation ended ([`justrdp::SessionOutput::Reactivated`]), carrying the
+    /// reactivation's [`justrdp::ServerAnnouncement`]: input it does not invite is dropped from
+    /// here on. The host re-sends its keyboard Synchronize here if it wants the server's lock
+    /// state to match its own.
+    Reactivated(justrdp::ServerAnnouncement),
     /// The Display Control dynamic channel is open and the server's caps arrived:
     /// [`SessionCommand::Resize`] is valid from now on.
     DisplayControlReady,
@@ -1089,7 +1092,9 @@ pub async fn run_session_with_commands(
                         .map_err(SessionFailure::Io)?;
                 }
                 SessionOutput::Deactivated => on_event(SessionEvent::Deactivated),
-                SessionOutput::Reactivated => on_event(SessionEvent::Reactivated),
+                SessionOutput::Reactivated => {
+                    on_event(SessionEvent::Reactivated(machine.server_announcement()))
+                }
                 SessionOutput::DisplayControlReady => {
                     tracing::debug!(target: "rdp_displaycontrol_caps", "display control ready");
                     on_event(SessionEvent::DisplayControlReady);
@@ -11736,6 +11741,10 @@ mod tests {
             // The Deactivation the resize opens (#442), in the order the host heard it.
             let window: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::default();
             let window_in_event = window.clone();
+            // The Server Announcement `SessionEvent::Reactivated` carried (#449).
+            let reactivated_with: Arc<std::sync::Mutex<Option<justrdp::ServerAnnouncement>>> =
+                Arc::default();
+            let reactivated_with_in_event = reactivated_with.clone();
 
             let ready_in_event = ready_seen.clone();
             let on_event = move |event: SessionEvent| {
@@ -11754,8 +11763,9 @@ mod tests {
                             .expect("queue the input sent during the Deactivation");
                         return;
                     }
-                    SessionEvent::Reactivated => {
+                    SessionEvent::Reactivated(server) => {
                         window_in_event.lock().unwrap().push("reactivated");
+                        *reactivated_with_in_event.lock().unwrap() = Some(server);
                         return;
                     }
                     other => panic!("unexpected session event during resize: {other:?}"),
@@ -11816,6 +11826,12 @@ mod tests {
                 ["deactivated", "reactivated"],
                 "the host hears one Deactivation, opened and closed"
             );
+            // Measured on this VM: the same Input set at connect and after the resize (#443).
+            let server = reactivated_with
+                .lock()
+                .unwrap()
+                .expect("Reactivated carries the announcement");
+            assert_eq!(server.input_flags, 0x0375, "{server:?}");
             assert!(
                 logs_contain("input dropped during a Deactivation"),
                 "the Shift tap sent inside the Deactivation went out"

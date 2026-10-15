@@ -50,8 +50,23 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   of every Demand Active it reads (`rdp_read_input_capability_set`, `libfreerdp/core/capabilities.c`).
   Measured on the WS2019 VM: `inputFlags` is `0x0375` at connect and after a Display Control
   resize reactivation (one run, #443's triage), so the transport switch is proven at unit level
-  only (`reactivation_replaces_the_server_input_flags`). The other Input-set bits (Unicode,
-  MouseX, horizontal wheel) are the host's to honour and stay unread by the core.
+  only (`reactivation_replaces_the_server_input_flags`).
+- **Input the Server Announcement does not invite is dropped** (#449): `encode_input` drops, per
+  event and against the current announcement, Unicode without `INPUT_FLAG_UNICODE`, MouseX
+  without `INPUT_FLAG_MOUSEX` and a horizontal-wheel Mouse event without
+  `INPUT_FLAG_MOUSE_HWHEEL`, with an `rdp_input_gate` record; the rest of the batch goes out. The
+  host reads the announcement through `SessionStateMachine::server_announcement`, and
+  `justrdp-tokio`'s `SessionEvent::Reactivated` carries the reactivation's, because the command
+  runner holds the machine for the whole session. What the host does about a dropped event (say,
+  scancodes in place of Unicode) is its own. `[MS-RDPBCGR]` 2.2.7.1.6 only says each flag
+  *"indicates support"*; FreeRDP gates in its protocol layer all the same
+  (`libfreerdp/core/input.c`: Unicode refused, MouseX and horizontal wheel skipped with a
+  warning, against settings re-read from every Demand Active), as #438 refuses an unannounced
+  Refresh Rect. Gating in the core with the host able to read the announcement was the
+  maintainer's call in #449's triage, over surfacing only, gating only and wontfix; dropping
+  rather than erroring and the event payload are derived. Relative mouse has no `InputEvent`
+  yet. Measured: the WS2019 VM announces `0x0375`, all three flags, so nothing the VM suite
+  sends is dropped.
 - **A Deactivation stops input and the share-bound requests, not channels** (#442). `[MS-RDPBCGR]`
   3.2.5.5.1: after Deactivate All *"the client MUST disable its graphics and input protocol
   handlers"*. From the moment the session leaves the active phase (a Deactivate All, or a Demand
