@@ -866,23 +866,6 @@ impl DemandActive {
         })
     }
 
-    /// Find the server's General set — the carrier of `refreshRectSupport` and
-    /// `suppressOutputSupport`.
-    pub fn general(&self) -> Option<&GeneralCapabilitySet> {
-        self.capability_sets.iter().find_map(|c| match c {
-            CapabilitySet::General(g) => Some(g),
-            _ => None,
-        })
-    }
-
-    /// Find the server's Input set — the carrier of `inputFlags`.
-    pub fn input(&self) -> Option<&InputCapabilitySet> {
-        self.capability_sets.iter().find_map(|c| match c {
-            CapabilitySet::Input(i) => Some(i),
-            _ => None,
-        })
-    }
-
     /// Find the server's Bitmap set — the carrier of the negotiated desktop size.
     pub fn bitmap(&self) -> Option<&BitmapCapabilitySet> {
         self.capability_sets.iter().find_map(|c| match c {

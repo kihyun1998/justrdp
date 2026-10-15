@@ -77,9 +77,10 @@ fuzz_target!(|input: &[u8]| {
             share_id: 1,
             desktop_size: (64, 48),
             capabilities: capability::default_client_capabilities(&core),
-            server_input_flags: capability::INPUT_FLAG_SCANCODES,
-            server_refresh_rect: false,
-            server_suppress_output: false,
+            server: justrdp::ServerAnnouncement {
+                input_flags: capability::INPUT_FLAG_SCANCODES,
+                ..Default::default()
+            },
             drdynvc_channel_id: None,
             static_channels: Vec::new(),
             dynamic_channels: Vec::new(),

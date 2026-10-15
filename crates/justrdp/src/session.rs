@@ -26,6 +26,44 @@ use justrdp_pdu::{
     share, sound, svc, tpkt, update, x224,
 };
 
+/// The server's Demand Active capability sets as the session acts on them. The default announces
+/// nothing, the same as [`Self::from_capabilities`] over no sets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerAnnouncement {
+    /// `inputFlags` from the Input capability set, 0 without one. Selects the input transport:
+    /// fast-path when `INPUT_FLAG_FASTPATH_INPUT`/`INPUT2` is set, the slow-path Input Event PDU
+    /// otherwise.
+    pub input_flags: u16,
+    /// A non-zero `refreshRectSupport` in the General capability set (`[MS-RDPBCGR]` 2.2.7.1.1).
+    /// Gates [`SessionStateMachine::request_refresh_rect`].
+    pub refresh_rect: bool,
+    /// A non-zero `suppressOutputSupport` in the General capability set. Gates
+    /// [`SessionStateMachine::request_suppress_output`] and
+    /// [`SessionStateMachine::request_resume_output`].
+    pub suppress_output: bool,
+}
+
+impl ServerAnnouncement {
+    /// Read the announcement from a Demand Active's capability sets. A missing Input set gives
+    /// `input_flags` 0; a missing General set announces neither PDU. Where a set repeats, the
+    /// first one counts.
+    pub fn from_capabilities(sets: &[CapabilitySet]) -> Self {
+        let input = sets.iter().find_map(|set| match set {
+            CapabilitySet::Input(input) => Some(input),
+            _ => None,
+        });
+        let general = sets.iter().find_map(|set| match set {
+            CapabilitySet::General(general) => Some(general),
+            _ => None,
+        });
+        Self {
+            input_flags: input.map_or(0, |i| i.input_flags),
+            refresh_rect: general.is_some_and(|g| g.refresh_rect_support != 0),
+            suppress_output: general.is_some_and(|g| g.suppress_output_support != 0),
+        }
+    }
+}
+
 /// Everything the session machine needs from the completed connect sequence: channel
 /// addressing from [`crate::McsConnectResult`], the share state from
 /// [`crate::ActivationResult`], and the same capability list the connect config carried (the
@@ -43,20 +81,10 @@ pub struct SessionConfig {
     pub desktop_size: (u16, u16),
     /// The Confirm Active capability sets (caller-owned, verbatim — ADR-0016).
     pub capabilities: Vec<CapabilitySet>,
-    /// The server's `inputFlags` from its Demand Active Input capability set
-    /// ([`crate::ActivationResult::server_capabilities`]). Selects the input transport:
-    /// fast-path when the server advertised `INPUT_FLAG_FASTPATH_INPUT`/`INPUT2`, the
-    /// slow-path Input Event PDU otherwise. A reactivation replaces it; a Demand Active with no
-    /// Input set leaves 0.
-    pub server_input_flags: u16,
-    /// The server announced the Refresh Rect PDU: a non-zero `refreshRectSupport` in its Demand
-    /// Active General capability set (`[MS-RDPBCGR]` 2.2.7.1.1). Gates
-    /// [`SessionStateMachine::request_refresh_rect`]; a reactivation replaces it.
-    pub server_refresh_rect: bool,
-    /// The server announced the Suppress Output PDU: a non-zero `suppressOutputSupport` in its
-    /// Demand Active General capability set. Gates [`SessionStateMachine::request_suppress_output`]
-    /// and [`SessionStateMachine::request_resume_output`]; a reactivation replaces it.
-    pub server_suppress_output: bool,
+    /// What the server's Demand Active announced: build it with
+    /// [`ServerAnnouncement::from_capabilities`] over
+    /// [`crate::ActivationResult::server_capabilities`]. A reactivation replaces it.
+    pub server: ServerAnnouncement,
     /// The MCS channel ID the server granted for the `drdynvc` static channel
     /// ([`crate::McsConnectResult::static_channels`], entry named `"drdynvc"`), or `None` if
     /// the channel was not requested/granted — dynamic channels (Display Control resize,
@@ -349,7 +377,7 @@ pub enum OutputControlError {
     /// [`SessionOutput::Reactivated`].
     NotActive,
     /// The server's General capability set did not announce the PDU
-    /// ([`SessionConfig::server_refresh_rect`], [`SessionConfig::server_suppress_output`]).
+    /// ([`ServerAnnouncement::refresh_rect`], [`ServerAnnouncement::suppress_output`]).
     NotSupported,
     /// A Refresh Rect with no areas.
     NoAreas,
@@ -1356,11 +1384,7 @@ impl SessionStateMachine {
         let demand = capability::DemandActive::decode(cur).map_err(SessionError::Decode)?;
         self.leave_active(outputs);
         self.config.share_id = header.share_id;
-        let general = demand.general();
-        self.config.server_refresh_rect = general.is_some_and(|g| g.refresh_rect_support != 0);
-        self.config.server_suppress_output =
-            general.is_some_and(|g| g.suppress_output_support != 0);
-        self.config.server_input_flags = demand.input().map_or(0, |i| i.input_flags);
+        self.config.server = ServerAnnouncement::from_capabilities(&demand.capability_sets);
         let (width, height) = demand
             .bitmap()
             .map(|b| (b.desktop_width, b.desktop_height))
@@ -1477,7 +1501,7 @@ impl SessionStateMachine {
             })
             .collect();
 
-        let fastpath_input = self.config.server_input_flags
+        let fastpath_input = self.config.server.input_flags
             & (capability::INPUT_FLAG_FASTPATH_INPUT | capability::INPUT_FLAG_FASTPATH_INPUT2)
             != 0;
         if fastpath_input {
@@ -1700,7 +1724,7 @@ impl SessionStateMachine {
         if self.phase != Phase::Active {
             return Err(OutputControlError::NotActive);
         }
-        if !self.config.server_refresh_rect {
+        if !self.config.server.refresh_rect {
             return Err(OutputControlError::NotSupported);
         }
         if areas.is_empty() {
@@ -1730,7 +1754,7 @@ impl SessionStateMachine {
         if self.phase != Phase::Active {
             return Err(OutputControlError::NotActive);
         }
-        if self.output_suppressed && self.config.server_suppress_output {
+        if self.output_suppressed && self.config.server.suppress_output {
             return Ok(Vec::new());
         }
         let frames = self.suppress_output(None)?;
@@ -1765,7 +1789,7 @@ impl SessionStateMachine {
         &self,
         desktop: Option<output_control::InclusiveRect>,
     ) -> Result<Vec<Vec<u8>>, OutputControlError> {
-        if !self.config.server_suppress_output {
+        if !self.config.server.suppress_output {
             return Err(OutputControlError::NotSupported);
         }
         let body = output_control::encode_suppress_output(desktop);
@@ -2364,10 +2388,11 @@ mod tests {
             share_id: SHARE,
             desktop_size: (16, 8),
             capabilities: capability::default_client_capabilities(&test_core()),
-            server_input_flags: capability::INPUT_FLAG_SCANCODES
-                | capability::INPUT_FLAG_FASTPATH_INPUT2,
-            server_refresh_rect: false,
-            server_suppress_output: false,
+            server: ServerAnnouncement {
+                input_flags: capability::INPUT_FLAG_SCANCODES
+                    | capability::INPUT_FLAG_FASTPATH_INPUT2,
+                ..Default::default()
+            },
             drdynvc_channel_id: Some(DRDYNVC),
             static_channels: [
                 ("cliprdr", CLIPRDR, 0),
@@ -2439,8 +2464,11 @@ mod tests {
                 user_channel_id: 1006,
                 io_channel_id: 1003,
                 share_id: 0x0001_03EA,
-                server_refresh_rect: true,
-                server_suppress_output: true,
+                server: ServerAnnouncement {
+                    refresh_rect: true,
+                    suppress_output: true,
+                    ..config().server
+                },
                 ..config()
             },
             Vec::new(),
@@ -2523,8 +2551,11 @@ mod tests {
     fn output_control_is_refused_when_the_server_did_not_announce_it() {
         let mut only_suppress = SessionStateMachine::new(
             SessionConfig {
-                server_refresh_rect: false,
-                server_suppress_output: true,
+                server: ServerAnnouncement {
+                    refresh_rect: false,
+                    suppress_output: true,
+                    ..config().server
+                },
                 ..config()
             },
             Vec::new(),
@@ -2538,8 +2569,11 @@ mod tests {
 
         let mut only_refresh = SessionStateMachine::new(
             SessionConfig {
-                server_refresh_rect: true,
-                server_suppress_output: false,
+                server: ServerAnnouncement {
+                    refresh_rect: true,
+                    suppress_output: false,
+                    ..config().server
+                },
                 ..config()
             },
             Vec::new(),
@@ -2665,6 +2699,83 @@ mod tests {
         assert_eq!(
             sm.request_suppress_output(),
             Err(OutputControlError::NotSupported)
+        );
+    }
+
+    /// The Server Announcement reads `inputFlags` from the Input set and the two support bytes
+    /// from the General set; a missing set announces nothing, which is also the default.
+    #[test]
+    fn server_announcement_reads_the_input_and_general_sets() {
+        let input = CapabilitySet::Input(capability::InputCapabilitySet {
+            input_flags: 0x0375,
+            ..Default::default()
+        });
+        let general = CapabilitySet::General(capability::GeneralCapabilitySet {
+            refresh_rect_support: 1,
+            suppress_output_support: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            ServerAnnouncement::from_capabilities(&[general.clone(), input.clone()]),
+            ServerAnnouncement {
+                input_flags: 0x0375,
+                refresh_rect: true,
+                suppress_output: false,
+            }
+        );
+        assert_eq!(
+            ServerAnnouncement::from_capabilities(&[general]),
+            ServerAnnouncement {
+                input_flags: 0,
+                refresh_rect: true,
+                suppress_output: false,
+            },
+            "no Input set: inputFlags 0"
+        );
+        assert_eq!(
+            ServerAnnouncement::from_capabilities(std::slice::from_ref(&input)),
+            ServerAnnouncement {
+                input_flags: 0x0375,
+                refresh_rect: false,
+                suppress_output: false,
+            },
+            "no General set: neither PDU announced"
+        );
+        assert_eq!(
+            ServerAnnouncement::from_capabilities(&[]),
+            ServerAnnouncement::default()
+        );
+        let second_input = CapabilitySet::Input(capability::InputCapabilitySet {
+            input_flags: capability::INPUT_FLAG_SCANCODES,
+            ..Default::default()
+        });
+        assert_eq!(
+            ServerAnnouncement::from_capabilities(&[input, second_input]).input_flags,
+            0x0375,
+            "the first Input set counts"
+        );
+    }
+
+    /// One Demand Active yields one Server Announcement on both legs: the host's at connect and
+    /// the core's at reactivation.
+    #[test]
+    fn connect_and_reactivation_derive_the_same_announcement() {
+        let sets = vec![
+            CapabilitySet::General(capability::GeneralCapabilitySet {
+                refresh_rect_support: 0,
+                suppress_output_support: 1,
+                ..Default::default()
+            }),
+            CapabilitySet::Input(capability::InputCapabilitySet {
+                input_flags: capability::INPUT_FLAG_SCANCODES,
+                ..Default::default()
+            }),
+        ];
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        reactivate(&mut sm, sets.clone());
+        assert_eq!(
+            sm.config.server,
+            ServerAnnouncement::from_capabilities(&sets)
         );
     }
 
@@ -4464,7 +4575,7 @@ mod tests {
     #[test]
     fn input_falls_back_to_slowpath_without_the_server_flag() {
         let mut cfg = config();
-        cfg.server_input_flags = capability::INPUT_FLAG_SCANCODES;
+        cfg.server.input_flags = capability::INPUT_FLAG_SCANCODES;
         let sm = SessionStateMachine::new(cfg, Vec::new())
             .expect("the test desktop size is within MAX_DESKTOP_DIM");
         let event = InputEvent::Mouse {
