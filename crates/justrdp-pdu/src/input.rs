@@ -138,7 +138,7 @@ pub enum InputEvent {
     },
     /// A Unicode text event (TS_FP_UNICODE_KEYBOARD_EVENT) — one UTF-16 code unit, for hosts
     /// that deliver text rather than key positions. Requires `INPUT_FLAG_UNICODE` from the
-    /// server.
+    /// server; the session drops it otherwise.
     Unicode {
         /// The UTF-16 code unit.
         code_unit: u16,
@@ -152,7 +152,9 @@ pub enum InputEvent {
         toggle_flags: u8,
     },
     /// A mouse move / button / vertical-or-horizontal wheel event (TS_FP_POINTER_EVENT /
-    /// TS_POINTER_EVENT), in absolute desktop coordinates.
+    /// TS_POINTER_EVENT), in absolute desktop coordinates. A horizontal-wheel event
+    /// ([`PTRFLAGS_HWHEEL`]) requires `INPUT_FLAG_MOUSE_HWHEEL` from the server; the session
+    /// drops it otherwise.
     Mouse {
         /// `PTRFLAGS_*` bits (move/buttons/wheel selectors).
         flags: u16,
@@ -166,7 +168,8 @@ pub enum InputEvent {
         y: u16,
     },
     /// An extended mouse-button event (TS_FP_POINTERX_EVENT / TS_POINTERX_EVENT): the
-    /// XBUTTON1/XBUTTON2 side buttons. Requires `INPUT_FLAG_MOUSEX` to have been negotiated.
+    /// XBUTTON1/XBUTTON2 side buttons. Requires `INPUT_FLAG_MOUSEX` from the server; the
+    /// session drops it otherwise.
     MouseX {
         /// `PTRXFLAGS_*` bits.
         flags: u16,

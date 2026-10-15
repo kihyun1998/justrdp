@@ -1450,12 +1450,21 @@ impl SessionStateMachine {
         Ok(())
     }
 
+    /// What the server's Demand Active announced: the connect-time value the host gave in
+    /// [`SessionConfig::server`] until a reactivation, then the reactivation's.
+    pub fn server_announcement(&self) -> ServerAnnouncement {
+        self.config.server
+    }
+
     /// Encode host input events into complete outbound wire frames. The
     /// transport is chosen from what the server's Input capability set advertised: fast-path
     /// input PDUs when `INPUT_FLAG_FASTPATH_INPUT`/`INPUT2` was set, the slow-path Input
     /// Event PDU otherwise. Batches over a single PDU's event bound are split automatically
     /// (the fast-path spill rule), and mouse coordinates are clamped to the current desktop —
     /// a stale coordinate from a pre-resize host event must not land outside the new desktop.
+    /// An event the current [`ServerAnnouncement`] does not invite is dropped and the rest of
+    /// the batch is encoded: Unicode without `INPUT_FLAG_UNICODE`, MouseX without
+    /// `INPUT_FLAG_MOUSEX`, a horizontal-wheel Mouse event without `INPUT_FLAG_MOUSE_HWHEEL`.
     ///
     /// The adapter writes the returned frames to the socket in order. Pure function of the
     /// machine's negotiated state: no I/O, no phase change. During a Deactivation
@@ -1478,8 +1487,31 @@ impl SessionStateMachine {
             self.config.desktop_size.0.saturating_sub(1),
             self.config.desktop_size.1.saturating_sub(1),
         );
+        let input_flags = self.config.server.input_flags;
         let events: Vec<InputEvent> = events
             .iter()
+            .filter(|event| {
+                let required = match **event {
+                    InputEvent::Unicode { .. } => Some(("UNICODE", capability::INPUT_FLAG_UNICODE)),
+                    InputEvent::MouseX { .. } => Some(("MOUSEX", capability::INPUT_FLAG_MOUSEX)),
+                    InputEvent::Mouse { flags, .. } if flags & input::PTRFLAGS_HWHEEL != 0 => {
+                        Some(("MOUSE_HWHEEL", capability::INPUT_FLAG_MOUSE_HWHEEL))
+                    }
+                    _ => None,
+                };
+                match required {
+                    Some((name, flag)) if input_flags & flag == 0 => {
+                        tracing::debug!(
+                            target: "rdp_input_gate",
+                            ?event,
+                            missing = name,
+                            "input event dropped: the server's Input set does not announce it"
+                        );
+                        false
+                    }
+                    _ => true,
+                }
+            })
             .map(|event| match *event {
                 InputEvent::Mouse {
                     flags,
@@ -2777,6 +2809,121 @@ mod tests {
             sm.config.server,
             ServerAnnouncement::from_capabilities(&sets)
         );
+    }
+
+    /// A machine whose server announced the fast-path transport plus `extra` input flags.
+    fn announcing(extra: u16) -> SessionStateMachine {
+        let mut cfg = config();
+        cfg.server.input_flags =
+            capability::INPUT_FLAG_SCANCODES | capability::INPUT_FLAG_FASTPATH_INPUT2 | extra;
+        SessionStateMachine::new(cfg, Vec::new()).unwrap()
+    }
+
+    fn unicode() -> InputEvent {
+        InputEvent::Unicode {
+            code_unit: 0x41,
+            release: false,
+        }
+    }
+
+    fn mouse_x() -> InputEvent {
+        InputEvent::MouseX {
+            flags: input::PTRXFLAGS_DOWN | input::PTRXFLAGS_BUTTON1,
+            x: 3,
+            y: 4,
+        }
+    }
+
+    fn horizontal_wheel() -> InputEvent {
+        InputEvent::Mouse {
+            flags: input::PTRFLAGS_HWHEEL,
+            wheel_units: 120,
+            x: 3,
+            y: 4,
+        }
+    }
+
+    /// Each event the Input set gates is encoded with its flag and dropped without it.
+    #[test]
+    fn input_the_server_did_not_announce_is_dropped() {
+        for (event, flag) in [
+            (unicode(), capability::INPUT_FLAG_UNICODE),
+            (mouse_x(), capability::INPUT_FLAG_MOUSEX),
+            (horizontal_wheel(), capability::INPUT_FLAG_MOUSE_HWHEEL),
+        ] {
+            assert_eq!(
+                announcing(0).encode_input(&[event]),
+                Vec::<Vec<u8>>::new(),
+                "{event:?} without its flag"
+            );
+            assert_eq!(
+                announcing(flag).encode_input(&[event]),
+                vec![input::encode_fastpath_input(&[event])],
+                "{event:?} with its flag"
+            );
+        }
+        let vertical_wheel = InputEvent::Mouse {
+            flags: input::PTRFLAGS_WHEEL,
+            wheel_units: 120,
+            x: 3,
+            y: 4,
+        };
+        assert_eq!(
+            announcing(0).encode_input(&[vertical_wheel]),
+            vec![input::encode_fastpath_input(&[vertical_wheel])],
+            "the vertical wheel needs no flag"
+        );
+    }
+
+    /// A dropped event leaves the rest of its batch, in order.
+    #[test]
+    fn a_dropped_event_keeps_the_rest_of_the_batch() {
+        let key = key_press()[0];
+        let sync = InputEvent::Sync { toggle_flags: 0 };
+        assert_eq!(
+            announcing(0).encode_input(&[key, unicode(), sync, mouse_x()]),
+            vec![input::encode_fastpath_input(&[key, sync])]
+        );
+        assert_eq!(
+            announcing(0).encode_input(&[unicode()]),
+            Vec::<Vec<u8>>::new()
+        );
+    }
+
+    /// The gate follows the current announcement: a reactivation that withdraws a flag drops
+    /// the event, one that grants it lets it through, and the getter reports each.
+    #[test]
+    fn the_input_gate_follows_the_reactivation() {
+        let input_set = |input_flags| {
+            CapabilitySet::Input(capability::InputCapabilitySet {
+                input_flags,
+                ..Default::default()
+            })
+        };
+        let mut sm = announcing(capability::INPUT_FLAG_UNICODE);
+        assert_eq!(
+            sm.server_announcement().input_flags,
+            capability::INPUT_FLAG_SCANCODES
+                | capability::INPUT_FLAG_FASTPATH_INPUT2
+                | capability::INPUT_FLAG_UNICODE
+        );
+        assert_eq!(sm.encode_input(&[unicode()]).len(), 1);
+
+        let without = capability::INPUT_FLAG_SCANCODES | capability::INPUT_FLAG_FASTPATH_INPUT2;
+        reactivate(&mut sm, vec![input_set(without)]);
+        font_map(&mut sm);
+        assert_eq!(sm.server_announcement().input_flags, without);
+        assert!(
+            sm.encode_input(&[unicode()]).is_empty(),
+            "UNICODE withdrawn"
+        );
+
+        reactivate(
+            &mut sm,
+            vec![input_set(without | capability::INPUT_FLAG_UNICODE)],
+        );
+        font_map(&mut sm);
+        assert_eq!(sm.encode_input(&[unicode()]).len(), 1, "UNICODE granted");
     }
 
     /// A reactivation's Demand Active replaces the server's input flags, so the input transport
