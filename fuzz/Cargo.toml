@@ -360,3 +360,11 @@ path = "fuzz_targets/xcrush.rs"
 test = false
 doc = false
 bench = false
+
+# ncrush (#455): RDP 6.0 bulk decompression, Huffman-coded with an offset cache.
+[[bin]]
+name = "ncrush"
+path = "fuzz_targets/ncrush.rs"
+test = false
+doc = false
+bench = false

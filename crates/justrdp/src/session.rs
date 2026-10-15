@@ -3722,7 +3722,7 @@ mod tests {
             "{outputs:?}"
         );
 
-        for (compressed_type, ty) in [(0x22, 2), (0x24, 4)] {
+        for (compressed_type, ty) in [(0x24, 4), (0x2f, 15)] {
             let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
             let frame = server_compressed_data_pdu(share::PDU_TYPE2_UPDATE, compressed_type, &[0]);
             assert_eq!(

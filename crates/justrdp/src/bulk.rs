@@ -3,12 +3,15 @@
 //! type nibble.
 
 use justrdp_codecs::mppc::{Mppc, MppcError, MppcLevel, PACKET_COMPRESSED, PACKET_FLUSHED};
+use justrdp_codecs::ncrush::{Ncrush, NcrushError};
 use justrdp_codecs::xcrush::{Xcrush, XcrushError};
 
 /// `PACKET_COMPR_TYPE_8K`: MPPC with an 8 KB history (RDP 4.0).
 pub const PACKET_COMPR_TYPE_8K: u8 = 0;
 /// `PACKET_COMPR_TYPE_64K`: MPPC with a 64 KB history (RDP 5.0).
 pub const PACKET_COMPR_TYPE_64K: u8 = 1;
+/// `PACKET_COMPR_TYPE_RDP6`: NCRUSH, `[MS-RDPEGDI]` 3.1.8.1 (RDP 6.0).
+pub const PACKET_COMPR_TYPE_RDP6: u8 = 2;
 /// `PACKET_COMPR_TYPE_RDP61`: XCRUSH, `[MS-RDPEGDI]` 3.1.8.2 (RDP 6.1).
 pub const PACKET_COMPR_TYPE_RDP61: u8 = 3;
 
@@ -29,6 +32,8 @@ pub enum BulkError {
     },
     /// The MPPC decompressor refused the payload.
     Mppc(MppcError),
+    /// The NCRUSH decompressor refused the payload.
+    Ncrush(NcrushError),
     /// The XCRUSH decompressor refused the payload.
     Xcrush(XcrushError),
 }
@@ -41,6 +46,7 @@ impl core::fmt::Display for BulkError {
                 write!(f, "bulk compression type changed from {from} to {to}")
             }
             Self::Mppc(e) => write!(f, "MPPC: {e}"),
+            Self::Ncrush(e) => write!(f, "NCRUSH: {e}"),
             Self::Xcrush(e) => write!(f, "XCRUSH: {e}"),
         }
     }
@@ -52,6 +58,7 @@ impl core::error::Error for BulkError {}
 #[derive(Debug)]
 enum Context {
     Mppc(Mppc),
+    Ncrush(Box<Ncrush>),
     Xcrush(Box<Xcrush>),
 }
 
@@ -61,6 +68,7 @@ impl Context {
         match ty {
             PACKET_COMPR_TYPE_8K => Self::Mppc(Mppc::new(MppcLevel::Rdp4)),
             PACKET_COMPR_TYPE_64K => Self::Mppc(Mppc::new(MppcLevel::Rdp5)),
+            PACKET_COMPR_TYPE_RDP6 => Self::Ncrush(Box::default()),
             _ => Self::Xcrush(Box::default()),
         }
     }
@@ -69,6 +77,7 @@ impl Context {
         match self {
             Self::Mppc(mppc) if mppc.level() == MppcLevel::Rdp4 => PACKET_COMPR_TYPE_8K,
             Self::Mppc(_) => PACKET_COMPR_TYPE_64K,
+            Self::Ncrush(_) => PACKET_COMPR_TYPE_RDP6,
             Self::Xcrush(_) => PACKET_COMPR_TYPE_RDP61,
         }
     }
@@ -95,6 +104,11 @@ impl Bulk {
                     Some(Context::Mppc(mppc)) => {
                         mppc.decompress(src, compression).map_err(BulkError::Mppc)?;
                     }
+                    Some(Context::Ncrush(ncrush)) => {
+                        ncrush
+                            .decompress(src, compression)
+                            .map_err(BulkError::Ncrush)?;
+                    }
                     Some(Context::Xcrush(xcrush)) if compression & PACKET_FLUSHED != 0 => {
                         xcrush.flush();
                     }
@@ -106,7 +120,10 @@ impl Bulk {
         let ty = compression & 0x0F;
         if !matches!(
             ty,
-            PACKET_COMPR_TYPE_8K | PACKET_COMPR_TYPE_64K | PACKET_COMPR_TYPE_RDP61
+            PACKET_COMPR_TYPE_8K
+                | PACKET_COMPR_TYPE_64K
+                | PACKET_COMPR_TYPE_RDP6
+                | PACKET_COMPR_TYPE_RDP61
         ) {
             return Err(BulkError::UnsupportedType(ty));
         }
@@ -122,6 +139,9 @@ impl Bulk {
         }
         match context {
             Context::Mppc(mppc) => mppc.decompress(src, compression).map_err(BulkError::Mppc),
+            Context::Ncrush(ncrush) => ncrush
+                .decompress(src, compression)
+                .map_err(BulkError::Ncrush),
             Context::Xcrush(xcrush) => xcrush
                 .decompress(src, compression)
                 .map_err(BulkError::Xcrush),
@@ -133,6 +153,7 @@ impl Bulk {
 mod tests {
     use super::*;
     use justrdp_codecs::mppc::{PACKET_AT_FRONT, PACKET_COMPRESSED};
+    use justrdp_codecs::ncrush::NcrushError;
 
     /// `"hi"` as two RDP 4/5 literals.
     const HI: [u8; 2] = *b"hi";
@@ -176,7 +197,7 @@ mod tests {
                 Ok(&b"hi"[..])
             );
         }
-        for ty in [2, 4, 15] {
+        for ty in [4, 15] {
             assert_eq!(
                 Bulk::default().decompress(&HI, ty | PACKET_COMPRESSED),
                 Err(BulkError::UnsupportedType(ty))
@@ -232,6 +253,45 @@ mod tests {
         assert_eq!(
             bulk.decompress(&HI, PACKET_COMPR_TYPE_64K | PACKET_COMPRESSED),
             Err(BulkError::TypeChanged { from: 3, to: 1 })
+        );
+    }
+
+    /// NCRUSH "hi": literals 'h' (index 104, code 0x0007, 10 bits) and 'i' (105, 0x0207, 10)
+    /// then end-of-stream (256, 0x17ff, 13), from `[MS-RDPEGDI]` Tables 1 and 2, least
+    /// significant bit first.
+    fn ncrush_hi() -> Vec<u8> {
+        let codes: [(u32, usize); 3] = [(0x0007, 10), (0x0207, 10), (0x17ff, 13)];
+        let mut bytes = vec![0u8; 5];
+        let mut at = 0;
+        for (code, len) in codes {
+            for i in 0..len {
+                bytes[at / 8] |= ((code >> i & 1) as u8) << (at % 8);
+                at += 1;
+            }
+        }
+        bytes
+    }
+
+    const RDP6: u8 = 2;
+
+    #[test]
+    fn ncrush_type_decompresses() {
+        let mut bulk = Bulk::default();
+        assert_eq!(
+            bulk.decompress(&ncrush_hi(), RDP6 | PACKET_COMPRESSED),
+            Ok(&b"hi"[..])
+        );
+    }
+
+    #[test]
+    fn an_uncompressed_flush_reaches_the_ncrush_history() {
+        let mut bulk = Bulk::default();
+        bulk.decompress(&ncrush_hi(), RDP6 | PACKET_COMPRESSED)
+            .unwrap();
+        // PACKET_AT_FRONT alone at offset 2 has nothing to slide: the flags reach NCRUSH.
+        assert_eq!(
+            bulk.decompress(b"raw", RDP6 | PACKET_AT_FRONT),
+            Err(BulkError::Ncrush(NcrushError::NothingToSlide { offset: 2 }))
         );
     }
 
