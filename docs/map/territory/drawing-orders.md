@@ -68,8 +68,7 @@ host is handed as one frame (#462). Epic #22 (the bitmap cache half is
   bound. It accepts the stall the Graphics Pipeline already accepts, a start whose end never
   comes; it did not decide whether either should get a bound, nor the Surface Commands frame
   marker, a different message.
-- **Unmatched markers are tolerated**, in ADR-0009's posture; §2's enumeration names no
-  sequencing fault, so this is a reading of it rather than its text. A start inside a frame
+- **Unmatched markers are tolerated** (ADR-0009, Amendment 2026-10-16): a start inside a frame
   continues it, and an end with no start and an action that is neither are ignored.
 - **A frame's held rects die with the framebuffer they name.** A reactivation drops the frame in
   flight, whose pixels the reactivation's full frame carries; a Graphics Pipeline resize

@@ -359,3 +359,23 @@ refusal ends the session. They chose the size bound, as a skip.
 total was already bounded by #372. This row bounds the ordinary case and ties a decode to memory the
 server has made resident; the worst case is unchanged.
 
+
+## Amendment (2026-10-16, #462): §2's enumeration gains a Frame Marker sequencing fault
+
+**Kind: judgement.** The 2026-08-25 amendment scoped §2 by enumeration, and the list names no
+fault of order. The Frame Marker alternate secondary drawing order (`[MS-RDPEGDI]` 2.2.2.2.1.3.7)
+brings one: a `TS_FRAME_START` inside a frame, a `TS_FRAME_END` with no start, and an `action` the
+spec names neither. All three are now **§2 faults, tolerated**: a start inside a frame continues
+it, an end with no start and an unknown action are ignored, each logged at `rdp_orders` debug.
+
+The grounds. The spec gives a marker no consequence beyond rendering ("SHOULD be rendered as a
+logical unit"), so a misplaced one is a rendering self-inconsistency of exactly §2's kind, and §3(a)
+is untouched: the marker is four fixed bytes, and a short one is still a typed error. FreeRDP's
+client does nothing with a marker at all (`gdi_frame_marker` returns `TRUE`), so tolerance here is
+the reference's behaviour, not a loosening of it. On the WS2019 VM, 38 starts met 38 ends; no
+unmatched marker has been observed.
+
+**What it does not decide:** a start whose end never comes. The session holds that frame's
+`FrameUpdate`s until the end, the maintainer's call of the same day, and with no end they never
+reach the host. The Graphics Pipeline's `StartFrame` has had the same property since #163. Neither
+is bounded, and whether either should be is open.
