@@ -115,7 +115,7 @@ host is handed as one frame (#462). Epic #22 (the bitmap cache half is
 - `justrdp-tokio/src/lib.rs` — `memblt_orders_paint_the_desktop_on_the_real_vm`,
   `scrblt_slides_the_start_menu_as_a_redraw_paints_it_on_the_real_vm`,
   `frame_markers_bracket_what_a_redraw_paints_on_the_real_vm`,
-  `bitmap_cache_order_sessions_survive_every_depth_on_the_real_vm`,
+  `bitmap_cache_order_sessions_are_not_reset_on_the_real_vm`,
   `orders_at_32_bpp_paint_what_a_redraw_paints_on_the_real_vm`, `orders_at_depth`, `OrderCensus`,
   `legacy_orders_config`
 - `fuzz/fuzz_targets/orders.rs`, `fuzz/fuzz_targets/session_orders.rs`
@@ -128,7 +128,7 @@ host is handed as one frame (#462). Epic #22 (the bitmap cache half is
   bitmap cache, the server painted in Surface Commands and sent no order.
 - **At 24 and 32 bpp FreeRDP's bitmap cache advertisement got the connection reset** 11 ms
   after activation, after two Frame Markers, with no Set Error Info; at 16 bpp it works. Still
-  so on 2026-10-16. It is FreeRDP's, not the depth's: see #463 below.
+  so on 2026-10-16. Something FreeRDP-specific triggers it, not the depth: see #463 below.
 - **What a 68 s interactive 16 bpp session carried:** 21,096 MemBlt and 159 ScrBlt, all
   SRCCOPY; 16,388 Cache Bitmap (Revision 2); 1,294 Frame Markers; no other order, and no glyph
   order with `GLYPH_SUPPORT_FULL` advertised and text typed.
@@ -167,21 +167,25 @@ alone could see neither: holding never touches the framebuffer.
 **Order sessions at 32 bpp (#463).** justrdp's bitmap-cache order advertisement is not reset
 at any depth: 32 bpp, 24 bpp (which this VM's colour-depth policy answers with 32) and 16 bpp,
 and at 32 bpp with the waiting list, with FreeRDP's five cells (600, 600, 2048, 4096, 2048) and
-with Frame Marker, each in its own connection, 8 s each, orders arriving in every one. A
-throwaway build that lifted the advertisement check then added FreeRDP's other differences one
-at a time at 32 bpp, and none reset either: its whole `orderSupport` (MemBlt V2 indices,
-OpaqueRect, LineTo, Polyline and the rest), `COLORINDEXSUPPORT`, both together, Frame
-Acknowledge 2, Large Pointer, its five plain sets (Share, Font, Control, Color Cache, Window
-Activation), Surface Commands, and `drawingFlags` 0x0A. **What resets FreeRDP is not
-identified**: not one of those alone, so a combination of them or something FreeRDP sends after
-activation.
+with Frame Marker, each in its own connection, orders arriving in every one
+(`bitmap_cache_order_sessions_are_not_reset_on_the_real_vm`). Measured once, not in a test: a
+throwaway build that lifted the advertisement check added FreeRDP's other differences one at a
+time at 32 bpp, and none reset either: its whole `orderSupport` (MemBlt V2 indices, OpaqueRect,
+LineTo, Polyline and the rest), `COLORINDEXSUPPORT`, both together, Frame Acknowledge 2, Large
+Pointer, its five plain sets (Share, Font, Control, Color Cache, Window Activation), Surface
+Commands, and `drawingFlags` 0x0A. **What resets FreeRDP is not identified.** Not tried: FreeRDP's
+Glyph, Offscreen, Brush, Bitmap Codecs, Input, Pointer and Virtual Channel sets as it fills them,
+its GCC blocks and Client Info, combinations of the above, and what it sends after activation.
+Nothing measured says FreeRDP's input is wrong rather than one the server mishandles.
 
 A 32 bpp session caches 32 bpp bitmaps (compressed, so RDP6 planar), and its desktop equals a
 Refresh Rect redraw. That redraw goes through the same decoder, so it cannot see a decode fault;
-what can is a 32 bpp NSCodec session's desktop, an independent decoder: the two differ by at
-most 21 per channel everywhere but the Start button's highlight and the clock, NSCodec's own
-loss. Neither shows the "activate Windows" watermark, which every 16 bpp session paints; at
-32 bpp the server does not draw it.
+what can is a 32 bpp NSCodec session's desktop, an independent decoder. Measured once, from the
+two tests' dumps (`justrdp-463-32bpp.ppm`, `justrdp-150-nscodec-surface-bits.ppm`): 4,064 pixels
+differ by at most 21 per channel, which is NSCodec's loss, and 1,996 differ by more, all in two
+40-row cells where the content itself differs, the Start button's highlight and the clock. In
+both dumps the "activate Windows" watermark's region (880–1279 × 640–739) is all black, where
+every 16 bpp dump draws the watermark: at 32 bpp the server does not paint it.
 
 **Two readings settled by the tie-break, neither reachable from this VM's traffic:**
 

@@ -8480,9 +8480,9 @@ mod tests {
         stopped: usize,
     }
 
-    /// Connect with `config`, read for `seconds`, and report what arrived. A closed connection
-    /// is a result here, not a failure.
-    async fn probe_orders(vm: &vm::Vm, config: ConnectConfig, seconds: u64) -> OrderProbe {
+    /// Connect with `config`, read until something has painted and no byte has arrived for 2 s
+    /// (30 s at most), and report what arrived. A closed connection is a result here.
+    async fn probe_orders(vm: &vm::Vm, config: ConnectConfig) -> OrderProbe {
         use justrdp_pdu::fastpath;
         let session_capabilities = config.capabilities.clone();
         let outcome = vm.connect(config).await;
@@ -8501,30 +8501,29 @@ mod tests {
         let mut closed = false;
         let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
         let mut readbuf = [0u8; 16 * 1024];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             for output in pending.drain(..) {
                 match output {
                     justrdp::SessionOutput::Frame(_) => frames += 1,
-                    justrdp::SessionOutput::WriteBytes(bytes)
-                        if stream.write_all(&bytes).await.is_err() =>
-                    {
-                        closed = true;
+                    justrdp::SessionOutput::WriteBytes(bytes) => {
+                        closed |= stream.write_all(&bytes).await.is_err();
                     }
                     _ => {}
                 }
             }
-            match tokio::time::timeout_at(deadline, stream.read(&mut readbuf)).await {
-                Ok(Ok(0)) | Ok(Err(_)) => {
-                    closed = true;
-                    break;
-                }
+            if closed || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut readbuf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => closed = true,
                 Ok(Ok(n)) => {
                     census.feed(&readbuf[..n]);
                     pending = feed_session(&mut machine, &readbuf[..n])
-                        .expect("every drawing order decodes");
+                        .expect("the session machine takes every byte the server sent");
                 }
-                Err(_) => break,
+                Err(_) if frames > 0 => break,
+                Err(_) => {}
             }
         }
         OrderProbe {
@@ -8557,7 +8556,8 @@ mod tests {
         }
         config.core.high_color_depth = match bpp {
             16 => gcc::HIGH_COLOR_DEPTH_16BPP,
-            _ => gcc::HIGH_COLOR_DEPTH_24BPP,
+            24 | 32 => gcc::HIGH_COLOR_DEPTH_24BPP,
+            _ => panic!("orders_at_depth takes 16, 24 or 32, not {bpp}"),
         };
         if bpp == 32 {
             config.core.early_capability_flags = config.core.early_capability_flags
@@ -8566,13 +8566,12 @@ mod tests {
         config
     }
 
-    /// Issue #463: the bitmap-cache order advertisement at 32, 24 and 16 bpp, and three
-    /// variations of it at 32 bpp, each in its own connection to one Windows session. FreeRDP
-    /// 3.32.1 advertising a bitmap cache at 24 or 32 bpp gets the connection reset right after
-    /// activation; none of these does, and each gets orders.
+    /// Issue #463: the bitmap-cache order advertisement asking for 32, 24 and 16 bpp, and three
+    /// variations of it at 32 bpp, each in its own connection to one Windows session: none is
+    /// closed, and each gets orders at the depth the server answers.
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
-    async fn bitmap_cache_order_sessions_survive_every_depth_on_the_real_vm() {
+    async fn bitmap_cache_order_sessions_are_not_reset_on_the_real_vm() {
         with_vm_session(|vm| async move {
             use justrdp_pdu::capability::{self, CapabilitySet};
             let rev2 = |mut config: ConnectConfig, flags: u16, cells: &[u32]| {
@@ -8624,12 +8623,11 @@ mod tests {
                     ),
                 ),
                 ("32 bpp, the same with Frame Marker", 32, frame_markers),
-                // The VM's colour-depth policy answers 24 with 32.
-                ("24 bpp", 32, orders_at_depth(24)),
+                ("24 bpp asked", 32, orders_at_depth(24)),
                 ("16 bpp", 16, orders_at_depth(16)),
             ];
             for (name, depth, config) in variants {
-                let probe = probe_orders(&vm, config, 8).await;
+                let probe = probe_orders(&vm, config).await;
                 eprintln!("#463: {name}: {probe:?}");
                 assert!(!probe.closed, "{name}: the server closed the connection");
                 assert_eq!(probe.server_bpp, depth, "{name}: the server's depth");
@@ -8646,9 +8644,8 @@ mod tests {
         .await
     }
 
-    /// Issue #463: a 32 bpp order session paints what the server paints when asked to redraw
-    /// the whole desktop. Its cached bitmaps are 32 bpp, which decode through RDP6 planar rather
-    /// than the interleaved RLE of 16 bpp.
+    /// Issue #463: a 32 bpp order session caches 32 bpp bitmaps and paints what the server paints
+    /// when asked to redraw the whole desktop.
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn orders_at_32_bpp_paint_what_a_redraw_paints_on_the_real_vm() {
@@ -8656,6 +8653,14 @@ mod tests {
             let config = orders_at_depth(32);
             let session_capabilities = config.capabilities.clone();
             let outcome = vm.connect(config).await;
+            assert_eq!(
+                justrdp::ServerAnnouncement::from_capabilities(
+                    &outcome.activation.server_capabilities
+                )
+                .bits_per_pixel,
+                32,
+                "the server's depth"
+            );
             let machine = SessionStateMachine::new(
                 session_config_from(&outcome, session_capabilities),
                 outcome.activation.leftover.clone(),
