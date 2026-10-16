@@ -9,8 +9,8 @@ fills a Revision 2 bitmap cache, and MemBlt and Mem3Blt blit from it with a ROP3
 an 8×8 brush. `justrdp-pdu::orders` holds the wire format, `justrdp-codecs::rop` the raster
 operations and brushes, and `justrdp::orders` the caches and the paint. ScrBlt copies within the
 framebuffer (#461), and Frame Markers bracket what the host is handed as one frame (#462).
-DstBlt, PatBlt and OpaqueRect fill rectangles, and GlyphIndex is decoded and not yet drawn
-(#475). Epic #22 (the bitmap cache half is
+DstBlt, PatBlt and OpaqueRect fill rectangles (#475), and GlyphIndex draws text from ten glyph
+caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
 #28's); #460 is the first slice.
 
 ## Governing decisions
@@ -69,15 +69,47 @@ DstBlt, PatBlt and OpaqueRect fill rectangles, and GlyphIndex is decoded and not
   and MemBlt all four (`xrdp_caps.c`, `no_orders_supported`); without DstBlt, justrdp got 38 bitmap
   updates and no order (2026-10-16). Building it in #475 was the maintainer's call that day, over a
   slice of its own first, or #475 with no real-server proof.
-- **GlyphIndex is decoded and not drawn** (#475; drawing is #476). A primary order of an
-  undecoded type ends its update, and xrdp sends GlyphIndex and Cache Glyph whatever the client
-  advertises: with the glyph cache off, FreeRDP logged "SERVER BUG ... not announced" for Cache
-  Glyph, and with `/relax-order-checks` still received 16 GlyphIndex. Two of justrdp's updates
-  ended there, losing the logo, the labels, the input boxes and the buttons, so #475 decodes it
-  and skips it (the maintainer's call, 2026-10-16, over finishing on that weaker measurement or
-  doing #476 first). Its rectangles and origin are plain 16-bit integers, never deltas, and an
-  order without `VariableBytes` reuses the last one's, as FreeRDP's
-  `update_read_glyph_index_order` reads them.
+- **GlyphIndex was decoded before it was drawn** (#475). A primary order of an undecoded type
+  ends its update, and xrdp sends GlyphIndex and Cache Glyph whatever the client advertises:
+  with the glyph cache off, FreeRDP logged "SERVER BUG ... not announced" for Cache Glyph, and
+  with `/relax-order-checks` still received 16 GlyphIndex. Two of justrdp's updates ended there,
+  losing the logo, the labels, the input boxes and the buttons, so #475 decoded it and skipped it
+  (the maintainer's call, 2026-10-16, over finishing on that weaker measurement or doing #476
+  first). Its rectangles and origin are plain 16-bit integers, never deltas, and an order without
+  `VariableBytes` reuses the last one's, as FreeRDP's `update_read_glyph_index_order` reads them;
+  the history keeps those bytes (`OrderHistory::glyph_index_data`), since an order borrows only
+  its update.
+- **Glyphs are drawn as FreeRDP places them, and painted as the spec says** (#476).
+  - Cache Glyph is Revision 1 (`GLYPH_SUPPORT_PARTIAL` and `FULL` mean the same,
+    `[MS-RDPBCGR]` 2.2.7.1.8); Revision 2 belongs to `ENCODE`, which FreeRDP also tells apart by
+    the negotiated level, not by the order, so `ENCODE` is refused. A glyph's bitmap is one bit
+    per pixel, most significant first, in whole-byte rows padded to four bytes. A glyph outside
+    the advertised caches or past its cache's cells is not stored.
+  - A glyph sits at the origin plus its offset. Its advance is `ulCharInc` when set, its width
+    under `SO_CHAR_INC_EQUAL_BM_BASE`, and otherwise the delta byte after its index (0x80 and two
+    more for a long one), added before the glyph is drawn, as FreeRDP's `update_glyph_offset`
+    does. xrdp writes exactly that: each glyph's delta is the previous glyph's advance, the first
+    0. FreeRDP never advances by `ulCharInc`; justrdp does, as the field's definition and #476's
+    acceptance say, and a glyph missing from the cache still takes its cell. That is a derivation
+    nothing measured: no measured server sets `ulCharInc`, nor `SO_VERTICAL` or `SO_REVERSED`, and
+    `SO_REVERSED` is ignored, as FreeRDP ignores it.
+  - Unless `fOpRedundant`, the opaque rectangle fills in `ForeColor` first; the glyphs' set bits
+    paint in `BackColor` (the spec's own naming: back is the text), clipped to the text
+    rectangle and the order's bounds. Both rectangles are inclusive and empty unless right and
+    bottom pass left and top, as FreeRDP measures them. The bits are tested only where the glyph
+    overlaps the painted area, which the budget charges. Besides the `ulCharInc` advance, two
+    FreeRDP behaviours are not followed, each on the spec's side and xrdp's screen: FreeRDP also fills each glyph's own cell in
+    `ForeColor` when the rectangle is not redundant (xrdp sets `fOpRedundant` 0 with an empty
+    opaque rectangle, and its bitmap screen has no such boxes), and it keeps the previous text
+    colour when it is.
+  - Fragments are not kept: the advertisement refuses a fragment cache, and a USE or ADD ends the
+    glyph run. The spec and FreeRDP read them differently (an ADD stores the bytes before it in
+    the spec, the buffer from its start in FreeRDP; a USE is followed by a delta in the spec, not
+    in FreeRDP), xrdp never sends one, and so nothing could settle which is right. #476 allowed
+    refusing them.
+  - xrdp fills glyph caches 7 to 11, slots 0 to 249 (`xrdp_cache.c`), oldest first. Caches 10
+    and 11 lie outside 2.2.2.2.1.1.2.13's 0 to 9, and their glyphs are skipped; the login screen
+    uses only cache 7.
 - **`nYSrc` is a top-down row of the cached bitmap.** The spec's formula
   (`ActualYSrc = (SourceBitmapHeight − nHeight) − nYSrc`) addresses bottom-up storage; the cache
   stores top-down RGBA, so it uses the field as sent, as FreeRDP's `gdi_memblt` does.
@@ -132,9 +164,10 @@ DstBlt, PatBlt and OpaqueRect fill rectangles, and GlyphIndex is decoded and not
 
 - `justrdp-pdu/src/orders.rs` — `decode_order`, `OrderHistory`, `OrdersUpdate`, `DrawingOrder`,
   `Clip`, `DstBlt`, `PatBlt`, `OpaqueRect`, `ScrBlt`, `MemBlt`, `Mem3Blt`, `GlyphIndex`, `Brush`,
-  `CacheBitmapRev2`, `OrderError`, `TS_ALTSEC_FRAME_MARKER`
+  `CacheBitmapRev2`, `CacheGlyph`, `GlyphData`, `OrderError`, `TS_ALTSEC_FRAME_MARKER`
 - `justrdp-pdu/src/capability.rs` — `BitmapCacheRev2CapabilitySet`, `BitmapCacheCellInfo`,
-  `ORDER_NEG_DSTBLT_INDEX`, `ORDER_NEG_PATBLT_INDEX`, `ORDER_NEG_SCRBLT_INDEX`,
+  `GlyphCacheCapabilitySet`, `ORDER_NEG_INDEX_INDEX`, `ORDER_NEG_DSTBLT_INDEX`,
+  `ORDER_NEG_PATBLT_INDEX`, `ORDER_NEG_SCRBLT_INDEX`,
   `ORDER_NEG_MEMBLT_INDEX`, `ORDER_NEG_MEM3BLT_INDEX`,
   `BITMAP_CACHE_REV2_MAX_ENTRIES`, `ORDER_FLAGS_EXTRA_FLAGS`,
   `ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT`
@@ -181,14 +214,15 @@ DstBlt, PatBlt and OpaqueRect fill rectangles, and GlyphIndex is decoded and not
   SaveBitmap, Cache Brush, the offscreen orders and Cache Bitmap revisions 1 and 3. xrdp has
   encoders for several of them (`libxrdp/xrdp_orders.c`), and none appeared.
 
-**xrdp's login screen in orders against bitmaps (#475, 2026-10-16).** A session advertising DstBlt, PatBlt,
-ScrBlt, MemBlt and Mem3Blt received 72 OpaqueRect, 2 PatBlt (PATINVERT, solid), 12 MemBlt over 12
-Cache Bitmap (Revision 2), 33 Cache Glyph and 9 GlyphIndex, and no update ended early. A session
-advertising no order got the same screen in bitmap updates. The two framebuffers differ in 1,241
-pixels, and every one lies inside a GlyphIndex's text or opaque rectangle: the text #476 draws
-(`xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_but_the_text`). The bitmap screen never
-passes through the order decoder or the fills, so for those it is independent; the logo's tiles
-decode through the same bitmap codecs in both sessions, so for them it is not.
+**xrdp's login screen in orders against bitmaps (#475, #476, 2026-10-16).** A session
+advertising DstBlt, PatBlt, ScrBlt, MemBlt, Mem3Blt and GlyphIndex over FreeRDP's ten default
+glyph caches received 72 OpaqueRect, 2 PatBlt (PATINVERT, solid), 12 MemBlt over 12 Cache Bitmap
+(Revision 2), 33 Cache Glyph into cache 7 and 9 GlyphIndex, and no update ended early. A session
+advertising no order got the same screen in bitmap updates. Without the glyphs (#475) the two
+differed in 1,241 pixels, all inside the GlyphIndex text rectangles; with them (#476) they differ
+in none (`xrdp_paints_its_login_screen_in_orders_as_in_bitmaps`). The bitmap screen never passes
+through the order decoder, the fills or the glyphs, so for those it is independent; the logo's
+tiles decode through the same bitmap codecs in both sessions, so for them it is not.
 
 **justrdp's own advertisement (#460):** MemBlt and Mem3Blt, caches of 120, 120 and 2553 entries,
 no waiting list, 16 bpp, no Surface Commands. The server sent only compressed 16 bpp Cache Bitmap
@@ -284,9 +318,11 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 ## Known holes / open
 
 - **Unbuilt:** LineTo, the Multi* orders, polygons, ellipses, SaveBitmap, FastIndex and
-  FastGlyph, Cache Color Table, Cache Brush, Cache Bitmap revisions 1 and 3, and every alternate
-  secondary order but Frame Marker. No measured server sent any of them. GlyphIndex and Cache
-  Glyph arrive from xrdp, and drawing them is #476.
+  FastGlyph, Cache Glyph Revision 2, glyph fragments, Cache Color Table, Cache Brush, Cache Bitmap
+  revisions 1 and 3, and every alternate secondary order but Frame Marker. No measured server
+  sent any of them.
+- **Glyph advances by `ulCharInc`, vertical and reversed text are proven only against the spec**:
+  xrdp's text is horizontal with per-glyph deltas.
 - **DstBlt is proven only against the spec and FreeRDP's decoder**, since no server has sent one.
 - **The defaults do not advertise orders**, at any depth; that stays the host's choice (the
   maintainer's call of 2026-10-16, made before #463's measurement for either outcome, and the

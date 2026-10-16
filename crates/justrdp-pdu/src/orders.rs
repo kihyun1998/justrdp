@@ -50,6 +50,10 @@ pub const TS_FRAME_START: u32 = 0x0000_0000;
 /// Frame Marker `action`: a logical frame ends.
 pub const TS_FRAME_END: u32 = 0x0000_0001;
 
+/// `orderType` of the Cache Glyph (Revision 1) secondary drawing order.
+pub const TS_CACHE_GLYPH: u8 = 0x03;
+/// Cache Glyph `extraFlags`: the glyphs' UTF-16 characters follow them.
+pub const CG_GLYPH_UNICODE_PRESENT: u16 = 0x0010;
 /// `orderType` (secondary): Cache Bitmap (Revision 2), uncompressed.
 pub const TS_CACHE_BITMAP_UNCOMPRESSED_REV2: u8 = 0x04;
 /// `orderType` (secondary): Cache Bitmap (Revision 2), compressed.
@@ -356,6 +360,80 @@ pub struct CacheBitmapRev2<'a> {
     pub data: &'a [u8],
 }
 
+/// Cache Glyph (Revision 1) (2.2.2.2.1.2.5): glyphs for one glyph cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheGlyph<'a> {
+    /// `cacheId`.
+    pub cache_id: u8,
+    count: u8,
+    data: &'a [u8],
+}
+
+impl<'a> CacheGlyph<'a> {
+    /// `glyphData`, in order.
+    pub fn glyphs(&self) -> impl Iterator<Item = GlyphData<'a>> + use<'a> {
+        let mut cur = ReadCursor::new(self.data, "glyphData");
+        (0..self.count).map_while(move |_| read_glyph(&mut cur).ok())
+    }
+}
+
+/// One glyph (TS_CACHE_GLYPH_DATA, 2.2.2.2.1.2.5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlyphData<'a> {
+    /// `cacheIndex`.
+    pub cache_index: u16,
+    /// `x`: the bitmap's left edge from the glyph origin.
+    pub x: i16,
+    /// `y`: the bitmap's top edge from the glyph origin.
+    pub y: i16,
+    /// `cx`: the width in pixels.
+    pub cx: u16,
+    /// `cy`: the height in pixels.
+    pub cy: u16,
+    /// `aj`: one bit per pixel, most significant first, each row whole bytes, the whole padded to
+    /// four bytes.
+    pub bits: &'a [u8],
+}
+
+fn read_glyph<'a>(cur: &mut ReadCursor<'a>) -> Result<GlyphData<'a>, DecodeError> {
+    let cache_index = cur.read_u16_le()?;
+    let x = cur.read_u16_le()? as i16;
+    let y = cur.read_u16_le()? as i16;
+    let cx = cur.read_u16_le()?;
+    let cy = cur.read_u16_le()?;
+    let rows = usize::from(cx).div_ceil(8) * usize::from(cy);
+    let bits = cur.read_slice(rows.next_multiple_of(4))?;
+    Ok(GlyphData {
+        cache_index,
+        x,
+        y,
+        cx,
+        cy,
+        bits,
+    })
+}
+
+fn decode_cache_glyph<'a>(
+    cur: &mut ReadCursor<'a>,
+    extra_flags: u16,
+) -> Result<CacheGlyph<'a>, DecodeError> {
+    let cache_id = cur.read_u8()?;
+    let count = cur.read_u8()?;
+    let mut glyphs = cur.clone();
+    for _ in 0..count {
+        read_glyph(&mut glyphs)?;
+    }
+    let data = cur.read_slice(cur.remaining() - glyphs.remaining())?;
+    if extra_flags & CG_GLYPH_UNICODE_PRESENT != 0 {
+        cur.read_slice(2 * usize::from(count))?;
+    }
+    Ok(CacheGlyph {
+        cache_id,
+        count,
+        data,
+    })
+}
+
 /// One decoded drawing order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawingOrder<'a> {
@@ -410,6 +488,8 @@ pub enum DrawingOrder<'a> {
     },
     /// Cache Bitmap (Revision 2).
     CacheBitmapRev2(CacheBitmapRev2<'a>),
+    /// Cache Glyph (Revision 1).
+    CacheGlyph(CacheGlyph<'a>),
     /// Frame Marker (2.2.2.2.1.3.7): the start or end of a logical frame.
     FrameMarker {
         /// `action`: [`TS_FRAME_START`], [`TS_FRAME_END`], or a value neither names.
@@ -798,6 +878,7 @@ fn decode_secondary<'a>(cur: &mut ReadCursor<'a>) -> Result<DrawingOrder<'a>, Or
                 order_type == TS_CACHE_BITMAP_COMPRESSED_REV2,
             )?)
         }
+        TS_CACHE_GLYPH => DrawingOrder::CacheGlyph(decode_cache_glyph(&mut body, extra_flags)?),
         _ => DrawingOrder::SkippedSecondary { order_type },
     })
 }
@@ -1346,6 +1427,90 @@ mod tests {
             (0x03, 0, 300),
             "field 17 is BrushStyle alone"
         );
+    }
+
+    /// A Cache Glyph order: its glyphs, each bitmap one bit per pixel in whole-byte rows padded
+    /// to four bytes, then the characters `CG_GLYPH_UNICODE_PRESENT` adds (2.2.2.2.1.2.5); a
+    /// glyph cut short is an error.
+    #[test]
+    fn cache_glyph_decodes_its_glyphs() {
+        let mut body = vec![7u8, 2];
+        for value in [3u16, (-1i16) as u16, (-9i16) as u16, 3, 2] {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        body.extend_from_slice(&[0xA0, 0x40, 0, 0]);
+        for value in [4u16, 0, (-8i16) as u16, 9, 1] {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        body.extend_from_slice(&[0xFF, 0x80, 0, 0]);
+        body.extend_from_slice(&[b'a', 0, b'b', 0]);
+        let mut bytes = vec![TS_STANDARD | TS_SECONDARY];
+        bytes.extend_from_slice(&((body.len() as i16) - 7).to_le_bytes());
+        bytes.extend_from_slice(&CG_GLYPH_UNICODE_PRESENT.to_le_bytes());
+        bytes.push(TS_CACHE_GLYPH);
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&frame_marker_bytes());
+        let mut history = OrderHistory::default();
+        let orders = decode_all(&bytes, &mut history);
+        let Ok(DrawingOrder::CacheGlyph(order)) = orders[0] else {
+            panic!("{orders:?}");
+        };
+        assert_eq!(order.cache_id, 7);
+        assert_eq!(
+            order.glyphs().collect::<Vec<_>>(),
+            [
+                GlyphData {
+                    cache_index: 3,
+                    x: -1,
+                    y: -9,
+                    cx: 3,
+                    cy: 2,
+                    bits: &[0xA0, 0x40, 0, 0],
+                },
+                GlyphData {
+                    cache_index: 4,
+                    x: 0,
+                    y: -8,
+                    cx: 9,
+                    cy: 1,
+                    bits: &[0xFF, 0x80, 0, 0],
+                },
+            ]
+        );
+        assert!(
+            matches!(orders[1], Ok(DrawingOrder::FrameMarker { .. })),
+            "the next order starts after the characters: {orders:?}"
+        );
+
+        let mut short = vec![TS_STANDARD | TS_SECONDARY];
+        let body = [7u8, 1, 3, 0, 0, 0, 0, 0, 8, 0, 8, 0, 0xFF];
+        short.extend_from_slice(&((body.len() as i16) - 7).to_le_bytes());
+        short.extend_from_slice(&0u16.to_le_bytes());
+        short.push(TS_CACHE_GLYPH);
+        short.extend_from_slice(&body);
+        assert!(matches!(
+            decode_all(&short, &mut history)[..],
+            [Err(OrderError::Decode(_))]
+        ));
+
+        // The glyph whole, the characters CG_GLYPH_UNICODE_PRESENT promises missing.
+        let mut no_characters = vec![TS_STANDARD | TS_SECONDARY];
+        let body = [7u8, 1, 3, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0x80, 0, 0, 0];
+        no_characters.extend_from_slice(&((body.len() as i16) - 7).to_le_bytes());
+        no_characters.extend_from_slice(&CG_GLYPH_UNICODE_PRESENT.to_le_bytes());
+        no_characters.push(TS_CACHE_GLYPH);
+        no_characters.extend_from_slice(&body);
+        assert!(matches!(
+            decode_all(&no_characters, &mut history)[..],
+            [Err(OrderError::Decode(_))]
+        ));
+    }
+
+    /// A Frame Marker start, as an alternate secondary order.
+    fn frame_marker_bytes() -> Vec<u8> {
+        let mut bytes = vec![TS_ALTSEC_FRAME_MARKER << 2 | TS_SECONDARY];
+        bytes.extend_from_slice(&TS_FRAME_START.to_le_bytes());
+        bytes
     }
 
     /// The history starts at PatBlt (3.2.1.1), so a first order without `TS_TYPE_CHANGE` is one.

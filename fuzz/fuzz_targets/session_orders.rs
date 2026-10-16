@@ -1,8 +1,9 @@
 #![no_main]
-//! Fuzz the session's drawing-order path (#460, #461, #462, #475): fast-path Orders Updates
+//! Fuzz the session's drawing-order path (#460, #461, #462, #475, #476): fast-path Orders Updates
 //! through `SessionStateMachine::process_bytes` with DstBlt, PatBlt (and so OpaqueRect), ScrBlt,
-//! MemBlt and Mem3Blt advertised over Revision 2 caches, so the cache fills, the ROPs, the fills,
-//! the blits, the copies within the framebuffer and the frames Frame Markers hold are reached. Sibling of `orders`'s `orders_never_panic` proptest.
+//! MemBlt, Mem3Blt and GlyphIndex advertised over Revision 2 and glyph caches, so the cache fills,
+//! the ROPs, the fills, the blits, the glyph runs, the copies within the framebuffer and the frames
+//! Frame Markers hold are reached. Sibling of `orders`'s `orders_never_panic` proptest.
 //!
 //! The input is split on its first byte: that many updates of equal share, each prefixed by a
 //! cache fill of a 4x4 bitmap into cache 0 entry 0 so a MemBlt has something to hit. A 64x48
@@ -36,7 +37,19 @@ fuzz_target!(|input: &[u8]| {
         ..Default::default()
     };
     let mut capabilities = capability::default_client_capabilities(&core);
-    capabilities.retain(|set| !matches!(set, CapabilitySet::BitmapCache(_)));
+    capabilities.retain(|set| {
+        !matches!(
+            set,
+            CapabilitySet::BitmapCache(_) | CapabilitySet::GlyphCache(_)
+        )
+    });
+    capabilities.push(CapabilitySet::GlyphCache(
+        capability::GlyphCacheCapabilitySet {
+            glyph_cache: [(4, 32); 10],
+            frag_cache: 0,
+            glyph_support_level: capability::GLYPH_SUPPORT_FULL,
+        },
+    ));
     for set in &mut capabilities {
         if let CapabilitySet::Order(o) = set {
             o.order_support[capability::ORDER_NEG_DSTBLT_INDEX] = 1;
@@ -44,6 +57,7 @@ fuzz_target!(|input: &[u8]| {
             o.order_support[capability::ORDER_NEG_SCRBLT_INDEX] = 1;
             o.order_support[capability::ORDER_NEG_MEMBLT_INDEX] = 1;
             o.order_support[capability::ORDER_NEG_MEM3BLT_INDEX] = 1;
+            o.order_support[capability::ORDER_NEG_INDEX_INDEX] = 1;
             o.order_flags |= capability::ORDER_FLAGS_EXTRA_FLAGS;
             o.order_support_ex_flags = capability::ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT;
         }
