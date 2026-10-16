@@ -214,9 +214,10 @@ server sends, never what servers send.
   `AUTORECONNECT_SUPPORTED`, which justrdp did not advertise (`## Reference behaviour`).
 - ~~**The cookie is decoded and nothing replays it.**~~ **Closed by #306.**
 - **Whether the server checks our verifier is not observable on this VM.** Enforced NLA
-  reattaches the session whatever the cookie holds. A server that accepts TLS-only would show
-  it, and justrdp has no TLS-only path ([X.224 negotiation](x224-negotiation.md)). The verifier stands on the known
-  answers and the FreeRDP cross-check instead.
+  reattaches the session whatever the cookie holds. A Windows server that accepts TLS-only would
+  show it; justrdp has a TLS-only path since #474 ([X.224 negotiation](x224-negotiation.md)), but
+  no such Windows server is at hand. xrdp accepts TLS-only but issues no auto-reconnect cookie that
+  has been seen. The verifier stands on the known answers and the FreeRDP cross-check instead.
 - **No committed fixture of an `ARC_SC_PRIVATE_PACKET`.** The real bytes carry a live session
   credential; the cookie branch is still covered by hand-built bodies in `session_info.rs`.
 - ~~**Set Keyboard Indicators (0x29) is still in the catch-all** (#305).~~ **Closed by #305**

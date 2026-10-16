@@ -154,7 +154,20 @@ grep 'client_common_save_session_info' fr.log   # Logon Info, and whether a cook
 xorgxrdp, openbox and a few X clients in WSL Ubuntu 24.04, listening on port 3390 so it does not
 collide with Windows' own 3389. The account is local and lab-only. Its login screen is the only
 measured source of OpaqueRect, PatBlt and the glyph orders, and its 8 bpp sessions of Cache Color
-Table (the census is in [Drawing orders](drawing-orders.md)). Traps, each measured once:
+Table (the census is in [Drawing orders](drawing-orders.md)). The census runs FreeRDP against
+it from WSL (WSLg shows the window), as for the VM above:
+
+```sh
+apt-get install -y xrdp xorgxrdp xterm openbox x11-apps   # as root; then port=3390 in xrdp.ini
+WLOG_FILTER=com.freerdp.core.update:DEBUG,com.freerdp.core.rdp:DEBUG \
+  timeout 40 xfreerdp3 /v:127.0.0.1:3390 /u:<user> /p:<password> /cert:ignore /bpp:16 \
+  /network:lan -nsc -rfx /cache:bitmap:on,glyph:on,offscreen:on,brush:on > fr.log 2>&1
+grep -o '\(Primary\|Secondary\|Alternate Secondary\) Drawing Order \[0x[0-9a-f]*\] [A-Za-z0-9 ()]*' \
+  fr.log | sort | uniq -c
+```
+
+A failing logon (`/u:nobody /p:wrong`) leaves the session on the login screen, which is the
+screen that carries the orders. Traps, each measured once:
 
 - **Windows reaches it at the WSL IP, not `127.0.0.1`.** On this host `127.0.0.1:3390` is refused
   from Windows while `wsl hostname -I`'s address connects. That address can change when WSL

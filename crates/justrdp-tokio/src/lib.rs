@@ -5,8 +5,8 @@
 //! failure.
 //!
 //! The loop currently drives the connect sequence through `tcp-connect` → `x224-negotiate` →
-//! `tls-handshake` → `nla-credssp` → the MCS/GCC half of `capability-exchange` (Connect-Initial,
-//! channel join). The TLS handshake and the CredSSP token exchange run here, not in the core:
+//! `tls-handshake` → `nla-credssp` (not under TLS-only security) → the MCS/GCC half of
+//! `capability-exchange` (Connect-Initial, channel join). The TLS handshake and the CredSSP token exchange run here, not in the core:
 //! rustls and `sspi` are their own state machines, so shuttling their records through the
 //! connect machine would add nothing (ADR-0002). After [`Action::StartTls`] the
 //! machine's writes and reads transparently ride the TLS stream (`Transport`).
@@ -447,7 +447,8 @@ async fn connect_inner(
                 }
                 Action::StartTls { selected } => {
                     // The handshake runs here, never in the core machine. We hand only the resulting
-                    // peer certificate back to the machine, which extracts its subjectPublicKey.
+                    // peer certificate back to the machine, which extracts its subjectPublicKey for
+                    // NLA, or under TLS-only security answers with the Connect-Initial.
                     let Transport::Tcp(stream) =
                         std::mem::replace(&mut transport, Transport::Absent)
                     else {
@@ -457,7 +458,7 @@ async fn connect_inner(
                         )));
                     };
                     // The trust policy decides the verifier: Chain fails *here*, inside the
-                    // handshake, when the cert is untrusted — NLA is never reached.
+                    // handshake, when the cert is untrusted — nothing after it is reached.
                     let tls_config = client_config(&options.trust, &server.host).map_err(|e| {
                         ConnectFailure::TlsHandshake {
                             reason: format!("building the TLS trust configuration: {e}"),
@@ -11488,7 +11489,8 @@ mod tests {
                 break;
             }
             match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut readbuf)).await {
-                Ok(Ok(0)) | Ok(Err(_)) => panic!("xrdp closed the session after {frames} frames"),
+                Ok(Ok(0)) => panic!("xrdp closed the session after {frames} frames"),
+                Ok(Err(e)) => panic!("reading from xrdp failed after {frames} frames: {e}"),
                 Ok(Ok(n)) => {
                     pending = feed_session(&mut machine, &readbuf[..n])
                         .expect("the session machine takes every byte xrdp sent");
