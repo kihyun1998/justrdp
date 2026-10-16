@@ -8239,6 +8239,9 @@ mod tests {
                     let mut cur = ReadCursor::new(update.order_data, "census order data");
                     for _ in 0..update.number_orders {
                         let name = match orders::decode_order(&mut cur, &mut self.history) {
+                            Ok(DrawingOrder::CacheColorTable(order)) => {
+                                format!("CacheColorTable {}", order.cache_index)
+                            }
                             Ok(DrawingOrder::CacheGlyph(order)) => {
                                 format!("CacheGlyph cache {}", order.cache_id)
                             }
@@ -11579,20 +11582,24 @@ mod tests {
         );
     }
 
-    /// Issues #475 and #476: xrdp's login screen painted in drawing orders, its text in glyphs,
-    /// is the screen xrdp paints in bitmap updates for a session that advertises no orders, pixel
-    /// for pixel.
-    #[tokio::test]
-    #[ignore = "requires the xrdp census server and JUSTRDP_XRDP_ADDR"]
-    async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps() {
+    /// xrdp's login screen at `bpp`, painted in drawing orders and its text in glyphs, is the
+    /// screen xrdp paints in bitmap updates at that depth for a session that advertises no orders,
+    /// pixel for pixel.
+    async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_at(bpp: u16) {
         use justrdp_pdu::capability::{self, CapabilitySet, GlyphCacheCapabilitySet};
-        let mut bitmaps = legacy_graphics_config();
-        bitmaps.core.high_color_depth = gcc::HIGH_COLOR_DEPTH_16BPP;
-        for set in &mut bitmaps.capabilities {
-            if let CapabilitySet::Bitmap(b) = set {
-                b.preferred_bits_per_pixel = 16;
+        let at_depth = |config: &mut ConnectConfig| {
+            config.core.high_color_depth = match bpp {
+                8 => gcc::HIGH_COLOR_DEPTH_8BPP,
+                _ => gcc::HIGH_COLOR_DEPTH_16BPP,
+            };
+            for set in &mut config.capabilities {
+                if let CapabilitySet::Bitmap(b) = set {
+                    b.preferred_bits_per_pixel = bpp;
+                }
             }
-        }
+        };
+        let mut bitmaps = legacy_graphics_config();
+        at_depth(&mut bitmaps);
         let oracle = xrdp_login(bitmaps).await;
         let mut orders = legacy_orders_config(&[
             capability::ORDER_NEG_DSTBLT_INDEX,
@@ -11622,17 +11629,27 @@ mod tests {
             .capabilities
             .retain(|set| !matches!(set, CapabilitySet::GlyphCache(_)));
         orders.capabilities.push(CapabilitySet::GlyphCache(glyphs));
+        at_depth(&mut orders);
         let ordered = xrdp_login(orders).await;
-        ordered.census.print("#476");
-        let oracle_path = dump_ppm(&oracle.framebuffer, "justrdp-476-oracle.ppm");
-        let ordered_path = dump_ppm(&ordered.framebuffer, "justrdp-476-orders.ppm");
+        let tag = format!("xrdp {bpp} bpp");
+        ordered.census.print(&tag);
+        oracle.census.print(&format!("{tag} oracle"));
+        let oracle_path = dump_ppm(
+            &oracle.framebuffer,
+            &format!("justrdp-xrdp-{bpp}-oracle.ppm"),
+        );
+        let ordered_path = dump_ppm(
+            &ordered.framebuffer,
+            &format!("justrdp-xrdp-{bpp}-orders.ppm"),
+        );
         eprintln!(
-            "#476: dumps {} and {}",
+            "{tag}: dumps {} and {}",
             oracle_path.display(),
             ordered_path.display()
         );
         assert!(
-            oracle.census.orders.is_empty() && oracle.census.slow_path_frames > 0,
+            oracle.census.count("MemBlt") + oracle.census.count("OpaqueRect") == 0
+                && oracle.census.slow_path_frames > 0,
             "the oracle is painted in bitmaps, not orders: {:?}",
             oracle.census.orders
         );
@@ -11657,12 +11674,36 @@ mod tests {
             .filter(|&i| rgb(&ordered.framebuffer, i) != rgb(&oracle.framebuffer, i))
             .map(|i| (i % width, i / width))
             .collect();
-        eprintln!("#476: {} pixels differ", differing.len());
+        eprintln!("{tag}: {} pixels differ", differing.len());
+        let colours: std::collections::HashSet<_> = (0..width
+            * usize::from(oracle.framebuffer.height()))
+            .map(|i| rgb(&oracle.framebuffer, i))
+            .collect();
+        assert!(
+            colours.len() > 16,
+            "near-monochrome: {} colours",
+            colours.len()
+        );
         assert_eq!(
             differing.get(..8.min(differing.len())),
             Some(&[][..]),
             "pixels differ"
         );
+    }
+
+    /// Issues #475 and #476, at 16 bpp.
+    #[tokio::test]
+    #[ignore = "requires the xrdp census server and JUSTRDP_XRDP_ADDR"]
+    async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps() {
+        xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_at(16).await;
+    }
+
+    /// Issue #477, at 8 bpp: the colours come from the session palette, which xrdp also sends as
+    /// colour table 0.
+    #[tokio::test]
+    #[ignore = "requires the xrdp census server and JUSTRDP_XRDP_ADDR"]
+    async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_at_8_bpp() {
+        xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_at(8).await;
     }
 
     #[tokio::test]

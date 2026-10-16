@@ -50,6 +50,8 @@ pub const TS_FRAME_START: u32 = 0x0000_0000;
 /// Frame Marker `action`: a logical frame ends.
 pub const TS_FRAME_END: u32 = 0x0000_0001;
 
+/// `orderType` of the Cache Color Table secondary drawing order.
+pub const TS_CACHE_COLOR_TABLE: u8 = 0x01;
 /// `orderType` of the Cache Glyph (Revision 1) secondary drawing order.
 pub const TS_CACHE_GLYPH: u8 = 0x03;
 /// Cache Glyph `extraFlags`: the glyphs' UTF-16 characters follow them.
@@ -360,6 +362,41 @@ pub struct CacheBitmapRev2<'a> {
     pub data: &'a [u8],
 }
 
+/// Cache Color Table (2.2.2.2.1.2.4): a palette of 256 colours for one Color Table Cache entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheColorTable<'a> {
+    /// `cacheIndex`: the entry, 0 to 5.
+    pub cache_index: u8,
+    quads: &'a [u8],
+}
+
+impl CacheColorTable<'_> {
+    /// `colorTable` as `[red, green, blue]`, from the wire's blue, green, red, pad quads.
+    pub fn colors(&self) -> impl Iterator<Item = [u8; 3]> + '_ {
+        self.quads
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|q| [q[2], q[1], q[0]])
+    }
+}
+
+fn decode_cache_color_table<'a>(
+    cur: &mut ReadCursor<'a>,
+) -> Result<CacheColorTable<'a>, DecodeError> {
+    let cache_index = cur.read_u8()?;
+    if cur.read_u16_le()? != 256 {
+        return Err(DecodeError::InvalidField {
+            field: "CACHE_COLOR_TABLE_ORDER.numberColors",
+            reason: "not 256",
+        });
+    }
+    Ok(CacheColorTable {
+        cache_index,
+        quads: cur.read_slice(256 * 4)?,
+    })
+}
+
 /// Cache Glyph (Revision 1) (2.2.2.2.1.2.5): glyphs for one glyph cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheGlyph<'a> {
@@ -490,6 +527,8 @@ pub enum DrawingOrder<'a> {
     CacheBitmapRev2(CacheBitmapRev2<'a>),
     /// Cache Glyph (Revision 1).
     CacheGlyph(CacheGlyph<'a>),
+    /// Cache Color Table.
+    CacheColorTable(CacheColorTable<'a>),
     /// Frame Marker (2.2.2.2.1.3.7): the start or end of a logical frame.
     FrameMarker {
         /// `action`: [`TS_FRAME_START`], [`TS_FRAME_END`], or a value neither names.
@@ -879,6 +918,7 @@ fn decode_secondary<'a>(cur: &mut ReadCursor<'a>) -> Result<DrawingOrder<'a>, Or
             )?)
         }
         TS_CACHE_GLYPH => DrawingOrder::CacheGlyph(decode_cache_glyph(&mut body, extra_flags)?),
+        TS_CACHE_COLOR_TABLE => DrawingOrder::CacheColorTable(decode_cache_color_table(&mut body)?),
         _ => DrawingOrder::SkippedSecondary { order_type },
     })
 }
@@ -1502,6 +1542,41 @@ mod tests {
         no_characters.extend_from_slice(&body);
         assert!(matches!(
             decode_all(&no_characters, &mut history)[..],
+            [Err(OrderError::Decode(_))]
+        ));
+    }
+
+    /// A Cache Color Table: 256 blue, green, red, pad quads read as `[red, green, blue]`
+    /// (2.2.2.2.1.2.4); a count other than 256 is an error.
+    #[test]
+    fn cache_color_table_decodes_256_colours() {
+        let table = |count: u16| {
+            let mut body = vec![2u8];
+            body.extend_from_slice(&count.to_le_bytes());
+            for i in 0..256u32 {
+                body.extend_from_slice(&[i as u8, 0x11, 0x22, 0]);
+            }
+            let mut bytes = vec![TS_STANDARD | TS_SECONDARY];
+            bytes.extend_from_slice(&((body.len() as i16) - 7).to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.push(TS_CACHE_COLOR_TABLE);
+            bytes.extend(body);
+            bytes
+        };
+        let bytes = table(256);
+        let mut history = OrderHistory::default();
+        let orders = decode_all(&bytes, &mut history);
+        let Ok(DrawingOrder::CacheColorTable(order)) = orders[0] else {
+            panic!("{orders:?}");
+        };
+        assert_eq!(order.cache_index, 2);
+        let colors: Vec<_> = order.colors().collect();
+        assert_eq!(colors.len(), 256);
+        assert_eq!(colors[0], [0x22, 0x11, 0]);
+        assert_eq!(colors[255], [0x22, 0x11, 255]);
+        let bytes = table(255);
+        assert!(matches!(
+            decode_all(&bytes, &mut history)[..],
             [Err(OrderError::Decode(_))]
         ));
     }

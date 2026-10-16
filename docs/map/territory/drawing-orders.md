@@ -153,9 +153,21 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   typed error). With no Revision 2 set every blit misses, so an unadvertised MemBlt paints only
   in a config `check` never saw.
 - **The colour depth is the server's.** `ServerAnnouncement::bits_per_pixel` comes from its
-  Demand Active, the client's Bitmap set only when that is 0. `check_orders` refuses orders at
-  8 bpp on the client's side; a server that answers 8 bpp anyway gets palette-index colours from
-  the session palette.
+  Demand Active, the client's Bitmap set only when that is 0. `check_orders` refuses orders below
+  8 bpp on the client's side.
+- **At 8 bpp the colours are the session palette's, as FreeRDP has them** (#477, the
+  maintainer's call of 2026-10-16). A cached bitmap's indices resolve through the palette of the
+  last Update Palette when it is filled, and an order's colour index through it when it paints.
+  `[MS-RDPEGDI]` says otherwise: six Color Table Cache entries, filled by Cache Color Table
+  (2.2.2.2.1.2.4), the entry a blit uses named by its `cacheId`'s high byte. FreeRDP 3.32.1 stores
+  those tables (`palette_cache_put`) and reads them nowhere. The call was made over the spec's
+  way, keeping 8 bpp bitmaps as indices and resolving them at the blit, after a measurement that
+  could not tell the two apart: xrdp 0.9.24 sends one Update Palette and one Cache Color Table,
+  entry 0, equal to the palette in all 256 colours (read blue, green, red, pad), and every blit
+  names entry 0. So Cache Color Table is decoded and paints nothing, and the two signs that a
+  server means it are logged at `rdp_orders` warn: a table unlike the palette, and a blit naming
+  an entry other than 0. An entry past the six is skipped. Below 8 bpp is still refused,
+  unmeasured. xrdp sends its colour table to a session that advertises no order too.
 - **Advertising the Revision 2 cache requires MemBlt *and* Mem3Blt.** `[MS-RDPBCGR]`
   2.2.7.1.4.2: a client MUST support both to receive Cache Bitmap (Revision 2). The census saw no
   Mem3Blt, but the obligation is the advertisement's, so the brush path is built.
@@ -220,7 +232,10 @@ glyph caches received 72 OpaqueRect, 2 PatBlt (PATINVERT, solid), 12 MemBlt over
 (Revision 2), 33 Cache Glyph into cache 7 and 9 GlyphIndex, and no update ended early. A session
 advertising no order got the same screen in bitmap updates. Without the glyphs (#475) the two
 differed in 1,241 pixels, all inside the GlyphIndex text rectangles; with them (#476) they differ
-in none (`xrdp_paints_its_login_screen_in_orders_as_in_bitmaps`). The bitmap screen never passes
+in none (`xrdp_paints_its_login_screen_in_orders_as_in_bitmaps`). At 8 bpp (#477) the order
+session got the same orders over 9 Cache Bitmap (Revision 2) at 8 bpp, a Palette Update and a
+Cache Color Table, and differs from the 8 bpp bitmap screen (28 colours) in none either
+(`…_at_8_bpp`). The bitmap screen never passes
 through the order decoder, the fills or the glyphs, so for those it is independent; the logo's
 tiles decode through the same bitmap codecs in both sessions, so for them it is not.
 
@@ -318,7 +333,7 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 ## Known holes / open
 
 - **Unbuilt:** LineTo, the Multi* orders, polygons, ellipses, SaveBitmap, FastIndex and
-  FastGlyph, Cache Glyph Revision 2, glyph fragments, Cache Color Table, Cache Brush, Cache Bitmap
+  FastGlyph, Cache Glyph Revision 2, glyph fragments, Cache Brush, Cache Bitmap
   revisions 1 and 3, and every alternate secondary order but Frame Marker. No measured server
   sent any of them.
 - **Glyph advances by `ulCharInc`, vertical and reversed text are proven only against the spec**:
@@ -327,6 +342,8 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 - **The defaults do not advertise orders**, at any depth; that stays the host's choice (the
   maintainer's call of 2026-10-16, made before #463's measurement for either outcome, and the
   outcome was that 32 bpp order sessions work).
-- **8 bpp** is refused: MemBlt's color table index needs the Color Table Cache.
+- **A server whose colour tables differ from its palette would paint wrong at 8 bpp**, and say so
+  in the log. None is known; the spec's way is what such a server would need.
+- **Below 8 bpp** is refused, unmeasured.
 - **Persistent bitmap caching** (keys, the Persistent Key List PDU) is refused at the
   advertisement and stays on #28.

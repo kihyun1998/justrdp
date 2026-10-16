@@ -283,10 +283,10 @@ fn check_orders(sets: &[CapabilitySet]) -> Result<(), ConnectConfigError> {
         CapabilitySet::Bitmap(b) => Some(b.preferred_bits_per_pixel),
         _ => None,
     });
-    if orders && depth.is_some_and(|bpp| bpp <= 8) {
+    if orders && depth.is_some_and(|bpp| bpp < 8) {
         return refuse(
             capability::CAPSET_ORDER,
-            "orders at 8 bpp take their colours from the Color Table Cache, which is not kept",
+            "orders below 8 bpp, whose colour tables the session does not keep",
         );
     }
     Ok(())
@@ -891,6 +891,18 @@ mod tests {
         assert_eq!(check(&config), Ok(()));
     }
 
+    /// Orders at 8 bpp pass: their colours resolve through the session palette (#477).
+    #[test]
+    fn orders_at_8_bpp_pass() {
+        let mut config = orders_config();
+        for set in &mut config.capabilities {
+            if let CapabilitySet::Bitmap(b) = set {
+                b.preferred_bits_per_pixel = 8;
+            }
+        }
+        assert_eq!(check(&config), Ok(()));
+    }
+
     /// DstBlt's index and PatBlt's, which also negotiates OpaqueRect, pass alone and with the
     /// blts (#475); an index the session does not paint, LineTo's, is refused.
     #[test]
@@ -1049,10 +1061,10 @@ mod tests {
                 capability::CAPSET_BITMAP_CACHE_REV2,
             ),
             (
-                "8 bpp",
+                "4 bpp",
                 |set| {
                     if let CapabilitySet::Bitmap(b) = set {
-                        b.preferred_bits_per_pixel = 8;
+                        b.preferred_bits_per_pixel = 4;
                     }
                 },
                 capability::CAPSET_ORDER,
