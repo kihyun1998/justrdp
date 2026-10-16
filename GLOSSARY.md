@@ -69,6 +69,11 @@ _Avoid_: capability flag (both kinds travel in capability sets)
 A rectangle of the desktop and its new pixels in RGBA8888, the unit justrdp hands the host during
 a Session.
 
+**Open frame**:
+A frame the server started and has not yet ended: a drawing-order Frame Marker start, or a Graphics
+Pipeline `StartFrame`. It holds back the Frame Updates of what it painted until its end, or until
+the host releases it.
+
 **Legacy graphics**:
 The graphics path of a session without the Graphics Pipeline: bitmap updates and surface commands
 decoded straight into the framebuffer.

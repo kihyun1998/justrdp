@@ -378,6 +378,9 @@ pub struct GraphicsProcessor {
     confirmed_flags: u32,
     frames_decoded: u32,
     in_frame: bool,
+    /// How many open frames an `EndFrame` closed or a channel close dropped, across every binding
+    /// of the channel.
+    frames_ended: u64,
     /// RGBA bytes painted by the list-bearing commands since this frame opened (#268). The
     /// ceiling is [`MAX_TOTAL_SURFACE_BYTES`], **derived rather than picked**: the most a frame
     /// can legitimately paint is every surface that could exist, once — and past that it is
@@ -427,6 +430,7 @@ impl Default for GraphicsProcessor {
             confirmed_flags: 0,
             frames_decoded: 0,
             in_frame: false,
+            frames_ended: 0,
             frame_paint: 0,
             awaiting_confirm: false,
             reset_spent: false,
@@ -661,6 +665,9 @@ impl GraphicsProcessor {
             }
             EgfxPdu::EndFrame { frame_id } => {
                 tracing::trace!(target: "rdp_egfx", frame_id, "EndFrame");
+                if self.in_frame {
+                    self.frames_ended += 1;
+                }
                 self.in_frame = false;
                 self.frames_decoded = self.frames_decoded.wrapping_add(1);
                 // The dirty regions are blitted by `flush_frames` after the payload (#163).
@@ -1287,9 +1294,23 @@ impl DvcProcessor for GraphicsProcessor {
         self.blit_dirty(framebuffer)
     }
 
+    fn frame_open(&self) -> bool {
+        self.in_frame
+    }
+
+    fn frames_ended(&self) -> u64 {
+        self.frames_ended
+    }
+
+    fn release_frames(&mut self, framebuffer: &mut Framebuffer) -> Vec<FrameUpdate> {
+        self.frame_paint = 0;
+        self.blit_dirty(framebuffer)
+    }
+
     fn close(&mut self) {
         *self = GraphicsProcessor {
             capsets: core::mem::take(&mut self.capsets),
+            frames_ended: self.frames_ended + u64::from(self.in_frame),
             ..GraphicsProcessor::default()
         };
     }
@@ -2492,6 +2513,85 @@ mod tests {
                 .iter()
                 .all(|p| *p == [255, 0, 0, 255])
         );
+    }
+
+    /// A release blits an open frame's dirty regions and restores its paint budget, and the
+    /// frame stays open: its EndFrame flushes only what was painted after the release (#470).
+    #[test]
+    fn a_release_flushes_an_open_frame_and_restores_its_budget() {
+        let mut p = GraphicsProcessor::default();
+        let mut fb = Framebuffer::new(16, 8).unwrap();
+        assert!(!p.frame_open());
+        assert_eq!(
+            p.release_frames(&mut fb),
+            [],
+            "no frame, nothing to release"
+        );
+        create_surface(&mut p, 1, 16, 8);
+        assert!(map_surface(&mut p, 1, 0, 0).is_empty());
+        assert!(
+            !p.flush_frames(&mut fb).is_empty(),
+            "the map flushes outside a frame"
+        );
+        let mut start = vec![0u8; 8];
+        start[4..8].copy_from_slice(&7u32.to_le_bytes());
+        assert!(feed(&mut p, egfx::CMDID_START_FRAME, &start).is_empty());
+        let fill = |p: &mut GraphicsProcessor, x: u16| {
+            assert!(
+                feed(
+                    p,
+                    egfx::CMDID_SOLID_FILL,
+                    &solid_fill_body(1, [0, 0, 255, 0], [x, 0, x + 1, 1]),
+                )
+                .is_empty()
+            );
+        };
+        fill(&mut p, 2);
+        assert_eq!(p.flush_frames(&mut fb), [], "held while the frame is open");
+        assert!(p.frame_open());
+        p.frame_paint = MAX_TOTAL_SURFACE_BYTES;
+
+        let released = p.release_frames(&mut fb);
+        let one = |x| FrameUpdate {
+            x,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(released, [one(2)]);
+        assert_eq!(region(&fb, &one(2)), [255, 0, 0, 255], "blitted");
+        assert!(p.frame_open(), "the frame stays open");
+        assert_eq!(p.frames_ended(), 0, "a release ends nothing");
+        assert_eq!(p.frame_paint, 0, "the budget is restored");
+        assert_eq!(p.release_frames(&mut fb), [], "nothing twice");
+
+        fill(&mut p, 5);
+        assert_eq!(p.flush_frames(&mut fb), []);
+        feed(&mut p, egfx::CMDID_END_FRAME, &7u32.to_le_bytes());
+        assert!(!p.frame_open());
+        assert_eq!(p.frames_ended(), 1);
+        feed(&mut p, egfx::CMDID_END_FRAME, &7u32.to_le_bytes());
+        assert_eq!(
+            p.frames_ended(),
+            1,
+            "an EndFrame with no frame open ends nothing"
+        );
+        assert_eq!(
+            p.flush_frames(&mut fb),
+            [one(5)],
+            "only what followed the release"
+        );
+        assert_eq!(
+            region(&fb, &one(5)),
+            [255, 0, 0, 255],
+            "a fill the spent budget would have skipped paints"
+        );
+        p.close();
+        assert_eq!(p.frames_ended(), 1, "a closed channel keeps the count");
+        assert!(feed(&mut p, egfx::CMDID_START_FRAME, &start).is_empty());
+        p.close();
+        assert!(!p.frame_open());
+        assert_eq!(p.frames_ended(), 2, "a close drops the open frame");
     }
 
     #[test]

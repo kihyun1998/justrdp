@@ -1829,6 +1829,37 @@ impl SessionStateMachine {
         Ok(())
     }
 
+    /// Whether a frame is open: a drawing-order Frame Marker start or a Graphics Pipeline
+    /// `StartFrame` whose end has not arrived. An open frame holds back the [`FrameUpdate`]s of
+    /// what it painted until its end, or until [`Self::release_open_frames`].
+    pub fn has_open_frame(&self) -> bool {
+        self.orders.in_frame() || self.drdynvc.frame_open()
+    }
+
+    /// How many frames have ended this session: Frame Marker ends and `EndFrame`s that closed an
+    /// open frame, and open frames a reactivation or a channel close dropped. It only grows, so a
+    /// host that saw a frame open and later sees a larger count knows that frame is gone, even
+    /// where another one opened before it looked again.
+    pub fn frames_ended(&self) -> u64 {
+        self.orders.frames_ended() + self.drdynvc.frames_ended()
+    }
+
+    /// Hand over now what the open frames hold back, as [`SessionOutput::Frame`]s, with the
+    /// Graphics Pipeline's dirty regions blitted into the framebuffer as its `EndFrame` would.
+    /// The frames stay open: a later end closes them and hands over only what was painted after
+    /// this. A Graphics Pipeline frame also starts a fresh paint budget.
+    ///
+    /// When to call it is the host's; the core keeps no clock. During a Deactivation nothing is
+    /// returned.
+    pub fn release_open_frames(&mut self) -> Vec<SessionOutput> {
+        if self.phase != Phase::Active {
+            return Vec::new();
+        }
+        let mut frames = self.orders.release_held();
+        frames.extend(self.drdynvc.release_frames(&mut self.framebuffer));
+        frames.into_iter().map(SessionOutput::Frame).collect()
+    }
+
     /// Ask the server to end this session — the Shutdown Request PDU (`[MS-RDPBCGR]` 2.2.2.1).
     ///
     /// The returned frames go to the socket verbatim. The PDU is **bodyless**: its Share Data
@@ -5587,6 +5618,98 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, SessionOutput::Frame(_))),
             "a rect past the resized framebuffer reached the host: {released:?}"
+        );
+    }
+
+    /// An order frame and a Graphics Pipeline frame left open both reach the host through a
+    /// release, stay open, and release nothing during a Deactivation (#470).
+    #[test]
+    fn a_release_hands_over_both_kinds_of_open_frame() {
+        use crate::orders::tests::{frame_marker, scrblt};
+        use justrdp_pdu::egfx;
+        use justrdp_pdu::orders::TS_FRAME_START;
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        assert!(!sm.has_open_frame());
+        assert_eq!(sm.release_open_frames(), [], "nothing open");
+
+        let mut sm = with_open_dvc(8, egfx::CHANNEL_NAME);
+        let create_surface = [1u16.to_le_bytes(), 16u16.to_le_bytes(), 16u16.to_le_bytes()]
+            .concat()
+            .into_iter()
+            .chain([egfx::PIXEL_FORMAT_XRGB_8888])
+            .collect::<Vec<u8>>();
+        let map = [&1u16.to_le_bytes()[..], &[0; 2], &[0; 4], &[0; 4]].concat();
+        let start = [0u32.to_le_bytes(), 7u32.to_le_bytes()].concat();
+        let mut graphics = Vec::new();
+        for (cmd, body) in [
+            (egfx::CMDID_CREATE_SURFACE, create_surface),
+            (egfx::CMDID_MAP_SURFACE_TO_OUTPUT, map),
+            (egfx::CMDID_START_FRAME, start),
+            (egfx::CMDID_SOLID_FILL, solid_fill_surface_1()),
+        ] {
+            for frame in server_egfx(8, cmd, &body) {
+                graphics.extend(sm.process_bytes(&frame).unwrap());
+            }
+            if cmd == egfx::CMDID_MAP_SURFACE_TO_OUTPUT {
+                graphics.clear();
+            }
+        }
+        assert!(sm.has_open_frame(), "the Graphics Pipeline frame alone");
+        let orders = fastpath::encode_pdu(&[(
+            fastpath::FP_UPDATE_ORDERS,
+            fastpath::FP_FRAGMENT_SINGLE,
+            &orders_body(&[
+                frame_marker(TS_FRAME_START),
+                scrblt([12, 0, 2, 1], 0xCC, [0, 0]),
+            ]),
+        )]);
+        graphics.extend(sm.process_bytes(&orders).unwrap());
+        assert_eq!(graphics, [], "both frames hold what they painted");
+        assert!(sm.has_open_frame());
+
+        let released = sm.release_open_frames();
+        let rect = |x, y, width, height| {
+            SessionOutput::Frame(FrameUpdate {
+                x,
+                y,
+                width,
+                height,
+            })
+        };
+        assert_eq!(released, [rect(12, 0, 2, 1), rect(0, 0, 4, 4)]);
+        assert_eq!(
+            frame_pixels(
+                &sm,
+                &FrameUpdate {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1
+                }
+            ),
+            [255, 0, 0, 255],
+            "the fill is blitted"
+        );
+        assert!(sm.has_open_frame(), "the frames stay open");
+        assert_eq!(sm.release_open_frames(), [], "nothing twice");
+        assert_eq!(sm.frames_ended(), 0, "a release ends nothing");
+
+        for frame in server_egfx(8, egfx::CMDID_END_FRAME, &7u32.to_le_bytes()) {
+            sm.process_bytes(&frame).unwrap();
+        }
+        assert_eq!(sm.frames_ended(), 1, "the Graphics Pipeline frame ended");
+        assert!(sm.has_open_frame(), "the order frame is still open");
+        sm.process_bytes(&fastpath::encode_pdu(&[(
+            fastpath::FP_UPDATE_ORDERS,
+            fastpath::FP_FRAGMENT_SINGLE,
+            &orders_body(&[scrblt([12, 0, 2, 1], 0xCC, [0, 0])]),
+        )]))
+        .unwrap();
+        deactivate_all(&mut sm);
+        assert_eq!(
+            sm.release_open_frames(),
+            [],
+            "nothing during a Deactivation"
         );
     }
 

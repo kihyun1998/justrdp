@@ -1,6 +1,6 @@
 # 0009 — Negotiation posture: tolerant of server self-inconsistency in rendering, strict on security integrity
 
-- Status: Accepted — amended 2026-08-25 (#252), 2026-08-31 (#268), 2026-09-04, 2026-09-16 (#286) and 2026-09-18 (#297); see the Amendments below
+- Status: Accepted — amended 2026-08-25 (#252), 2026-08-31 (#268), 2026-09-04, 2026-09-16 (#286), 2026-09-18 (#297), 2026-10-06 (#376) and 2026-10-16 (#462, closed by #470); see the Amendments below
 - Date: 2026-07-03
 - Closes issue #101
 
@@ -379,3 +379,15 @@ unmatched marker has been observed.
 `FrameUpdate`s until the end, the maintainer's call of the same day, and with no end they never
 reach the host. The Graphics Pipeline's `StartFrame` has had the same property since #163. Neither
 is bounded, and whether either should be is open.
+
+**Closed by #470 the same day.** Whether to bound it was the maintainer's call, made over three
+other options shown with their costs (a bound by update count inside the core, no bound as the
+posture, and deciding later): the host releases a frame whose end never comes, and the core only
+provides the means. The interval was not part of that call; they were shown "a default policy,
+for example a time".
+`SessionStateMachine::release_open_frames` hands over what the open frames hold and leaves them
+open, so a late end still closes them; `has_open_frame` says whether there is one, and
+`frames_ended` how many have ended. The
+`justrdp-tokio` session runners call it once a frame has stayed open for 1 s; that interval is the
+adapter's policy, a derivation recorded in `docs/map/territory/adapter-drive-loop.md`. Neither a
+release nor a late end is a fault, so §2's enumeration is unchanged.

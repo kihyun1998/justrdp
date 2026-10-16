@@ -61,6 +61,8 @@ pub(crate) struct Orders {
     in_frame: bool,
     /// The rects painted since that start, in paint order, at most [`MAX_HELD_RECTS`].
     held: Vec<FrameUpdate>,
+    /// How many frames a `TS_FRAME_END` closed or a reactivation dropped.
+    frames_ended: u64,
 }
 
 /// Above this many held rects a frame collapses to their bounding box.
@@ -93,12 +95,16 @@ impl Orders {
             mem3blt: support.is_some_and(|s| s[capability::ORDER_NEG_MEM3BLT_INDEX] != 0),
             in_frame: false,
             held: Vec::new(),
+            frames_ended: 0,
         }
     }
 
     /// Forget the primary order history and any frame in flight (a Deactivation–Reactivation).
     pub(crate) fn reactivate(&mut self) {
         self.history = OrderHistory::default();
+        if self.in_frame {
+            self.frames_ended += 1;
+        }
         self.in_frame = false;
         self.held.clear();
     }
@@ -107,6 +113,21 @@ impl Orders {
     /// frame stays open, so its end still closes it.
     pub(crate) fn discard_held(&mut self) {
         self.held.clear();
+    }
+
+    /// Whether a `TS_FRAME_START` is waiting for its `TS_FRAME_END`.
+    pub(crate) fn in_frame(&self) -> bool {
+        self.in_frame
+    }
+
+    /// How many frames a `TS_FRAME_END` closed or a reactivation dropped.
+    pub(crate) fn frames_ended(&self) -> u64 {
+        self.frames_ended
+    }
+
+    /// Hand over the rects held for the frame in flight, which stays open.
+    pub(crate) fn release_held(&mut self) -> Vec<FrameUpdate> {
+        core::mem::take(&mut self.held)
     }
 
     /// Hand the rects one order painted to the host now, or hold them for the frame's end.
@@ -152,6 +173,7 @@ impl Orders {
             }
             orders::TS_FRAME_END if self.in_frame => {
                 self.in_frame = false;
+                self.frames_ended += 1;
                 frames.append(&mut self.held);
             }
             orders::TS_FRAME_END => {
@@ -972,6 +994,52 @@ pub(crate) mod tests {
         assert_eq!(frames, [frame(1, 0, 1, 1), frame(2, 0, 1, 1)]);
     }
 
+    /// A release hands the held rects over and leaves the frame open: its end still closes it
+    /// and hands over only what was painted after the release (#470).
+    #[test]
+    fn a_release_hands_over_an_open_frame_and_keeps_it_open() {
+        use justrdp_pdu::orders::{TS_FRAME_END, TS_FRAME_START};
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(8, 1).unwrap();
+        assert!(!orders.in_frame());
+        assert_eq!(orders.release_held(), [], "no frame, nothing held");
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_bitmap(0, 0, &[&[RED]]),
+                frame_marker(TS_FRAME_START),
+                memblt((0, 0), [0, 0, 1, 1], SRCCOPY, [0, 0]),
+            ],
+        );
+        assert_eq!(frames, []);
+        assert!(orders.in_frame());
+        assert_eq!(orders.release_held(), [frame(0, 0, 1, 1)]);
+        assert!(orders.in_frame(), "the frame stays open");
+        assert_eq!(orders.release_held(), [], "nothing twice");
+        assert_eq!(orders.frames_ended(), 0, "a release ends nothing");
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[memblt((0, 0), [1, 0, 1, 1], SRCCOPY, [0, 0])],
+        );
+        assert_eq!(frames, [], "still held after the release");
+        let frames = run(&mut orders, &mut fb, &[frame_marker(TS_FRAME_END)]);
+        assert_eq!(
+            frames,
+            [frame(1, 0, 1, 1)],
+            "only what followed the release"
+        );
+        assert!(!orders.in_frame());
+        assert_eq!(orders.frames_ended(), 1);
+        run(&mut orders, &mut fb, &[frame_marker(TS_FRAME_END)]);
+        assert_eq!(
+            orders.frames_ended(),
+            1,
+            "an end with no start ends nothing"
+        );
+    }
+
     /// Past 64 held rects a frame collapses to their bounding box and goes on holding, as
     /// EGFX's does: what reaches the host stays within 64 rects and still covers every one.
     #[test]
@@ -1014,6 +1082,12 @@ pub(crate) mod tests {
             ],
         );
         orders.reactivate();
+        assert!(!orders.in_frame());
+        assert_eq!(
+            orders.frames_ended(),
+            1,
+            "the dropped frame counts as ended"
+        );
         // The next pair releases only what it brackets.
         let frames = run(
             &mut orders,
@@ -1025,6 +1099,12 @@ pub(crate) mod tests {
             ],
         );
         assert_eq!(frames, [frame(1, 0, 1, 1)]);
+        orders.reactivate();
+        assert_eq!(
+            orders.frames_ended(),
+            2,
+            "a reactivation with no frame open drops none"
+        );
     }
 
     /// A miss or an index outside the caches is skipped, and the update goes on.
