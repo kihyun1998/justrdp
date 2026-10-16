@@ -286,7 +286,7 @@ fn check_orders(sets: &[CapabilitySet]) -> Result<(), ConnectConfigError> {
     if orders && depth.is_some_and(|bpp| bpp < 8) {
         return refuse(
             capability::CAPSET_ORDER,
-            "orders below 8 bpp, whose colour tables the session does not keep",
+            "orders below 8 bpp, which nothing has measured",
         );
     }
     Ok(())

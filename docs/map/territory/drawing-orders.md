@@ -167,7 +167,11 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   names entry 0. So Cache Color Table is decoded and paints nothing, and the two signs that a
   server means it are logged at `rdp_orders` warn: a table unlike the palette, and a blit naming
   an entry other than 0. An entry past the six is skipped. Below 8 bpp is still refused,
-  unmeasured. xrdp sends its colour table to a session that advertises no order too.
+  unmeasured. xrdp sends its colour table to a session that advertises no order too, and sends
+  its Update Palette before the table, so the table is compared with the palette it was made
+  from. A table that came before any Update Palette would be compared with the default all-black
+  palette, and an order painted before one paints from that palette, without a skip; a derivation
+  that no measured server reaches.
 - **Advertising the Revision 2 cache requires MemBlt *and* Mem3Blt.** `[MS-RDPBCGR]`
   2.2.7.1.4.2: a client MUST support both to receive Cache Bitmap (Revision 2). The census saw no
   Mem3Blt, but the obligation is the advertisement's, so the brush path is built.
@@ -345,5 +349,8 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 - **A server whose colour tables differ from its palette would paint wrong at 8 bpp**, and say so
   in the log. None is known; the spec's way is what such a server would need.
 - **Below 8 bpp** is refused, unmeasured.
+- **The 8 bpp proof is the login screen**, 9 cache bitmaps; the logged-in desktop, which FreeRDP's
+  census saw carry 5,024 MemBlt at 8 bpp, needs a logon justrdp cannot make on TLS-only security
+  without a password, and was not compared.
 - **Persistent bitmap caching** (keys, the Persistent Key List PDU) is refused at the
   advertisement and stays on #28.

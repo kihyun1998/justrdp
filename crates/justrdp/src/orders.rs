@@ -611,6 +611,14 @@ impl Orders {
                 "a drawing order this client did not advertise, painted anyway"
             );
         }
+        // The high byte names a colour table; the colours are the session palette's.
+        if bits_per_pixel <= 8 && order.cache_id >> 8 != 0 {
+            tracing::warn!(
+                target: "rdp_orders",
+                color_table = order.cache_id >> 8,
+                "a blit names a colour table other than 0; its colours come from the palette"
+            );
+        }
         let clip = match clip {
             Clip::None => None,
             Clip::Bounds(bounds) => Some(bounds),
@@ -626,15 +634,7 @@ impl Orders {
             )?),
             _ => None,
         };
-        // The low byte is the cache; the high byte names a colour table, and the colours are
-        // the session palette's.
-        if bits_per_pixel <= 8 && order.cache_id >> 8 != 0 {
-            tracing::warn!(
-                target: "rdp_orders",
-                color_table = order.cache_id >> 8,
-                "a blit names a colour table other than 0; its colours come from the palette"
-            );
-        }
+        // The low byte is the cache.
         let cache_id = order.cache_id & 0x00FF;
         let bitmap = self
             .slot(cache_id, order.cache_index)?

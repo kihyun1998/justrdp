@@ -11590,7 +11590,8 @@ mod tests {
         let at_depth = |config: &mut ConnectConfig| {
             config.core.high_color_depth = match bpp {
                 8 => gcc::HIGH_COLOR_DEPTH_8BPP,
-                _ => gcc::HIGH_COLOR_DEPTH_16BPP,
+                16 => gcc::HIGH_COLOR_DEPTH_16BPP,
+                _ => panic!("the xrdp comparison runs at 8 or 16 bpp, not {bpp}"),
             };
             for set in &mut config.capabilities {
                 if let CapabilitySet::Bitmap(b) = set {
@@ -11648,10 +11649,21 @@ mod tests {
             ordered_path.display()
         );
         assert!(
-            oracle.census.count("MemBlt") + oracle.census.count("OpaqueRect") == 0
+            oracle
+                .census
+                .orders
+                .keys()
+                .all(|kind| kind.starts_with("CacheColorTable"))
                 && oracle.census.slow_path_frames > 0,
             "the oracle is painted in bitmaps, not orders: {:?}",
             oracle.census.orders
+        );
+        assert!(
+            ordered.census.count(&format!(
+                "CacheBitmapRev2 cache 2 compressed true {bpp} bpp"
+            )) > 0,
+            "no {bpp} bpp cache fill: the server answered another depth: {:?}",
+            ordered.census.orders
         );
         for kind in ["OpaqueRect", "PatBlt", "GlyphIndex", "CacheGlyph"] {
             assert!(ordered.census.count(kind) > 0, "no {kind} arrived");
