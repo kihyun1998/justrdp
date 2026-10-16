@@ -112,6 +112,12 @@ pub const ORDERFLAGS_EX_CACHE_BITMAP_REV3_SUPPORT: u16 = 0x0002;
 /// `orderSupportExFlags`: the Frame Marker alternate secondary order is supported.
 pub const ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT: u16 = 0x0004;
 
+/// `orderSupport` index of the GlyphIndex primary drawing order (`TS_NEG_INDEX_INDEX`).
+pub const ORDER_NEG_INDEX_INDEX: usize = 0x1B;
+/// `GlyphSupportLevel` `GLYPH_SUPPORT_FULL`: Cache Glyph (Revision 1), as `PARTIAL`.
+pub const GLYPH_SUPPORT_FULL: u16 = 0x0002;
+/// `GlyphSupportLevel` `GLYPH_SUPPORT_ENCODE`: Cache Glyph (Revision 2).
+pub const GLYPH_SUPPORT_ENCODE: u16 = 0x0003;
 /// `orderSupport` index of the DstBlt primary drawing order (`TS_NEG_DSTBLT_INDEX`).
 pub const ORDER_NEG_DSTBLT_INDEX: usize = 0x00;
 /// `orderSupport` index of the PatBlt and OpaqueRect primary drawing orders

@@ -82,8 +82,9 @@ pub const HONOURED_SOUND_FLAGS: u16 = capability::SOUND_FLAG_BEEPS;
 pub const HONOURED_SURFACE_COMMANDS: u32 = capability::SURFCMDS_SET_SURFACE_BITS;
 
 /// The `orderSupport` entries the session paints: DstBlt, PatBlt with OpaqueRect (one index),
-/// ScrBlt, MemBlt and Mem3Blt (`crate::orders`).
-pub const HONOURED_ORDERS: [usize; 5] = [
+/// ScrBlt, MemBlt, Mem3Blt and GlyphIndex (`crate::orders`).
+pub const HONOURED_ORDERS: [usize; 6] = [
+    capability::ORDER_NEG_INDEX_INDEX,
     capability::ORDER_NEG_DSTBLT_INDEX,
     capability::ORDER_NEG_PATBLT_INDEX,
     capability::ORDER_NEG_SCRBLT_INDEX,
@@ -269,6 +270,15 @@ fn check_orders(sets: &[CapabilitySet]) -> Result<(), ConnectConfigError> {
             "receiving Cache Bitmap (Revision 2) requires MemBlt and Mem3Blt (2.2.7.1.4.2)",
         );
     }
+    let glyphs = sets
+        .iter()
+        .any(|set| matches!(set, CapabilitySet::GlyphCache(g) if g.glyph_support_level != 0));
+    if support.is_some_and(|s| s[capability::ORDER_NEG_INDEX_INDEX] != 0) && !glyphs {
+        return refuse(
+            capability::CAPSET_ORDER,
+            "GlyphIndex draws from a glyph cache, and none is advertised",
+        );
+    }
     let depth = sets.iter().find_map(|set| match set {
         CapabilitySet::Bitmap(b) => Some(b.preferred_bits_per_pixel),
         _ => None,
@@ -305,7 +315,7 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
         {
             refuse(
                 capability::CAPSET_ORDER,
-                "orderSupport enables a drawing order other than DstBlt, PatBlt, OpaqueRect, ScrBlt, MemBlt and Mem3Blt",
+                "orderSupport enables a drawing order other than DstBlt, PatBlt, OpaqueRect, ScrBlt, MemBlt, Mem3Blt and GlyphIndex",
             )
         }
         CapabilitySet::Order(o) if o.order_flags & !HONOURED_ORDER_FLAGS != 0 => refuse(
@@ -349,10 +359,26 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
             capability::CAPSET_BRUSH,
             "a brush level above BRUSH_DEFAULT invites Cache Brush orders",
         ),
-        CapabilitySet::GlyphCache(g) if g.glyph_support_level != 0 => refuse(
+        CapabilitySet::GlyphCache(g) if g.glyph_support_level > capability::GLYPH_SUPPORT_FULL => {
+            refuse(
+                capability::CAPSET_GLYPH_CACHE,
+                "GLYPH_SUPPORT_ENCODE invites Cache Glyph (Revision 2), which the session skips",
+            )
+        }
+        CapabilitySet::GlyphCache(g) if g.glyph_support_level != 0 && g.frag_cache != 0 => refuse(
             capability::CAPSET_GLYPH_CACHE,
-            "a glyph level above GLYPH_SUPPORT_NONE invites glyph orders",
+            "a fragment cache invites glyph fragments, which the session does not keep",
         ),
+        CapabilitySet::GlyphCache(g)
+            if g.glyph_cache
+                .iter()
+                .any(|&(entries, cell)| entries > 254 || cell > 2048) =>
+        {
+            refuse(
+                capability::CAPSET_GLYPH_CACHE,
+                "a glyph cache past 254 entries or 2048-byte cells (2.2.7.1.8.1)",
+            )
+        }
         CapabilitySet::OffscreenCache(o) if o.offscreen_support_level != 0 => refuse(
             capability::CAPSET_OFFSCREEN_CACHE,
             "an offscreen cache invites offscreen bitmap orders",
@@ -720,7 +746,7 @@ mod tests {
             ),
             (
                 CapabilitySet::GlyphCache(GlyphCacheCapabilitySet {
-                    glyph_support_level: 2,
+                    glyph_support_level: capability::GLYPH_SUPPORT_ENCODE,
                     ..Default::default()
                 }),
                 capability::CAPSET_GLYPH_CACHE,
@@ -896,6 +922,50 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A glyph cache of Revision 1 glyphs passes with GlyphIndex (#476); Revision 2, a fragment
+    /// cache, a cache past 254 entries or a cell past 2048 bytes is refused, and so is GlyphIndex
+    /// with no glyph cache.
+    #[test]
+    fn a_revision_1_glyph_cache_passes_and_what_it_cannot_keep_is_refused() {
+        let with_glyphs = |edit: fn(&mut GlyphCacheCapabilitySet), index: bool| {
+            let mut config = orders_config();
+            let mut glyphs = GlyphCacheCapabilitySet {
+                glyph_cache: [(254, 256); 10],
+                frag_cache: 0,
+                glyph_support_level: capability::GLYPH_SUPPORT_FULL,
+            };
+            edit(&mut glyphs);
+            for set in &mut config.capabilities {
+                match set {
+                    CapabilitySet::GlyphCache(g) => *g = glyphs.clone(),
+                    CapabilitySet::Order(o) => {
+                        o.order_support[capability::ORDER_NEG_INDEX_INDEX] = u8::from(index);
+                    }
+                    _ => {}
+                }
+            }
+            check(&config)
+        };
+        assert_eq!(with_glyphs(|_| {}, true), Ok(()));
+        assert_eq!(with_glyphs(|g| g.glyph_support_level = 1, true), Ok(()));
+        assert_eq!(
+            with_glyphs(|_| {}, false),
+            Ok(()),
+            "the level implies GlyphIndex"
+        );
+        let refused = |result: Result<(), ConnectConfigError>| {
+            matches!(result, Err(ConnectConfigError::CapabilitySet { .. }))
+        };
+        assert!(refused(with_glyphs(
+            |g| g.glyph_support_level = capability::GLYPH_SUPPORT_ENCODE,
+            true
+        )));
+        assert!(refused(with_glyphs(|g| g.frag_cache = 0x0100_0100, true)));
+        assert!(refused(with_glyphs(|g| g.glyph_cache[3].0 = 255, true)));
+        assert!(refused(with_glyphs(|g| g.glyph_cache[9].1 = 2049, true)));
+        assert!(refused(with_glyphs(|g| g.glyph_support_level = 0, true)));
     }
 
     /// Each way an order advertisement promises what the session does not keep is refused.

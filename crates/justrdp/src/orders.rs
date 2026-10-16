@@ -13,8 +13,8 @@ use justrdp_codecs::rop::{self, Pattern};
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::orders::{
-    self, BITMAPCACHE_WAITING_LIST_INDEX, Bounds, Brush, CacheBitmapRev2, Clip, DrawingOrder,
-    Mem3Blt, MemBlt, OrderError, OrderHistory, OrdersUpdate, ScrBlt,
+    self, BITMAPCACHE_WAITING_LIST_INDEX, Bounds, Brush, CacheBitmapRev2, CacheGlyph, Clip,
+    DrawingOrder, GlyphIndex, Mem3Blt, MemBlt, OrderError, OrderHistory, OrdersUpdate, ScrBlt,
 };
 
 /// ROP3 SRCCOPY: the source, unchanged.
@@ -46,8 +46,10 @@ enum Skip {
     UnsupportedBrush,
     /// A DstBlt whose ROP reads the pattern or the source.
     DstBltReadsMore,
-    /// A GlyphIndex: decoded so the update goes on, not drawn.
-    GlyphIndexNotDrawn,
+    /// A glyph run reached a fragment operation (USE or ADD), and no fragment cache is kept.
+    GlyphFragment,
+    /// A glyph outside the advertised glyph caches, or larger than its cache's cells.
+    UncachedGlyph,
     /// The update's paint budget is spent.
     OverBudget,
 }
@@ -60,6 +62,9 @@ pub(crate) struct Orders {
     history: OrderHistory,
     /// Each advertised Revision 2 cache, its entries followed by one waiting-list entry.
     caches: Vec<Vec<Option<CachedBitmap>>>,
+    /// The ten glyph caches, each the advertised entries, and each one's cell size in bytes.
+    glyphs: Vec<(Vec<Option<Glyph>>, usize)>,
+    glyph_index: bool,
     dstblt: bool,
     /// PatBlt and OpaqueRect, which one `orderSupport` index negotiates.
     patblt: bool,
@@ -96,9 +101,25 @@ impl Orders {
                 _ => None,
             })
             .unwrap_or_default();
+        let glyphs = capabilities
+            .iter()
+            .find_map(|set| match set {
+                CapabilitySet::GlyphCache(g) if g.glyph_support_level != 0 => Some(
+                    g.glyph_cache
+                        .iter()
+                        .map(|&(entries, cell)| {
+                            (vec![None; usize::from(entries)], usize::from(cell))
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
         Self {
             history: OrderHistory::default(),
             caches,
+            glyph_index: support.is_some_and(|s| s[capability::ORDER_NEG_INDEX_INDEX] != 0),
+            glyphs,
             dstblt: support.is_some_and(|s| s[capability::ORDER_NEG_DSTBLT_INDEX] != 0),
             patblt: support.is_some_and(|s| s[capability::ORDER_NEG_PATBLT_INDEX] != 0),
             scrblt: support.is_some_and(|s| s[capability::ORDER_NEG_SCRBLT_INDEX] != 0),
@@ -232,9 +253,16 @@ impl Orders {
                 DrawingOrder::CacheBitmapRev2(order) => {
                     self.cache_bitmap(&order, palette, bits_per_pixel, &mut budget)
                 }
-                DrawingOrder::GlyphIndex { .. } => {
-                    Err(NotApplied::Skipped(Skip::GlyphIndexNotDrawn))
-                }
+                DrawingOrder::CacheGlyph(order) => self.cache_glyph(&order, &mut budget),
+                DrawingOrder::GlyphIndex { order, clip } => self.glyph_index(
+                    &order,
+                    clip,
+                    framebuffer,
+                    palette,
+                    bits_per_pixel,
+                    &mut budget,
+                    &mut painted,
+                ),
                 DrawingOrder::DstBlt { order, clip } => {
                     if matches!(order.rop, 0x00 | 0x55 | 0xAA | 0xFF) {
                         let dstblt = Fill {
@@ -345,6 +373,163 @@ impl Orders {
             );
         }
         Ok(())
+    }
+
+    /// Store a Cache Glyph's glyphs. One outside the caches is skipped; one larger than its
+    /// cache's cells is skipped and its entry emptied.
+    fn cache_glyph(
+        &mut self,
+        order: &CacheGlyph<'_>,
+        budget: &mut usize,
+    ) -> Result<(), NotApplied> {
+        let mut outcome = Ok(());
+        for glyph in order.glyphs() {
+            let Some((cache, cell)) = self.glyphs.get_mut(usize::from(order.cache_id)) else {
+                outcome = Err(NotApplied::Skipped(Skip::UncachedGlyph));
+                continue;
+            };
+            let Some(slot) = cache.get_mut(usize::from(glyph.cache_index)) else {
+                outcome = Err(NotApplied::Skipped(Skip::UncachedGlyph));
+                continue;
+            };
+            if glyph.bits.len() > *cell {
+                *slot = None;
+                outcome = Err(NotApplied::Skipped(Skip::UncachedGlyph));
+                continue;
+            }
+            if !charge(budget, glyph.bits.len()) {
+                *slot = None;
+                outcome = Err(NotApplied::Skipped(Skip::OverBudget));
+                continue;
+            }
+            *slot = Some(Glyph {
+                x: glyph.x,
+                y: glyph.y,
+                cx: glyph.cx,
+                cy: glyph.cy,
+                bits: glyph.bits.to_vec(),
+            });
+        }
+        outcome
+    }
+
+    /// Paint a GlyphIndex: its opaque rectangle, then its glyphs in the text colour, clipped to
+    /// its text rectangle and its bounds.
+    #[allow(clippy::too_many_arguments)]
+    fn glyph_index(
+        &self,
+        order: &GlyphIndex,
+        clip: Clip,
+        framebuffer: &mut Framebuffer,
+        palette: &Palette,
+        bits_per_pixel: u16,
+        budget: &mut usize,
+        frames: &mut Vec<FrameUpdate>,
+    ) -> Result<(), NotApplied> {
+        if !self.glyph_index {
+            tracing::warn!(
+                target: "rdp_orders",
+                "a GlyphIndex this client did not advertise, painted anyway"
+            );
+        }
+        if matches!(clip, Clip::Unknown) {
+            return Err(NotApplied::Skipped(Skip::UnknownClip));
+        }
+        let text = order_color(order.back_color, palette, bits_per_pixel)?;
+        if order.op_redundant == 0
+            && let Some(op) = inclusive(order.op)
+        {
+            let color = order_color(order.fore_color, palette, bits_per_pixel)?;
+            let opaque = Fill {
+                dest: op,
+                rop: PATCOPY,
+                brush: Pattern::Solid(color),
+                clip,
+            };
+            fill(true, opaque, framebuffer, budget, frames)?;
+        }
+        let Some(bk) = inclusive(order.bk) else {
+            return Ok(());
+        };
+        let clip = match clip {
+            Clip::Bounds(bounds) => Some(bounds),
+            _ => None,
+        };
+        let size = (framebuffer.width(), framebuffer.height());
+        let Some(area) = clip_blt(bk, [bk[0], bk[1]], size, framebuffer, clip) else {
+            return Ok(());
+        };
+        if !charge(budget, area.width * area.height * 4) {
+            return Err(NotApplied::Skipped(Skip::OverBudget));
+        }
+        let stride = usize::from(framebuffer.width()) * 4;
+        let mut block = Vec::with_capacity(area.width * area.height * 4);
+        for row in 0..area.height {
+            let start = (area.top as usize + row) * stride + area.left as usize * 4;
+            block.extend_from_slice(&framebuffer.pixels()[start..start + area.width * 4]);
+        }
+        let text = text.to_le_bytes();
+        let data = self.history.glyph_index_data();
+        let (mut x, mut y) = (i32::from(order.x), i32::from(order.y));
+        let deltas = order.char_inc == 0 && order.fl_accel & SO_CHAR_INC_EQUAL_BM_BASE == 0;
+        let mut outcome = Ok(());
+        let mut at = 0;
+        while let Some(&index) = data.get(at) {
+            at += 1;
+            if index >= GLYPH_FRAGMENT_USE {
+                outcome = Err(NotApplied::Skipped(Skip::GlyphFragment));
+                break;
+            }
+            if deltas && let Some(&delta) = data.get(at) {
+                at += 1;
+                let mut delta = i32::from(delta);
+                if delta & 0x80 != 0 && at + 1 < data.len() {
+                    delta = i32::from(u16::from_le_bytes([data[at], data[at + 1]]));
+                    at += 2;
+                }
+                if order.fl_accel & SO_VERTICAL != 0 {
+                    y += delta;
+                }
+                if order.fl_accel & SO_HORIZONTAL != 0 {
+                    x += delta;
+                }
+            }
+            let glyph = self
+                .glyphs
+                .get(usize::from(order.cache_id))
+                .and_then(|(cache, _)| cache.get(usize::from(index)))
+                .and_then(Option::as_ref);
+            let Some(glyph) = glyph else {
+                outcome = Err(NotApplied::Skipped(Skip::CacheMiss));
+                continue;
+            };
+            let (left, top) = (x + i32::from(glyph.x), y + i32::from(glyph.y));
+            let row_bytes = usize::from(glyph.cx).div_ceil(8);
+            for row in 0..i32::from(glyph.cy) {
+                let py = top + row - area.top;
+                if py < 0 || py >= area.height as i32 {
+                    continue;
+                }
+                for column in 0..i32::from(glyph.cx) {
+                    let px = left + column - area.left;
+                    if px < 0 || px >= area.width as i32 {
+                        continue;
+                    }
+                    let byte = glyph.bits[row as usize * row_bytes + column as usize / 8];
+                    if byte & (0x80 >> (column % 8)) != 0 {
+                        let o = (py as usize * area.width + px as usize) * 4;
+                        block[o..o + 4].copy_from_slice(&text);
+                    }
+                }
+            }
+            if order.fl_accel & SO_CHAR_INC_EQUAL_BM_BASE != 0 {
+                x += i32::from(glyph.cx);
+            } else if order.char_inc != 0 {
+                x += i32::from(order.char_inc);
+            }
+        }
+        frames.extend(area.blit(framebuffer, &block));
+        outcome
     }
 
     /// Store a Cache Bitmap (Revision 2) bitmap. Past the budget the entry is emptied instead,
@@ -577,6 +762,35 @@ fn clip_blt(
         shift_x,
         shift_y,
     })
+}
+
+/// One cached glyph: its offset from the glyph origin, its size, and one bit per pixel in
+/// whole-byte rows, most significant first.
+#[derive(Debug, Clone)]
+struct Glyph {
+    x: i16,
+    y: i16,
+    cx: u16,
+    cy: u16,
+    bits: Vec<u8>,
+}
+
+/// `flAccel` `SO_HORIZONTAL`.
+const SO_HORIZONTAL: u8 = 0x02;
+/// `flAccel` `SO_VERTICAL`.
+const SO_VERTICAL: u8 = 0x04;
+/// `flAccel` `SO_CHAR_INC_EQUAL_BM_BASE`: each glyph advances by its width.
+const SO_CHAR_INC_EQUAL_BM_BASE: u8 = 0x20;
+/// The `VariableBytes` USE operation; ADD is 0xFF.
+const GLYPH_FRAGMENT_USE: u8 = 0xFE;
+
+/// An inclusive `[left, top, right, bottom]` as `[left, top, width, height]`, empty unless right
+/// and bottom pass left and top, the width and height capped to the coordinate range.
+fn inclusive([left, top, right, bottom]: [i16; 4]) -> Option<[i16; 4]> {
+    let side = |low: i16, high: i16| {
+        (high > low).then(|| (i32::from(high) - i32::from(low) + 1).min(i32::from(i16::MAX)) as i16)
+    };
+    Some([left, top, side(left, right)?, side(top, bottom)?])
 }
 
 /// A rectangle painted with a brush through a ROP over its own pixels: a DstBlt, a PatBlt or an
@@ -992,10 +1206,260 @@ pub(crate) mod tests {
         assert_eq!(pixel(&fb, 3, 0), rgba(RED), "PATCOPY is not a DstBlt ROP");
     }
 
-    /// A GlyphIndex is decoded and not drawn (#475; drawing it is #476), and the orders after
-    /// it in the update are applied.
+    /// [`capabilities`] with ten glyph caches of 4 entries and 16-byte cells, and GlyphIndex.
+    fn glyph_capabilities() -> Vec<CapabilitySet> {
+        let mut sets = capabilities(4, true);
+        if let CapabilitySet::Order(o) = &mut sets[0] {
+            o.order_support[capability::ORDER_NEG_INDEX_INDEX] = 1;
+        }
+        sets.push(CapabilitySet::GlyphCache(
+            justrdp_pdu::capability::GlyphCacheCapabilitySet {
+                glyph_cache: [(4, 16); 10],
+                frag_cache: 0,
+                glyph_support_level: capability::GLYPH_SUPPORT_FULL,
+            },
+        ));
+        sets
+    }
+
+    /// A Cache Glyph order of one glyph: `rows` of `#` and `.`, its offset `(x, y)`.
+    fn cache_glyph(cache_id: u8, index: u16, (x, y): (i16, i16), rows: &[&str]) -> Vec<u8> {
+        let (cx, cy) = (rows[0].len(), rows.len());
+        let mut body = vec![cache_id, 1];
+        for value in [index, x as u16, y as u16, cx as u16, cy as u16] {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut bits = Vec::new();
+        for row in rows {
+            let mut bytes = vec![0u8; cx.div_ceil(8)];
+            for (column, c) in row.chars().enumerate() {
+                if c == '#' {
+                    bytes[column / 8] |= 0x80 >> (column % 8);
+                }
+            }
+            bits.extend(bytes);
+        }
+        bits.resize(bits.len().next_multiple_of(4), 0);
+        body.extend(bits);
+        let mut order = vec![TS_STANDARD | TS_SECONDARY];
+        order.extend_from_slice(&((body.len() as i16) - 7).to_le_bytes());
+        order.extend_from_slice(&0u16.to_le_bytes());
+        order.push(justrdp_pdu::orders::TS_CACHE_GLYPH);
+        order.extend(body);
+        order
+    }
+
+    /// A GlyphIndex with every field: `accel` is `cacheId`, `flAccel`, `ulCharInc`,
+    /// `fOpRedundant`; `colors` are `BackColor` (the text), `ForeColor` (the opaque rectangle).
+    fn glyph_index(
+        accel: [u8; 4],
+        colors: [u16; 2],
+        bk: [i16; 4],
+        op: [i16; 4],
+        origin: (i16, i16),
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut order = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            justrdp_pdu::orders::TS_ENC_INDEX_ORDER,
+            0xFF,
+            0xFF,
+            0x3F,
+        ];
+        order.extend_from_slice(&accel);
+        for color in colors {
+            order.extend_from_slice(&color.to_le_bytes());
+            order.push(0);
+        }
+        for value in bk.into_iter().chain(op) {
+            order.extend_from_slice(&value.to_le_bytes());
+        }
+        order.extend_from_slice(&[0; 11]);
+        order.extend_from_slice(&origin.0.to_le_bytes());
+        order.extend_from_slice(&origin.1.to_le_bytes());
+        order.push(data.len() as u8);
+        order.extend_from_slice(data);
+        order
+    }
+
+    /// The columns of row `y` that are `color`, as `#` and `.`.
+    fn row_of(fb: &Framebuffer, y: usize, color: u16) -> String {
+        (0..usize::from(fb.width()))
+            .map(|x| {
+                if pixel(fb, x, y) == rgba(color) {
+                    '#'
+                } else {
+                    '.'
+                }
+            })
+            .collect()
+    }
+
+    /// A glyph's set bits paint in `BackColor` at the origin plus its offset, and nothing else
+    /// does; each delta, one byte or 0x80 and two, moves the origin before its glyph (#476, as
+    /// FreeRDP's `update_glyph_offset`).
     #[test]
-    fn a_glyph_index_is_skipped_and_the_update_goes_on() {
+    fn glyphs_paint_their_set_bits_at_their_offsets() {
+        let mut orders = Orders::new(&glyph_capabilities());
+        let mut fb = Framebuffer::new(12, 3).unwrap();
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                opaque_rect([0, 0, 12, 3], WHITE),
+                cache_glyph(2, 1, (0, -2), &["#.#", ".#."]),
+                glyph_index(
+                    [2, 0x03, 0, 1],
+                    [BLUE, RED],
+                    [0, 0, 11, 2],
+                    [0; 4],
+                    (2, 3),
+                    &[1, 0, 1, 0x80, 5, 0],
+                ),
+            ],
+        );
+        assert_eq!(frames, [frame(0, 0, 12, 3), frame(0, 0, 12, 3)]);
+        assert_eq!(row_of(&fb, 0, BLUE), "............");
+        assert_eq!(row_of(&fb, 1, BLUE), "..#.#..#.#..");
+        assert_eq!(row_of(&fb, 2, BLUE), "...#....#...");
+        assert_eq!(
+            row_of(&fb, 1, WHITE),
+            "##.#.##.#.##",
+            "clear bits are see-through"
+        );
+    }
+
+    /// `SO_CHAR_INC_EQUAL_BM_BASE` advances each glyph by its width and `ulCharInc` by a fixed
+    /// pitch, both with no delta bytes; the text rectangle clips.
+    #[test]
+    fn glyph_advances_and_the_text_rectangle() {
+        let paint = |accel: [u8; 4], bk: [i16; 4]| {
+            let mut orders = Orders::new(&glyph_capabilities());
+            let mut fb = Framebuffer::new(12, 2).unwrap();
+            run(
+                &mut orders,
+                &mut fb,
+                &[
+                    cache_glyph(0, 0, (0, 0), &["##"]),
+                    glyph_index(accel, [BLUE, RED], bk, [0; 4], (1, 0), &[0, 0, 0]),
+                ],
+            );
+            row_of(&fb, 0, BLUE)
+        };
+        assert_eq!(
+            paint([0, 0x23, 0, 1], [0, 0, 11, 1]),
+            ".######.....",
+            "by width"
+        );
+        assert_eq!(
+            paint([0, 0x03, 4, 1], [0, 0, 11, 1]),
+            ".##..##..##.",
+            "fixed pitch"
+        );
+        assert_eq!(
+            paint([0, 0x23, 0, 1], [2, 0, 5, 1]),
+            "..####......",
+            "clipped"
+        );
+        assert_eq!(
+            paint([0, 0x23, 0, 1], [0, 0, 11, 0]),
+            "............",
+            "a text rectangle whose bottom is its top is empty, as FreeRDP measures it"
+        );
+    }
+
+    /// Unless `fOpRedundant`, the opaque rectangle fills in `ForeColor` before the glyphs.
+    #[test]
+    fn the_opaque_rectangle_fills_before_the_glyphs() {
+        let mut orders = Orders::new(&glyph_capabilities());
+        let mut fb = Framebuffer::new(6, 2).unwrap();
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_glyph(0, 0, (0, 0), &["#"]),
+                glyph_index(
+                    [0, 0x23, 0, 0],
+                    [BLUE, RED],
+                    [0, 0, 5, 1],
+                    [1, 0, 4, 1],
+                    (2, 0),
+                    &[0],
+                ),
+            ],
+        );
+        assert_eq!(row_of(&fb, 0, RED), ".#.##.");
+        assert_eq!(row_of(&fb, 0, BLUE), "..#...");
+        let mut orders = Orders::new(&glyph_capabilities());
+        let mut fb = Framebuffer::new(6, 2).unwrap();
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_glyph(0, 0, (0, 0), &["#"]),
+                glyph_index(
+                    [0, 0x23, 0, 1],
+                    [BLUE, RED],
+                    [0, 0, 5, 1],
+                    [1, 0, 4, 1],
+                    (2, 0),
+                    &[0],
+                ),
+            ],
+        );
+        assert_eq!(row_of(&fb, 0, RED), "......", "redundant: no fill");
+    }
+
+    /// A fragment operation ends the run, since no fragment cache is kept; a glyph outside the
+    /// caches or past its cell is not stored, and a miss draws nothing; the update goes on.
+    #[test]
+    fn fragments_and_uncached_glyphs_draw_nothing() {
+        let mut orders = Orders::new(&glyph_capabilities());
+        let mut fb = Framebuffer::new(8, 2).unwrap();
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_glyph(0, 0, (0, 0), &["#"]),
+                cache_glyph(0, 4, (0, 0), &["#"]),
+                cache_glyph(10, 0, (0, 0), &["#"]),
+                cache_glyph(1, 0, (0, 0), &["#"; 20]),
+                glyph_index(
+                    [0, 0x23, 0, 1],
+                    [BLUE, RED],
+                    [0, 0, 7, 1],
+                    [0; 4],
+                    (0, 0),
+                    &[0, 0xFE, 0, 0],
+                ),
+                glyph_index(
+                    [0, 0x23, 0, 1],
+                    [BLUE, RED],
+                    [0, 0, 7, 1],
+                    [0; 4],
+                    (3, 0),
+                    &[4],
+                ),
+                glyph_index(
+                    [1, 0x23, 0, 1],
+                    [BLUE, RED],
+                    [0, 0, 7, 1],
+                    [0; 4],
+                    (5, 0),
+                    &[0],
+                ),
+                opaque_rect([7, 0, 1, 1], GREEN),
+            ],
+        );
+        assert_eq!(row_of(&fb, 0, BLUE), "#.......");
+        assert_eq!(pixel(&fb, 7, 0), rgba(GREEN));
+        assert_eq!(frames.last(), Some(&frame(7, 0, 1, 1)));
+    }
+
+    /// A GlyphIndex with no text rectangle draws nothing, and the orders after it in the update
+    /// are applied.
+    #[test]
+    fn a_glyph_index_with_no_text_rectangle_draws_nothing() {
         let mut orders = Orders::new(&capabilities(4, true));
         let mut fb = Framebuffer::new(4, 1).unwrap();
         let mut glyph_index = vec![

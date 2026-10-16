@@ -8239,6 +8239,9 @@ mod tests {
                     let mut cur = ReadCursor::new(update.order_data, "census order data");
                     for _ in 0..update.number_orders {
                         let name = match orders::decode_order(&mut cur, &mut self.history) {
+                            Ok(DrawingOrder::CacheGlyph(order)) => {
+                                format!("CacheGlyph cache {}", order.cache_id)
+                            }
                             Ok(DrawingOrder::GlyphIndex { order, .. }) => {
                                 self.glyph_rects.push(order.bk);
                                 if order.op_redundant == 0 && order.op != [0; 4] {
@@ -11576,36 +11579,55 @@ mod tests {
         );
     }
 
-    /// Issue #475: xrdp's login screen painted in DstBlt, OpaqueRect and PatBlt is the screen
-    /// xrdp paints in bitmap updates for a session that advertises no orders, except for the
-    /// text, which GlyphIndex carries and #476 draws: every pixel that differs lies inside a
-    /// GlyphIndex's text rectangle, or its opaque one where it has one, and those rectangles
-    /// cover a small part of the screen.
+    /// Issues #475 and #476: xrdp's login screen painted in drawing orders, its text in glyphs,
+    /// is the screen xrdp paints in bitmap updates for a session that advertises no orders, pixel
+    /// for pixel.
     #[tokio::test]
     #[ignore = "requires the xrdp census server and JUSTRDP_XRDP_ADDR"]
-    async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_but_the_text() {
-        use justrdp_pdu::capability;
+    async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps() {
+        use justrdp_pdu::capability::{self, CapabilitySet, GlyphCacheCapabilitySet};
         let mut bitmaps = legacy_graphics_config();
         bitmaps.core.high_color_depth = gcc::HIGH_COLOR_DEPTH_16BPP;
         for set in &mut bitmaps.capabilities {
-            if let justrdp_pdu::capability::CapabilitySet::Bitmap(b) = set {
+            if let CapabilitySet::Bitmap(b) = set {
                 b.preferred_bits_per_pixel = 16;
             }
         }
         let oracle = xrdp_login(bitmaps).await;
-        let ordered = xrdp_login(legacy_orders_config(&[
+        let mut orders = legacy_orders_config(&[
             capability::ORDER_NEG_DSTBLT_INDEX,
             capability::ORDER_NEG_PATBLT_INDEX,
             capability::ORDER_NEG_SCRBLT_INDEX,
             capability::ORDER_NEG_MEMBLT_INDEX,
             capability::ORDER_NEG_MEM3BLT_INDEX,
-        ]))
-        .await;
-        ordered.census.print("#475");
-        let oracle_path = dump_ppm(&oracle.framebuffer, "justrdp-475-oracle.ppm");
-        let ordered_path = dump_ppm(&ordered.framebuffer, "justrdp-475-orders.ppm");
+            capability::ORDER_NEG_INDEX_INDEX,
+        ]);
+        let glyphs = GlyphCacheCapabilitySet {
+            glyph_cache: [
+                (254, 4),
+                (254, 4),
+                (254, 8),
+                (254, 8),
+                (254, 16),
+                (254, 32),
+                (254, 64),
+                (254, 128),
+                (254, 256),
+                (64, 2048),
+            ],
+            frag_cache: 0,
+            glyph_support_level: capability::GLYPH_SUPPORT_FULL,
+        };
+        orders
+            .capabilities
+            .retain(|set| !matches!(set, CapabilitySet::GlyphCache(_)));
+        orders.capabilities.push(CapabilitySet::GlyphCache(glyphs));
+        let ordered = xrdp_login(orders).await;
+        ordered.census.print("#476");
+        let oracle_path = dump_ppm(&oracle.framebuffer, "justrdp-476-oracle.ppm");
+        let ordered_path = dump_ppm(&ordered.framebuffer, "justrdp-476-orders.ppm");
         eprintln!(
-            "#475: dumps {} and {}",
+            "#476: dumps {} and {}",
             oracle_path.display(),
             ordered_path.display()
         );
@@ -11614,7 +11636,7 @@ mod tests {
             "the oracle is painted in bitmaps, not orders: {:?}",
             oracle.census.orders
         );
-        for kind in ["OpaqueRect", "PatBlt", "GlyphIndex"] {
+        for kind in ["OpaqueRect", "PatBlt", "GlyphIndex", "CacheGlyph"] {
             assert!(ordered.census.count(kind) > 0, "no {kind} arrived");
         }
         assert_eq!(
@@ -11627,47 +11649,20 @@ mod tests {
             (ordered.framebuffer.width(), ordered.framebuffer.height())
         );
         let width = usize::from(ordered.framebuffer.width());
-        let height = usize::from(ordered.framebuffer.height());
-        let rgb = |fb: &justrdp::Framebuffer, x: usize, y: usize| {
-            let o = (y * width + x) * 4;
+        let rgb = |fb: &justrdp::Framebuffer, i: usize| {
+            let o = i * 4;
             [fb.pixels()[o], fb.pixels()[o + 1], fb.pixels()[o + 2]]
         };
-        let in_text = |x: usize, y: usize| {
-            ordered.census.glyph_rects.iter().any(|&[l, t, r, b]| {
-                (i32::from(l)..=i32::from(r)).contains(&(x as i32))
-                    && (i32::from(t)..=i32::from(b)).contains(&(y as i32))
-            })
-        };
-        let mut differing = 0usize;
-        let mut outside = Vec::new();
-        for y in 0..height {
-            for x in 0..width {
-                if rgb(&ordered.framebuffer, x, y) != rgb(&oracle.framebuffer, x, y) {
-                    differing += 1;
-                    if !in_text(x, y) && outside.len() < 8 {
-                        outside.push((x, y));
-                    }
-                }
-            }
-        }
-        let exempt = (0..height)
-            .flat_map(|y| (0..width).map(move |x| (x, y)))
-            .filter(|&(x, y)| in_text(x, y))
-            .count();
-        eprintln!(
-            "#475: {differing} pixels differ, all expected inside the text rectangles, which \
-             cover {exempt} of {} pixels",
-            width * height
+        let differing: Vec<(usize, usize)> = (0..width * usize::from(ordered.framebuffer.height()))
+            .filter(|&i| rgb(&ordered.framebuffer, i) != rgb(&oracle.framebuffer, i))
+            .map(|i| (i % width, i / width))
+            .collect();
+        eprintln!("#476: {} pixels differ", differing.len());
+        assert_eq!(
+            differing.get(..8.min(differing.len())),
+            Some(&[][..]),
+            "pixels differ"
         );
-        assert!(
-            differing > 0,
-            "the text is missing, so some pixels must differ"
-        );
-        assert!(
-            exempt * 50 < width * height,
-            "the text rectangles cover {exempt} pixels, 2% of the screen or more"
-        );
-        assert_eq!(outside, [], "pixels differing outside every text rectangle");
     }
 
     #[tokio::test]
