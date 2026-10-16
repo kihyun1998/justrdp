@@ -60,10 +60,11 @@ DstBlt, PatBlt and OpaqueRect fill rectangles, and GlyphIndex is decoded and not
   fields, each replacing its own byte of the colour the history holds, as FreeRDP's
   `update_read_opaque_rect_order` merges them; it fills with that colour as PATCOPY. PatBlt runs
   its brush through its ROP with no source, sharing Mem3Blt's brush; a cached brush is skipped,
-  as for Mem3Blt.
+  as for Mem3Blt, unless the ROP never reads the brush.
 - **DstBlt runs only destination ROPs.** 2.2.2.2.1.1.2.1 says its ROP MUST depend on the
   destination alone, which leaves BLACKNESS, DSTINVERT, the no-op and WHITENESS; any other is a
-  server self-inconsistency and the order is skipped. No measured server has sent a DstBlt. It is
+  server self-inconsistency and the order is skipped (ADR-0009 §2). That is a derivation, not a
+  call anyone made: FreeRDP's `gdi_dstblt` runs such a ROP anyway. No measured server has sent a DstBlt. It is
   built because xrdp 0.9.24 draws in orders only for a client advertising DstBlt, PatBlt, ScrBlt
   and MemBlt all four (`xrdp_caps.c`, `no_orders_supported`); without DstBlt, justrdp got 38 bitmap
   updates and no order (2026-10-16). Building it in #475 was the maintainer's call that day, over a
@@ -180,7 +181,7 @@ DstBlt, PatBlt and OpaqueRect fill rectangles, and GlyphIndex is decoded and not
   SaveBitmap, Cache Brush, the offscreen orders and Cache Bitmap revisions 1 and 3. xrdp has
   encoders for several of them (`libxrdp/xrdp_orders.c`), and none appeared.
 
-**xrdp's login screen in orders against bitmaps (#475).** A session advertising DstBlt, PatBlt,
+**xrdp's login screen in orders against bitmaps (#475, 2026-10-16).** A session advertising DstBlt, PatBlt,
 ScrBlt, MemBlt and Mem3Blt received 72 OpaqueRect, 2 PatBlt (PATINVERT, solid), 12 MemBlt over 12
 Cache Bitmap (Revision 2), 33 Cache Glyph and 9 GlyphIndex, and no update ended early. A session
 advertising no order got the same screen in bitmap updates. The two framebuffers differ in 1,241

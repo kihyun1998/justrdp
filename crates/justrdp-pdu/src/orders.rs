@@ -1160,7 +1160,13 @@ mod tests {
         bytes.push(0xF0); // bRop
         bytes.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
         bytes.extend_from_slice(&[(-2i8) as u8, 5, 0x02, 0x03, 1, 2, 3, 4, 5, 6, 7]);
-        bytes.extend_from_slice(&[TS_STANDARD | TS_ZERO_FIELD_BYTE_BIT0, 0x10, 0x5A]);
+        // Then bRop and nLeftRect as a delta.
+        bytes.extend_from_slice(&[
+            TS_STANDARD | TS_ZERO_FIELD_BYTE_BIT0 | TS_DELTA_COORDINATES,
+            0x11,
+            (-4i8) as u8,
+            0x5A,
+        ]);
         let mut history = OrderHistory::default();
         let expected = PatBlt {
             left: 10,
@@ -1187,6 +1193,7 @@ mod tests {
                 }),
                 Ok(DrawingOrder::PatBlt {
                     order: PatBlt {
+                        left: 6,
                         rop: 0x5A,
                         ..expected
                     },
@@ -1206,7 +1213,8 @@ mod tests {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
-        bytes.extend_from_slice(&[TS_STANDARD, 0x20, 0x11]); // only Green
+        // Then Green and nTopRect as a delta.
+        bytes.extend_from_slice(&[TS_STANDARD | TS_DELTA_COORDINATES, 0x22, 5, 0x11]);
         let mut history = OrderHistory::default();
         let first = OpaqueRect {
             left: 1,
@@ -1224,6 +1232,7 @@ mod tests {
                 }),
                 Ok(DrawingOrder::OpaqueRect {
                     order: OpaqueRect {
+                        top: 7,
                         color: 0xCC_11AA,
                         ..first
                     },

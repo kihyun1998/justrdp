@@ -8195,8 +8195,8 @@ mod tests {
         scrblts: Vec<([i16; 4], [i16; 2])>,
         /// Every DstBlt's, OpaqueRect's and PatBlt's `[left, top, width, height]`.
         fills: Vec<[i16; 4]>,
-        /// Every GlyphIndex's text background and opaque rectangles, `[left, top, right,
-        /// bottom]`.
+        /// Every GlyphIndex's text background rectangle and, when it has one, its opaque
+        /// rectangle, `[left, top, right, bottom]`.
         glyph_rects: Vec<[i16; 4]>,
     }
 
@@ -8241,7 +8241,9 @@ mod tests {
                         let name = match orders::decode_order(&mut cur, &mut self.history) {
                             Ok(DrawingOrder::GlyphIndex { order, .. }) => {
                                 self.glyph_rects.push(order.bk);
-                                self.glyph_rects.push(order.op);
+                                if order.op_redundant == 0 && order.op != [0; 4] {
+                                    self.glyph_rects.push(order.op);
+                                }
                                 "GlyphIndex".to_string()
                             }
                             Ok(DrawingOrder::DstBlt { order, .. }) => {
@@ -11577,8 +11579,8 @@ mod tests {
     /// Issue #475: xrdp's login screen painted in DstBlt, OpaqueRect and PatBlt is the screen
     /// xrdp paints in bitmap updates for a session that advertises no orders, except for the
     /// text, which GlyphIndex carries and #476 draws: every pixel that differs lies inside a
-    /// GlyphIndex's text or opaque rectangle. xrdp sends orders only to a client advertising
-    /// DstBlt, PatBlt, ScrBlt and MemBlt, and sends glyph orders whatever the client advertises.
+    /// GlyphIndex's text rectangle, or its opaque one where it has one, and those rectangles
+    /// cover a small part of the screen.
     #[tokio::test]
     #[ignore = "requires the xrdp census server and JUSTRDP_XRDP_ADDR"]
     async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_but_the_text() {
@@ -11648,10 +11650,22 @@ mod tests {
                 }
             }
         }
-        eprintln!("#475: {differing} pixels differ, all expected inside text rectangles");
+        let exempt = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|&(x, y)| in_text(x, y))
+            .count();
+        eprintln!(
+            "#475: {differing} pixels differ, all expected inside the text rectangles, which \
+             cover {exempt} of {} pixels",
+            width * height
+        );
         assert!(
             differing > 0,
             "the text is missing, so some pixels must differ"
+        );
+        assert!(
+            exempt * 50 < width * height,
+            "the text rectangles cover {exempt} pixels, 2% of the screen or more"
         );
         assert_eq!(outside, [], "pixels differing outside every text rectangle");
     }
