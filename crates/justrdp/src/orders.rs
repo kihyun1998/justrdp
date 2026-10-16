@@ -109,6 +109,16 @@ impl Orders {
         self.held.clear();
     }
 
+    /// Whether a `TS_FRAME_START` is waiting for its `TS_FRAME_END`.
+    pub(crate) fn in_frame(&self) -> bool {
+        self.in_frame
+    }
+
+    /// Hand over the rects held for the frame in flight, which stays open.
+    pub(crate) fn release_held(&mut self) -> Vec<FrameUpdate> {
+        core::mem::take(&mut self.held)
+    }
+
     /// Hand the rects one order painted to the host now, or hold them for the frame's end.
     fn deliver(&mut self, painted: &mut Vec<FrameUpdate>, frames: &mut Vec<FrameUpdate>) {
         if !self.in_frame {
@@ -970,6 +980,40 @@ pub(crate) mod tests {
         assert_eq!(frames, [frame(0, 0, 1, 1)]);
         let frames = run(&mut orders, &mut fb, &[frame_marker(TS_FRAME_END)]);
         assert_eq!(frames, [frame(1, 0, 1, 1), frame(2, 0, 1, 1)]);
+    }
+
+    /// A release hands the held rects over and leaves the frame open: its end still closes it
+    /// and hands over only what was painted after the release (#470).
+    #[test]
+    fn a_release_hands_over_an_open_frame_and_keeps_it_open() {
+        use justrdp_pdu::orders::{TS_FRAME_END, TS_FRAME_START};
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(8, 1).unwrap();
+        assert!(!orders.in_frame());
+        assert_eq!(orders.release_held(), [], "no frame, nothing held");
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_bitmap(0, 0, &[&[RED]]),
+                frame_marker(TS_FRAME_START),
+                memblt((0, 0), [0, 0, 1, 1], SRCCOPY, [0, 0]),
+            ],
+        );
+        assert_eq!(frames, []);
+        assert!(orders.in_frame());
+        assert_eq!(orders.release_held(), [frame(0, 0, 1, 1)]);
+        assert!(orders.in_frame(), "the frame stays open");
+        assert_eq!(orders.release_held(), [], "nothing twice");
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[memblt((0, 0), [1, 0, 1, 1], SRCCOPY, [0, 0])],
+        );
+        assert_eq!(frames, [], "still held after the release");
+        let frames = run(&mut orders, &mut fb, &[frame_marker(TS_FRAME_END)]);
+        assert_eq!(frames, [frame(1, 0, 1, 1)], "only what followed the release");
+        assert!(!orders.in_frame());
     }
 
     /// Past 64 held rects a frame collapses to their bounding box and goes on holding, as

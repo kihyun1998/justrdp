@@ -59,6 +59,15 @@ pub trait DvcProcessor {
     fn flush_frames(&mut self, _framebuffer: &mut Framebuffer) -> Vec<FrameUpdate> {
         Vec::new()
     }
+    /// Whether a frame this processor holds back from [`Self::flush_frames`] is open.
+    fn frame_open(&self) -> bool {
+        false
+    }
+    /// Blit and return what an open frame holds back, as its end would, and leave it open; a
+    /// processor that budgets per frame starts a fresh budget.
+    fn release_frames(&mut self, _framebuffer: &mut Framebuffer) -> Vec<FrameUpdate> {
+        Vec::new()
+    }
     /// The channel closed (server Close PDU); drop per-channel state.
     fn close(&mut self);
 }
@@ -362,6 +371,20 @@ impl Drdynvc {
         let mut frames = Vec::new();
         for processor in &mut self.processors {
             frames.extend(processor.flush_frames(framebuffer));
+        }
+        frames
+    }
+
+    /// Whether any processor has a frame open.
+    pub(crate) fn frame_open(&self) -> bool {
+        self.processors.iter().any(|processor| processor.frame_open())
+    }
+
+    /// Every processor's [`DvcProcessor::release_frames`], in order.
+    pub(crate) fn release_frames(&mut self, framebuffer: &mut Framebuffer) -> Vec<FrameUpdate> {
+        let mut frames = Vec::new();
+        for processor in &mut self.processors {
+            frames.extend(processor.release_frames(framebuffer));
         }
         frames
     }

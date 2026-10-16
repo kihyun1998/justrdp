@@ -1829,6 +1829,29 @@ impl SessionStateMachine {
         Ok(())
     }
 
+    /// Whether a frame is open: a drawing-order Frame Marker start or a Graphics Pipeline
+    /// `StartFrame` whose end has not arrived. An open frame holds back the [`FrameUpdate`]s of
+    /// what it painted until its end, or until [`Self::release_open_frames`].
+    pub fn has_open_frame(&self) -> bool {
+        self.orders.in_frame() || self.drdynvc.frame_open()
+    }
+
+    /// Hand over now what the open frames hold back, as [`SessionOutput::Frame`]s, with the
+    /// Graphics Pipeline's dirty regions blitted into the framebuffer as its `EndFrame` would.
+    /// The frames stay open: a later end closes them and hands over only what was painted after
+    /// this. A Graphics Pipeline frame also starts a fresh paint budget.
+    ///
+    /// When to call it is the host's; the core keeps no clock. During a Deactivation nothing is
+    /// returned.
+    pub fn release_open_frames(&mut self) -> Vec<SessionOutput> {
+        if self.phase != Phase::Active {
+            return Vec::new();
+        }
+        let mut frames = self.orders.release_held();
+        frames.extend(self.drdynvc.release_frames(&mut self.framebuffer));
+        frames.into_iter().map(SessionOutput::Frame).collect()
+    }
+
     /// Ask the server to end this session — the Shutdown Request PDU (`[MS-RDPBCGR]` 2.2.2.1).
     ///
     /// The returned frames go to the socket verbatim. The PDU is **bodyless**: its Share Data
@@ -5588,6 +5611,81 @@ mod tests {
                 .any(|o| matches!(o, SessionOutput::Frame(_))),
             "a rect past the resized framebuffer reached the host: {released:?}"
         );
+    }
+
+    /// An order frame and a Graphics Pipeline frame left open both reach the host through a
+    /// release, stay open, and release nothing during a Deactivation (#470).
+    #[test]
+    fn a_release_hands_over_both_kinds_of_open_frame() {
+        use crate::orders::tests::{frame_marker, scrblt};
+        use justrdp_pdu::egfx;
+        use justrdp_pdu::orders::TS_FRAME_START;
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        assert!(!sm.has_open_frame());
+        assert_eq!(sm.release_open_frames(), [], "nothing open");
+
+        let mut sm = with_open_dvc(8, egfx::CHANNEL_NAME);
+        let create_surface = [1u16.to_le_bytes(), 16u16.to_le_bytes(), 16u16.to_le_bytes()]
+            .concat()
+            .into_iter()
+            .chain([egfx::PIXEL_FORMAT_XRGB_8888])
+            .collect::<Vec<u8>>();
+        let map = [&1u16.to_le_bytes()[..], &[0; 2], &[0; 4], &[0; 4]].concat();
+        let start = [0u32.to_le_bytes(), 7u32.to_le_bytes()].concat();
+        let mut graphics = Vec::new();
+        for (cmd, body) in [
+            (egfx::CMDID_CREATE_SURFACE, create_surface),
+            (egfx::CMDID_MAP_SURFACE_TO_OUTPUT, map),
+            (egfx::CMDID_START_FRAME, start),
+            (egfx::CMDID_SOLID_FILL, solid_fill_surface_1()),
+        ] {
+            for frame in server_egfx(8, cmd, &body) {
+                graphics.extend(sm.process_bytes(&frame).unwrap());
+            }
+            if cmd == egfx::CMDID_MAP_SURFACE_TO_OUTPUT {
+                graphics.clear();
+            }
+        }
+        let orders = fastpath::encode_pdu(&[(
+            fastpath::FP_UPDATE_ORDERS,
+            fastpath::FP_FRAGMENT_SINGLE,
+            &orders_body(&[
+                frame_marker(TS_FRAME_START),
+                scrblt([12, 0, 2, 1], 0xCC, [0, 0]),
+            ]),
+        )]);
+        graphics.extend(sm.process_bytes(&orders).unwrap());
+        assert_eq!(graphics, [], "both frames hold what they painted");
+        assert!(sm.has_open_frame());
+
+        let released = sm.release_open_frames();
+        let rect = |x, y, width, height| {
+            SessionOutput::Frame(FrameUpdate {
+                x,
+                y,
+                width,
+                height,
+            })
+        };
+        assert_eq!(released, [rect(12, 0, 2, 1), rect(0, 0, 4, 4)]);
+        assert_eq!(
+            frame_pixels(&sm, &FrameUpdate {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1
+            }),
+            [255, 0, 0, 255],
+            "the fill is blitted"
+        );
+        assert!(sm.has_open_frame(), "the frames stay open");
+        assert_eq!(sm.release_open_frames(), [], "nothing twice");
+
+        for frame in server_egfx(8, egfx::CMDID_SOLID_FILL, &solid_fill_surface_1()) {
+            sm.process_bytes(&frame).unwrap();
+        }
+        deactivate_all(&mut sm);
+        assert_eq!(sm.release_open_frames(), [], "nothing during a Deactivation");
     }
 
     /// The other side of the line the variant draws: the same error from a path no dynamic
