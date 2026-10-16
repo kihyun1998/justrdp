@@ -181,6 +181,10 @@ screen that carries the orders. Traps, each measured once:
   (`xrdp_sec_process_logon_info`, logged as *"received wrong flags, likely decrypt not
   working"*), and answers with a Disconnect Provider Ultimatum. `test_config` leaves out two of
   them, so `a_tls_only_session_paints_the_xrdp_login_screen` sets its own.
+- **xrdp draws in orders only for a client advertising DstBlt, PatBlt, ScrBlt and MemBlt** all
+  four (`xrdp_caps.c`); a client missing one gets bitmap updates. And it sends Cache Glyph and
+  GlyphIndex whatever the client advertises, so a FreeRDP census needs `/relax-order-checks` when
+  the glyph cache is off.
 - **No password reaches it**, because the core holds none, so xrdp shows its login screen with
   the user name filled in. With no orders advertised it paints that screen in 42 slow-path Bitmap
   Updates (and 2 fast-path New Pointers), measured from a session capture on 2026-10-16. That is

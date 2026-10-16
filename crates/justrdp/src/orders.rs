@@ -13,12 +13,14 @@ use justrdp_codecs::rop::{self, Pattern};
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::orders::{
-    self, BITMAPCACHE_WAITING_LIST_INDEX, Bounds, CacheBitmapRev2, Clip, DrawingOrder, Mem3Blt,
-    MemBlt, OrderError, OrderHistory, OrdersUpdate, ScrBlt,
+    self, BITMAPCACHE_WAITING_LIST_INDEX, Bounds, Brush, CacheBitmapRev2, Clip, DrawingOrder,
+    Mem3Blt, MemBlt, OrderError, OrderHistory, OrdersUpdate, ScrBlt,
 };
 
 /// ROP3 SRCCOPY: the source, unchanged.
 const SRCCOPY: u8 = 0xCC;
+/// ROP3 PATCOPY: the pattern, unchanged.
+const PATCOPY: u8 = 0xF0;
 
 /// One cached bitmap, decoded to top-down RGBA.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,11 +39,15 @@ enum Skip {
     CacheOutOfRange,
     /// The entry it names holds no bitmap.
     CacheMiss,
-    /// A bitmap larger than its cache's tile size.
+    /// A bitmap of more pixels than its cache's entry, the tile side squared.
     OversizedBitmap,
     /// A brush this session cannot draw: cached, hollow under a ROP that reads the pattern, or
     /// a hatch outside the six.
     UnsupportedBrush,
+    /// A DstBlt whose ROP reads the pattern or the source.
+    DstBltReadsMore,
+    /// A GlyphIndex: decoded so the update goes on, not drawn.
+    GlyphIndexNotDrawn,
     /// The update's paint budget is spent.
     OverBudget,
 }
@@ -54,6 +60,8 @@ pub(crate) struct Orders {
     history: OrderHistory,
     /// Each advertised Revision 2 cache, its entries followed by one waiting-list entry.
     caches: Vec<Vec<Option<CachedBitmap>>>,
+    /// DstBlt, PatBlt and OpaqueRect.
+    patblt: bool,
     scrblt: bool,
     memblt: bool,
     mem3blt: bool,
@@ -90,6 +98,10 @@ impl Orders {
         Self {
             history: OrderHistory::default(),
             caches,
+            patblt: support.is_some_and(|s| {
+                s[capability::ORDER_NEG_DSTBLT_INDEX] != 0
+                    || s[capability::ORDER_NEG_PATBLT_INDEX] != 0
+            }),
             scrblt: support.is_some_and(|s| s[capability::ORDER_NEG_SCRBLT_INDEX] != 0),
             memblt: support.is_some_and(|s| s[capability::ORDER_NEG_MEMBLT_INDEX] != 0),
             mem3blt: support.is_some_and(|s| s[capability::ORDER_NEG_MEM3BLT_INDEX] != 0),
@@ -221,6 +233,58 @@ impl Orders {
                 DrawingOrder::CacheBitmapRev2(order) => {
                     self.cache_bitmap(&order, palette, bits_per_pixel, &mut budget)
                 }
+                DrawingOrder::GlyphIndex { .. } => {
+                    Err(NotApplied::Skipped(Skip::GlyphIndexNotDrawn))
+                }
+                DrawingOrder::DstBlt { order, clip } => {
+                    if matches!(order.rop, 0x00 | 0x55 | 0xAA | 0xFF) {
+                        self.fill(
+                            [order.left, order.top, order.width, order.height],
+                            order.rop,
+                            Pattern::Solid(0),
+                            clip,
+                            framebuffer,
+                            &mut budget,
+                            &mut painted,
+                        )
+                    } else {
+                        Err(NotApplied::Skipped(Skip::DstBltReadsMore))
+                    }
+                }
+                DrawingOrder::PatBlt { order, clip } => {
+                    match pattern(
+                        &order.brush,
+                        order.fore_color,
+                        order.back_color,
+                        palette,
+                        bits_per_pixel,
+                    ) {
+                        Ok(brush) => self.fill(
+                            [order.left, order.top, order.width, order.height],
+                            order.rop,
+                            brush,
+                            clip,
+                            framebuffer,
+                            &mut budget,
+                            &mut painted,
+                        ),
+                        Err(not_applied) => Err(not_applied),
+                    }
+                }
+                DrawingOrder::OpaqueRect { order, clip } => {
+                    match order_color(order.color, palette, bits_per_pixel) {
+                        Ok(color) => self.fill(
+                            [order.left, order.top, order.width, order.height],
+                            PATCOPY,
+                            Pattern::Solid(color),
+                            clip,
+                            framebuffer,
+                            &mut budget,
+                            &mut painted,
+                        ),
+                        Err(not_applied) => Err(not_applied),
+                    }
+                }
                 DrawingOrder::ScrBlt { order, clip } => {
                     self.scrblt(&order, clip, framebuffer, &mut budget, &mut painted)
                 }
@@ -293,7 +357,7 @@ impl Orders {
         let tile = 16usize << order.cache_id;
         let slot = self.slot(u16::from(order.cache_id), order.cache_index)?;
         let (width, height) = (usize::from(order.width), usize::from(order.height));
-        if width > tile || height > tile {
+        if width * height > tile * tile {
             *slot = None;
             return Err(NotApplied::Skipped(Skip::OversizedBitmap));
         }
@@ -361,9 +425,13 @@ impl Orders {
             Clip::Unknown => return Err(NotApplied::Skipped(Skip::UnknownClip)),
         };
         let pattern = match mem3blt {
-            Some(order) if rop::uses_pattern(order.blt.rop) => {
-                Some(pattern(order, palette, bits_per_pixel)?)
-            }
+            Some(order) if rop::uses_pattern(order.blt.rop) => Some(pattern(
+                &order.brush,
+                order.fore_color,
+                order.back_color,
+                palette,
+                bits_per_pixel,
+            )?),
             _ => None,
         };
         // The low byte is the cache; the high byte, a color table entry, is not read.
@@ -392,6 +460,56 @@ impl Orders {
             pattern,
             framebuffer,
         );
+        frames.extend(area.blit(framebuffer, &block));
+        Ok(())
+    }
+
+    /// Paint a DstBlt, a PatBlt or an OpaqueRect: `brush` through `rop` over the rectangle's
+    /// current pixels.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        &mut self,
+        dest: [i16; 4],
+        rop: u8,
+        brush: Pattern,
+        clip: Clip,
+        framebuffer: &mut Framebuffer,
+        budget: &mut usize,
+        frames: &mut Vec<FrameUpdate>,
+    ) -> Result<(), NotApplied> {
+        if !self.patblt {
+            tracing::warn!(
+                target: "rdp_orders",
+                rop,
+                "a drawing order this client did not advertise, painted anyway"
+            );
+        }
+        let clip = match clip {
+            Clip::None => None,
+            Clip::Bounds(bounds) => Some(bounds),
+            Clip::Unknown => return Err(NotApplied::Skipped(Skip::UnknownClip)),
+        };
+        let size = (framebuffer.width(), framebuffer.height());
+        let Some(area) = clip_blt(dest, [dest[0], dest[1]], size, framebuffer, clip) else {
+            return Ok(());
+        };
+        if !charge(budget, area.width * area.height * 4) {
+            return Err(NotApplied::Skipped(Skip::OverBudget));
+        }
+        let stride = usize::from(framebuffer.width()) * 4;
+        let mut block = vec![0u8; area.width * area.height * 4];
+        for row in 0..area.height {
+            let y = area.top as usize + row;
+            let start = y * stride + area.left as usize * 4;
+            let target = &framebuffer.pixels()[start..start + area.width * 4];
+            let out = &mut block[row * area.width * 4..(row + 1) * area.width * 4];
+            for column in 0..area.width {
+                let at = column * 4;
+                let p = brush.pixel(area.left + column as i32, y as i32);
+                let d = word(&target[at..at + 4]);
+                out[at..at + 4].copy_from_slice(&rop::rop3(rop, p, 0, d).to_le_bytes());
+            }
+        }
         frames.extend(area.blit(framebuffer, &block));
         Ok(())
     }
@@ -556,11 +674,16 @@ fn word(pixel: &[u8]) -> u32 {
     u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]])
 }
 
-/// A Mem3Blt's brush, ready to paint.
-fn pattern(order: &Mem3Blt, palette: &Palette, bits_per_pixel: u16) -> Result<Pattern, NotApplied> {
-    let brush = &order.brush;
-    let fore = order_color(order.fore_color, palette, bits_per_pixel)?;
-    let back = order_color(order.back_color, palette, bits_per_pixel)?;
+/// A brush with its `ForeColor` and `BackColor`, ready to paint.
+fn pattern(
+    brush: &Brush,
+    fore_color: u32,
+    back_color: u32,
+    palette: &Palette,
+    bits_per_pixel: u16,
+) -> Result<Pattern, NotApplied> {
+    let fore = order_color(fore_color, palette, bits_per_pixel)?;
+    let back = order_color(back_color, palette, bits_per_pixel)?;
     let rows = match brush.style {
         rop::BS_SOLID => return Ok(Pattern::Solid(fore)),
         rop::BS_HATCHED => *rop::HATCH_PATTERNS
@@ -614,9 +737,12 @@ pub(crate) mod tests {
         [rgba[0], rgba[1], rgba[2], rgba[3]]
     }
 
-    /// The capability sets with MemBlt (and Mem3Blt) over three Revision 2 caches of `entries`.
+    /// The capability sets with DstBlt, PatBlt, ScrBlt, MemBlt (and Mem3Blt) over three
+    /// Revision 2 caches of `entries`.
     pub(crate) fn capabilities(entries: u32, mem3blt: bool) -> Vec<CapabilitySet> {
         let mut order = OrderCapabilitySet::default();
+        order.order_support[capability::ORDER_NEG_DSTBLT_INDEX] = 1;
+        order.order_support[capability::ORDER_NEG_PATBLT_INDEX] = 1;
         order.order_support[capability::ORDER_NEG_SCRBLT_INDEX] = 1;
         order.order_support[capability::ORDER_NEG_MEMBLT_INDEX] = 1;
         order.order_support[capability::ORDER_NEG_MEM3BLT_INDEX] = u8::from(mem3blt);
@@ -713,6 +839,198 @@ pub(crate) mod tests {
         order.extend_from_slice(&[0; 7]);
         order.extend_from_slice(&cache.1.to_le_bytes());
         order
+    }
+
+    /// A PatBlt with every field: `colors` are `BackColor`, `ForeColor`, and `brush` is
+    /// `BrushOrgX`, `BrushOrgY`, `BrushStyle`, `BrushHatch`.
+    pub(crate) fn patblt(dest: [i16; 4], rop: u8, colors: [u16; 2], brush: [u8; 4]) -> Vec<u8> {
+        let mut order = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            justrdp_pdu::orders::TS_ENC_PATBLT_ORDER,
+            0xFF,
+            0x0F,
+        ];
+        for value in dest {
+            order.extend_from_slice(&value.to_le_bytes());
+        }
+        order.push(rop);
+        for color in colors {
+            order.extend_from_slice(&color.to_le_bytes());
+            order.push(0);
+        }
+        order.extend_from_slice(&brush);
+        order.extend_from_slice(&[0; 7]);
+        order
+    }
+
+    /// An OpaqueRect of a 16 bpp `color`, whose two bytes are `RedOrPaletteIndex` and `Green`.
+    pub(crate) fn opaque_rect(dest: [i16; 4], color: u16) -> Vec<u8> {
+        let mut order = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            justrdp_pdu::orders::TS_ENC_OPAQUERECT_ORDER,
+            0x7F,
+        ];
+        for value in dest {
+            order.extend_from_slice(&value.to_le_bytes());
+        }
+        order.extend_from_slice(&color.to_le_bytes());
+        order.push(0);
+        order
+    }
+
+    /// OpaqueRect fills its rectangle with its colour, clipped to the framebuffer; PatBlt
+    /// paints its brush through its ROP over what is there (#475).
+    #[test]
+    fn opaque_rect_and_patblt_fill_their_rectangles() {
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(4, 2).unwrap();
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                opaque_rect([1, 0, 2, 1], RED),
+                opaque_rect([3, 1, 5, 5], GREEN),
+            ],
+        );
+        assert_eq!(frames, [frame(1, 0, 2, 1), frame(3, 1, 1, 1)]);
+        assert_eq!(pixel(&fb, 0, 0), BLACK);
+        assert_eq!(pixel(&fb, 1, 0), rgba(RED));
+        assert_eq!(pixel(&fb, 2, 0), rgba(RED));
+        assert_eq!(pixel(&fb, 3, 1), rgba(GREEN));
+
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                // PATCOPY, solid: the foreground.
+                patblt([0, 1, 1, 1], 0xF0, [WHITE, BLUE], [0, 0, rop::BS_SOLID, 0]),
+                // PATINVERT over the red: pattern XOR destination.
+                patblt([1, 0, 1, 1], 0x5A, [WHITE, BLUE], [0, 0, rop::BS_SOLID, 0]),
+                // DSTINVERT reads no pattern.
+                patblt([2, 0, 1, 1], 0x55, [WHITE, BLUE], [0, 0, rop::BS_SOLID, 0]),
+                // PATCOPY, HS_HORIZONTAL from origin (0, -3): row 3 of the pattern, the
+                // line, lands on row 0 and paints the foreground; row 1 is background.
+                patblt(
+                    [3, 0, 1, 2],
+                    0xF0,
+                    [WHITE, BLUE],
+                    [0, (-3i8) as u8, rop::BS_HATCHED, 0],
+                ),
+            ],
+        );
+        assert_eq!(frames.len(), 4);
+        assert_eq!(pixel(&fb, 0, 1), rgba(BLUE));
+        let word = |p: [u8; 4]| u32::from_le_bytes(p);
+        assert_eq!(
+            word(pixel(&fb, 1, 0)),
+            rop::rop3(0x5A, word(rgba(BLUE)), 0, word(rgba(RED)))
+        );
+        assert_eq!(
+            word(pixel(&fb, 2, 0)),
+            rop::rop3(0x55, 0, 0, word(rgba(RED)))
+        );
+        assert_ne!(pixel(&fb, 2, 0), rgba(RED), "DSTINVERT changed it");
+        assert_eq!(pixel(&fb, 3, 0), rgba(BLUE));
+        assert_eq!(pixel(&fb, 3, 1), rgba(WHITE));
+    }
+
+    /// A DstBlt with every field.
+    pub(crate) fn dstblt(dest: [i16; 4], rop: u8) -> Vec<u8> {
+        let mut order = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            justrdp_pdu::orders::TS_ENC_DSTBLT_ORDER,
+            0x1F,
+        ];
+        for value in dest {
+            order.extend_from_slice(&value.to_le_bytes());
+        }
+        order.push(rop);
+        order
+    }
+
+    /// DstBlt runs its ROP on the destination alone (#475): BLACKNESS, DSTINVERT, WHITENESS. A
+    /// ROP that reads the pattern or the source breaks 2.2.2.2.1.1.2.1's MUST and paints nothing.
+    #[test]
+    fn dstblt_runs_destination_only_rops_and_skips_the_rest() {
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(4, 1).unwrap();
+        run(&mut orders, &mut fb, &[opaque_rect([0, 0, 4, 1], RED)]);
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                dstblt([0, 0, 1, 1], 0x00),
+                dstblt([1, 0, 1, 1], 0x55),
+                dstblt([2, 0, 1, 1], 0xFF),
+                dstblt([3, 0, 1, 1], 0xF0),
+            ],
+        );
+        assert_eq!(
+            frames,
+            [frame(0, 0, 1, 1), frame(1, 0, 1, 1), frame(2, 0, 1, 1)]
+        );
+        let word = |p: [u8; 4]| u32::from_le_bytes(p);
+        assert_eq!(pixel(&fb, 0, 0), BLACK);
+        assert_eq!(
+            word(pixel(&fb, 1, 0)),
+            rop::rop3(0x55, 0, 0, word(rgba(RED)))
+        );
+        assert_eq!(pixel(&fb, 2, 0), [0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(pixel(&fb, 3, 0), rgba(RED), "PATCOPY is not a DstBlt ROP");
+    }
+
+    /// A GlyphIndex is decoded and not drawn (#475; drawing it is #476), and the orders after
+    /// it in the update are applied.
+    #[test]
+    fn a_glyph_index_is_skipped_and_the_update_goes_on() {
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(4, 1).unwrap();
+        let mut glyph_index = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            justrdp_pdu::orders::TS_ENC_INDEX_ORDER,
+            0x00,
+            0x00,
+            0x20,
+        ];
+        glyph_index.extend_from_slice(&[2, 0x00, 0x01]); // VariableBytes: one glyph index
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[glyph_index, opaque_rect([2, 0, 1, 1], RED)],
+        );
+        assert_eq!(frames, [frame(2, 0, 1, 1)]);
+        assert_eq!(pixel(&fb, 2, 0), rgba(RED));
+    }
+
+    /// A PatBlt whose brush cannot be drawn paints nothing, and the update goes on; one that
+    /// was not advertised is painted all the same (ADR-0009 §2: accept-and-log).
+    #[test]
+    fn patblt_with_a_cached_brush_is_skipped_and_unadvertised_ones_paint() {
+        let mut fb = Framebuffer::new(2, 1).unwrap();
+        let mut orders = Orders::new(&capabilities(4, true));
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                patblt(
+                    [0, 0, 1, 1],
+                    0xF0,
+                    [WHITE, BLUE],
+                    [0, 0, rop::TS_CACHED_BRUSH | 1, 0],
+                ),
+                opaque_rect([1, 0, 1, 1], RED),
+            ],
+        );
+        assert_eq!(frames, [frame(1, 0, 1, 1)]);
+        assert_eq!(pixel(&fb, 0, 0), BLACK);
+        let mut unadvertised = capabilities(4, true);
+        if let CapabilitySet::Order(o) = &mut unadvertised[0] {
+            o.order_support[capability::ORDER_NEG_PATBLT_INDEX] = 0;
+        }
+        let mut orders = Orders::new(&unadvertised);
+        let frames = run(&mut orders, &mut fb, &[opaque_rect([0, 0, 1, 1], GREEN)]);
+        assert_eq!(frames, [frame(0, 0, 1, 1)]);
+        assert_eq!(pixel(&fb, 0, 0), rgba(GREEN));
     }
 
     fn run_with(
@@ -1159,14 +1477,14 @@ pub(crate) mod tests {
     fn an_undecoded_order_ends_the_update() {
         let mut orders = Orders::new(&capabilities(4, true));
         let mut fb = Framebuffer::new(4, 1).unwrap();
-        let opaque_rect = vec![TS_STANDARD | TS_TYPE_CHANGE, 0x0A, 0x00];
+        let line_to = vec![TS_STANDARD | TS_TYPE_CHANGE, 0x09, 0x00, 0x00];
         let frames = run(
             &mut orders,
             &mut fb,
             &[
                 cache_bitmap(0, 0, &[&[RED]]),
                 memblt((0, 0), [0, 0, 1, 1], SRCCOPY, [0, 0]),
-                opaque_rect,
+                line_to,
                 memblt((0, 0), [1, 0, 1, 1], SRCCOPY, [0, 0]),
             ],
         );
@@ -1270,23 +1588,47 @@ pub(crate) mod tests {
         assert_eq!(frames, [frame(0, 0, 1, 1)]);
     }
 
-    /// A bitmap larger than its cache's tile is not stored, and its entry is emptied.
+    /// A bitmap of more pixels than its cache's entry is not stored, and its entry is emptied;
+    /// one wider or taller than the tile's side but within the entry is.
     #[test]
-    fn a_bitmap_past_its_tile_size_is_not_cached() {
+    fn a_bitmap_past_its_cache_entry_size_is_not_cached() {
         let mut orders = Orders::new(&capabilities(4, true));
-        let mut fb = Framebuffer::new(32, 1).unwrap();
+        let mut fb = Framebuffer::new(32, 16).unwrap();
+        // Wider than cache 0's 16-pixel tile side, inside its 256-pixel entry: xrdp puts its
+        // 64x12 tiles in cache 1 the same way (#475).
+        let wide = vec![RED; 17];
         let frames = run(
             &mut orders,
             &mut fb,
             &[
-                cache_bitmap(0, 0, &[&[RED]]),
-                cache_bitmap(0, 0, &[&[RED; 17]]),
-                memblt((0, 0), [0, 0, 1, 1], SRCCOPY, [0, 0]),
-                cache_bitmap(1, 0, &[&[RED; 17]]),
-                memblt((1, 0), [0, 0, 17, 1], SRCCOPY, [0, 0]),
+                cache_bitmap(0, 0, &[&wide]),
+                memblt((0, 0), [0, 0, 17, 1], SRCCOPY, [0, 0]),
             ],
         );
         assert_eq!(frames, [frame(0, 0, 17, 1)]);
+        // Exactly the entry, 16x16: stored.
+        let side = vec![GREEN; 16];
+        let rows: Vec<&[u16]> = vec![&side; 16];
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_bitmap(0, 1, &rows),
+                memblt((0, 1), [0, 0, 16, 16], SRCCOPY, [0, 0]),
+            ],
+        );
+        assert_eq!(frames, [frame(0, 0, 16, 16)]);
+        // 17x16 pixels pass the entry: not stored, and the entry is emptied.
+        let rows: Vec<&[u16]> = vec![&wide; 16];
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_bitmap(0, 0, &rows),
+                memblt((0, 0), [0, 0, 1, 1], SRCCOPY, [0, 0]),
+            ],
+        );
+        assert_eq!(frames, []);
     }
 
     /// Past the budget nothing more is painted or decoded, but every order still advances the

@@ -4,12 +4,13 @@
 
 The GDI drawing orders of `[MS-RDPEGDI]`: compact paint commands a server sends in an Orders
 Update on either transport, decoded against a history of the previous orders, painting from caches
-the server fills. What is built is the bitmap cache path and nothing else, because it is what the
-test VM sends: Cache Bitmap (Revision 2) fills a Revision 2 bitmap cache, and MemBlt and Mem3Blt
-blit from it with a ROP3, Mem3Blt through an 8×8 brush. `justrdp-pdu::orders` holds the wire
-format, `justrdp-codecs::rop` the raster operations and brushes, and `justrdp::orders` the caches
-and the paint. ScrBlt copies within the framebuffer (#461), and Frame Markers bracket what the
-host is handed as one frame (#462). Epic #22 (the bitmap cache half is
+the server fills. What is built is what the two measured servers send: Cache Bitmap (Revision 2)
+fills a Revision 2 bitmap cache, and MemBlt and Mem3Blt blit from it with a ROP3, Mem3Blt through
+an 8×8 brush. `justrdp-pdu::orders` holds the wire format, `justrdp-codecs::rop` the raster
+operations and brushes, and `justrdp::orders` the caches and the paint. ScrBlt copies within the
+framebuffer (#461), and Frame Markers bracket what the host is handed as one frame (#462).
+DstBlt, PatBlt and OpaqueRect fill rectangles, and GlyphIndex is decoded and not yet drawn
+(#475). Epic #22 (the bitmap cache half is
 #28's); #460 is the first slice.
 
 ## Governing decisions
@@ -45,10 +46,37 @@ host is handed as one frame (#462). Epic #22 (the bitmap cache half is
 - **The waiting-list index is an extra entry per cache.** `BITMAPCACHE_WAITING_LIST_INDEX`
   (32767) names one slot past the cache's own entries, never the last real one, as FreeRDP's
   `bitmap_cache_put` allocates it; a `CBR2_DO_NOT_CACHE` fill goes there.
-- **A cache holds bitmaps up to its tile size**, `16 << cacheId` on each side (3.1.1.1.1), so a
-  cache's decoded size is bounded by the host's entry counts. A larger fill is refused and its
-  entry emptied, so a later MemBlt misses rather than painting the bitmap that was there before.
-  The budget does the same: past it a fill empties its entry.
+- **A cache entry holds as many pixels as its tile**, `16 << cacheId` squared: `[MS-RDPEGDI]`
+  3.1.1.1.1's table sizes each entry in bytes (the tile's pixels at the session's depth), not by
+  side. So a cache's decoded size is bounded by the host's entry counts. A fill with more pixels
+  is refused and its entry emptied, so a later MemBlt misses rather than painting the bitmap that
+  was there before. The budget does the same: past it a fill empties its entry. Until #475 each
+  side was held to the tile's, which no WS2019 fill ever crossed; xrdp puts the last 12 rows of a
+  64-wide image in cache 1 as 64×12 and 48×12 tiles (768 and 576 pixels, under 1,024), and the
+  side rule dropped them. Fixing it in #475 was the maintainer's call (2026-10-16).
+- **One `orderSupport` index negotiates PatBlt and OpaqueRect** (`TS_NEG_PATBLT_INDEX`,
+  `[MS-RDPBCGR]` 2.2.7.1.3; `[MS-RDPEGDI]` 2.2.2.2.1.1.2.3: "support for PatBlt implies support
+  for OpaqueRect"), so the two arrived together (#475). OpaqueRect's colour is three one-byte
+  fields, each replacing its own byte of the colour the history holds, as FreeRDP's
+  `update_read_opaque_rect_order` merges them; it fills with that colour as PATCOPY. PatBlt runs
+  its brush through its ROP with no source, sharing Mem3Blt's brush; a cached brush is skipped,
+  as for Mem3Blt.
+- **DstBlt runs only destination ROPs.** 2.2.2.2.1.1.2.1 says its ROP MUST depend on the
+  destination alone, which leaves BLACKNESS, DSTINVERT, the no-op and WHITENESS; any other is a
+  server self-inconsistency and the order is skipped. No measured server has sent a DstBlt. It is
+  built because xrdp 0.9.24 draws in orders only for a client advertising DstBlt, PatBlt, ScrBlt
+  and MemBlt all four (`xrdp_caps.c`, `no_orders_supported`); without DstBlt, justrdp got 38 bitmap
+  updates and no order (2026-10-16). Building it in #475 was the maintainer's call that day, over a
+  slice of its own first, or #475 with no real-server proof.
+- **GlyphIndex is decoded and not drawn** (#475; drawing is #476). A primary order of an
+  undecoded type ends its update, and xrdp sends GlyphIndex and Cache Glyph whatever the client
+  advertises: with the glyph cache off, FreeRDP logged "SERVER BUG ... not announced" for Cache
+  Glyph, and with `/relax-order-checks` still received 16 GlyphIndex. Two of justrdp's updates
+  ended there, losing the logo, the labels, the input boxes and the buttons, so #475 decodes it
+  and skips it (the maintainer's call, 2026-10-16, over finishing on that weaker measurement or
+  doing #476 first). Its rectangles and origin are plain 16-bit integers, never deltas, and an
+  order without `VariableBytes` reuses the last one's, as FreeRDP's
+  `update_read_glyph_index_order` reads them.
 - **`nYSrc` is a top-down row of the cached bitmap.** The spec's formula
   (`ActualYSrc = (SourceBitmapHeight − nHeight) − nYSrc`) addresses bottom-up storage; the cache
   stores top-down RGBA, so it uses the field as sent, as FreeRDP's `gdi_memblt` does.
@@ -102,15 +130,17 @@ host is handed as one frame (#462). Epic #22 (the bitmap cache half is
 ## Code
 
 - `justrdp-pdu/src/orders.rs` — `decode_order`, `OrderHistory`, `OrdersUpdate`, `DrawingOrder`,
-  `Clip`, `ScrBlt`, `MemBlt`, `Mem3Blt`, `Brush`, `CacheBitmapRev2`, `OrderError`,
-  `TS_ALTSEC_FRAME_MARKER`
+  `Clip`, `DstBlt`, `PatBlt`, `OpaqueRect`, `ScrBlt`, `MemBlt`, `Mem3Blt`, `GlyphIndex`, `Brush`,
+  `CacheBitmapRev2`, `OrderError`, `TS_ALTSEC_FRAME_MARKER`
 - `justrdp-pdu/src/capability.rs` — `BitmapCacheRev2CapabilitySet`, `BitmapCacheCellInfo`,
-  `ORDER_NEG_SCRBLT_INDEX`, `ORDER_NEG_MEMBLT_INDEX`, `ORDER_NEG_MEM3BLT_INDEX`,
+  `ORDER_NEG_DSTBLT_INDEX`, `ORDER_NEG_PATBLT_INDEX`, `ORDER_NEG_SCRBLT_INDEX`,
+  `ORDER_NEG_MEMBLT_INDEX`, `ORDER_NEG_MEM3BLT_INDEX`,
   `BITMAP_CACHE_REV2_MAX_ENTRIES`, `ORDER_FLAGS_EXTRA_FLAGS`,
   `ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT`
 - `justrdp-codecs/src/rop.rs` — `rop3`, `uses_pattern`, `Pattern`, `pattern_rows`,
   `HATCH_PATTERNS`
-- `justrdp/src/orders.rs` — `Orders`, `clip_blt`, `compose`, `order_color`, `MAX_HELD_RECTS`
+- `justrdp/src/orders.rs` — `Orders`, `clip_blt`, `compose`, `pattern`, `order_color`,
+  `MAX_HELD_RECTS`
 - `justrdp/src/advertise.rs` — `HONOURED_ORDERS`, `HONOURED_ORDER_FLAGS`,
   `HONOURED_BITMAP_CACHE_REV2_FLAGS`, `HONOURED_ORDER_EX_FLAGS`, `check_orders`
 - `justrdp/src/session.rs` — `apply_orders`, `on_demand_active`, `ServerAnnouncement`,
@@ -149,6 +179,15 @@ host is handed as one frame (#462). Epic #22 (the bitmap cache half is
 - **Still sent by neither server**: DstBlt, LineTo, the Multi* orders, polygons, ellipses,
   SaveBitmap, Cache Brush, the offscreen orders and Cache Bitmap revisions 1 and 3. xrdp has
   encoders for several of them (`libxrdp/xrdp_orders.c`), and none appeared.
+
+**xrdp's login screen in orders against bitmaps (#475).** A session advertising DstBlt, PatBlt,
+ScrBlt, MemBlt and Mem3Blt received 72 OpaqueRect, 2 PatBlt (PATINVERT, solid), 12 MemBlt over 12
+Cache Bitmap (Revision 2), 33 Cache Glyph and 9 GlyphIndex, and no update ended early. A session
+advertising no order got the same screen in bitmap updates. The two framebuffers differ in 1,241
+pixels, and every one lies inside a GlyphIndex's text or opaque rectangle: the text #476 draws
+(`xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_but_the_text`). The bitmap screen never
+passes through the order decoder or the fills, so for those it is independent; the logo's tiles
+decode through the same bitmap codecs in both sessions, so for them it is not.
 
 **justrdp's own advertisement (#460):** MemBlt and Mem3Blt, caches of 120, 120 and 2553 entries,
 no waiting list, 16 bpp, no Surface Commands. The server sent only compressed 16 bpp Cache Bitmap
@@ -243,9 +282,11 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 
 ## Known holes / open
 
-- **Every order the census saw none of** is unbuilt: DstBlt, PatBlt, OpaqueRect, LineTo, the
-  Multi* orders, polygons, ellipses, SaveBitmap, the glyph orders, Cache Color Table, Cache Brush,
-  Cache Bitmap revisions 1 and 3, and every alternate secondary order but Frame Marker.
+- **Unbuilt:** LineTo, the Multi* orders, polygons, ellipses, SaveBitmap, FastIndex and
+  FastGlyph, Cache Color Table, Cache Brush, Cache Bitmap revisions 1 and 3, and every alternate
+  secondary order but Frame Marker. No measured server sent any of them. GlyphIndex and Cache
+  Glyph arrive from xrdp, and drawing them is #476.
+- **DstBlt is proven only against the spec and FreeRDP's decoder**, since no server has sent one.
 - **The defaults do not advertise orders**, at any depth; that stays the host's choice (the
   maintainer's call of 2026-10-16, made before #463's measurement for either outcome, and the
   outcome was that 32 bpp order sessions work).

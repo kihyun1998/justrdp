@@ -1,8 +1,8 @@
 #![no_main]
-//! Fuzz the session's drawing-order path (#460, #461, #462): fast-path Orders Updates through
-//! `SessionStateMachine::process_bytes` with ScrBlt, MemBlt and Mem3Blt advertised over Revision 2
-//! caches, so the cache fills, the ROPs, the blits, the copies within the framebuffer and the
-//! frames Frame Markers hold are reached. Sibling of `orders`'s `orders_never_panic` proptest.
+//! Fuzz the session's drawing-order path (#460, #461, #462, #475): fast-path Orders Updates
+//! through `SessionStateMachine::process_bytes` with PatBlt (and so OpaqueRect), ScrBlt, MemBlt
+//! and Mem3Blt advertised over Revision 2 caches, so the cache fills, the ROPs, the fills, the
+//! blits, the copies within the framebuffer and the frames Frame Markers hold are reached. Sibling of `orders`'s `orders_never_panic` proptest.
 //!
 //! The input is split on its first byte: that many updates of equal share, each prefixed by a
 //! cache fill of a 4x4 bitmap into cache 0 entry 0 so a MemBlt has something to hit. A 64x48
@@ -39,6 +39,7 @@ fuzz_target!(|input: &[u8]| {
     capabilities.retain(|set| !matches!(set, CapabilitySet::BitmapCache(_)));
     for set in &mut capabilities {
         if let CapabilitySet::Order(o) = set {
+            o.order_support[capability::ORDER_NEG_PATBLT_INDEX] = 1;
             o.order_support[capability::ORDER_NEG_SCRBLT_INDEX] = 1;
             o.order_support[capability::ORDER_NEG_MEMBLT_INDEX] = 1;
             o.order_support[capability::ORDER_NEG_MEM3BLT_INDEX] = 1;

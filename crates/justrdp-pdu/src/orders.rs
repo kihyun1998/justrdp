@@ -30,12 +30,18 @@ pub const TS_ZERO_FIELD_BYTE_BIT1: u8 = 0x80;
 
 /// `orderType` (primary): PatBlt, the type both ends start from.
 pub const TS_ENC_PATBLT_ORDER: u8 = 0x01;
+/// `orderType` of the DstBlt primary drawing order.
+pub const TS_ENC_DSTBLT_ORDER: u8 = 0x00;
 /// `orderType` (primary): ScrBlt.
 pub const TS_ENC_SCRBLT_ORDER: u8 = 0x02;
+/// `orderType` of the OpaqueRect primary drawing order.
+pub const TS_ENC_OPAQUERECT_ORDER: u8 = 0x0A;
 /// `orderType` (primary): MemBlt.
 pub const TS_ENC_MEMBLT_ORDER: u8 = 0x0D;
 /// `orderType` (primary): Mem3Blt.
 pub const TS_ENC_MEM3BLT_ORDER: u8 = 0x0E;
+/// `orderType` of the GlyphIndex primary drawing order.
+pub const TS_ENC_INDEX_ORDER: u8 = 0x1B;
 
 /// `orderType` (alternate secondary): Frame Marker.
 pub const TS_ALTSEC_FRAME_MARKER: u8 = 0x0D;
@@ -215,6 +221,90 @@ pub struct ScrBlt {
     pub y_src: i16,
 }
 
+/// The fields of a GlyphIndex order (2.2.2.2.1.1.2.13) but `VariableBytes`, which the history
+/// holds ([`OrderHistory::glyph_index_data`]): a run of cached glyphs drawn at an origin over an
+/// optional opaque rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GlyphIndex {
+    /// `cacheId`: the glyph cache.
+    pub cache_id: u8,
+    /// `flAccel` (`SO_*`).
+    pub fl_accel: u8,
+    /// `ulCharInc`: the fixed advance in pixels, or 0.
+    pub char_inc: u8,
+    /// `fOpRedundant`.
+    pub op_redundant: u8,
+    /// `BackColor`, the three wire bytes little-endian (TS_COLOR): the text colour.
+    pub back_color: u32,
+    /// `ForeColor`, the three wire bytes little-endian (TS_COLOR): the opaque rectangle's colour.
+    pub fore_color: u32,
+    /// `BkLeft`, `BkTop`, `BkRight`, `BkBottom`: the text background rectangle.
+    pub bk: [i16; 4],
+    /// `OpLeft`, `OpTop`, `OpRight`, `OpBottom`: the opaque rectangle.
+    pub op: [i16; 4],
+    /// The brush.
+    pub brush: Brush,
+    /// `X`: the first glyph's origin.
+    pub x: i16,
+    /// `Y`.
+    pub y: i16,
+}
+
+/// The fields of a DstBlt order (2.2.2.2.1.1.2.1), as the history holds them: a rectangle
+/// through a ROP3 that reads only the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DstBlt {
+    /// `nLeftRect`.
+    pub left: i16,
+    /// `nTopRect`.
+    pub top: i16,
+    /// `nWidth`.
+    pub width: i16,
+    /// `nHeight`.
+    pub height: i16,
+    /// `bRop`: the ROP3 index.
+    pub rop: u8,
+}
+
+/// The fields of a PatBlt order (2.2.2.2.1.1.2.3), as the history holds them: a rectangle
+/// filled with a brush through a ROP3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PatBlt {
+    /// `nLeftRect`.
+    pub left: i16,
+    /// `nTopRect`.
+    pub top: i16,
+    /// `nWidth`.
+    pub width: i16,
+    /// `nHeight`.
+    pub height: i16,
+    /// `bRop`: the ROP3 index.
+    pub rop: u8,
+    /// `BackColor`, the three wire bytes little-endian (TS_COLOR).
+    pub back_color: u32,
+    /// `ForeColor`, the three wire bytes little-endian (TS_COLOR).
+    pub fore_color: u32,
+    /// The brush.
+    pub brush: Brush,
+}
+
+/// The fields of an OpaqueRect order (2.2.2.2.1.1.2.5), as the history holds them: a rectangle
+/// filled with one colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpaqueRect {
+    /// `nLeftRect`.
+    pub left: i16,
+    /// `nTopRect`.
+    pub top: i16,
+    /// `nWidth`.
+    pub width: i16,
+    /// `nHeight`.
+    pub height: i16,
+    /// `RedOrPaletteIndex`, `Green` and `Blue`, little-endian as a TS_COLOR's bytes; each is a
+    /// field of its own.
+    pub color: u32,
+}
+
 /// An 8×8 brush (2.2.2.2.1.1.2.3 `BrushOrgX` … `BrushExtra`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Brush {
@@ -269,6 +359,27 @@ pub struct CacheBitmapRev2<'a> {
 /// One decoded drawing order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawingOrder<'a> {
+    /// DstBlt.
+    DstBlt {
+        /// The order.
+        order: DstBlt,
+        /// Its clip.
+        clip: Clip,
+    },
+    /// PatBlt.
+    PatBlt {
+        /// The order.
+        order: PatBlt,
+        /// Its clip.
+        clip: Clip,
+    },
+    /// OpaqueRect.
+    OpaqueRect {
+        /// The order.
+        order: OpaqueRect,
+        /// Its clip.
+        clip: Clip,
+    },
     /// ScrBlt.
     ScrBlt {
         /// The order.
@@ -287,6 +398,13 @@ pub enum DrawingOrder<'a> {
     Mem3Blt {
         /// The order.
         order: Mem3Blt,
+        /// Its clip.
+        clip: Clip,
+    },
+    /// GlyphIndex.
+    GlyphIndex {
+        /// The order.
+        order: GlyphIndex,
         /// Its clip.
         clip: Clip,
     },
@@ -314,9 +432,15 @@ pub struct OrderHistory {
     /// False once an order of an undecoded type may have moved the rectangle; true again when
     /// a `bounds` field gives all four edges absolutely.
     bounds_known: bool,
+    dstblt: DstBlt,
+    patblt: PatBlt,
+    opaque_rect: OpaqueRect,
     scrblt: ScrBlt,
     memblt: MemBlt,
     mem3blt: Mem3Blt,
+    glyph_index: GlyphIndex,
+    /// The last GlyphIndex's `VariableBytes`: its length, then the bytes.
+    glyph_index_data: (u8, [u8; 255]),
 }
 
 impl Default for OrderHistory {
@@ -326,10 +450,22 @@ impl Default for OrderHistory {
             order_type: TS_ENC_PATBLT_ORDER,
             bounds: Bounds::default(),
             bounds_known: true,
+            dstblt: DstBlt::default(),
+            patblt: PatBlt::default(),
+            opaque_rect: OpaqueRect::default(),
             scrblt: ScrBlt::default(),
             memblt: MemBlt::default(),
             mem3blt: Mem3Blt::default(),
+            glyph_index: GlyphIndex::default(),
+            glyph_index_data: (0, [0; 255]),
         }
+    }
+}
+
+impl OrderHistory {
+    /// The last GlyphIndex's `VariableBytes`: glyph indices and fragment operations.
+    pub fn glyph_index_data(&self) -> &[u8] {
+        &self.glyph_index_data.1[..usize::from(self.glyph_index_data.0)]
     }
 }
 
@@ -337,9 +473,13 @@ impl Default for OrderHistory {
 /// decoded here.
 fn field_bytes(order_type: u8) -> Option<usize> {
     match order_type {
+        TS_ENC_DSTBLT_ORDER => Some(1),
+        TS_ENC_PATBLT_ORDER => Some(2),
         TS_ENC_SCRBLT_ORDER => Some(1),
+        TS_ENC_OPAQUERECT_ORDER => Some(1),
         TS_ENC_MEMBLT_ORDER => Some(2),
         TS_ENC_MEM3BLT_ORDER => Some(3),
+        TS_ENC_INDEX_ORDER => Some(3),
         _ => None,
     }
 }
@@ -411,6 +551,75 @@ fn decode_primary<'a>(
     let delta = control & TS_DELTA_COORDINATES != 0;
     let mut fields = Fields { cur, fields, delta };
     Ok(match order_type {
+        TS_ENC_DSTBLT_ORDER => {
+            let order = &mut history.dstblt;
+            fields.coord(0x01, &mut order.left)?;
+            fields.coord(0x02, &mut order.top)?;
+            fields.coord(0x04, &mut order.width)?;
+            fields.coord(0x08, &mut order.height)?;
+            fields.u8(0x10, &mut order.rop)?;
+            DrawingOrder::DstBlt {
+                order: *order,
+                clip,
+            }
+        }
+        TS_ENC_PATBLT_ORDER => {
+            let order = &mut history.patblt;
+            fields.coord(0x0001, &mut order.left)?;
+            fields.coord(0x0002, &mut order.top)?;
+            fields.coord(0x0004, &mut order.width)?;
+            fields.coord(0x0008, &mut order.height)?;
+            fields.u8(0x0010, &mut order.rop)?;
+            fields.color(0x0020, &mut order.back_color)?;
+            fields.color(0x0040, &mut order.fore_color)?;
+            fields.brush(0x0080, &mut order.brush)?;
+            DrawingOrder::PatBlt {
+                order: *order,
+                clip,
+            }
+        }
+        TS_ENC_OPAQUERECT_ORDER => {
+            let order = &mut history.opaque_rect;
+            fields.coord(0x01, &mut order.left)?;
+            fields.coord(0x02, &mut order.top)?;
+            fields.coord(0x04, &mut order.width)?;
+            fields.coord(0x08, &mut order.height)?;
+            for (index, flag) in [0x10, 0x20, 0x40].into_iter().enumerate() {
+                let mut byte = order.color.to_le_bytes()[index];
+                fields.u8(flag, &mut byte)?;
+                let shift = 8 * index;
+                order.color = order.color & !(0xFF << shift) | u32::from(byte) << shift;
+            }
+            DrawingOrder::OpaqueRect {
+                order: *order,
+                clip,
+            }
+        }
+        TS_ENC_INDEX_ORDER => {
+            let order = &mut history.glyph_index;
+            fields.u8(0x00_0001, &mut order.cache_id)?;
+            fields.u8(0x00_0002, &mut order.fl_accel)?;
+            fields.u8(0x00_0004, &mut order.char_inc)?;
+            fields.u8(0x00_0008, &mut order.op_redundant)?;
+            fields.color(0x00_0010, &mut order.back_color)?;
+            fields.color(0x00_0020, &mut order.fore_color)?;
+            for (index, value) in order.bk.iter_mut().chain(order.op.iter_mut()).enumerate() {
+                fields.i16(0x00_0040 << index, value)?;
+            }
+            fields.brush(0x00_4000, &mut order.brush)?;
+            fields.i16(0x08_0000, &mut order.x)?;
+            fields.i16(0x10_0000, &mut order.y)?;
+            if fields.present(0x20_0000) {
+                let len = fields.cur.read_u8()?;
+                let bytes = fields.cur.read_slice(usize::from(len))?;
+                history.glyph_index_data.1[..bytes.len()].copy_from_slice(bytes);
+                history.glyph_index_data.0 = len;
+            }
+            DrawingOrder::GlyphIndex {
+                order: *order,
+                clip,
+            }
+        }
         TS_ENC_SCRBLT_ORDER => {
             let order = &mut history.scrblt;
             fields.coord(0x01, &mut order.left)?;
@@ -508,6 +717,14 @@ impl Fields<'_, '_> {
     fn u16(&mut self, flag: u32, value: &mut u16) -> Result<(), DecodeError> {
         if self.present(flag) {
             *value = self.cur.read_u16_le()?;
+        }
+        Ok(())
+    }
+
+    /// A 16-bit signed field that is not a Coord: never a delta.
+    fn i16(&mut self, flag: u32, value: &mut i16) -> Result<(), DecodeError> {
+        if self.present(flag) {
+            *value = self.cur.read_u16_le()? as i16;
         }
         Ok(())
     }
@@ -854,19 +1071,19 @@ mod tests {
     #[test]
     fn an_undecoded_primary_makes_later_bounds_unknown() {
         let mut history = OrderHistory::default();
-        let unsupported = [TS_STANDARD | TS_TYPE_CHANGE | TS_BOUNDS, 0x0A];
+        let unsupported = [TS_STANDARD | TS_TYPE_CHANGE | TS_BOUNDS, 0x09];
         assert_eq!(
             decode_all(&unsupported, &mut history),
             [Err(OrderError::Unsupported {
                 class: OrderClass::Primary,
-                order_type: 0x0A
+                order_type: 0x09
             })]
         );
         // Same type again, no TS_TYPE_CHANGE: still that type, still unsupported.
         assert!(matches!(
             decode_all(&[TS_STANDARD], &mut history)[0],
             Err(OrderError::Unsupported {
-                order_type: 0x0A,
+                order_type: 0x09,
                 ..
             })
         ));
@@ -925,6 +1142,215 @@ mod tests {
             }
         );
         assert_eq!(order.blt.cache_index, 9);
+    }
+
+    /// PatBlt's twelve fields over two field-flag bytes, then one that changes only `bRop`:
+    /// the second carries the rest (2.2.2.2.1.1.2.3).
+    #[test]
+    fn patblt_reads_every_field_and_carries_them_over() {
+        let mut bytes = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            TS_ENC_PATBLT_ORDER,
+            0xFF,
+            0x0F,
+        ];
+        for value in [10i16, 20, 64, 32] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.push(0xF0); // bRop
+        bytes.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        bytes.extend_from_slice(&[(-2i8) as u8, 5, 0x02, 0x03, 1, 2, 3, 4, 5, 6, 7]);
+        bytes.extend_from_slice(&[TS_STANDARD | TS_ZERO_FIELD_BYTE_BIT0, 0x10, 0x5A]);
+        let mut history = OrderHistory::default();
+        let expected = PatBlt {
+            left: 10,
+            top: 20,
+            width: 64,
+            height: 32,
+            rop: 0xF0,
+            back_color: 0x33_2211,
+            fore_color: 0x66_5544,
+            brush: Brush {
+                org_x: -2,
+                org_y: 5,
+                style: 0x02,
+                hatch: 0x03,
+                extra: [1, 2, 3, 4, 5, 6, 7],
+            },
+        };
+        assert_eq!(
+            decode_all(&bytes, &mut history),
+            [
+                Ok(DrawingOrder::PatBlt {
+                    order: expected,
+                    clip: Clip::None
+                }),
+                Ok(DrawingOrder::PatBlt {
+                    order: PatBlt {
+                        rop: 0x5A,
+                        ..expected
+                    },
+                    clip: Clip::None
+                }),
+            ]
+        );
+    }
+
+    /// OpaqueRect's colour is three one-byte fields, each replacing its own byte of the colour
+    /// the history holds, as FreeRDP's `update_read_opaque_rect_order` merges them
+    /// (2.2.2.2.1.1.2.5).
+    #[test]
+    fn opaque_rect_colour_bytes_update_one_at_a_time() {
+        let mut bytes = vec![TS_STANDARD | TS_TYPE_CHANGE, TS_ENC_OPAQUERECT_ORDER, 0x7F];
+        for value in [1i16, 2, 3, 4] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        bytes.extend_from_slice(&[TS_STANDARD, 0x20, 0x11]); // only Green
+        let mut history = OrderHistory::default();
+        let first = OpaqueRect {
+            left: 1,
+            top: 2,
+            width: 3,
+            height: 4,
+            color: 0xCC_BBAA,
+        };
+        assert_eq!(
+            decode_all(&bytes, &mut history),
+            [
+                Ok(DrawingOrder::OpaqueRect {
+                    order: first,
+                    clip: Clip::None
+                }),
+                Ok(DrawingOrder::OpaqueRect {
+                    order: OpaqueRect {
+                        color: 0xCC_11AA,
+                        ..first
+                    },
+                    clip: Clip::None
+                }),
+            ]
+        );
+    }
+
+    /// DstBlt's five fields fit one field-flag byte, and carry over (2.2.2.2.1.1.2.1).
+    #[test]
+    fn dstblt_fields_carry_over_between_orders() {
+        let mut bytes = vec![TS_STANDARD | TS_TYPE_CHANGE, TS_ENC_DSTBLT_ORDER, 0x1F];
+        for value in [3i16, 4, 5, 6] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.push(0x55);
+        bytes.extend_from_slice(&[TS_STANDARD | TS_DELTA_COORDINATES, 0x01, 2]);
+        let mut history = OrderHistory::default();
+        let expected = DstBlt {
+            left: 3,
+            top: 4,
+            width: 5,
+            height: 6,
+            rop: 0x55,
+        };
+        assert_eq!(
+            decode_all(&bytes, &mut history),
+            [
+                Ok(DrawingOrder::DstBlt {
+                    order: expected,
+                    clip: Clip::None
+                }),
+                Ok(DrawingOrder::DstBlt {
+                    order: DstBlt {
+                        left: 5,
+                        ..expected
+                    },
+                    clip: Clip::None
+                }),
+            ]
+        );
+    }
+
+    /// GlyphIndex's twenty-two fields over three field-flag bytes (2.2.2.2.1.1.2.13). Its
+    /// rectangles and origin are plain 16-bit integers, never deltas, and an order without
+    /// `VariableBytes` reuses the last one's, as FreeRDP's `update_read_glyph_index_order`
+    /// reads them.
+    #[test]
+    fn glyph_index_reads_every_field_and_reuses_its_glyphs() {
+        let mut bytes = vec![
+            TS_STANDARD | TS_TYPE_CHANGE | TS_DELTA_COORDINATES,
+            TS_ENC_INDEX_ORDER,
+            0xFF,
+            0xFF,
+            0x3F,
+        ];
+        bytes.extend_from_slice(&[7, 0x03, 8, 1]); // cacheId, flAccel, ulCharInc, fOpRedundant
+        bytes.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        for value in [10i16, 20, 110, 40, 0, 0, 0, 0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // brush
+        for value in [12i16, 35] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[3, 0x01, 0x02, 0x03]);
+        let mut history = OrderHistory::default();
+        let orders = decode_all(&bytes, &mut history);
+        let Ok(DrawingOrder::GlyphIndex { order: first, .. }) = orders[0] else {
+            panic!("{orders:?}");
+        };
+        assert_eq!(
+            (
+                first.cache_id,
+                first.fl_accel,
+                first.char_inc,
+                first.op_redundant
+            ),
+            (7, 0x03, 8, 1)
+        );
+        assert_eq!((first.back_color, first.fore_color), (0x33_2211, 0x66_5544));
+        assert_eq!(first.bk, [10, 20, 110, 40]);
+        assert_eq!(first.op, [0; 4]);
+        assert_eq!((first.x, first.y), (12, 35));
+        assert_eq!(history.glyph_index_data(), [1, 2, 3]);
+
+        // Then only X, still not a delta.
+        let mut bytes = vec![TS_STANDARD | TS_DELTA_COORDINATES, 0x00, 0x00, 0x08];
+        bytes.extend_from_slice(&300i16.to_le_bytes());
+        let Ok(DrawingOrder::GlyphIndex { order: second, .. }) =
+            decode_all(&bytes, &mut history)[0]
+        else {
+            panic!();
+        };
+        assert_eq!(second.x, 300);
+        assert_eq!(
+            history.glyph_index_data(),
+            [1, 2, 3],
+            "VariableBytes absent: the last ones"
+        );
+
+        // Then only BrushStyle, field 17.
+        let bytes = [TS_STANDARD, 0x00, 0x00, 0x01, 0x03];
+        let Ok(DrawingOrder::GlyphIndex { order: third, .. }) = decode_all(&bytes, &mut history)[0]
+        else {
+            panic!();
+        };
+        assert_eq!(
+            (third.brush.style, third.brush.hatch, third.x),
+            (0x03, 0, 300),
+            "field 17 is BrushStyle alone"
+        );
+    }
+
+    /// The history starts at PatBlt (3.2.1.1), so a first order without `TS_TYPE_CHANGE` is one.
+    #[test]
+    fn a_first_order_without_a_type_is_a_patblt() {
+        let bytes = [TS_STANDARD, 0x01, 0x00, 0x07, 0x00];
+        let mut history = OrderHistory::default();
+        assert!(matches!(
+            decode_all(&bytes, &mut history)[..],
+            [Ok(DrawingOrder::PatBlt {
+                order: PatBlt { left: 7, .. },
+                ..
+            })]
+        ));
     }
 
     fn cache_bitmap_rev2(order_type: u8, extra_flags: u16, body: &[u8]) -> Vec<u8> {
