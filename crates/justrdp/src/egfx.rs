@@ -378,6 +378,8 @@ pub struct GraphicsProcessor {
     confirmed_flags: u32,
     frames_decoded: u32,
     in_frame: bool,
+    /// How many open frames an `EndFrame` has closed, across every binding of the channel.
+    frames_ended: u64,
     /// RGBA bytes painted by the list-bearing commands since this frame opened (#268). The
     /// ceiling is [`MAX_TOTAL_SURFACE_BYTES`], **derived rather than picked**: the most a frame
     /// can legitimately paint is every surface that could exist, once — and past that it is
@@ -427,6 +429,7 @@ impl Default for GraphicsProcessor {
             confirmed_flags: 0,
             frames_decoded: 0,
             in_frame: false,
+            frames_ended: 0,
             frame_paint: 0,
             awaiting_confirm: false,
             reset_spent: false,
@@ -661,6 +664,9 @@ impl GraphicsProcessor {
             }
             EgfxPdu::EndFrame { frame_id } => {
                 tracing::trace!(target: "rdp_egfx", frame_id, "EndFrame");
+                if self.in_frame {
+                    self.frames_ended += 1;
+                }
                 self.in_frame = false;
                 self.frames_decoded = self.frames_decoded.wrapping_add(1);
                 // The dirty regions are blitted by `flush_frames` after the payload (#163).
@@ -1291,6 +1297,10 @@ impl DvcProcessor for GraphicsProcessor {
         self.in_frame
     }
 
+    fn frames_ended(&self) -> u64 {
+        self.frames_ended
+    }
+
     fn release_frames(&mut self, framebuffer: &mut Framebuffer) -> Vec<FrameUpdate> {
         self.frame_paint = 0;
         self.blit_dirty(framebuffer)
@@ -1299,6 +1309,7 @@ impl DvcProcessor for GraphicsProcessor {
     fn close(&mut self) {
         *self = GraphicsProcessor {
             capsets: core::mem::take(&mut self.capsets),
+            frames_ended: self.frames_ended,
             ..GraphicsProcessor::default()
         };
     }
@@ -2549,6 +2560,7 @@ mod tests {
         assert_eq!(released, [one(2)]);
         assert_eq!(region(&fb, &one(2)), [255, 0, 0, 255], "blitted");
         assert!(p.frame_open(), "the frame stays open");
+        assert_eq!(p.frames_ended(), 0, "a release ends nothing");
         assert_eq!(p.frame_paint, 0, "the budget is restored");
         assert_eq!(p.release_frames(&mut fb), [], "nothing twice");
 
@@ -2556,6 +2568,13 @@ mod tests {
         assert_eq!(p.flush_frames(&mut fb), []);
         feed(&mut p, egfx::CMDID_END_FRAME, &7u32.to_le_bytes());
         assert!(!p.frame_open());
+        assert_eq!(p.frames_ended(), 1);
+        feed(&mut p, egfx::CMDID_END_FRAME, &7u32.to_le_bytes());
+        assert_eq!(
+            p.frames_ended(),
+            1,
+            "an EndFrame with no frame open ends nothing"
+        );
         assert_eq!(
             p.flush_frames(&mut fb),
             [one(5)],
@@ -2566,6 +2585,8 @@ mod tests {
             [255, 0, 0, 255],
             "a fill the spent budget would have skipped paints"
         );
+        p.close();
+        assert_eq!(p.frames_ended(), 1, "a closed channel keeps the count");
     }
 
     #[test]

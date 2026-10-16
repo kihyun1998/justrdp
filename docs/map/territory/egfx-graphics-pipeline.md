@@ -180,7 +180,11 @@ acknowledge frames. It is server→client only, and it is reachable only if
   for a processor that does not render. The session reaches them through
   `SessionStateMachine::release_open_frames` and `has_open_frame`, and the `justrdp-tokio`
   runners call it after 1 s ([Adapter drive loop](adapter-drive-loop.md)). The release does not
-  send a `FrameAcknowledge`: that answers an `EndFrame`, and a late one still gets it.
+  send a `FrameAcknowledge`: that answers an `EndFrame`, and a late one still gets it. **For a
+  frame that never ends, the 256 MiB budget becomes a rate**, 256 MiB per release; that is no
+  more than a server gets anyway by sending a `StartFrame`, or by drawing outside a frame, where
+  every message restores it. `frames_ended` counts the `EndFrame`s that closed an open frame and
+  survives the channel's close, so the session's count only grows.
 
 - **The destination surface bounds a bitmap's size, not its position** (#376, the
   maintainer's call). A `destRect` wider or taller than its surface is **skipped** with an

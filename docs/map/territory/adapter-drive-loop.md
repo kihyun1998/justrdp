@@ -50,11 +50,16 @@ read as the adapter growing a third of its size.
   IronRDP's `Framed::write_all` documents). A new arm that awaits a write *as the raced
   future* reintroduces it.
 - **A frame left open is released after 1 s** (#470). `run_session_with_input` and
-  `run_session_with_commands` (which `run_session` reaches through the first) track
-  `SessionStateMachine::has_open_frame` after every batch of outputs. `OpenFrameRelease` arms a
+  `run_session_with_commands` (which `run_session` reaches through the first) look at the
+  machine once per batch of outputs, which is once per socket read. `OpenFrameRelease` arms a
   deadline `OPEN_FRAME_RELEASE` after the first batch that leaves a frame open, and a `select!`
   arm then calls `release_open_frames` and feeds what it returns through the same output loop as
-  the socket's. A frame that ends first disarms it; one still open after a release re-arms it.
+  the socket's. A batch that leaves no frame open disarms it; one still open after a release
+  re-arms it. **`has_open_frame` alone cannot say a frame ended**: a read that ends one frame and
+  opens the next leaves it true on both sides, and the first frame's deadline would release the
+  second one milliseconds in. So the runner also compares `SessionStateMachine::frames_ended`,
+  which only grows, and restarts the interval when it moved (found by #470's review, before
+  merge).
   That the host releases, and the core only provides the means, was the maintainer's call
   (2026-10-16); **the 1 s is a derivation, not their call**: it only has to sit far above any
   frame a server ends. Measured on the WS2019 VM (2026-10-16, throwaway instrumentation of
@@ -65,7 +70,15 @@ read as the adapter growing a third of its size.
   the socket. The interval is not host-configurable. The VM tests drive the machine themselves,
   not through a runner, so they never release. The proof is
   `run_session_with_input_releases_an_unended_frame` and its `run_session_with_commands` twin, on
-  tokio's paused clock over a loopback TLS server.
+  tokio's paused clock over a loopback TLS server, and
+  `the_release_deadline_follows_the_frame_open_now` for the restart.
+- **Tokio's paused clock does not wait for a loopback socket.** It jumps to the next timer
+  whenever the runtime has nothing ready, and a byte written on loopback is not always readable
+  by then; on this Windows host readiness comes through IOCP. A test whose server sleeps between
+  writes therefore lets virtual time pass the client's deadline before the client has read: #470's
+  first restart test saw a frame end at 1.536 s that was sent at 0.6 s. A paused-clock test over a
+  socket is sound only while the client's own timer is the only one, as in the two release tests;
+  timing across several writes is tested on the machine directly.
 - **The VM-dependent tests live here and are `#[ignore]`d**, which is why the
   coverage job excludes this crate.
 - **Every write goes out through `write_frame`, which flushes** (#325). The connect driver, the

@@ -1836,6 +1836,13 @@ impl SessionStateMachine {
         self.orders.in_frame() || self.drdynvc.frame_open()
     }
 
+    /// How many frames have ended this session: Frame Marker ends and `EndFrame`s that closed an
+    /// open frame. It only grows, so a host that saw a frame open and later sees a larger count
+    /// knows that frame ended, even where another one opened before it looked again.
+    pub fn frames_ended(&self) -> u64 {
+        self.orders.frames_ended() + self.drdynvc.frames_ended()
+    }
+
     /// Hand over now what the open frames hold back, as [`SessionOutput::Frame`]s, with the
     /// Graphics Pipeline's dirty regions blitted into the framebuffer as its `EndFrame` would.
     /// The frames stay open: a later end closes them and hands over only what was painted after
@@ -5684,10 +5691,19 @@ mod tests {
         );
         assert!(sm.has_open_frame(), "the frames stay open");
         assert_eq!(sm.release_open_frames(), [], "nothing twice");
+        assert_eq!(sm.frames_ended(), 0, "a release ends nothing");
 
-        for frame in server_egfx(8, egfx::CMDID_SOLID_FILL, &solid_fill_surface_1()) {
+        for frame in server_egfx(8, egfx::CMDID_END_FRAME, &7u32.to_le_bytes()) {
             sm.process_bytes(&frame).unwrap();
         }
+        assert_eq!(sm.frames_ended(), 1, "the Graphics Pipeline frame ended");
+        assert!(sm.has_open_frame(), "the order frame is still open");
+        sm.process_bytes(&fastpath::encode_pdu(&[(
+            fastpath::FP_UPDATE_ORDERS,
+            fastpath::FP_FRAGMENT_SINGLE,
+            &orders_body(&[scrblt([12, 0, 2, 1], 0xCC, [0, 0])]),
+        )]))
+        .unwrap();
         deactivate_all(&mut sm);
         assert_eq!(
             sm.release_open_frames(),

@@ -61,6 +61,8 @@ pub(crate) struct Orders {
     in_frame: bool,
     /// The rects painted since that start, in paint order, at most [`MAX_HELD_RECTS`].
     held: Vec<FrameUpdate>,
+    /// How many frames a `TS_FRAME_END` has closed.
+    frames_ended: u64,
 }
 
 /// Above this many held rects a frame collapses to their bounding box.
@@ -93,6 +95,7 @@ impl Orders {
             mem3blt: support.is_some_and(|s| s[capability::ORDER_NEG_MEM3BLT_INDEX] != 0),
             in_frame: false,
             held: Vec::new(),
+            frames_ended: 0,
         }
     }
 
@@ -112,6 +115,11 @@ impl Orders {
     /// Whether a `TS_FRAME_START` is waiting for its `TS_FRAME_END`.
     pub(crate) fn in_frame(&self) -> bool {
         self.in_frame
+    }
+
+    /// How many frames a `TS_FRAME_END` has closed.
+    pub(crate) fn frames_ended(&self) -> u64 {
+        self.frames_ended
     }
 
     /// Hand over the rects held for the frame in flight, which stays open.
@@ -162,6 +170,7 @@ impl Orders {
             }
             orders::TS_FRAME_END if self.in_frame => {
                 self.in_frame = false;
+                self.frames_ended += 1;
                 frames.append(&mut self.held);
             }
             orders::TS_FRAME_END => {
@@ -1005,6 +1014,7 @@ pub(crate) mod tests {
         assert_eq!(orders.release_held(), [frame(0, 0, 1, 1)]);
         assert!(orders.in_frame(), "the frame stays open");
         assert_eq!(orders.release_held(), [], "nothing twice");
+        assert_eq!(orders.frames_ended(), 0, "a release ends nothing");
         let frames = run(
             &mut orders,
             &mut fb,
@@ -1018,6 +1028,13 @@ pub(crate) mod tests {
             "only what followed the release"
         );
         assert!(!orders.in_frame());
+        assert_eq!(orders.frames_ended(), 1);
+        run(&mut orders, &mut fb, &[frame_marker(TS_FRAME_END)]);
+        assert_eq!(
+            orders.frames_ended(),
+            1,
+            "an end with no start ends nothing"
+        );
     }
 
     /// Past 64 held rects a frame collapses to their bounding box and goes on holding, as

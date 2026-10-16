@@ -63,6 +63,10 @@ pub trait DvcProcessor {
     fn frame_open(&self) -> bool {
         false
     }
+    /// How many of those frames have ended, across the processor's life.
+    fn frames_ended(&self) -> u64 {
+        0
+    }
     /// Blit and return what an open frame holds back, as its end would, and leave it open; a
     /// processor that budgets per frame starts a fresh budget.
     fn release_frames(&mut self, _framebuffer: &mut Framebuffer) -> Vec<FrameUpdate> {
@@ -380,6 +384,14 @@ impl Drdynvc {
         self.processors
             .iter()
             .any(|processor| processor.frame_open())
+    }
+
+    /// How many frames every processor has ended.
+    pub(crate) fn frames_ended(&self) -> u64 {
+        self.processors
+            .iter()
+            .map(|processor| processor.frames_ended())
+            .sum()
     }
 
     /// Every processor's [`DvcProcessor::release_frames`], in order.

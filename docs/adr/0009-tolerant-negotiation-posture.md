@@ -386,7 +386,8 @@ posture, and deciding later): the host releases a frame whose end never comes, a
 provides the means. The interval was not part of that call; they were shown "a default policy,
 for example a time".
 `SessionStateMachine::release_open_frames` hands over what the open frames hold and leaves them
-open, so a late end still closes them, and `has_open_frame` says whether there is one. The
+open, so a late end still closes them; `has_open_frame` says whether there is one, and
+`frames_ended` how many have ended. The
 `justrdp-tokio` session runners call it once a frame has stayed open for 1 s; that interval is the
 adapter's policy, a derivation recorded in `docs/map/territory/adapter-drive-loop.md`. Neither a
 release nor a late end is a fault, so §2's enumeration is unchanged.
