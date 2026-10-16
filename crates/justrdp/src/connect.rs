@@ -160,8 +160,10 @@ pub enum Action {
     WriteBytes(Vec<u8>),
     /// The X.224 negotiation selected `selected`; the adapter must now upgrade the socket to TLS
     /// (rustls handshake) and hand the server's leaf certificate back via
-    /// [`Event::TlsEstablished`]. The TLS records themselves never enter this machine (ADR-0002
-    /// — the handshake runs in the adapter, outside the connect state machine).
+    /// [`Event::TlsEstablished`]. Under `SSL` the machine answers that with the MCS
+    /// Connect-Initial; under `HYBRID` and `HYBRID_EX`, with [`Action::StartNla`]. The TLS
+    /// records themselves never enter this machine (ADR-0002 — the handshake runs in the adapter,
+    /// outside the connect state machine).
     StartTls { selected: SecurityProtocol },
     /// The TLS upgrade is complete and the server's `subjectPublicKey` has been extracted; the
     /// adapter must now run the CredSSP token exchange (NLA), binding `pubKeyAuth` to
@@ -305,6 +307,15 @@ pub enum ConnectError {
     /// HYBRID_EX only: the server's Early User Authorization Result PDU denied access
     /// (`AUTHZ_ACCESS_DENIED`) — user authorization failed, so the connection must be dropped.
     EarlyUserAuthDenied,
+    /// The server's Core Data echoed a `requestedProtocols` other than the one the client sent
+    /// (`[MS-RDPBCGR]` 3.2.5.3.4): the X.224 request was altered on the way. An absent echo is
+    /// `PROTOCOL_RDP` (0).
+    RequestedProtocolsMismatch {
+        /// What the client sent.
+        requested: SecurityProtocol,
+        /// What the server says it received.
+        echoed: SecurityProtocol,
+    },
     /// The MCS Connect-Response carried a non-successful `result` code.
     McsConnectFailed {
         /// The T.125 `Result` value (1..=15; 0 is rt-successful).
@@ -358,7 +369,8 @@ enum Stage {
     /// Socket is up; the X.224 security negotiation request has been sent, awaiting the confirm.
     X224Negotiate,
     /// X.224 selected a TLS-based protocol; the adapter is running the rustls handshake, after
-    /// which it hands back the server certificate via [`Event::TlsEstablished`].
+    /// which it hands back the server certificate via [`Event::TlsEstablished`]. Under `SSL` the
+    /// MCS phase follows; under `HYBRID` and `HYBRID_EX`, NLA.
     TlsHandshake { selected: SecurityProtocol },
     /// TLS is up and the server's public key extracted; the adapter is running the CredSSP
     /// token exchange, completion signalled via [`Event::NlaComplete`].
@@ -525,6 +537,12 @@ impl ConnectStateMachine {
                 self.inbox.extend_from_slice(bytes);
                 self.drain_frames()
             }
+            (Stage::TlsHandshake { selected }, Event::TlsEstablished(_))
+                if selected == SecurityProtocol::SSL =>
+            {
+                // TLS-only security: the handshake was the whole security exchange.
+                self.start_mcs(selected)
+            }
             (Stage::TlsHandshake { selected }, Event::TlsEstablished(cert_der)) => {
                 match crate::tls::extract_subject_public_key(cert_der) {
                     Ok(server_public_key) => {
@@ -542,7 +560,7 @@ impl ConnectStateMachine {
             }
             (Stage::NlaCredssp { selected }, Event::NlaComplete) => {
                 // HYBRID_EX appends a 4-byte Early User Authorization Result PDU after CredSSP;
-                // the machine must consume it before MCS. Plain HYBRID/SSL proceed directly.
+                // the machine must consume it before MCS. Plain HYBRID proceeds directly.
                 if selected.contains(SecurityProtocol::HYBRID_EX) {
                     self.stage = Stage::EarlyUserAuth { selected };
                     vec![Action::AwaitEarlyUserAuth]
@@ -576,10 +594,10 @@ impl ConnectStateMachine {
         }
     }
 
-    /// Authentication finished: enter the MCS/GCC half of capability exchange. Builds the
-    /// Connect-Initial from the caller's config — the only field the machine touches is
-    /// `serverSelectedProtocol`, which echoes the negotiated protocol (a wire fact). Every
-    /// `earlyCapabilityFlags` bit is the caller's, verbatim (ADR-0016).
+    /// The security exchange finished (TLS alone, or TLS and NLA): enter the MCS/GCC half of
+    /// capability exchange. Builds the Connect-Initial from the caller's config — the only field
+    /// the machine touches is `serverSelectedProtocol`, which echoes the negotiated protocol (a
+    /// wire fact). Every `earlyCapabilityFlags` bit is the caller's, verbatim (ADR-0016).
     fn start_mcs(&mut self, selected: SecurityProtocol) -> Vec<Action> {
         self.stage = Stage::GccExchange { selected };
         let mut core = self.config.core.clone();
@@ -715,6 +733,16 @@ impl ConnectStateMachine {
             });
         }
         let blocks = &response.conference.blocks;
+        let echoed = blocks
+            .core
+            .client_requested_protocols
+            .unwrap_or(SecurityProtocol::from_bits(0));
+        if echoed != self.config.requested {
+            return self.fail(ConnectError::RequestedProtocolsMismatch {
+                requested: self.config.requested,
+                echoed,
+            });
+        }
 
         // One server channel ID answers each requested channel, in order (ID 0 = refused).
         if blocks.network.channel_ids.len() != self.config.channels.len() {
@@ -1642,6 +1670,59 @@ pub(crate) mod tests {
         assert_eq!(sm.stage(), "nla-credssp");
     }
 
+    /// TLS-only security (#474): with `SSL` selected the TLS handshake is the whole of the
+    /// security exchange, so the machine writes the Connect-Initial at once, echoing `SSL`, and
+    /// never asks for NLA. The certificate is not parsed: only CredSSP binds to its key.
+    #[test]
+    fn tls_established_under_ssl_writes_connect_initial_without_nla() {
+        let mut sm = awaiting_tls(SecurityProtocol::SSL);
+        let actions = sm.process(Event::TlsEstablished(&[0xDE, 0xAD, 0xBE, 0xEF]));
+        let [Action::WriteBytes(frame)] = actions.as_slice() else {
+            panic!("expected only the Connect-Initial write, got {actions:?}");
+        };
+        let parsed: iron_mcs::ConnectInitial =
+            ironrdp_pdu::decode(decode_mcs_frame(frame).unwrap()).unwrap();
+        assert_eq!(
+            parsed
+                .conference_create_request
+                .gcc_blocks()
+                .core
+                .optional_data
+                .server_selected_protocol
+                .unwrap()
+                .bits(),
+            SecurityProtocol::SSL.bits()
+        );
+        assert_eq!(sm.stage(), "capability-exchange");
+        let late = sm.process(Event::NlaComplete);
+        assert!(
+            matches!(
+                late[..],
+                [Action::FailWith(ConnectError::UnexpectedEvent { .. })]
+            ),
+            "no NLA stage to complete: {late:?}"
+        );
+    }
+
+    /// HYBRID_EX, like HYBRID, follows the TLS handshake with NLA (#474's other side).
+    #[test]
+    fn tls_established_under_hybrid_ex_emits_start_nla() {
+        let mut sm = awaiting_tls(SecurityProtocol::HYBRID_EX);
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let actions = sm.process(Event::TlsEstablished(key.cert.der().as_ref()));
+        assert!(
+            matches!(
+                actions[..],
+                [Action::StartNla {
+                    selected: SecurityProtocol::HYBRID_EX,
+                    ..
+                }]
+            ),
+            "{actions:?}"
+        );
+        assert_eq!(sm.stage(), "nla-credssp");
+    }
+
     #[test]
     fn nla_complete_without_hybrid_ex_writes_connect_initial() {
         // On a plain HYBRID connection, NLA completion flows straight into MCS: the machine
@@ -1723,6 +1804,23 @@ pub(crate) mod tests {
         );
     }
 
+    /// A host that asked only for NLA is not downgraded to TLS-only (#474): `SSL` is honoured
+    /// only when it was requested.
+    #[test]
+    fn received_confirm_selecting_unrequested_ssl_fails() {
+        let mut sm = negotiating_with(ConnectConfig {
+            requested: SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX,
+            ..config()
+        });
+        let actions = sm.process(Event::Received(&connection_confirm(SecurityProtocol::SSL)));
+        assert_eq!(
+            actions,
+            vec![Action::FailWith(ConnectError::UnsupportedProtocol(
+                SecurityProtocol::SSL
+            ))]
+        );
+    }
+
     #[test]
     fn received_confirm_selecting_standard_security_is_rejected() {
         let mut sm = negotiating();
@@ -1793,8 +1891,22 @@ pub(crate) mod tests {
     }
 
     /// An ironrdp-encoded server Connect-Response: io channel 1003, channel IDs answering the
-    /// two requested channels, optional skip-channel-join flag.
+    /// two requested channels, optional skip-channel-join flag, and `clientRequestedProtocols`
+    /// echoing the tests' request.
     fn iron_connect_response(skip_join: bool, channel_ids: Vec<u16>) -> Vec<u8> {
+        iron_connect_response_echoing(
+            Some(IronProtocol::from_bits_truncate(requested().bits())),
+            skip_join,
+            channel_ids,
+        )
+    }
+
+    /// [`iron_connect_response`] with `clientRequestedProtocols` set to `echoed`.
+    fn iron_connect_response_echoing(
+        echoed: Option<IronProtocol>,
+        skip_join: bool,
+        channel_ids: Vec<u16>,
+    ) -> Vec<u8> {
         let flags = if skip_join {
             iron_gcc::ServerEarlyCapabilityFlags::SKIP_CHANNELJOIN_SUPPORTED
         } else {
@@ -1804,8 +1916,8 @@ pub(crate) mod tests {
             core: iron_gcc::ServerCoreData {
                 version: iron_gcc::RdpVersion::V10_12,
                 optional_data: iron_gcc::ServerCoreOptionalData {
-                    client_requested_protocols: Some(IronProtocol::HYBRID_EX),
-                    early_capability_flags: Some(flags),
+                    client_requested_protocols: echoed,
+                    early_capability_flags: if echoed.is_some() { Some(flags) } else { None },
                 },
             },
             network: iron_gcc::ServerNetworkData {
@@ -1863,6 +1975,33 @@ pub(crate) mod tests {
         let actions = sm.process(Event::Received(&iron_attach_user_confirm(1007)));
         assert_eq!(actions.len(), 4, "user + io + 2 static channel joins");
         sm
+    }
+
+    /// `[MS-RDPBCGR]` 3.2.5.3.4: the Server Core Data echoes the request the server received, and
+    /// the connect ends when it differs from the one sent (#474). A request stripped in transit,
+    /// here to `SSL` alone, is how a plaintext Connection Request is downgraded; an absent echo
+    /// counts as `PROTOCOL_RDP`.
+    #[test]
+    fn a_connect_response_echoing_another_request_fails() {
+        for (echoed, as_seen) in [
+            (Some(IronProtocol::SSL), SecurityProtocol::SSL),
+            (None, SecurityProtocol::from_bits(0)),
+        ] {
+            let mut sm = awaiting_connect_response(config());
+            let actions = sm.process(Event::Received(&iron_connect_response_echoing(
+                echoed,
+                false,
+                vec![1004, 1005],
+            )));
+            assert_eq!(
+                actions,
+                vec![Action::FailWith(ConnectError::RequestedProtocolsMismatch {
+                    requested: requested(),
+                    echoed: as_seen,
+                })],
+                "echo {echoed:?}"
+            );
+        }
     }
 
     #[test]

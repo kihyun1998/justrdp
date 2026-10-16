@@ -36,11 +36,24 @@ deciding the exchange itself.
   the adapter before the MCS phase.
 - The machine emits `Action::StartTls { selected }` and never sees a TLS record —
   the handshake belongs to the adapter (ADR-0002; [TLS transport security](tls-transport-security.md)).
-- **NLA is mandatory: there is no TLS-only path.** Even when the server selects
-  `PROTOCOL_SSL`, `Event::TlsEstablished` leads to `Action::StartNla`. The target set when the
-  build was scoped (2026-06-08) is a modern Windows Server with NLA enforced, and the test VM
-  refuses a TLS-only connect (`HYBRID_REQUIRED_BY_SERVER`). Standard RDP Security (RC4) is not
+- **TLS-only security is a path of its own** (#474). When the server selects `PROTOCOL_SSL`,
+  `Event::TlsEstablished` leads straight to the MCS Connect-Initial: no CredSSP, no Early User
+  Authorization Result, and the certificate is not parsed, since only CredSSP binds to its key.
+  Without it, a request carrying `SSL` (the default `SSL|HYBRID|HYBRID_EX`) advertises a protocol
+  the client cannot complete; xrdp selects `SSL` from that request. That the path exists is the
+  maintainer's call (2026-10-16), made over keeping NLA mandatory and dropping `SSL` from the
+  default request, or deferring both. The test VM refuses a TLS-only connect
+  (`HYBRID_REQUIRED_BY_SERVER`), so xrdp is its only proof. Standard RDP Security (RC4) is not
   supported at all.
+- **The request is checked twice against a downgrade.** The Connection Request and Confirm are
+  plaintext, so an attacker can strip `HYBRID` from the request and a server that allows TLS-only
+  then selects `SSL` honestly. Two checks stand against it. `SSL` is honoured only when the host
+  requested it. And the Server Core Data's `clientRequestedProtocols`, which travels inside TLS,
+  must equal the request sent (`[MS-RDPBCGR]` 3.2.5.3.4, a SHOULD taken as a MUST on ADR-0009's
+  strict side); otherwise the connect fails with `ConnectError::RequestedProtocolsMismatch`.
+  An absent echo counts as `PROTOCOL_RDP`. Both measured servers echo the request:
+  xrdp 0.9.24 sent `0x0B` for justrdp's `0x0B` (a capture on 2026-10-16), and the WS2019 VM's
+  connect still reaches session-active.
 - **A correlation id is the host's, and the flag and the structure travel together** (#441).
   `ConnectConfig::correlation_id` puts a 16-byte id in an `RDP_NEG_CORRELATION_INFO` after the
   request (2.2.1.1.2), which a server or broker records for diagnostics. 2.2.1.1 makes
@@ -111,3 +124,7 @@ on has never been written down for this territory.
   *security* downgrade is stated in ADR-0009 only as the side it is not on.
 - RD Gateway (epic #23) changes what "the socket" is before this exchange happens;
   nothing here anticipates it.
+- **Where the echo check could refuse a server that is not hostile, unmeasured.** A TLS-capable
+  server that omits `clientRequestedProtocols` reads as `PROTOCOL_RDP` and fails, and so does a
+  TLS-terminating proxy that negotiates with the backend on its own and forwards the backend's
+  GCC. Neither has been seen; the two measured servers echo the request.

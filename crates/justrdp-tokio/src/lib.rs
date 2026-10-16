@@ -5,11 +5,12 @@
 //! failure.
 //!
 //! The loop currently drives the connect sequence through `tcp-connect` → `x224-negotiate` →
-//! `tls-handshake` → `nla-credssp` → the MCS/GCC half of `capability-exchange` (Connect-Initial,
-//! channel join). The TLS handshake and the CredSSP token exchange run here, not in the core:
-//! rustls and `sspi` are their own state machines, so shuttling their records through the
-//! connect machine would add nothing (ADR-0002). After [`Action::StartTls`] the
-//! machine's writes and reads transparently ride the TLS stream (`Transport`).
+//! `tls-handshake` → `nla-credssp` (not under TLS-only security) → the MCS/GCC half of
+//! `capability-exchange` (Connect-Initial, channel join). The TLS handshake and the CredSSP
+//! token exchange run here, not in the core: rustls and `sspi` are their own state machines, so
+//! shuttling their records through the connect machine would add nothing (ADR-0002). After
+//! [`Action::StartTls`] the machine's writes and reads transparently ride the TLS stream
+//! (`Transport`).
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/kihyun1998/justrdp/master/logo/icons/justrdp-icon-light-128.png",
@@ -447,7 +448,8 @@ async fn connect_inner(
                 }
                 Action::StartTls { selected } => {
                     // The handshake runs here, never in the core machine. We hand only the resulting
-                    // peer certificate back to the machine, which extracts its subjectPublicKey.
+                    // peer certificate back to the machine, which extracts its subjectPublicKey for
+                    // NLA, or under TLS-only security answers with the Connect-Initial.
                     let Transport::Tcp(stream) =
                         std::mem::replace(&mut transport, Transport::Absent)
                     else {
@@ -457,7 +459,7 @@ async fn connect_inner(
                         )));
                     };
                     // The trust policy decides the verifier: Chain fails *here*, inside the
-                    // handshake, when the cert is untrusted — NLA is never reached.
+                    // handshake, when the cert is untrusted — nothing after it is reached.
                     let tls_config = client_config(&options.trust, &server.host).map_err(|e| {
                         ConnectFailure::TlsHandshake {
                             reason: format!("building the TLS trust configuration: {e}"),
@@ -11430,6 +11432,88 @@ mod tests {
         assert_eq!(
             release.at, None,
             "an end with nothing open after it disarms"
+        );
+    }
+
+    /// Issue #474: xrdp selects TLS-only security, and the session reaches session-active and
+    /// paints xrdp's login screen. The address is `JUSTRDP_XRDP_ADDR` (the xrdp census server,
+    /// `docs/map/territory/verification-harness.md`); no password is sent, so xrdp shows its
+    /// login screen rather than logging on.
+    #[tokio::test]
+    #[ignore = "requires the xrdp census server and JUSTRDP_XRDP_ADDR"]
+    async fn a_tls_only_session_paints_the_xrdp_login_screen() {
+        let addr: SocketAddr = std::env::var("JUSTRDP_XRDP_ADDR")
+            .expect("JUSTRDP_XRDP_ADDR names the xrdp census server, e.g. 172.27.236.70:3390")
+            .parse()
+            .expect("JUSTRDP_XRDP_ADDR is ip:port");
+        let mut config = legacy_graphics_config();
+        config.client_info.flags = client_info::ClientInfoFlags::MOUSE
+            | client_info::ClientInfoFlags::DISABLE_CTRL_ALT_DEL
+            | client_info::ClientInfoFlags::MAXIMIZE_SHELL
+            | client_info::ClientInfoFlags::LOGON_NOTIFY
+            | client_info::ClientInfoFlags::LOGON_ERRORS
+            | client_info::ClientInfoFlags::MOUSE_HAS_WHEEL;
+        let capabilities = config.capabilities.clone();
+        let mut stages = Vec::new();
+        let outcome = connect_danger(addr, config, test_credentials(), |stage| {
+            stages.push(stage.to_string())
+        })
+        .await
+        .unwrap_or_else(|e| panic!("a TLS-only connect fails after {stages:?}: {e:?}"));
+        assert!(
+            !stages.iter().any(|s| s == "nla-credssp"),
+            "no NLA under TLS-only security: {stages:?}"
+        );
+        let mut machine = SessionStateMachine::new(
+            session_config_from(&outcome, capabilities),
+            outcome.activation.leftover.clone(),
+        )
+        .expect("the desktop size is within MAX_DESKTOP_DIM");
+        let mut stream = outcome.stream;
+        let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
+        let mut frames = 0usize;
+        let mut readbuf = vec![0u8; 64 * 1024];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            for output in pending.drain(..) {
+                match output {
+                    SessionOutput::Frame(_) => frames += 1,
+                    SessionOutput::WriteBytes(bytes) => {
+                        write_frame(&mut stream, &bytes)
+                            .await
+                            .expect("write to xrdp");
+                    }
+                    _ => {}
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut readbuf)).await {
+                Ok(Ok(0)) => panic!("xrdp closed the session after {frames} frames"),
+                Ok(Err(e)) => panic!("reading from xrdp failed after {frames} frames: {e}"),
+                Ok(Ok(n)) => {
+                    pending = feed_session(&mut machine, &readbuf[..n])
+                        .expect("the session machine takes every byte xrdp sent");
+                }
+                Err(_) if frames > 0 => break,
+                Err(_) => {}
+            }
+        }
+        let path = dump_ppm(machine.framebuffer(), "justrdp-474-xrdp-login.ppm");
+        eprintln!(
+            "#474: {frames} frames, stages {stages:?}, dump {}",
+            path.display()
+        );
+        let mut distinct = std::collections::HashSet::new();
+        for px in machine.framebuffer().pixels().as_chunks::<4>().0 {
+            distinct.insert([px[0], px[1], px[2]]);
+        }
+        assert!(frames > 0, "xrdp painted nothing");
+        assert!(
+            distinct.len() > 16,
+            "near-monochrome: {} colours",
+            distinct.len()
         );
     }
 
