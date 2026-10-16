@@ -137,6 +137,19 @@ host is handed as one frame (#462). Epic #22 (the bitmap cache half is
   SRCCOPY; 16,388 Cache Bitmap (Revision 2); 1,294 Frame Markers; no other order, and no glyph
   order with `GLYPH_SUPPORT_FULL` advertised and text typed.
 
+**A second census: xrdp 0.9.24 (2026-10-16).** FreeRDP 3.32.1 against the xrdp server
+([Verification harness](verification-harness.md)), every cache advertised:
+
+- **The logged-in Xorg desktop paints like WS2019**: in 40 s at 16 bpp, 11,047 MemBlt (all
+  SRCCOPY) and 782 Cache Bitmap V2, and no other order.
+- **The login screen, which xrdp draws itself, is where the other orders are**: 46 OpaqueRect, 33
+  Cache Glyph, 16 GlyphIndex and 8 PatBlt (all PATCOPY). The counts are the same at 16, 24 and
+  32 bpp. At 8 bpp there is also 1 Cache Color Table, as on the 8 bpp desktop (5,024 MemBlt and
+  350 Cache Bitmap V2 in 20 s).
+- **Still sent by neither server**: DstBlt, LineTo, the Multi* orders, polygons, ellipses,
+  SaveBitmap, Cache Brush, the offscreen orders and Cache Bitmap revisions 1 and 3. xrdp has
+  encoders for several of them (`libxrdp/xrdp_orders.c`), and none appeared.
+
 **justrdp's own advertisement (#460):** MemBlt and Mem3Blt, caches of 120, 120 and 2553 entries,
 no waiting list, 16 bpp, no Surface Commands. The server sent only compressed 16 bpp Cache Bitmap
 (Revision 2) into cache 2 and SRCCOPY MemBlt, on the fast path; the fixture

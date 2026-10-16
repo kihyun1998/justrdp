@@ -19,7 +19,8 @@ are seven, entered in order:
 2. **x224-negotiate**: the X.224 Connection Request/Confirm that selects the security protocol
    (SSL / HYBRID / HYBRID_EX).
 3. **tls-handshake**: the TLS upgrade.
-4. **nla-credssp**: Network Level Authentication over CredSSP.
+4. **nla-credssp**: Network Level Authentication over CredSSP. Skipped when the server selects
+   TLS-only security (SSL).
 5. **capability-exchange**: client/server advertise and negotiate feature flags and desktop size.
 6. **activation**: synchronize, control and font exchange that finalize the session.
 7. **session-active**: entered on successful activation; lasts until disconnect.

@@ -32,6 +32,10 @@ the extraction of the server's `subjectPublicKey`, which is not a TLS concern at
   `SubjectPublicKeyInfo`, not the whole SPKI.** The distinction is load-bearing and
   is stated at the `Action::StartNla` docs; getting it wrong produces a CredSSP
   exchange that completes locally and fails against a real server.
+- **Under TLS-only security the trust policy is the whole of server authentication** (#474).
+  With `PROTOCOL_SSL` selected there is no CredSSP, so no `pubKeyAuth` binds the session to the
+  certificate's key and nothing after the handshake checks the server again. Whatever the
+  `TrustPolicy` accepts is the server. The machine does not parse the certificate on this path.
 
 ## Code
 

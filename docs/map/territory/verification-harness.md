@@ -150,6 +150,29 @@ grep 'client_common_save_session_info' fr.log   # Logon Info, and whether a cook
   quote `~` (`bash -lc '~/x.sh'`) when calling it from Git Bash, which otherwise expands it to
   the Windows home.
 
+**A second server: xrdp in WSL** (#22, #474; set up 2026-10-16). It is xrdp 0.9.24 with
+xorgxrdp, openbox and a few X clients in WSL Ubuntu 24.04, listening on port 3390 so it does not
+collide with Windows' own 3389. The account is local and lab-only. Its login screen is the only
+measured source of OpaqueRect, PatBlt and the glyph orders, and its 8 bpp sessions of Cache Color
+Table (the census is in [Drawing orders](drawing-orders.md)). Traps, each measured once:
+
+- **Windows reaches it at the WSL IP, not `127.0.0.1`.** On this host `127.0.0.1:3390` is refused
+  from Windows while `wsl hostname -I`'s address connects. That address can change when WSL
+  restarts, so the test reads it from `JUSTRDP_XRDP_ADDR`.
+- **WSL shuts down when idle**, and xrdp with it. A connect in the same second as WSL's restart
+  was refused. A test run just after the background command keeping WSL up had ended failed, and
+  passed once WSL was kept up again; that failure's message was not kept, so the cause is
+  presumed. Keep WSL up with a background `wsl -d Ubuntu-24.04 -- sleep 3000` while testing.
+- **xrdp refuses Client Info without `0x33` in its flags**: `INFO_MOUSE`,
+  `INFO_DISABLECTRLALTDEL`, `INFO_UNICODE` and `INFO_MAXIMIZESHELL` all set
+  (`xrdp_sec_process_logon_info`, logged as *"received wrong flags, likely decrypt not
+  working"*), and answers with a Disconnect Provider Ultimatum. `test_config` leaves out two of
+  them, so `a_tls_only_session_paints_the_xrdp_login_screen` sets its own.
+- **No password reaches it**, because the core holds none, so xrdp shows its login screen with
+  the user name filled in. With no orders advertised it paints that screen in 42 slow-path Bitmap
+  Updates (and 2 fast-path New Pointers), measured from a session capture on 2026-10-16. That is
+  the screen the order slices compare against.
+
 **What FreeRDP sends, not only what it receives** (#306). `/dump:record,file:<path>` writes every
 PDU **before TLS**, in both directions, as records of `u64` tick, `u8` direction, `u32` CRC,
 `u64` length and the bytes. For a client the direction byte reads inverted: `1` marks what the
@@ -189,6 +212,10 @@ was checked against.
 - [Adapter drive loop](adapter-drive-loop.md) — hosts the VM and loopback tests.
 
 ## Known holes / open
+
+- **The xrdp server is not a fixture.** It lives in one WSL install on one machine, set up by
+  hand. Nothing in the repo rebuilds it, and the xrdp test is skipped wherever
+  `JUSTRDP_XRDP_ADDR` is unset.
 
 - **A mutation restored by moving its backup back is not restored for cargo** (#306). `move`
   keeps the backup's older mtime, cargo's fingerprint then calls the source unchanged, and the

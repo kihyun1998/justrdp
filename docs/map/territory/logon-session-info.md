@@ -150,9 +150,10 @@ split.
 with a corrupted one, and with no cookie at all produced the same thing: the same session, a
 fresh cookie, no logon notification, no Auto-Reconnect Status PDU. CredSSP has already
 authenticated the user by the time Client Info arrives, so the server reattaches the session
-either way. The VM refuses a TLS-only connect (`HYBRID_REQUIRED_BY_SERVER`), and justrdp is
-NLA-mandatory ([X.224 negotiation](x224-negotiation.md)), so the differential that would expose the verifier —
-a credential-less reconnect — is not available here.
+either way. The VM refuses a TLS-only connect (`HYBRID_REQUIRED_BY_SERVER`), so the differential
+that would expose the verifier, a credential-less reconnect, is not available here. justrdp has
+had a TLS-only path since #474 ([X.224 negotiation](x224-negotiation.md)), but only against a
+server that allows one.
 
 **What does stand behind the verifier.** RFC 2202's HMAC-MD5 vectors, Python's `hmac` for
 5.5's own input, and a cross-check on real server bytes: FreeRDP auto-reconnected through a

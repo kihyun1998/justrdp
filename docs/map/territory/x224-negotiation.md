@@ -36,11 +36,17 @@ deciding the exchange itself.
   the adapter before the MCS phase.
 - The machine emits `Action::StartTls { selected }` and never sees a TLS record —
   the handshake belongs to the adapter (ADR-0002; [TLS transport security](tls-transport-security.md)).
-- **NLA is mandatory: there is no TLS-only path.** Even when the server selects
-  `PROTOCOL_SSL`, `Event::TlsEstablished` leads to `Action::StartNla`. The target set when the
-  build was scoped (2026-06-08) is a modern Windows Server with NLA enforced, and the test VM
-  refuses a TLS-only connect (`HYBRID_REQUIRED_BY_SERVER`). Standard RDP Security (RC4) is not
-  supported at all.
+- **TLS-only security is a path of its own** (#474). When the server selects `PROTOCOL_SSL`,
+  `Event::TlsEstablished` leads straight to the MCS Connect-Initial: no CredSSP, no Early User
+  Authorization Result, and the certificate is not parsed, since only CredSSP binds to its key.
+  Until #474 the machine asked for NLA after every TLS handshake, so the default request
+  (`SSL|HYBRID|HYBRID_EX`) advertised a protocol it could not complete. That was the scope set on
+  2026-06-08 (a modern Windows Server with NLA enforced; the test VM refuses a TLS-only connect
+  with `HYBRID_REQUIRED_BY_SERVER`). xrdp selects `SSL` from that request and got a CredSSP
+  exchange it does not speak. Building the path was the maintainer's call (2026-10-16), over
+  keeping NLA mandatory and dropping `SSL` from the default request, or deferring both.
+  `SSL` is honoured only when the host requested it, so a host that asks for NLA alone is never
+  downgraded. Standard RDP Security (RC4) is not supported at all.
 - **A correlation id is the host's, and the flag and the structure travel together** (#441).
   `ConnectConfig::correlation_id` puts a 16-byte id in an `RDP_NEG_CORRELATION_INFO` after the
   request (2.2.1.1.2), which a server or broker records for diagnostics. 2.2.1.1 makes
