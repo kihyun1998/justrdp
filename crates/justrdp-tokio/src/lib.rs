@@ -8337,8 +8337,9 @@ mod tests {
 
     /// Issue #460: advertising MemBlt and Mem3Blt over a Revision 2 bitmap cache at 16 bpp,
     /// with no Surface Commands to fall back on, the VM paints the desktop in drawing orders and
-    /// the session paints every pixel from the cache. `JUSTRDP_SESSION_CAPTURE_FILE` records the
-    /// bytes a committed fixture is carved from.
+    /// the session paints every pixel from the cache, one frame per painting order, unadvertised
+    /// ones included (#479). `JUSTRDP_SESSION_CAPTURE_FILE` records the bytes a committed fixture
+    /// is carved from.
     #[tokio::test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn memblt_orders_paint_the_desktop_on_the_real_vm() {
@@ -8424,9 +8425,30 @@ mod tests {
                 "the desktop arrived as bitmap updates, not orders"
             );
             assert_eq!(
-                frames,
-                census.count("MemBlt") + census.count("Mem3Blt"),
-                "every frame is one blit's"
+                census.count("FrameMarker"),
+                0,
+                "a Frame Marker pair holds its orders' rects for one delivery"
+            );
+            assert_eq!(
+                census.count("GlyphIndex"),
+                0,
+                "a GlyphIndex with an opaque rect delivers two frames"
+            );
+            let painting: usize = [
+                "MemBlt",
+                "Mem3Blt",
+                "ScrBlt",
+                "DstBlt",
+                "PatBlt",
+                "OpaqueRect",
+            ]
+            .map(|kind| census.count(kind))
+            .iter()
+            .sum();
+            assert_eq!(
+                frames, painting,
+                "every frame is one painting order's, advertised or not: {:?}",
+                census.orders
             );
             assert_eq!(covered, width * height, "every pixel of the desktop is painted");
             let fb = machine.framebuffer();
