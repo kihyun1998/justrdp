@@ -63,7 +63,7 @@ pub trait DvcProcessor {
     fn frame_open(&self) -> bool {
         false
     }
-    /// How many of those frames have ended, across the processor's life.
+    /// How many of those frames have ended or been dropped, across the processor's life.
     fn frames_ended(&self) -> u64 {
         0
     }

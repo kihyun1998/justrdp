@@ -58,8 +58,8 @@ read as the adapter growing a third of its size.
   re-arms it. **`has_open_frame` alone cannot say a frame ended**: a read that ends one frame and
   opens the next leaves it true on both sides, and the first frame's deadline would release the
   second one milliseconds in. So the runner also compares `SessionStateMachine::frames_ended`,
-  which only grows, and restarts the interval when it moved (found by #470's review, before
-  merge).
+  which only grows (a frame a reactivation or a channel close drops counts too), and restarts the
+  interval when it moved.
   That the host releases, and the core only provides the means, was the maintainer's call
   (2026-10-16); **the 1 s is a derivation, not their call**: it only has to sit far above any
   frame a server ends. Measured on the WS2019 VM (2026-10-16, throwaway instrumentation of
@@ -74,7 +74,8 @@ read as the adapter growing a third of its size.
   `the_release_deadline_follows_the_frame_open_now` for the restart.
 - **Tokio's paused clock does not wait for a loopback socket.** It jumps to the next timer
   whenever the runtime has nothing ready, and a byte written on loopback is not always readable
-  by then; on this Windows host readiness comes through IOCP. A test whose server sleeps between
+  by then (presumably because readiness reaches the runtime through IOCP on this Windows host; not
+  measured). A test whose server sleeps between
   writes therefore lets virtual time pass the client's deadline before the client has read: #470's
   first restart test saw a frame end at 1.536 s that was sent at 0.6 s. A paused-clock test over a
   socket is sound only while the client's own timer is the only one, as in the two release tests;

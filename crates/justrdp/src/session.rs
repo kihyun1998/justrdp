@@ -1837,8 +1837,9 @@ impl SessionStateMachine {
     }
 
     /// How many frames have ended this session: Frame Marker ends and `EndFrame`s that closed an
-    /// open frame. It only grows, so a host that saw a frame open and later sees a larger count
-    /// knows that frame ended, even where another one opened before it looked again.
+    /// open frame, and open frames a reactivation or a channel close dropped. It only grows, so a
+    /// host that saw a frame open and later sees a larger count knows that frame is gone, even
+    /// where another one opened before it looked again.
     pub fn frames_ended(&self) -> u64 {
         self.orders.frames_ended() + self.drdynvc.frames_ended()
     }

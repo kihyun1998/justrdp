@@ -378,7 +378,8 @@ pub struct GraphicsProcessor {
     confirmed_flags: u32,
     frames_decoded: u32,
     in_frame: bool,
-    /// How many open frames an `EndFrame` has closed, across every binding of the channel.
+    /// How many open frames an `EndFrame` closed or a channel close dropped, across every binding
+    /// of the channel.
     frames_ended: u64,
     /// RGBA bytes painted by the list-bearing commands since this frame opened (#268). The
     /// ceiling is [`MAX_TOTAL_SURFACE_BYTES`], **derived rather than picked**: the most a frame
@@ -1309,7 +1310,7 @@ impl DvcProcessor for GraphicsProcessor {
     fn close(&mut self) {
         *self = GraphicsProcessor {
             capsets: core::mem::take(&mut self.capsets),
-            frames_ended: self.frames_ended,
+            frames_ended: self.frames_ended + u64::from(self.in_frame),
             ..GraphicsProcessor::default()
         };
     }
@@ -2587,6 +2588,10 @@ mod tests {
         );
         p.close();
         assert_eq!(p.frames_ended(), 1, "a closed channel keeps the count");
+        assert!(feed(&mut p, egfx::CMDID_START_FRAME, &start).is_empty());
+        p.close();
+        assert!(!p.frame_open());
+        assert_eq!(p.frames_ended(), 2, "a close drops the open frame");
     }
 
     #[test]

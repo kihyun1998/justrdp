@@ -61,7 +61,7 @@ pub(crate) struct Orders {
     in_frame: bool,
     /// The rects painted since that start, in paint order, at most [`MAX_HELD_RECTS`].
     held: Vec<FrameUpdate>,
-    /// How many frames a `TS_FRAME_END` has closed.
+    /// How many frames a `TS_FRAME_END` closed or a reactivation dropped.
     frames_ended: u64,
 }
 
@@ -102,6 +102,9 @@ impl Orders {
     /// Forget the primary order history and any frame in flight (a Deactivation–Reactivation).
     pub(crate) fn reactivate(&mut self) {
         self.history = OrderHistory::default();
+        if self.in_frame {
+            self.frames_ended += 1;
+        }
         self.in_frame = false;
         self.held.clear();
     }
@@ -117,7 +120,7 @@ impl Orders {
         self.in_frame
     }
 
-    /// How many frames a `TS_FRAME_END` has closed.
+    /// How many frames a `TS_FRAME_END` closed or a reactivation dropped.
     pub(crate) fn frames_ended(&self) -> u64 {
         self.frames_ended
     }
@@ -1079,6 +1082,12 @@ pub(crate) mod tests {
             ],
         );
         orders.reactivate();
+        assert!(!orders.in_frame());
+        assert_eq!(
+            orders.frames_ended(),
+            1,
+            "the dropped frame counts as ended"
+        );
         // The next pair releases only what it brackets.
         let frames = run(
             &mut orders,
@@ -1090,6 +1099,12 @@ pub(crate) mod tests {
             ],
         );
         assert_eq!(frames, [frame(1, 0, 1, 1)]);
+        orders.reactivate();
+        assert_eq!(
+            orders.frames_ended(),
+            2,
+            "a reactivation with no frame open drops none"
+        );
     }
 
     /// A miss or an index outside the caches is skipped, and the update goes on.
