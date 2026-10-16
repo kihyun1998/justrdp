@@ -362,7 +362,7 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
         CapabilitySet::GlyphCache(g) if g.glyph_support_level > capability::GLYPH_SUPPORT_FULL => {
             refuse(
                 capability::CAPSET_GLYPH_CACHE,
-                "GLYPH_SUPPORT_ENCODE invites Cache Glyph (Revision 2), which the session skips",
+                "GLYPH_SUPPORT_ENCODE invites Cache Glyph (Revision 2), which the session does not decode",
             )
         }
         CapabilitySet::GlyphCache(g) if g.glyph_support_level != 0 && g.frag_cache != 0 => refuse(

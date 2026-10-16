@@ -501,20 +501,21 @@ impl Orders {
                 .and_then(Option::as_ref);
             let Some(glyph) = glyph else {
                 outcome = Err(NotApplied::Skipped(Skip::CacheMiss));
+                if order.fl_accel & SO_CHAR_INC_EQUAL_BM_BASE == 0 {
+                    x += i32::from(order.char_inc);
+                }
                 continue;
             };
             let (left, top) = (x + i32::from(glyph.x), y + i32::from(glyph.y));
             let row_bytes = usize::from(glyph.cx).div_ceil(8);
-            for row in 0..i32::from(glyph.cy) {
+            let rows = (area.top - top).max(0)
+                ..(area.top + area.height as i32 - top).min(i32::from(glyph.cy));
+            let columns = (area.left - left).max(0)
+                ..(area.left + area.width as i32 - left).min(i32::from(glyph.cx));
+            for row in rows {
                 let py = top + row - area.top;
-                if py < 0 || py >= area.height as i32 {
-                    continue;
-                }
-                for column in 0..i32::from(glyph.cx) {
+                for column in columns.clone() {
                     let px = left + column - area.left;
-                    if px < 0 || px >= area.width as i32 {
-                        continue;
-                    }
                     let byte = glyph.bits[row as usize * row_bytes + column as usize / 8];
                     if byte & (0x80 >> (column % 8)) != 0 {
                         let o = (py as usize * area.width + px as usize) * 4;
@@ -1368,6 +1369,30 @@ pub(crate) mod tests {
         );
     }
 
+    /// At a fixed pitch a missing glyph still takes its cell, so the glyphs after it keep their
+    /// places.
+    #[test]
+    fn a_missing_glyph_keeps_its_cell_at_a_fixed_pitch() {
+        let mut orders = Orders::new(&glyph_capabilities());
+        let mut fb = Framebuffer::new(12, 2).unwrap();
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_glyph(0, 0, (0, 0), &["##"]),
+                glyph_index(
+                    [0, 0x03, 4, 1],
+                    [BLUE, RED],
+                    [0, 0, 11, 1],
+                    [0; 4],
+                    (1, 0),
+                    &[3, 0],
+                ),
+            ],
+        );
+        assert_eq!(row_of(&fb, 0, BLUE), ".....##.....");
+    }
+
     /// Unless `fOpRedundant`, the opaque rectangle fills in `ForeColor` before the glyphs.
     #[test]
     fn the_opaque_rectangle_fills_before_the_glyphs() {
@@ -2167,8 +2192,10 @@ pub(crate) mod tests {
         fn orders_never_panic(
             number_orders in 0u16..64,
             data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
+            glyphs in proptest::prelude::any::<bool>(),
         ) {
-            let mut orders = Orders::new(&capabilities(4, true));
+            let sets = if glyphs { glyph_capabilities() } else { capabilities(4, true) };
+            let mut orders = Orders::new(&sets);
             let mut fb = Framebuffer::new(16, 8).unwrap();
             let mut bytes = cache_bitmap(0, 0, &[&[RED, GREEN], &[BLUE, WHITE]]);
             bytes.extend_from_slice(&data);

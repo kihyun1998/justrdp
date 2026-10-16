@@ -50,11 +50,11 @@ pub const TS_FRAME_START: u32 = 0x0000_0000;
 /// Frame Marker `action`: a logical frame ends.
 pub const TS_FRAME_END: u32 = 0x0000_0001;
 
-/// `orderType` (secondary): Cache Bitmap (Revision 2), uncompressed.
 /// `orderType` of the Cache Glyph (Revision 1) secondary drawing order.
 pub const TS_CACHE_GLYPH: u8 = 0x03;
 /// Cache Glyph `extraFlags`: the glyphs' UTF-16 characters follow them.
 pub const CG_GLYPH_UNICODE_PRESENT: u16 = 0x0010;
+/// `orderType` (secondary): Cache Bitmap (Revision 2), uncompressed.
 pub const TS_CACHE_BITMAP_UNCOMPRESSED_REV2: u8 = 0x04;
 /// `orderType` (secondary): Cache Bitmap (Revision 2), compressed.
 pub const TS_CACHE_BITMAP_COMPRESSED_REV2: u8 = 0x05;

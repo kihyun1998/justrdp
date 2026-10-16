@@ -89,14 +89,16 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
     under `SO_CHAR_INC_EQUAL_BM_BASE`, and otherwise the delta byte after its index (0x80 and two
     more for a long one), added before the glyph is drawn, as FreeRDP's `update_glyph_offset`
     does. xrdp writes exactly that: each glyph's delta is the previous glyph's advance, the first
-    0. FreeRDP never advances by `ulCharInc`; justrdp does, as the field's definition says. No
-    measured server sets it, nor `SO_VERTICAL` or `SO_REVERSED`, and `SO_REVERSED` is ignored, as
-    FreeRDP ignores it.
+    0. FreeRDP never advances by `ulCharInc`; justrdp does, as the field's definition and #476's
+    acceptance say, and a glyph missing from the cache still takes its cell. That is a derivation
+    nothing measured: no measured server sets `ulCharInc`, nor `SO_VERTICAL` or `SO_REVERSED`, and
+    `SO_REVERSED` is ignored, as FreeRDP ignores it.
   - Unless `fOpRedundant`, the opaque rectangle fills in `ForeColor` first; the glyphs' set bits
     paint in `BackColor` (the spec's own naming: back is the text), clipped to the text
     rectangle and the order's bounds. Both rectangles are inclusive and empty unless right and
-    bottom pass left and top, as FreeRDP measures them. Two FreeRDP behaviours are not followed,
-    each on the spec's side and xrdp's screen: FreeRDP also fills each glyph's own cell in
+    bottom pass left and top, as FreeRDP measures them. The bits are tested only where the glyph
+    overlaps the painted area, which the budget charges. Besides the `ulCharInc` advance, two
+    FreeRDP behaviours are not followed, each on the spec's side and xrdp's screen: FreeRDP also fills each glyph's own cell in
     `ForeColor` when the rectangle is not redundant (xrdp sets `fOpRedundant` 0 with an empty
     opaque rectangle, and its bitmap screen has no such boxes), and it keeps the previous text
     colour when it is.
