@@ -6,10 +6,11 @@
 //!
 //! The loop currently drives the connect sequence through `tcp-connect` → `x224-negotiate` →
 //! `tls-handshake` → `nla-credssp` (not under TLS-only security) → the MCS/GCC half of
-//! `capability-exchange` (Connect-Initial, channel join). The TLS handshake and the CredSSP token exchange run here, not in the core:
-//! rustls and `sspi` are their own state machines, so shuttling their records through the
-//! connect machine would add nothing (ADR-0002). After [`Action::StartTls`] the
-//! machine's writes and reads transparently ride the TLS stream (`Transport`).
+//! `capability-exchange` (Connect-Initial, channel join). The TLS handshake and the CredSSP
+//! token exchange run here, not in the core: rustls and `sspi` are their own state machines, so
+//! shuttling their records through the connect machine would add nothing (ADR-0002). After
+//! [`Action::StartTls`] the machine's writes and reads transparently ride the TLS stream
+//! (`Transport`).
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/kihyun1998/justrdp/master/logo/icons/justrdp-icon-light-128.png",

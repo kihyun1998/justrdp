@@ -124,3 +124,7 @@ on has never been written down for this territory.
   *security* downgrade is stated in ADR-0009 only as the side it is not on.
 - RD Gateway (epic #23) changes what "the socket" is before this exchange happens;
   nothing here anticipates it.
+- **Where the echo check could refuse a server that is not hostile, unmeasured.** A TLS-capable
+  server that omits `clientRequestedProtocols` reads as `PROTOCOL_RDP` and fails, and so does a
+  TLS-terminating proxy that negotiates with the backend on its own and forwards the backend's
+  GCC. Neither has been seen; the two measured servers echo the request.

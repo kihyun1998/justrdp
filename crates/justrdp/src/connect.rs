@@ -595,10 +595,9 @@ impl ConnectStateMachine {
     }
 
     /// The security exchange finished (TLS alone, or TLS and NLA): enter the MCS/GCC half of
-    /// capability exchange. Builds the
-    /// Connect-Initial from the caller's config — the only field the machine touches is
-    /// `serverSelectedProtocol`, which echoes the negotiated protocol (a wire fact). Every
-    /// `earlyCapabilityFlags` bit is the caller's, verbatim (ADR-0016).
+    /// capability exchange. Builds the Connect-Initial from the caller's config — the only field
+    /// the machine touches is `serverSelectedProtocol`, which echoes the negotiated protocol (a
+    /// wire fact). Every `earlyCapabilityFlags` bit is the caller's, verbatim (ADR-0016).
     fn start_mcs(&mut self, selected: SecurityProtocol) -> Vec<Action> {
         self.stage = Stage::GccExchange { selected };
         let mut core = self.config.core.clone();
