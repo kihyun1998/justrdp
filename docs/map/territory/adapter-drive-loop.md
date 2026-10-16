@@ -55,7 +55,8 @@ read as the adapter growing a third of its size.
   deadline `OPEN_FRAME_RELEASE` after the first batch that leaves a frame open, and a `select!`
   arm then calls `release_open_frames` and feeds what it returns through the same output loop as
   the socket's. A batch that leaves no frame open disarms it; one still open after a release
-  re-arms it. **`has_open_frame` alone cannot say a frame ended**: a read that ends one frame and
+  re-arms it, and so does a frame open across a Deactivation, whose releases return nothing.
+  **`has_open_frame` alone cannot say a frame ended**: a read that ends one frame and
   opens the next leaves it true on both sides, and the first frame's deadline would release the
   second one milliseconds in. So the runner also compares `SessionStateMachine::frames_ended`,
   which only grows (a frame a reactivation or a channel close drops counts too), and restarts the
