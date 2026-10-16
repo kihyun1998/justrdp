@@ -65,9 +65,13 @@ host is handed as one frame (#462). Epic #22 (the bitmap cache half is
   end in paint order, collapsing to one bounding box past 64 as the Graphics Pipeline's frames
   do. The call was made over three options, shown with their costs: this; FreeRDP's, whose
   `gdi_frame_marker` does nothing and hands every rect over at once; and holding with a new
-  bound. It accepts the stall the Graphics Pipeline already accepts, a start whose end never
-  comes; it did not decide whether either should get a bound, nor the Surface Commands frame
-  marker, a different message.
+  bound. It did not decide what happens to a start whose end never comes (#470, below), nor the
+  Surface Commands frame marker, a different message.
+- **A frame whose end never comes is the host's to release** (#470, the maintainer's call of
+  2026-10-16). `SessionStateMachine::release_open_frames` hands the held rects over and leaves the
+  frame open; its end, if it comes, hands over only what was painted after. The `justrdp-tokio`
+  runners release after 1 s ([Adapter drive loop](adapter-drive-loop.md)). A Graphics Pipeline
+  frame open at the same time is released by the same call.
 - **Unmatched markers are tolerated** (ADR-0009, Amendment 2026-10-16): a start inside a frame
   continues it, and an end with no start and an action that is neither are ignored.
 - **A frame's held rects die with the framebuffer they name.** A reactivation drops the frame in
@@ -222,6 +226,7 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
   decoders the bitmap update path uses (`decode_bitmap`).
 - [Verification harness](verification-harness.md) — the FreeRDP census procedure and the VM's
   colour-depth dependence.
+- [Adapter drive loop](adapter-drive-loop.md) — the runners release an order frame left open.
 
 ## Known holes / open
 

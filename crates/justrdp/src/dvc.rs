@@ -377,7 +377,9 @@ impl Drdynvc {
 
     /// Whether any processor has a frame open.
     pub(crate) fn frame_open(&self) -> bool {
-        self.processors.iter().any(|processor| processor.frame_open())
+        self.processors
+            .iter()
+            .any(|processor| processor.frame_open())
     }
 
     /// Every processor's [`DvcProcessor::release_frames`], in order.

@@ -709,6 +709,43 @@ fn feed_session(
         .map_err(SessionFailure::Protocol)
 }
 
+/// How long a session runner lets a frame stay open before it releases what the frame holds
+/// ([`SessionStateMachine::release_open_frames`]).
+const OPEN_FRAME_RELEASE: Duration = Duration::from_secs(1);
+
+/// When a session runner next releases the machine's open frames: [`OPEN_FRAME_RELEASE`] after
+/// it first saw a frame open since the last release, or never while none is.
+#[derive(Default)]
+struct OpenFrameRelease {
+    at: Option<tokio::time::Instant>,
+}
+
+impl OpenFrameRelease {
+    fn track(&mut self, machine: &SessionStateMachine) {
+        if !machine.has_open_frame() {
+            self.at = None;
+        } else if self.at.is_none() {
+            self.at = Some(tokio::time::Instant::now() + OPEN_FRAME_RELEASE);
+        }
+    }
+
+    fn armed(&self) -> bool {
+        self.at.is_some()
+    }
+
+    async fn due(&self) {
+        match self.at {
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => core::future::pending().await,
+        }
+    }
+
+    fn release(&mut self, machine: &mut SessionStateMachine) -> Vec<SessionOutput> {
+        self.at = None;
+        machine.release_open_frames()
+    }
+}
+
 /// Notify `on_stage` only when the machine's stage actually changed, so each connect stage is
 /// announced exactly once.
 fn announce_stage(
@@ -794,6 +831,7 @@ pub async fn run_session_with_input(
 ) -> Result<DisconnectReason, SessionFailure> {
     let mut readbuf = [0u8; 16 * 1024];
     let mut input_open = true;
+    let mut open_frames = OpenFrameRelease::default();
     // Drain bytes the connect sequence already buffered (ActivationResult::leftover, handed
     // to SessionStateMachine::new) before the first socket read.
     let mut pending = machine
@@ -871,7 +909,11 @@ pub async fn run_session_with_input(
                 }
             }
         }
+        open_frames.track(machine);
         tokio::select! {
+            () = open_frames.due(), if open_frames.armed() => {
+                pending = open_frames.release(machine);
+            }
             received = stream.read(&mut readbuf) => {
                 match received {
                     // Orderly server close: surface whatever the server attributed.
@@ -1078,6 +1120,7 @@ pub async fn run_session_with_commands(
 ) -> Result<DisconnectReason, SessionFailure> {
     let mut readbuf = [0u8; 16 * 1024];
     let mut commands_open = true;
+    let mut open_frames = OpenFrameRelease::default();
     let mut pending = machine
         .process_bytes(&[])
         .map_err(SessionFailure::Protocol)?;
@@ -1135,10 +1178,14 @@ pub async fn run_session_with_commands(
                 }
             }
         }
+        open_frames.track(machine);
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::debug!("session cancelled by the host");
                 return Ok(DisconnectReason::LocalClosed);
+            }
+            () = open_frames.due(), if open_frames.armed() => {
+                pending = open_frames.release(machine);
             }
             received = stream.read(&mut readbuf) => {
                 match received {
@@ -11097,6 +11144,146 @@ mod tests {
         body.push(payload.len() as u8);
         body.extend_from_slice(payload);
         justrdp_pdu::tpkt::encode(&justrdp_pdu::x224::encode_data(&body))
+    }
+
+    /// A loopback session server: it writes `frames`, then holds the connection open until
+    /// `done` is notified, and closes it.
+    async fn holding_session_server(
+        frames: Vec<Vec<u8>>,
+        done: Arc<tokio::sync::Notify>,
+    ) -> SocketAddr {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.der().clone();
+        let key = ck.signing_key.serialize_der();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            for frame in frames {
+                tls.write_all(&frame).await.unwrap();
+            }
+            done.notified().await;
+            let _ = tls.shutdown().await;
+        });
+        addr
+    }
+
+    /// Issue #470: a drawing-order frame that starts and never ends reaches the frame sink
+    /// through the runner's release, 1 s after it opened, not before, and once. The clock is
+    /// tokio's paused one and the only timer is the runner's, so it advances only to that
+    /// release.
+    async fn an_unended_frame_is_released_by(runner: &str) {
+        use justrdp_pdu::{capability, fastpath, orders};
+        let mut scrblt = vec![
+            orders::TS_STANDARD | orders::TS_TYPE_CHANGE,
+            orders::TS_ENC_SCRBLT_ORDER,
+            0x7F,
+        ];
+        for value in [12i16, 0, 2, 1] {
+            scrblt.extend_from_slice(&value.to_le_bytes());
+        }
+        scrblt.push(0xCC);
+        scrblt.extend_from_slice(&[0; 4]);
+        let mut body = 2u16.to_le_bytes().to_vec();
+        body.push(orders::TS_ALTSEC_FRAME_MARKER << 2 | orders::TS_SECONDARY);
+        body.extend_from_slice(&orders::TS_FRAME_START.to_le_bytes());
+        body.extend_from_slice(&scrblt);
+        let update = fastpath::encode_pdu(&[(
+            fastpath::FP_UPDATE_ORDERS,
+            fastpath::FP_FRAGMENT_SINGLE,
+            &body,
+        )]);
+        let done = Arc::new(tokio::sync::Notify::new());
+        let addr = holding_session_server(vec![update], done.clone()).await;
+        let watchdog = done.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(10));
+            watchdog.notify_one();
+        });
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let connector = TlsConnector::from(Arc::new(
+            client_config(&TrustPolicy::DangerAcceptAny, "localhost").unwrap(),
+        ));
+        let mut stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), sock)
+            .await
+            .unwrap();
+        let mut machine = SessionStateMachine::new(
+            justrdp::SessionConfig {
+                user_channel_id: 1007,
+                io_channel_id: 1003,
+                share_id: 0x0001_03EA,
+                desktop_size: (16, 8),
+                capabilities: legacy_orders_config(&[capability::ORDER_NEG_SCRBLT_INDEX])
+                    .capabilities,
+                server: justrdp::ServerAnnouncement::default(),
+                drdynvc_channel_id: None,
+                static_channels: Vec::new(),
+                dynamic_channels: Vec::new(),
+                egfx: Default::default(),
+            },
+            Vec::new(),
+        )
+        .expect("the test desktop size is within MAX_DESKTOP_DIM");
+
+        let started = tokio::time::Instant::now();
+        let mut delivered = Vec::new();
+        let on_frame = |frame: &FrameUpdate, _: &Framebuffer| {
+            delivered.push((started.elapsed(), *frame));
+            done.notify_one();
+        };
+        let ended = match runner {
+            "run_session_with_input" => {
+                let (_tx, mut input) = tokio::sync::mpsc::channel(1);
+                run_session_with_input(&mut stream, &mut machine, on_frame, |_| {}, &mut input)
+                    .await
+            }
+            _ => {
+                let (_tx, mut commands) = tokio::sync::mpsc::channel(1);
+                run_session_with_commands(
+                    &mut stream,
+                    &mut machine,
+                    on_frame,
+                    |_| {},
+                    |_| {},
+                    &mut commands,
+                    &CancellationToken::new(),
+                )
+                .await
+            }
+        };
+        assert!(ended.is_ok(), "{runner}: {ended:?}");
+        let [(after, frame)] = delivered[..] else {
+            panic!("{runner}: one release, got {delivered:?}");
+        };
+        assert_eq!(
+            frame,
+            FrameUpdate {
+                x: 12,
+                y: 0,
+                width: 2,
+                height: 1
+            },
+            "{runner}"
+        );
+        let interval = Duration::from_secs(1);
+        assert!(
+            after >= interval && after < interval + Duration::from_millis(100),
+            "{runner}: released after {after:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_session_with_input_releases_an_unended_frame() {
+        an_unended_frame_is_released_by("run_session_with_input").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_session_with_commands_releases_an_unended_frame() {
+        an_unended_frame_is_released_by("run_session_with_commands").await;
     }
 
     #[tokio::test]

@@ -1012,7 +1012,11 @@ pub(crate) mod tests {
         );
         assert_eq!(frames, [], "still held after the release");
         let frames = run(&mut orders, &mut fb, &[frame_marker(TS_FRAME_END)]);
-        assert_eq!(frames, [frame(1, 0, 1, 1)], "only what followed the release");
+        assert_eq!(
+            frames,
+            [frame(1, 0, 1, 1)],
+            "only what followed the release"
+        );
         assert!(!orders.in_frame());
     }
 

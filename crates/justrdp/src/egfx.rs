@@ -1292,9 +1292,6 @@ impl DvcProcessor for GraphicsProcessor {
     }
 
     fn release_frames(&mut self, framebuffer: &mut Framebuffer) -> Vec<FrameUpdate> {
-        if !self.in_frame {
-            return Vec::new();
-        }
         self.frame_paint = 0;
         self.blit_dirty(framebuffer)
     }
@@ -2513,10 +2510,17 @@ mod tests {
         let mut p = GraphicsProcessor::default();
         let mut fb = Framebuffer::new(16, 8).unwrap();
         assert!(!p.frame_open());
-        assert_eq!(p.release_frames(&mut fb), [], "no frame, nothing to release");
+        assert_eq!(
+            p.release_frames(&mut fb),
+            [],
+            "no frame, nothing to release"
+        );
         create_surface(&mut p, 1, 16, 8);
         assert!(map_surface(&mut p, 1, 0, 0).is_empty());
-        assert!(!p.flush_frames(&mut fb).is_empty(), "the map flushes outside a frame");
+        assert!(
+            !p.flush_frames(&mut fb).is_empty(),
+            "the map flushes outside a frame"
+        );
         let mut start = vec![0u8; 8];
         start[4..8].copy_from_slice(&7u32.to_le_bytes());
         assert!(feed(&mut p, egfx::CMDID_START_FRAME, &start).is_empty());

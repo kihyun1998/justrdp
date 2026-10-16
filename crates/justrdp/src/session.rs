@@ -5646,6 +5646,7 @@ mod tests {
                 graphics.clear();
             }
         }
+        assert!(sm.has_open_frame(), "the Graphics Pipeline frame alone");
         let orders = fastpath::encode_pdu(&[(
             fastpath::FP_UPDATE_ORDERS,
             fastpath::FP_FRAGMENT_SINGLE,
@@ -5669,12 +5670,15 @@ mod tests {
         };
         assert_eq!(released, [rect(12, 0, 2, 1), rect(0, 0, 4, 4)]);
         assert_eq!(
-            frame_pixels(&sm, &FrameUpdate {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1
-            }),
+            frame_pixels(
+                &sm,
+                &FrameUpdate {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1
+                }
+            ),
             [255, 0, 0, 255],
             "the fill is blitted"
         );
@@ -5685,7 +5689,11 @@ mod tests {
             sm.process_bytes(&frame).unwrap();
         }
         deactivate_all(&mut sm);
-        assert_eq!(sm.release_open_frames(), [], "nothing during a Deactivation");
+        assert_eq!(
+            sm.release_open_frames(),
+            [],
+            "nothing during a Deactivation"
+        );
     }
 
     /// The other side of the line the variant draws: the same error from a path no dynamic

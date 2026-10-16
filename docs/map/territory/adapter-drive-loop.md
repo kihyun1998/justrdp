@@ -49,6 +49,23 @@ read as the adapter growing a third of its size.
   retrying duplicates the bytes already sent, which desynchronises the stream (the same trap
   IronRDP's `Framed::write_all` documents). A new arm that awaits a write *as the raced
   future* reintroduces it.
+- **A frame left open is released after 1 s** (#470). `run_session_with_input` and
+  `run_session_with_commands` (which `run_session` reaches through the first) track
+  `SessionStateMachine::has_open_frame` after every batch of outputs. `OpenFrameRelease` arms a
+  deadline `OPEN_FRAME_RELEASE` after the first batch that leaves a frame open, and a `select!`
+  arm then calls `release_open_frames` and feeds what it returns through the same output loop as
+  the socket's. A frame that ends first disarms it; one still open after a release re-arms it.
+  That the host releases, and the core only provides the means, was the maintainer's call
+  (2026-10-16); **the 1 s is a derivation, not their call**: it only has to sit far above any
+  frame a server ends. Measured on the WS2019 VM (2026-10-16, throwaway instrumentation of
+  `feed_session`, never committed), over one order Frame Marker session and two Graphics Pipeline
+  sessions: 3 frames were still open when a socket read had been fed, open for 0.4, 3.5 and
+  7.6 ms; every other frame started and ended inside one read. The arm is a sleep, so it is
+  cancel-safe like the read, and it adds no read site: the capture funnel stays the only path from
+  the socket. The interval is not host-configurable. The VM tests drive the machine themselves,
+  not through a runner, so they never release. The proof is
+  `run_session_with_input_releases_an_unended_frame` and its `run_session_with_commands` twin, on
+  tokio's paused clock over a loopback TLS server.
 - **The VM-dependent tests live here and are `#[ignore]`d**, which is why the
   coverage job excludes this crate.
 - **Every write goes out through `write_frame`, which flushes** (#325). The connect driver, the
@@ -73,7 +90,8 @@ read as the adapter growing a third of its size.
   `configure_session_socket`, `Transport`, `ConnectOutcome`, `ConnectOptions`,
   `ConnectTimeouts`, `ConnectFailure`, `Credentials`, `ServerAddr`, `run_session`,
   `run_session_with_input`, `run_session_with_commands`, `SessionCommand`,
-  `SessionEvent`, `SessionFailure`, `generate_license_entropy`, `write_frame`
+  `SessionEvent`, `SessionFailure`, `generate_license_entropy`, `write_frame`,
+  `OPEN_FRAME_RELEASE`, `OpenFrameRelease`
 - `justrdp-tokio/src/trust.rs` — the injected policy (see
   [TLS transport security](tls-transport-security.md))
 

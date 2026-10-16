@@ -171,6 +171,17 @@ acknowledge frames. It is server→client only, and it is reachable only if
   outside a `StartFrame` bracket**, so the per-message reset guards a case this server does
   not produce. It is not dead code.
 
+- **A frame whose `EndFrame` never comes is the host's to release** (#470, the maintainer's call
+  of 2026-10-16). Until then such a frame held two things back: its dirty regions, which
+  `flush_frames` does not blit while `in_frame` is set, and its paint budget, which only
+  `StartFrame` restores. So it froze the host's picture and, once 256 MiB had been painted, the
+  painting too. `DvcProcessor::release_frames` blits the dirty regions as an `EndFrame` would and
+  restores the budget, leaving the frame open; `frame_open` reports it. Both default to nothing
+  for a processor that does not render. The session reaches them through
+  `SessionStateMachine::release_open_frames` and `has_open_frame`, and the `justrdp-tokio`
+  runners call it after 1 s ([Adapter drive loop](adapter-drive-loop.md)). The release does not
+  send a `FrameAcknowledge`: that answers an `EndFrame`, and a late one still gets it.
+
 - **The destination surface bounds a bitmap's size, not its position** (#376, the
   maintainer's call). A `destRect` wider or taller than its surface is **skipped** with an
   `rdp_egfx` warning before it decodes or is charged; one that fits and overhangs an edge is
@@ -270,6 +281,7 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   the on/off switch for this whole territory.
 - [Capability exchange & activation](capability-exchange-activation.md) — surface
   commands and frame-ack are capability-gated.
+- [Adapter drive loop](adapter-drive-loop.md) — the runners release a frame left open.
 
 ## Known holes / open
 
