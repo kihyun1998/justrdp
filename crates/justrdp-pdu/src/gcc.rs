@@ -117,6 +117,8 @@ pub const RDP_VERSION_10_12: u32 = 0x0008_0011;
 
 /// `highColorDepth` — 16 bpp.
 pub const HIGH_COLOR_DEPTH_16BPP: u16 = 0x0010;
+/// `highColorDepth`: 8 bits per pixel.
+pub const HIGH_COLOR_DEPTH_8BPP: u16 = 0x0008;
 /// `highColorDepth` — 24 bpp.
 pub const HIGH_COLOR_DEPTH_24BPP: u16 = 0x0018;
 /// `supportedColorDepths` bits: 24, 16, 15, 32 bpp respectively.

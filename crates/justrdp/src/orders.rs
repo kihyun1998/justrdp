@@ -13,8 +13,9 @@ use justrdp_codecs::rop::{self, Pattern};
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::orders::{
-    self, BITMAPCACHE_WAITING_LIST_INDEX, Bounds, Brush, CacheBitmapRev2, CacheGlyph, Clip,
-    DrawingOrder, GlyphIndex, Mem3Blt, MemBlt, OrderError, OrderHistory, OrdersUpdate, ScrBlt,
+    self, BITMAPCACHE_WAITING_LIST_INDEX, Bounds, Brush, CacheBitmapRev2, CacheColorTable,
+    CacheGlyph, Clip, DrawingOrder, GlyphIndex, Mem3Blt, MemBlt, OrderError, OrderHistory,
+    OrdersUpdate, ScrBlt,
 };
 
 /// ROP3 SRCCOPY: the source, unchanged.
@@ -50,6 +51,8 @@ enum Skip {
     GlyphFragment,
     /// A glyph outside the advertised glyph caches, or larger than its cache's cells.
     UncachedGlyph,
+    /// A Cache Color Table entry past the six (2.2.2.2.1.2.4).
+    OutsideColorTables,
     /// The update's paint budget is spent.
     OverBudget,
 }
@@ -254,6 +257,7 @@ impl Orders {
                     self.cache_bitmap(&order, palette, bits_per_pixel, &mut budget)
                 }
                 DrawingOrder::CacheGlyph(order) => self.cache_glyph(&order, &mut budget),
+                DrawingOrder::CacheColorTable(order) => color_table(&order, palette),
                 DrawingOrder::GlyphIndex { order, clip } => self.glyph_index(
                     &order,
                     clip,
@@ -607,6 +611,14 @@ impl Orders {
                 "a drawing order this client did not advertise, painted anyway"
             );
         }
+        // The high byte names a colour table; the colours are the session palette's.
+        if bits_per_pixel <= 8 && order.cache_id >> 8 != 0 {
+            tracing::warn!(
+                target: "rdp_orders",
+                color_table = order.cache_id >> 8,
+                "a blit names a colour table other than 0; its colours come from the palette"
+            );
+        }
         let clip = match clip {
             Clip::None => None,
             Clip::Bounds(bounds) => Some(bounds),
@@ -622,7 +634,7 @@ impl Orders {
             )?),
             _ => None,
         };
-        // The low byte is the cache; the high byte, a color table entry, is not read.
+        // The low byte is the cache.
         let cache_id = order.cache_id & 0x00FF;
         let bitmap = self
             .slot(cache_id, order.cache_index)?
@@ -763,6 +775,28 @@ fn clip_blt(
         shift_x,
         shift_y,
     })
+}
+
+/// A Cache Color Table, which does not paint: 8 bpp colours resolve through the session palette.
+/// One that differs from the palette, or names an entry past the six, is logged.
+fn color_table(order: &CacheColorTable<'_>, palette: &Palette) -> Result<(), NotApplied> {
+    if order.cache_index > 5 {
+        return Err(NotApplied::Skipped(Skip::OutsideColorTables));
+    }
+    let differing = order
+        .colors()
+        .zip(palette.entries)
+        .filter(|(table, entry)| table != entry)
+        .count();
+    if differing > 0 {
+        tracing::warn!(
+            target: "rdp_orders",
+            cache_index = order.cache_index,
+            differing,
+            "a colour table differs from the session palette; colours come from the palette"
+        );
+    }
+    Ok(())
 }
 
 /// One cached glyph: its offset from the glyph origin, its size, and one bit per pixel in
@@ -1570,6 +1604,153 @@ pub(crate) mod tests {
             )
             .unwrap();
         frames
+    }
+
+    /// Apply `parts` in an 8 bpp session with `palette`.
+    fn run_8bpp(
+        orders: &mut Orders,
+        fb: &mut Framebuffer,
+        parts: &[Vec<u8>],
+        palette: &Palette,
+    ) -> Vec<FrameUpdate> {
+        let data = parts.concat();
+        let mut frames = Vec::new();
+        orders
+            .apply(
+                OrdersUpdate {
+                    number_orders: parts.len() as u16,
+                    order_data: &data,
+                },
+                fb,
+                palette,
+                8,
+                1 << 20,
+                &mut frames,
+            )
+            .unwrap();
+        frames
+    }
+
+    /// A Cache Bitmap (Revision 2) order storing an uncompressed 8 bpp bitmap of palette
+    /// indices, `rows` top-down, four pixels wide so no row needs padding.
+    fn cache_bitmap_8(cache_id: u16, index: u16, rows: &[[u8; 4]]) -> Vec<u8> {
+        let data: Vec<u8> = rows.iter().rev().flatten().copied().collect();
+        let mut body = vec![0x80, 4, 0x80, rows.len() as u8];
+        body.extend_from_slice(&[0xC0, 0, 0, data.len() as u8]);
+        body.extend_from_slice(&[0x80 | (index >> 8) as u8, index as u8]);
+        body.extend(data);
+        let mut order = vec![TS_STANDARD | TS_SECONDARY];
+        order.extend_from_slice(&((body.len() as i16) - 7).to_le_bytes());
+        order.extend_from_slice(&(cache_id | 0x3 << 3).to_le_bytes());
+        order.push(TS_CACHE_BITMAP_UNCOMPRESSED_REV2);
+        order.extend(body);
+        order
+    }
+
+    /// A Cache Color Table of entry `index`, every colour `[r, g, b]` from `colors`.
+    fn color_table(index: u8, colors: &[[u8; 3]; 256]) -> Vec<u8> {
+        let mut body = vec![index];
+        body.extend_from_slice(&256u16.to_le_bytes());
+        for [r, g, b] in colors {
+            body.extend_from_slice(&[*b, *g, *r, 0]);
+        }
+        let mut order = vec![TS_STANDARD | TS_SECONDARY];
+        order.extend_from_slice(&((body.len() as i16) - 7).to_le_bytes());
+        order.extend_from_slice(&0u16.to_le_bytes());
+        order.push(justrdp_pdu::orders::TS_CACHE_COLOR_TABLE);
+        order.extend(body);
+        order
+    }
+
+    /// A palette whose entry 1 is red and 2 green.
+    fn two_colour_palette() -> Palette {
+        let mut palette = Palette::default();
+        palette.entries[1] = [0xFF, 0, 0];
+        palette.entries[2] = [0, 0xFF, 0];
+        palette
+    }
+
+    /// At 8 bpp a cached bitmap's indices and an order's colour index resolve through the
+    /// session palette (#477, as FreeRDP's `gdi_palette_update` palette).
+    #[test]
+    fn eight_bpp_orders_resolve_through_the_palette() {
+        let palette = two_colour_palette();
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(4, 2).unwrap();
+        run_8bpp(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_bitmap_8(0, 0, &[[1, 2, 1, 2]]),
+                memblt((0, 0), [0, 0, 4, 1], SRCCOPY, [0, 0]),
+                opaque_rect([0, 1, 4, 1], 2),
+            ],
+            &palette,
+        );
+        let red = [0xFF, 0, 0, 0xFF];
+        let green = [0, 0xFF, 0, 0xFF];
+        assert_eq!(
+            [
+                pixel(&fb, 0, 0),
+                pixel(&fb, 1, 0),
+                pixel(&fb, 2, 0),
+                pixel(&fb, 3, 0)
+            ],
+            [red, green, red, green]
+        );
+        assert_eq!(pixel(&fb, 0, 1), green);
+    }
+
+    /// A Cache Color Table paints nothing; one that differs from the palette is logged, one
+    /// equal to it is not, and an entry past the six is skipped (#477).
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_colour_table_unlike_the_palette_is_logged() {
+        let palette = two_colour_palette();
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(4, 1).unwrap();
+        let frames = run_8bpp(
+            &mut orders,
+            &mut fb,
+            &[color_table(0, &palette.entries)],
+            &palette,
+        );
+        assert_eq!(frames, []);
+        assert!(!logs_contain("differs from the session palette"));
+        let mut other = palette.entries;
+        other[7] = [1, 2, 3];
+        run_8bpp(&mut orders, &mut fb, &[color_table(1, &other)], &palette);
+        assert!(logs_contain("differs from the session palette"));
+        assert!(logs_contain("differing=1"));
+        run_8bpp(&mut orders, &mut fb, &[color_table(6, &other)], &palette);
+        assert!(logs_contain("OutsideColorTables"));
+    }
+
+    /// A blit naming a colour table other than 0 is logged and painted from the palette (#477).
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_blit_naming_another_colour_table_is_logged() {
+        let palette = two_colour_palette();
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(4, 1).unwrap();
+        run_8bpp(
+            &mut orders,
+            &mut fb,
+            &[
+                cache_bitmap_8(0, 0, &[[1, 1, 1, 1]]),
+                memblt((0, 0), [0, 0, 1, 1], SRCCOPY, [0, 0]),
+            ],
+            &palette,
+        );
+        assert!(!logs_contain("names a colour table other than 0"));
+        run_8bpp(
+            &mut orders,
+            &mut fb,
+            &[memblt((0x0100, 0), [1, 0, 1, 1], SRCCOPY, [0, 0])],
+            &palette,
+        );
+        assert!(logs_contain("names a colour table other than 0"));
+        assert_eq!(pixel(&fb, 1, 0), [0xFF, 0, 0, 0xFF]);
     }
 
     fn run(orders: &mut Orders, fb: &mut Framebuffer, parts: &[Vec<u8>]) -> Vec<FrameUpdate> {
