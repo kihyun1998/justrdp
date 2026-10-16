@@ -8193,6 +8193,11 @@ mod tests {
         slow_path_frames: usize,
         /// Every ScrBlt's `[left, top, width, height]` and `[nXSrc, nYSrc]`.
         scrblts: Vec<([i16; 4], [i16; 2])>,
+        /// Every DstBlt's, OpaqueRect's and PatBlt's `[left, top, width, height]`.
+        fills: Vec<[i16; 4]>,
+        /// Every GlyphIndex's text background rectangle and, when it has one, its opaque
+        /// rectangle, `[left, top, right, bottom]`.
+        glyph_rects: Vec<[i16; 4]>,
     }
 
     impl OrderCensus {
@@ -8234,6 +8239,31 @@ mod tests {
                     let mut cur = ReadCursor::new(update.order_data, "census order data");
                     for _ in 0..update.number_orders {
                         let name = match orders::decode_order(&mut cur, &mut self.history) {
+                            Ok(DrawingOrder::GlyphIndex { order, .. }) => {
+                                self.glyph_rects.push(order.bk);
+                                if order.op_redundant == 0 && order.op != [0; 4] {
+                                    self.glyph_rects.push(order.op);
+                                }
+                                "GlyphIndex".to_string()
+                            }
+                            Ok(DrawingOrder::DstBlt { order, .. }) => {
+                                self.fills
+                                    .push([order.left, order.top, order.width, order.height]);
+                                format!("DstBlt rop {:#04x}", order.rop)
+                            }
+                            Ok(DrawingOrder::PatBlt { order, .. }) => {
+                                self.fills
+                                    .push([order.left, order.top, order.width, order.height]);
+                                format!(
+                                    "PatBlt rop {:#04x} brush {:#04x}",
+                                    order.rop, order.brush.style
+                                )
+                            }
+                            Ok(DrawingOrder::OpaqueRect { order, .. }) => {
+                                self.fills
+                                    .push([order.left, order.top, order.width, order.height]);
+                                "OpaqueRect".to_string()
+                            }
                             Ok(DrawingOrder::ScrBlt { order, .. }) => {
                                 self.scrblts.push((
                                     [order.left, order.top, order.width, order.height],
@@ -11435,18 +11465,24 @@ mod tests {
         );
     }
 
-    /// Issue #474: xrdp selects TLS-only security, and the session reaches session-active and
-    /// paints xrdp's login screen. The address is `JUSTRDP_XRDP_ADDR` (the xrdp census server,
-    /// `docs/map/territory/verification-harness.md`); no password is sent, so xrdp shows its
-    /// login screen rather than logging on.
-    #[tokio::test]
-    #[ignore = "requires the xrdp census server and JUSTRDP_XRDP_ADDR"]
-    async fn a_tls_only_session_paints_the_xrdp_login_screen() {
+    /// What a session against the xrdp census server's login screen received.
+    struct XrdpLogin {
+        framebuffer: justrdp::Framebuffer,
+        frames: Vec<FrameUpdate>,
+        stages: Vec<String>,
+        census: OrderCensus,
+    }
+
+    /// Connect to the xrdp census server at `JUSTRDP_XRDP_ADDR`
+    /// (`docs/map/territory/verification-harness.md`) with `config`, and read until something has
+    /// painted and nothing has arrived for 2 s (20 s at most). xrdp refuses Client Info without
+    /// `0x33` in its flags, so they are set here. No password is sent, so xrdp shows its login
+    /// screen.
+    async fn xrdp_login(mut config: ConnectConfig) -> XrdpLogin {
         let addr: SocketAddr = std::env::var("JUSTRDP_XRDP_ADDR")
             .expect("JUSTRDP_XRDP_ADDR names the xrdp census server, e.g. 172.27.236.70:3390")
             .parse()
             .expect("JUSTRDP_XRDP_ADDR is ip:port");
-        let mut config = legacy_graphics_config();
         config.client_info.flags = client_info::ClientInfoFlags::MOUSE
             | client_info::ClientInfoFlags::DISABLE_CTRL_ALT_DEL
             | client_info::ClientInfoFlags::MAXIMIZE_SHELL
@@ -11459,11 +11495,9 @@ mod tests {
             stages.push(stage.to_string())
         })
         .await
-        .unwrap_or_else(|e| panic!("a TLS-only connect fails after {stages:?}: {e:?}"));
-        assert!(
-            !stages.iter().any(|s| s == "nla-credssp"),
-            "no NLA under TLS-only security: {stages:?}"
-        );
+        .unwrap_or_else(|e| panic!("connecting to xrdp fails after {stages:?}: {e:?}"));
+        let mut census = OrderCensus::default();
+        census.feed(&outcome.activation.leftover);
         let mut machine = SessionStateMachine::new(
             session_config_from(&outcome, capabilities),
             outcome.activation.leftover.clone(),
@@ -11471,13 +11505,13 @@ mod tests {
         .expect("the desktop size is within MAX_DESKTOP_DIM");
         let mut stream = outcome.stream;
         let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
-        let mut frames = 0usize;
+        let mut frames = Vec::new();
         let mut readbuf = vec![0u8; 64 * 1024];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             for output in pending.drain(..) {
                 match output {
-                    SessionOutput::Frame(_) => frames += 1,
+                    SessionOutput::Frame(frame) => frames.push(frame),
                     SessionOutput::WriteBytes(bytes) => {
                         write_frame(&mut stream, &bytes)
                             .await
@@ -11490,31 +11524,150 @@ mod tests {
                 break;
             }
             match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut readbuf)).await {
-                Ok(Ok(0)) => panic!("xrdp closed the session after {frames} frames"),
-                Ok(Err(e)) => panic!("reading from xrdp failed after {frames} frames: {e}"),
+                Ok(Ok(0)) => panic!("xrdp closed the session after {} frames", frames.len()),
+                Ok(Err(e)) => panic!(
+                    "reading from xrdp failed after {} frames: {e}",
+                    frames.len()
+                ),
                 Ok(Ok(n)) => {
+                    census.feed(&readbuf[..n]);
                     pending = feed_session(&mut machine, &readbuf[..n])
                         .expect("the session machine takes every byte xrdp sent");
                 }
-                Err(_) if frames > 0 => break,
+                Err(_) if !frames.is_empty() => break,
                 Err(_) => {}
             }
         }
-        let path = dump_ppm(machine.framebuffer(), "justrdp-474-xrdp-login.ppm");
+        XrdpLogin {
+            framebuffer: machine.framebuffer().clone(),
+            frames,
+            stages,
+            census,
+        }
+    }
+
+    /// Issue #474: xrdp selects TLS-only security, and the session reaches session-active and
+    /// paints xrdp's login screen.
+    #[tokio::test]
+    #[ignore = "requires the xrdp census server and JUSTRDP_XRDP_ADDR"]
+    async fn a_tls_only_session_paints_the_xrdp_login_screen() {
+        let login = xrdp_login(legacy_graphics_config()).await;
+        assert!(
+            !login.stages.iter().any(|s| s == "nla-credssp"),
+            "no NLA under TLS-only security: {:?}",
+            login.stages
+        );
+        let path = dump_ppm(&login.framebuffer, "justrdp-474-xrdp-login.ppm");
         eprintln!(
-            "#474: {frames} frames, stages {stages:?}, dump {}",
+            "#474: {} frames, stages {:?}, dump {}",
+            login.frames.len(),
+            login.stages,
             path.display()
         );
         let mut distinct = std::collections::HashSet::new();
-        for px in machine.framebuffer().pixels().as_chunks::<4>().0 {
+        for px in login.framebuffer.pixels().as_chunks::<4>().0 {
             distinct.insert([px[0], px[1], px[2]]);
         }
-        assert!(frames > 0, "xrdp painted nothing");
+        assert!(!login.frames.is_empty(), "xrdp painted nothing");
         assert!(
             distinct.len() > 16,
             "near-monochrome: {} colours",
             distinct.len()
         );
+    }
+
+    /// Issue #475: xrdp's login screen painted in DstBlt, OpaqueRect and PatBlt is the screen
+    /// xrdp paints in bitmap updates for a session that advertises no orders, except for the
+    /// text, which GlyphIndex carries and #476 draws: every pixel that differs lies inside a
+    /// GlyphIndex's text rectangle, or its opaque one where it has one, and those rectangles
+    /// cover a small part of the screen.
+    #[tokio::test]
+    #[ignore = "requires the xrdp census server and JUSTRDP_XRDP_ADDR"]
+    async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_but_the_text() {
+        use justrdp_pdu::capability;
+        let mut bitmaps = legacy_graphics_config();
+        bitmaps.core.high_color_depth = gcc::HIGH_COLOR_DEPTH_16BPP;
+        for set in &mut bitmaps.capabilities {
+            if let justrdp_pdu::capability::CapabilitySet::Bitmap(b) = set {
+                b.preferred_bits_per_pixel = 16;
+            }
+        }
+        let oracle = xrdp_login(bitmaps).await;
+        let ordered = xrdp_login(legacy_orders_config(&[
+            capability::ORDER_NEG_DSTBLT_INDEX,
+            capability::ORDER_NEG_PATBLT_INDEX,
+            capability::ORDER_NEG_SCRBLT_INDEX,
+            capability::ORDER_NEG_MEMBLT_INDEX,
+            capability::ORDER_NEG_MEM3BLT_INDEX,
+        ]))
+        .await;
+        ordered.census.print("#475");
+        let oracle_path = dump_ppm(&oracle.framebuffer, "justrdp-475-oracle.ppm");
+        let ordered_path = dump_ppm(&ordered.framebuffer, "justrdp-475-orders.ppm");
+        eprintln!(
+            "#475: dumps {} and {}",
+            oracle_path.display(),
+            ordered_path.display()
+        );
+        assert!(
+            oracle.census.orders.is_empty() && oracle.census.slow_path_frames > 0,
+            "the oracle is painted in bitmaps, not orders: {:?}",
+            oracle.census.orders
+        );
+        for kind in ["OpaqueRect", "PatBlt", "GlyphIndex"] {
+            assert!(ordered.census.count(kind) > 0, "no {kind} arrived");
+        }
+        assert_eq!(
+            ordered.census.count("stopped"),
+            0,
+            "an update was cut short"
+        );
+        assert_eq!(
+            (oracle.framebuffer.width(), oracle.framebuffer.height()),
+            (ordered.framebuffer.width(), ordered.framebuffer.height())
+        );
+        let width = usize::from(ordered.framebuffer.width());
+        let height = usize::from(ordered.framebuffer.height());
+        let rgb = |fb: &justrdp::Framebuffer, x: usize, y: usize| {
+            let o = (y * width + x) * 4;
+            [fb.pixels()[o], fb.pixels()[o + 1], fb.pixels()[o + 2]]
+        };
+        let in_text = |x: usize, y: usize| {
+            ordered.census.glyph_rects.iter().any(|&[l, t, r, b]| {
+                (i32::from(l)..=i32::from(r)).contains(&(x as i32))
+                    && (i32::from(t)..=i32::from(b)).contains(&(y as i32))
+            })
+        };
+        let mut differing = 0usize;
+        let mut outside = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                if rgb(&ordered.framebuffer, x, y) != rgb(&oracle.framebuffer, x, y) {
+                    differing += 1;
+                    if !in_text(x, y) && outside.len() < 8 {
+                        outside.push((x, y));
+                    }
+                }
+            }
+        }
+        let exempt = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|&(x, y)| in_text(x, y))
+            .count();
+        eprintln!(
+            "#475: {differing} pixels differ, all expected inside the text rectangles, which \
+             cover {exempt} of {} pixels",
+            width * height
+        );
+        assert!(
+            differing > 0,
+            "the text is missing, so some pixels must differ"
+        );
+        assert!(
+            exempt * 50 < width * height,
+            "the text rectangles cover {exempt} pixels, 2% of the screen or more"
+        );
+        assert_eq!(outside, [], "pixels differing outside every text rectangle");
     }
 
     #[tokio::test]

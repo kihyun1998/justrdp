@@ -81,8 +81,11 @@ pub const HONOURED_SOUND_FLAGS: u16 = capability::SOUND_FLAG_BEEPS;
 /// The Surface Commands set's `cmdFlags` the core honours.
 pub const HONOURED_SURFACE_COMMANDS: u32 = capability::SURFCMDS_SET_SURFACE_BITS;
 
-/// The `orderSupport` entries the session paints: ScrBlt, MemBlt and Mem3Blt (`crate::orders`).
-pub const HONOURED_ORDERS: [usize; 3] = [
+/// The `orderSupport` entries the session paints: DstBlt, PatBlt with OpaqueRect (one index),
+/// ScrBlt, MemBlt and Mem3Blt (`crate::orders`).
+pub const HONOURED_ORDERS: [usize; 5] = [
+    capability::ORDER_NEG_DSTBLT_INDEX,
+    capability::ORDER_NEG_PATBLT_INDEX,
     capability::ORDER_NEG_SCRBLT_INDEX,
     capability::ORDER_NEG_MEMBLT_INDEX,
     capability::ORDER_NEG_MEM3BLT_INDEX,
@@ -302,7 +305,7 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
         {
             refuse(
                 capability::CAPSET_ORDER,
-                "orderSupport enables a drawing order other than ScrBlt, MemBlt and Mem3Blt",
+                "orderSupport enables a drawing order other than DstBlt, PatBlt, OpaqueRect, ScrBlt, MemBlt and Mem3Blt",
             )
         }
         CapabilitySet::Order(o) if o.order_flags & !HONOURED_ORDER_FLAGS != 0 => refuse(
@@ -684,7 +687,7 @@ mod tests {
     #[test]
     fn capability_sets_that_invite_unhandled_traffic_are_refused() {
         let mut orders = OrderCapabilitySet::default();
-        orders.order_support[0] = 1; // TS_NEG_DSTBLT_INDEX
+        orders.order_support[0x08] = 1; // TS_NEG_LINETO_INDEX
         let mut general = crate::connect::tests::config()
             .capabilities
             .into_iter()
@@ -860,6 +863,39 @@ mod tests {
             }
         }
         assert_eq!(check(&config), Ok(()));
+    }
+
+    /// DstBlt's index and PatBlt's, which also negotiates OpaqueRect, pass alone and with the
+    /// blts (#475); an index the session does not paint, LineTo's, is refused.
+    #[test]
+    fn patblt_passes_and_an_unpainted_order_is_refused() {
+        let with = |index: usize| {
+            let mut config = orders_config();
+            for set in &mut config.capabilities {
+                if let CapabilitySet::Order(o) = set {
+                    o.order_support[index] = 1;
+                }
+            }
+            check(&config)
+        };
+        assert_eq!(with(capability::ORDER_NEG_PATBLT_INDEX), Ok(()));
+        assert_eq!(with(capability::ORDER_NEG_DSTBLT_INDEX), Ok(()));
+        let mut patblt = OrderCapabilitySet::default();
+        patblt.order_support[capability::ORDER_NEG_PATBLT_INDEX] = 1;
+        let mut config = crate::connect::tests::config();
+        for set in &mut config.capabilities {
+            if let CapabilitySet::Order(o) = set {
+                *o = patblt.clone();
+            }
+        }
+        assert_eq!(check(&config), Ok(()));
+        assert!(matches!(
+            with(0x08),
+            Err(ConnectConfigError::CapabilitySet {
+                set_type: capability::CAPSET_ORDER,
+                ..
+            })
+        ));
     }
 
     /// Each way an order advertisement promises what the session does not keep is refused.

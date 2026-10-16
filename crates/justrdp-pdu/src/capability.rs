@@ -112,6 +112,11 @@ pub const ORDERFLAGS_EX_CACHE_BITMAP_REV3_SUPPORT: u16 = 0x0002;
 /// `orderSupportExFlags`: the Frame Marker alternate secondary order is supported.
 pub const ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT: u16 = 0x0004;
 
+/// `orderSupport` index of the DstBlt primary drawing order (`TS_NEG_DSTBLT_INDEX`).
+pub const ORDER_NEG_DSTBLT_INDEX: usize = 0x00;
+/// `orderSupport` index of the PatBlt and OpaqueRect primary drawing orders
+/// (`TS_NEG_PATBLT_INDEX`): one index negotiates both.
+pub const ORDER_NEG_PATBLT_INDEX: usize = 0x01;
 /// `orderSupport` index of the ScrBlt primary drawing order (`TS_NEG_SCRBLT_INDEX`).
 pub const ORDER_NEG_SCRBLT_INDEX: usize = 0x02;
 /// `orderSupport` index of the MemBlt primary drawing order (`TS_NEG_MEMBLT_INDEX`).
