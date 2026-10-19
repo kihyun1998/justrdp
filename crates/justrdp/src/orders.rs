@@ -14,8 +14,8 @@ use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::orders::{
     self, BITMAPCACHE_WAITING_LIST_INDEX, Bounds, Brush, CacheBitmapRev2, CacheColorTable,
-    CacheGlyph, Clip, DrawingOrder, GlyphIndex, Mem3Blt, MemBlt, OrderError, OrderHistory,
-    OrdersUpdate, ScrBlt,
+    CacheGlyph, Clip, CreateOffscreenBitmap, DrawingOrder, GlyphIndex, Mem3Blt, MemBlt, OrderError,
+    OrderHistory, OrdersUpdate, ScrBlt, TS_BITMAPCACHE_SCREEN_ID,
 };
 
 /// ROP3 SRCCOPY: the source, unchanged.
@@ -55,6 +55,52 @@ enum Skip {
     OutsideColorTables,
     /// The update's paint budget is spent.
     OverBudget,
+    /// The target is an offscreen bitmap that does not exist.
+    UnknownSurface,
+    /// A Create Offscreen Bitmap past the advertised cache.
+    OffscreenRefused,
+    /// A Create Offscreen Bitmap of no pixels.
+    OffscreenEmpty,
+}
+
+impl Offscreen {
+    /// Empty entry `id`.
+    fn remove(&mut self, id: usize) {
+        if let Some(surface) = self.surfaces.get_mut(id).and_then(Option::take) {
+            self.used -= u64::from(surface.width()) * u64::from(surface.height());
+        }
+    }
+
+    /// Drop every bitmap and stop keeping them.
+    fn flush(&mut self) {
+        self.surfaces.clear();
+        self.used = 0;
+        self.disabled = true;
+    }
+}
+
+/// Where orders paint (2.2.2.2.1.3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Screen,
+    Surface(u16),
+    /// A Switch Surface named an entry that does not exist.
+    Unknown,
+}
+
+/// The Offscreen Bitmap Cache (3.1.1.1.5).
+#[derive(Debug, Default)]
+struct Offscreen {
+    /// Each advertised entry; empty when no cache was advertised.
+    surfaces: Vec<Option<Framebuffer>>,
+    /// `offscreenCacheSize`, in KB.
+    size_kb: u32,
+    /// The pixels of every bitmap held.
+    used: u64,
+    /// The cache was flushed after a Create it could not hold, and is no longer kept.
+    disabled: bool,
+    /// An Offscreen Bitmap Cache Error PDU is owed to the server.
+    error_owed: bool,
 }
 
 /// The connection's drawing-order state: the primary order history, the bitmap caches and which
@@ -67,6 +113,8 @@ pub(crate) struct Orders {
     caches: Vec<Vec<Option<CachedBitmap>>>,
     /// The ten glyph caches, each the advertised entries, and each one's cell size in bytes.
     glyphs: Vec<(Vec<Option<Glyph>>, usize)>,
+    offscreen: Offscreen,
+    target: Target,
     glyph_index: bool,
     dstblt: bool,
     /// PatBlt and OpaqueRect, which one `orderSupport` index negotiates.
@@ -119,9 +167,24 @@ impl Orders {
                 _ => None,
             })
             .unwrap_or_default();
+        let offscreen = capabilities
+            .iter()
+            .find_map(|set| match set {
+                CapabilitySet::OffscreenCache(o) if o.offscreen_support_level != 0 => {
+                    Some(Offscreen {
+                        surfaces: vec![None; usize::from(o.offscreen_cache_entries)],
+                        size_kb: u32::from(o.offscreen_cache_size),
+                        ..Offscreen::default()
+                    })
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
         Self {
             history: OrderHistory::default(),
             caches,
+            offscreen,
+            target: Target::Screen,
             glyph_index: support.is_some_and(|s| s[capability::ORDER_NEG_INDEX_INDEX] != 0),
             glyphs,
             dstblt: support.is_some_and(|s| s[capability::ORDER_NEG_DSTBLT_INDEX] != 0),
@@ -140,6 +203,7 @@ impl Orders {
     /// Forget the primary order history and any frame in flight (a Deactivation–Reactivation).
     pub(crate) fn reactivate(&mut self) {
         self.history = OrderHistory::default();
+        self.target = Target::Screen;
         if self.in_frame {
             self.frames_ended += 1;
         }
@@ -151,6 +215,11 @@ impl Orders {
     /// frame stays open, so its end still closes it.
     pub(crate) fn discard_held(&mut self) {
         self.held.clear();
+    }
+
+    /// Whether an Offscreen Bitmap Cache Error PDU is owed; true once.
+    pub(crate) fn take_offscreen_error(&mut self) -> bool {
+        core::mem::take(&mut self.offscreen.error_owed)
     }
 
     /// Whether a `TS_FRAME_START` is waiting for its `TS_FRAME_END`.
@@ -255,7 +324,44 @@ impl Orders {
                 }
                 Err(OrderError::Decode(error)) => return Err(crate::SessionError::Decode(error)),
             };
+            let paints = matches!(
+                order,
+                DrawingOrder::DstBlt { .. }
+                    | DrawingOrder::PatBlt { .. }
+                    | DrawingOrder::OpaqueRect { .. }
+                    | DrawingOrder::MultiOpaqueRect { .. }
+                    | DrawingOrder::ScrBlt { .. }
+                    | DrawingOrder::MemBlt { .. }
+                    | DrawingOrder::Mem3Blt { .. }
+                    | DrawingOrder::GlyphIndex { .. }
+            );
+            let target_id = match self.target {
+                Target::Surface(id) => Some(id),
+                _ => None,
+            };
+            let mut surface = match target_id {
+                Some(id) if paints => self
+                    .offscreen
+                    .surfaces
+                    .get_mut(usize::from(id))
+                    .and_then(Option::take),
+                _ => None,
+            };
+            let lost = paints
+                && (self.target == Target::Unknown || target_id.is_some() && surface.is_none());
+            let (target, screen) = match surface.as_mut() {
+                Some(surface) => (surface, Some(&*framebuffer)),
+                None => (&mut *framebuffer, None),
+            };
             let outcome = match order {
+                _ if lost => Err(NotApplied::Skipped(Skip::UnknownSurface)),
+                DrawingOrder::SwitchSurface { bitmap_id } => {
+                    self.switch_surface(bitmap_id);
+                    Ok(())
+                }
+                DrawingOrder::CreateOffscreenBitmap(order) => {
+                    self.create_offscreen(&order, bits_per_pixel, &mut budget)
+                }
                 DrawingOrder::CacheBitmapRev2(order) => {
                     self.cache_bitmap(&order, palette, bits_per_pixel, &mut budget)
                 }
@@ -264,7 +370,7 @@ impl Orders {
                 DrawingOrder::GlyphIndex { order, clip } => self.glyph_index(
                     &order,
                     clip,
-                    framebuffer,
+                    target,
                     palette,
                     bits_per_pixel,
                     &mut budget,
@@ -278,7 +384,7 @@ impl Orders {
                             brush: Pattern::Solid(0),
                             clip,
                         };
-                        fill(self.dstblt, dstblt, framebuffer, &mut budget, &mut painted)
+                        fill(self.dstblt, dstblt, target, &mut budget, &mut painted)
                     } else {
                         Err(NotApplied::Skipped(Skip::DstBltReadsMore))
                     }
@@ -302,7 +408,7 @@ impl Orders {
                             brush,
                             clip,
                         };
-                        fill(self.patblt, patblt, framebuffer, &mut budget, &mut painted)
+                        fill(self.patblt, patblt, target, &mut budget, &mut painted)
                     })
                 }
                 DrawingOrder::OpaqueRect { order, clip } => {
@@ -313,13 +419,7 @@ impl Orders {
                             brush: Pattern::Solid(color),
                             clip,
                         };
-                        fill(
-                            self.patblt,
-                            opaque_rect,
-                            framebuffer,
-                            &mut budget,
-                            &mut painted,
-                        )
+                        fill(self.patblt, opaque_rect, target, &mut budget, &mut painted)
                     })
                 }
                 DrawingOrder::MultiOpaqueRect { order, clip } => {
@@ -340,19 +440,20 @@ impl Orders {
                                     brush: Pattern::Solid(color),
                                     clip,
                                 };
-                                fill(true, rect, framebuffer, &mut budget, &mut painted)
+                                fill(true, rect, target, &mut budget, &mut painted)
                             })
                     })
                 }
                 DrawingOrder::ScrBlt { order, clip } => {
-                    self.scrblt(&order, clip, framebuffer, &mut budget, &mut painted)
+                    self.scrblt(&order, clip, screen, target, &mut budget, &mut painted)
                 }
                 DrawingOrder::MemBlt { order, clip } => self.blt(
                     self.memblt,
                     &order,
                     None,
                     clip,
-                    framebuffer,
+                    target,
+                    target_id,
                     palette,
                     bits_per_pixel,
                     &mut budget,
@@ -363,7 +464,8 @@ impl Orders {
                     &order.blt,
                     Some(&order),
                     clip,
-                    framebuffer,
+                    target,
+                    target_id,
                     palette,
                     bits_per_pixel,
                     &mut budget,
@@ -382,6 +484,10 @@ impl Orders {
                     Ok(())
                 }
             };
+            if let (Some(id), Some(surface)) = (target_id, surface) {
+                self.offscreen.surfaces[usize::from(id)] = Some(surface);
+                painted.clear();
+            }
             self.deliver(&mut painted, frames);
             match outcome {
                 Ok(()) => {}
@@ -402,6 +508,101 @@ impl Orders {
             );
         }
         Ok(())
+    }
+
+    /// A Switch Surface: the screen, an offscreen bitmap, or, for one that does not exist, a
+    /// target nothing paints until the next Switch. Ignored with no offscreen cache advertised
+    /// (3.2.5.1.3.1.2).
+    fn switch_surface(&mut self, bitmap_id: u16) {
+        if self.offscreen.surfaces.is_empty() && !self.offscreen.disabled {
+            return;
+        }
+        self.target = if bitmap_id == orders::SCREEN_BITMAP_SURFACE {
+            Target::Screen
+        } else if self
+            .offscreen
+            .surfaces
+            .get(usize::from(bitmap_id))
+            .is_some_and(Option::is_some)
+        {
+            Target::Surface(bitmap_id)
+        } else {
+            tracing::warn!(
+                target: "rdp_orders",
+                bitmap_id,
+                "a Switch Surface to an offscreen bitmap that does not exist; nothing paints \
+                 until the next"
+            );
+            Target::Unknown
+        };
+    }
+
+    /// A Create Offscreen Bitmap: a black bitmap at its id, then its delete list. The size,
+    /// counted at `bits_per_pixel`, leaves out what the Create replaces and deletes. One past the
+    /// advertised entries or size, past the update's paint budget, or one this client cannot
+    /// allocate, flushes the cache and owes the server an Offscreen Bitmap Cache Error PDU; the
+    /// cache is not kept after.
+    fn create_offscreen(
+        &mut self,
+        order: &CreateOffscreenBitmap<'_>,
+        bits_per_pixel: u16,
+        budget: &mut usize,
+    ) -> Result<(), NotApplied> {
+        let offscreen = &mut self.offscreen;
+        if offscreen.surfaces.is_empty() {
+            return Ok(());
+        }
+        let id = usize::from(order.id);
+        let mut freeing: Vec<usize> = order.deleted().map(usize::from).chain([id]).collect();
+        freeing.sort_unstable();
+        freeing.dedup();
+        let freed: u64 = freeing
+            .iter()
+            .filter_map(|&index| offscreen.surfaces.get(index)?.as_ref())
+            .map(|surface| u64::from(surface.width()) * u64::from(surface.height()))
+            .sum();
+        let wanted = u64::from(order.cx) * u64::from(order.cy);
+        let depth = u64::from(bits_per_pixel.div_ceil(8).max(1));
+        let fits = id < offscreen.surfaces.len()
+            && (offscreen.used - freed + wanted) * depth <= u64::from(offscreen.size_kb) * 1024;
+        let created = if fits {
+            offscreen.remove(id);
+            if wanted == 0 {
+                Some(Err(Skip::OffscreenEmpty))
+            } else if !charge(
+                budget,
+                usize::from(order.cx)
+                    .saturating_mul(usize::from(order.cy))
+                    .saturating_mul(4),
+            ) {
+                None
+            } else {
+                Framebuffer::new(order.cx, order.cy).ok().map(Ok)
+            }
+        } else {
+            None
+        };
+        let Some(created) = created else {
+            tracing::warn!(
+                target: "rdp_orders",
+                id = order.id,
+                cx = order.cx,
+                cy = order.cy,
+                "a Create Offscreen Bitmap past the advertised cache; it is flushed and no longer kept"
+            );
+            offscreen.flush();
+            offscreen.error_owed = true;
+            self.target = Target::Screen;
+            return Err(NotApplied::Skipped(Skip::OffscreenRefused));
+        };
+        let outcome = created.map(|surface| {
+            offscreen.used += wanted;
+            offscreen.surfaces[id] = Some(surface);
+        });
+        for index in order.deleted() {
+            offscreen.remove(usize::from(index));
+        }
+        outcome.map_err(NotApplied::Skipped)
     }
 
     /// Store a Cache Glyph's glyphs. One outside the caches is skipped; one larger than its
@@ -623,7 +824,8 @@ impl Orders {
         order: &MemBlt,
         mem3blt: Option<&Mem3Blt>,
         clip: Clip,
-        framebuffer: &mut Framebuffer,
+        target: &mut Framebuffer,
+        target_id: Option<u16>,
         palette: &Palette,
         bits_per_pixel: u16,
         budget: &mut usize,
@@ -661,15 +863,29 @@ impl Orders {
         };
         // The low byte is the cache.
         let cache_id = order.cache_id & 0x00FF;
-        let bitmap = self
-            .slot(cache_id, order.cache_index)?
-            .as_ref()
-            .ok_or(NotApplied::Skipped(Skip::CacheMiss))?;
+        let source: (&[u8], u16, u16) = if cache_id == u16::from(TS_BITMAPCACHE_SCREEN_ID) {
+            let surface = if target_id == Some(order.cache_index) {
+                &*target
+            } else {
+                self.offscreen
+                    .surfaces
+                    .get(usize::from(order.cache_index))
+                    .and_then(Option::as_ref)
+                    .ok_or(NotApplied::Skipped(Skip::CacheMiss))?
+            };
+            (surface.pixels(), surface.width(), surface.height())
+        } else {
+            let bitmap = self
+                .slot(cache_id, order.cache_index)?
+                .as_ref()
+                .ok_or(NotApplied::Skipped(Skip::CacheMiss))?;
+            (&bitmap.rgba, bitmap.width, bitmap.height)
+        };
         let Some(area) = clip_blt(
             [order.left, order.top, order.width, order.height],
             [order.x_src, order.y_src],
-            (bitmap.width, bitmap.height),
-            framebuffer,
+            (source.1, source.2),
+            target,
             clip,
         ) else {
             return Ok(());
@@ -679,22 +895,24 @@ impl Orders {
         }
         let block = compose(
             &area,
-            &bitmap.rgba,
-            usize::from(bitmap.width),
+            source.0,
+            usize::from(source.1),
             order.rop,
             pattern,
-            framebuffer,
+            target,
         );
-        frames.extend(area.blit(framebuffer, &block));
+        frames.extend(area.blit(target, &block));
         Ok(())
     }
 
-    /// Paint a ScrBlt: a copy within the framebuffer, read whole before anything is written.
+    /// Paint a ScrBlt: a copy from the screen, `screen` or the target itself when that is the
+    /// screen (2.2.2.2.1.1.2.7), read whole before anything is written.
     fn scrblt(
         &self,
         order: &ScrBlt,
         clip: Clip,
-        framebuffer: &mut Framebuffer,
+        screen: Option<&Framebuffer>,
+        target: &mut Framebuffer,
         budget: &mut usize,
         frames: &mut Vec<FrameUpdate>,
     ) -> Result<(), NotApplied> {
@@ -710,11 +928,12 @@ impl Orders {
             Clip::Bounds(bounds) => Some(bounds),
             Clip::Unknown => return Err(NotApplied::Skipped(Skip::UnknownClip)),
         };
+        let from = screen.unwrap_or(target);
         let Some(area) = clip_blt(
             [order.left, order.top, order.width, order.height],
             [order.x_src, order.y_src],
-            (framebuffer.width(), framebuffer.height()),
-            framebuffer,
+            (from.width(), from.height()),
+            target,
             clip,
         ) else {
             return Ok(());
@@ -723,21 +942,21 @@ impl Orders {
         if !charge(budget, area.width * area.height * 4 * 2) {
             return Err(NotApplied::Skipped(Skip::OverBudget));
         }
-        let stride = usize::from(framebuffer.width()) * 4;
+        let stride = usize::from(from.width()) * 4;
         let mut source = Vec::with_capacity(area.width * area.height * 4);
         for row in 0..area.height {
             let start = (area.top + area.shift_y) as usize * stride
                 + row * stride
                 + (area.left + area.shift_x) as usize * 4;
-            source.extend_from_slice(&framebuffer.pixels()[start..start + area.width * 4]);
+            source.extend_from_slice(&from.pixels()[start..start + area.width * 4]);
         }
         let copied = Area {
             shift_x: -area.left,
             shift_y: -area.top,
             ..area
         };
-        let block = compose(&copied, &source, area.width, order.rop, None, framebuffer);
-        frames.extend(area.blit(framebuffer, &block));
+        let block = compose(&copied, &source, area.width, order.rop, None, target);
+        frames.extend(area.blit(target, &block));
         Ok(())
     }
 }
@@ -1304,6 +1523,340 @@ pub(crate) mod tests {
         assert_eq!(pixel(&fb, 4, 1), rgba(GREEN));
         assert_eq!(pixel(&fb, 5, 1), rgba(RED));
         assert_eq!(pixel(&fb, 0, 2), BLACK);
+    }
+
+    /// [`capabilities`] with an offscreen cache of `size` KB and `entries` entries.
+    fn offscreen_capabilities(size: u16, entries: u16) -> Vec<CapabilitySet> {
+        let mut sets = capabilities(4, true);
+        sets.push(CapabilitySet::OffscreenCache(
+            capability::OffscreenCacheCapabilitySet {
+                offscreen_support_level: 1,
+                offscreen_cache_size: size,
+                offscreen_cache_entries: entries,
+            },
+        ));
+        sets
+    }
+
+    /// A Create Offscreen Bitmap of `cx` × `cy` at `id`, deleting `deleted`.
+    pub(crate) fn create_offscreen(id: u16, cx: u16, cy: u16, deleted: &[u16]) -> Vec<u8> {
+        let flags = id | if deleted.is_empty() { 0 } else { 0x8000 };
+        let mut order =
+            vec![TS_SECONDARY | justrdp_pdu::orders::TS_ALTSEC_CREATE_OFFSCR_BITMAP << 2];
+        for value in [flags, cx, cy] {
+            order.extend_from_slice(&value.to_le_bytes());
+        }
+        if !deleted.is_empty() {
+            order.extend_from_slice(&(deleted.len() as u16).to_le_bytes());
+            for index in deleted {
+                order.extend_from_slice(&index.to_le_bytes());
+            }
+        }
+        order
+    }
+
+    /// A Switch Surface to `id`.
+    pub(crate) fn switch_surface(id: u16) -> Vec<u8> {
+        let mut order = vec![TS_SECONDARY | justrdp_pdu::orders::TS_ALTSEC_SWITCH_SURFACE << 2];
+        order.extend_from_slice(&id.to_le_bytes());
+        order
+    }
+
+    const SCREEN: u16 = justrdp_pdu::orders::SCREEN_BITMAP_SURFACE;
+    const OFFSCREEN: u16 = 0xFF;
+
+    /// Orders on an offscreen bitmap paint it and deliver nothing; a MemBlt from it puts it on
+    /// the screen, a frame (#489).
+    #[test]
+    fn an_offscreen_bitmap_reaches_the_screen_through_a_blit() {
+        let mut orders = Orders::new(&offscreen_capabilities(100, 4));
+        let mut fb = Framebuffer::new(4, 2).unwrap();
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                create_offscreen(0, 4, 2, &[]),
+                switch_surface(0),
+                opaque_rect([0, 0, 4, 2], RED),
+                multi_opaque_rect(None, GREEN, &[[3, 1, 1, 1]]),
+            ],
+        );
+        assert_eq!(frames, []);
+        assert_eq!(pixel(&fb, 0, 0), BLACK);
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                switch_surface(SCREEN),
+                memblt((OFFSCREEN, 0), [1, 0, 3, 2], SRCCOPY, [1, 0]),
+            ],
+        );
+        assert_eq!(frames, [frame(1, 0, 3, 2)]);
+        assert_eq!(pixel(&fb, 0, 0), BLACK);
+        assert_eq!(pixel(&fb, 1, 0), rgba(RED));
+        assert_eq!(pixel(&fb, 3, 1), rgba(GREEN));
+    }
+
+    /// A ScrBlt reads the screen whatever the target (2.2.2.2.1.1.2.7).
+    #[test]
+    fn a_scrblt_onto_an_offscreen_bitmap_reads_the_screen() {
+        let mut orders = Orders::new(&offscreen_capabilities(100, 4));
+        let mut fb = Framebuffer::new(4, 1).unwrap();
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                opaque_rect([0, 0, 1, 1], GREEN),
+                create_offscreen(0, 2, 1, &[]),
+                switch_surface(0),
+                opaque_rect([0, 0, 2, 1], RED),
+                scrblt([1, 0, 1, 1], SRCCOPY, [0, 0]),
+                switch_surface(SCREEN),
+                memblt((OFFSCREEN, 0), [2, 0, 2, 1], SRCCOPY, [0, 0]),
+            ],
+        );
+        assert_eq!(pixel(&fb, 2, 0), rgba(RED));
+        assert_eq!(
+            pixel(&fb, 3, 0),
+            rgba(GREEN),
+            "the ScrBlt copied the screen's pixel"
+        );
+    }
+
+    /// A MemBlt from the offscreen bitmap it paints reads its source before it writes.
+    #[test]
+    fn a_memblt_from_its_own_target_reads_before_it_writes() {
+        let mut orders = Orders::new(&offscreen_capabilities(100, 4));
+        let mut fb = Framebuffer::new(3, 1).unwrap();
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                create_offscreen(1, 3, 1, &[]),
+                switch_surface(1),
+                opaque_rect([0, 0, 1, 1], RED),
+                opaque_rect([1, 0, 1, 1], GREEN),
+                memblt((OFFSCREEN, 1), [1, 0, 2, 1], SRCCOPY, [0, 0]),
+                switch_surface(SCREEN),
+                memblt((OFFSCREEN, 1), [0, 0, 3, 1], SRCCOPY, [0, 0]),
+            ],
+        );
+        assert_eq!(
+            [pixel(&fb, 0, 0), pixel(&fb, 1, 0), pixel(&fb, 2, 0)],
+            [rgba(RED), rgba(RED), rgba(GREEN)]
+        );
+    }
+
+    /// A Switch Surface to an entry never created, or past the advertised entries, paints
+    /// nothing until the next Switch (#489's decision (b)).
+    #[test]
+    fn a_switch_to_a_missing_or_out_of_range_surface_skips_until_the_next() {
+        let mut orders = Orders::new(&offscreen_capabilities(100, 2));
+        let mut fb = Framebuffer::new(2, 1).unwrap();
+        for target in [1, 2, 0x7FFF] {
+            let frames = run(
+                &mut orders,
+                &mut fb,
+                &[switch_surface(target), opaque_rect([0, 0, 2, 1], RED)],
+            );
+            assert_eq!(frames, [], "a Switch to {target}");
+            assert_eq!(pixel(&fb, 0, 0), BLACK, "a Switch to {target}");
+        }
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[switch_surface(SCREEN), opaque_rect([0, 0, 1, 1], RED)],
+        );
+        assert_eq!(frames, [frame(0, 0, 1, 1)]);
+    }
+
+    /// A Create past the advertised size, counted at the session depth, or past the advertised
+    /// entries asks for the Offscreen Bitmap Cache Error PDU once, flushes every offscreen
+    /// bitmap, paints the screen, and ends offscreen caching (#489's decision (a)).
+    #[test]
+    fn a_create_past_the_advertised_cache_flushes_and_disables_it() {
+        // 1 KB at 16 bpp is 512 pixels.
+        for overflow in [
+            create_offscreen(1, 1, 1, &[]),
+            create_offscreen(4, 1, 1, &[]),
+        ] {
+            let mut orders = Orders::new(&offscreen_capabilities(1, 4));
+            let mut fb = Framebuffer::new(2, 1).unwrap();
+            run(
+                &mut orders,
+                &mut fb,
+                &[create_offscreen(0, 32, 16, &[]), switch_surface(0)],
+            );
+            assert!(!orders.take_offscreen_error(), "512 pixels fit");
+            let frames = run(
+                &mut orders,
+                &mut fb,
+                &[overflow.clone(), opaque_rect([0, 0, 1, 1], RED)],
+            );
+            assert!(orders.take_offscreen_error());
+            assert!(!orders.take_offscreen_error(), "asked for once");
+            assert_eq!(
+                frames,
+                [frame(0, 0, 1, 1)],
+                "the target is the screen again"
+            );
+            // Flushed, and no longer kept.
+            let frames = run(
+                &mut orders,
+                &mut fb,
+                &[
+                    create_offscreen(0, 1, 1, &[]),
+                    switch_surface(0),
+                    opaque_rect([1, 0, 1, 1], RED),
+                ],
+            );
+            assert_eq!(frames, []);
+            assert_eq!(pixel(&fb, 1, 0), BLACK);
+            assert!(
+                !orders.take_offscreen_error(),
+                "later errors are not reported"
+            );
+        }
+    }
+
+    /// A Create replaces the bitmap at its id, the new one black; its delete list empties
+    /// entries; a Create at the current target's id leaves the new bitmap the target.
+    #[test]
+    fn a_create_replaces_its_entry_and_deletes_its_list() {
+        let mut orders = Orders::new(&offscreen_capabilities(100, 4));
+        let mut fb = Framebuffer::new(2, 1).unwrap();
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                create_offscreen(0, 1, 1, &[]),
+                create_offscreen(1, 1, 1, &[]),
+                switch_surface(0),
+                opaque_rect([0, 0, 1, 1], RED),
+                create_offscreen(0, 1, 1, &[1]),
+                opaque_rect([0, 0, 1, 1], GREEN),
+                switch_surface(SCREEN),
+                memblt((OFFSCREEN, 0), [0, 0, 1, 1], SRCCOPY, [0, 0]),
+                memblt((OFFSCREEN, 1), [1, 0, 1, 1], SRCCOPY, [0, 0]),
+            ],
+        );
+        assert_eq!(
+            pixel(&fb, 0, 0),
+            rgba(GREEN),
+            "the new bitmap was the target"
+        );
+        assert_eq!(frames, [frame(0, 0, 1, 1)], "entry 1 was deleted");
+    }
+
+    /// A Create of no pixels empties its entry and owes nothing; one the update's paint budget
+    /// cannot buy is refused as one past the cache is (#489).
+    #[test]
+    fn a_create_of_no_pixels_empties_its_entry_and_one_over_budget_flushes() {
+        let mut orders = Orders::new(&offscreen_capabilities(100, 4));
+        let mut fb = Framebuffer::new(2, 1).unwrap();
+        let blit = |id: u16| {
+            vec![memblt(
+                (OFFSCREEN, id),
+                [id as i16, 0, 1, 1],
+                SRCCOPY,
+                [0, 0],
+            )]
+        };
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                create_offscreen(0, 4, 4, &[]),
+                create_offscreen(1, 1, 1, &[]),
+            ],
+        );
+        run(&mut orders, &mut fb, &[create_offscreen(1, 0, 3, &[])]);
+        assert_eq!(run(&mut orders, &mut fb, &blit(1)), []);
+        assert!(!orders.take_offscreen_error());
+        // Exactly 4 x 4 x 4 bytes buys it again; one short is refused.
+        run_with(&mut orders, &mut fb, &[create_offscreen(0, 4, 4, &[])], 64);
+        assert_eq!(run(&mut orders, &mut fb, &blit(0)), [frame(0, 0, 1, 1)]);
+        assert!(!orders.take_offscreen_error());
+        run_with(&mut orders, &mut fb, &[create_offscreen(0, 4, 4, &[])], 63);
+        assert!(orders.take_offscreen_error());
+        assert_eq!(run(&mut orders, &mut fb, &blit(0)), [], "flushed");
+    }
+
+    /// A Create's delete list frees room before its size is checked, and applies even to a
+    /// Create that paints nothing.
+    #[test]
+    fn a_delete_list_frees_room_and_applies_whatever_the_create_makes() {
+        // 1 KB at 16 bpp is 512 pixels.
+        let mut orders = Orders::new(&offscreen_capabilities(1, 4));
+        let mut fb = Framebuffer::new(4, 1).unwrap();
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                create_offscreen(0, 16, 16, &[]),
+                create_offscreen(1, 16, 16, &[]),
+                create_offscreen(2, 16, 16, &[0]),
+                create_offscreen(3, 0, 1, &[1]),
+            ],
+        );
+        assert!(
+            !orders.take_offscreen_error(),
+            "deleting entry 0 made room for entry 2"
+        );
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &(0..4)
+                .map(|id| memblt((OFFSCREEN, id), [id as i16, 0, 1, 1], SRCCOPY, [0, 0]))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(frames, [frame(2, 0, 1, 1)], "only entry 2 is left");
+    }
+
+    /// A Deactivation-Reactivation keeps the offscreen bitmaps and paints the screen.
+    #[test]
+    fn a_reactivation_keeps_the_offscreen_bitmaps_and_paints_the_screen() {
+        let mut orders = Orders::new(&offscreen_capabilities(100, 4));
+        let mut fb = Framebuffer::new(2, 1).unwrap();
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                create_offscreen(0, 1, 1, &[]),
+                switch_surface(0),
+                opaque_rect([0, 0, 1, 1], RED),
+            ],
+        );
+        orders.reactivate();
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                opaque_rect([1, 0, 1, 1], GREEN),
+                memblt((OFFSCREEN, 0), [0, 0, 1, 1], SRCCOPY, [0, 0]),
+            ],
+        );
+        assert_eq!(frames, [frame(1, 0, 1, 1), frame(0, 0, 1, 1)]);
+        assert_eq!(pixel(&fb, 0, 0), rgba(RED));
+    }
+
+    /// Without an offscreen cache advertised, Create and Switch are ignored: the screen is
+    /// still the target.
+    #[test]
+    fn offscreen_orders_are_ignored_without_the_cache() {
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(1, 1).unwrap();
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                create_offscreen(0, 1, 1, &[]),
+                switch_surface(0),
+                opaque_rect([0, 0, 1, 1], RED),
+            ],
+        );
+        assert_eq!(frames, [frame(0, 0, 1, 1)]);
+        assert!(!orders.take_offscreen_error());
     }
 
     /// A DstBlt with every field.

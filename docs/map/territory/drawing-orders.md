@@ -79,10 +79,45 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   cache** (2026-10-19). FreeRDP on its logon screen got 2 with every cache, 2 without the glyph
   or the brush cache, and none without the offscreen cache, when it got what justrdp gets: 382
   MemBlt and 4 OpaqueRect. The server draws its shapes on offscreen surfaces and blits them to
-  the screen. So MultiOpaqueRect is proven against the spec's example and FreeRDP only, and
-  advertised; that it ship so, with its real-server proof left to the offscreen orders (#489),
-  was the maintainer's call (2026-10-19), made over holding the branch until #489 and folding it
-  into #489.
+  the screen. Shipping it on the spec's example and FreeRDP, its real-server proof left to the
+  offscreen orders (#489), was the maintainer's call (2026-10-19), made over holding the branch
+  until #489 and folding it into #489. #489 then brought one on the logon screen, inside the
+  comparison below.
+- **Offscreen bitmaps are held in the core, as RGBA framebuffers** (#489). The surface model, its
+  bounds and the out-of-range Switch were the maintainer's calls of 2026-10-19, recorded with what
+  they were decided on in #489's body:
+  - `Orders` keeps the advertised entries and a target: the screen, an offscreen bitmap, or
+    unknown. Every paint order paints the target.
+  - Only a paint on the screen delivers a `FrameUpdate`. Frame Marker held rects and the
+    open-frame release (#470) therefore see only the screen.
+  - A MemBlt whose `cacheId` low byte is 0xFF reads offscreen bitmap `cacheIndex`. One that reads
+    its own target is safe as it stands, since `compose` builds the whole block before `blit`
+    writes it.
+  - ScrBlt reads the screen whatever the target (2.2.2.2.1.1.2.7, and FreeRDP's `gdi_scrblt`).
+  - A Create Offscreen Bitmap replaces its entry with a black bitmap, then empties its delete
+    list's entries (FreeRDP's order). The delete list applies even when the Create makes
+    nothing. A Create at the target's id leaves the new bitmap the target.
+  - **The advertised size is enforced**, in KB counted at the session's depth as the server
+    counts it, and so is the entry count. The size leaves out the entries the Create replaces and
+    deletes, since a delete list is how the server makes room. The bitmaps are RGBA, so they hold
+    twice the advertised size at 16 bpp and four times at 8 bpp. A Create past either flushes every bitmap, returns the
+    target to the screen and turns offscreen off for the session. The session sends one
+    Offscreen Bitmap Cache Error PDU (`OC_ERR_FLUSH_AND_DISABLE_OFFSCREEN`, 2.2.2.3.2). FreeRDP
+    enforces only the count.
+  - **A Switch to an entry never created, or past the entries, makes the target unknown.** Paint
+    orders are then skipped until the next Switch, as a cache index out of range is (ADR-0009
+    §2). The spec says to drop the connection.
+  - **Without the cache advertised**, Create and Switch are ignored (3.2.5.1.3.1.1 and .2).
+  - **A Create of no pixels empties its entry.** FreeRDP's decoder refuses it instead.
+  - **A Deactivation-Reactivation keeps the bitmaps and returns the target to the screen**, as
+    the bitmap caches are kept. FreeRDP's `update_reset_state` resets only the order history, and
+    its caches live for the connection.
+  - **Each Create's `cx × cy × 4` bytes are charged to the update's paint budget**, two
+    framebuffers. A Create the budget cannot buy is refused as one past the cache is, with the
+    error PDU, so the server resends what it drew rather than leaving the blitted area wrong (the
+    maintainer's call, 2026-10-19). A bitmap larger than two screens can therefore never be
+    made; the largest measured is one screen.
+  - The allow-list accepts `offscreenSupportLevel` TRUE only, and only with MemBlt (3.2.5.1.3.1.1).
 - **DstBlt runs only destination ROPs.** 2.2.2.2.1.1.2.1 says its ROP MUST depend on the
   destination alone, which leaves BLACKNESS, DSTINVERT, the no-op and WHITENESS; any other is a
   server self-inconsistency and the order is skipped (ADR-0009 §2). That is a derivation, not a
@@ -203,7 +238,10 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
 - `justrdp-pdu/src/orders.rs` — `decode_order`, `OrderHistory`, `OrdersUpdate`, `DrawingOrder`,
   `Clip`, `DstBlt`, `PatBlt`, `OpaqueRect`, `MultiOpaqueRect`, `MAX_DELTA_RECTS`, `ScrBlt`,
   `MemBlt`, `Mem3Blt`, `GlyphIndex`, `Brush`,
-  `CacheBitmapRev2`, `CacheGlyph`, `GlyphData`, `OrderError`, `TS_ALTSEC_FRAME_MARKER`
+  `CacheBitmapRev2`, `CacheGlyph`, `GlyphData`, `CreateOffscreenBitmap`, `OrderError`,
+  `TS_ALTSEC_FRAME_MARKER`, `TS_ALTSEC_SWITCH_SURFACE`, `TS_ALTSEC_CREATE_OFFSCR_BITMAP`,
+  `SCREEN_BITMAP_SURFACE`
+- `justrdp-pdu/src/share.rs` — `PDU_TYPE2_OFFSCRCACHE_ERROR`, `OC_ERR_FLUSH_AND_DISABLE_OFFSCREEN`
 - `justrdp-pdu/src/capability.rs` — `BitmapCacheRev2CapabilitySet`, `BitmapCacheCellInfo`,
   `GlyphCacheCapabilitySet`, `ORDER_NEG_INDEX_INDEX`, `ORDER_NEG_DSTBLT_INDEX`,
   `ORDER_NEG_PATBLT_INDEX`, `ORDER_NEG_MULTIOPAQUERECT_INDEX`, `ORDER_NEG_SCRBLT_INDEX`,
@@ -291,6 +329,26 @@ Cache Color Table, and differs from the 8 bpp bitmap screen (28 colours) in none
 (`…_at_8_bpp`). The bitmap screen never passes
 through the order decoder, the fills or the glyphs, so for those it is independent; the logo's
 tiles decode through the same bitmap codecs in both sessions, so for them it is not.
+
+**Offscreen bitmaps on the 2008 R2 VM (#489, 2026-10-19).** A throwaway probe, never committed,
+advertised justrdp's orders and an offscreen cache:
+
+| Session | Creates | Ids | Largest | Peak live, 16 bpp |
+|---|---|---|---|---|
+| Logon screen, 7,680 KB | 10 | 0–2 | 1280×800 | 2,133 KB |
+| Logon screen, 512 KB | 9 | 0–2 | 1280×36 | 223 KB |
+| Desktop, 7,680 KB | 49 | 0–3 | 1280×800 | 4,023 KB |
+
+- **The server keeps to the advertised size.**
+- **What it draws on offscreen bitmaps:** OpaqueRect, GlyphIndex, MemBlt (from the bitmap cache and
+  from another offscreen bitmap), DstBlt, MultiOpaqueRect and PatBlt.
+- **Never seen:** delete lists, and ScrBlt onto an offscreen target.
+- **Text arrives as GlyphIndex, not FastGlyph**, with offscreen advertised.
+
+With the cache built, the logon screen in orders (10 Create Offscreen Bitmap, 29 Switch Surface,
+25 MemBlt from offscreen, 744 OpaqueRect, 288 GlyphIndex, 10 DstBlt, 1 MultiOpaqueRect) equals the
+bitmap screen with no pixel differing (`the_gdi_orders_vm_paints_its_logon_screen_in_orders_as_in_bitmaps`).
+A MemBlt from offscreen that misses moves 11,169 pixels of it.
 
 **justrdp's own advertisement (#460):** MemBlt and Mem3Blt, caches of 120, 120 and 2553 entries,
 no waiting list, 16 bpp, no Surface Commands. The server sent only compressed 16 bpp Cache Bitmap
@@ -387,14 +445,16 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 
 - **Unbuilt:** LineTo, MultiDstBlt, MultiPatBlt, MultiScrBlt, polygons, ellipses, SaveBitmap,
   FastIndex and FastGlyph, Cache Glyph Revision 2, glyph fragments, Cache Brush, Cache Bitmap
-  revisions 1 and 3, and every alternate secondary order but Frame Marker. The 2008 R2 VM sends
-  FastGlyph, Cache Brush, Polyline and the offscreen orders (#486 to #489); no measured server
-  sent the rest.
-- **MultiOpaqueRect is proven only against the spec and FreeRDP**: the one server that sends it
-  does so only with the offscreen cache advertised (#489).
+  revisions 1 and 3, and every alternate secondary order but Frame Marker, Switch Surface and
+  Create Offscreen Bitmap. The 2008 R2 VM sends FastGlyph (to a client advertising it), Cache
+  Brush and Polyline (#486 to #488); no measured server sent the rest.
+- **The Offscreen Bitmap Cache Error PDU is proven only by unit tests**: the measured server
+  keeps to the advertised size, so nothing real reaches it.
 - **Glyph advances by `ulCharInc`, vertical and reversed text are proven only against the spec**:
   xrdp's text is horizontal with per-glyph deltas.
-- **DstBlt is proven only against the spec and FreeRDP's decoder**, since no server has sent one.
+- **DstBlt's real-server proof is BLACKNESS on an offscreen bitmap** (#489): the 2008 R2 logon
+  screen's ten, inside its comparison. Its other three ROPs are proven against the spec and
+  FreeRDP only.
 - **The defaults do not advertise orders**, at any depth; that stays the host's choice (the
   maintainer's call of 2026-10-16, made before #463's measurement for either outcome, and the
   outcome was that 32 bpp order sessions work).

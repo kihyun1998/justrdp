@@ -47,8 +47,14 @@ pub const MAX_DELTA_RECTS: usize = 45;
 /// `orderType` of the GlyphIndex primary drawing order.
 pub const TS_ENC_INDEX_ORDER: u8 = 0x1B;
 
+/// `orderType` (alternate secondary): Switch Surface.
+pub const TS_ALTSEC_SWITCH_SURFACE: u8 = 0x00;
+/// `orderType` (alternate secondary): Create Offscreen Bitmap.
+pub const TS_ALTSEC_CREATE_OFFSCR_BITMAP: u8 = 0x01;
 /// `orderType` (alternate secondary): Frame Marker.
 pub const TS_ALTSEC_FRAME_MARKER: u8 = 0x0D;
+/// Switch Surface `bitmapId`: the primary drawing surface, the screen.
+pub const SCREEN_BITMAP_SURFACE: u16 = 0xFFFF;
 /// Frame Marker `action`: a logical frame starts.
 pub const TS_FRAME_START: u32 = 0x0000_0000;
 /// Frame Marker `action`: a logical frame ends.
@@ -558,6 +564,14 @@ pub enum DrawingOrder<'a> {
     CacheGlyph(CacheGlyph<'a>),
     /// Cache Color Table.
     CacheColorTable(CacheColorTable<'a>),
+    /// Switch Surface (2.2.2.2.1.3.3): later orders paint `bitmap_id`'s offscreen bitmap, or
+    /// the screen for [`SCREEN_BITMAP_SURFACE`].
+    SwitchSurface {
+        /// `bitmapId`.
+        bitmap_id: u16,
+    },
+    /// Create Offscreen Bitmap (2.2.2.2.1.3.2).
+    CreateOffscreenBitmap(CreateOffscreenBitmap<'a>),
     /// Frame Marker (2.2.2.2.1.3.7): the start or end of a logical frame.
     FrameMarker {
         /// `action`: [`TS_FRAME_START`], [`TS_FRAME_END`], or a value neither names.
@@ -655,6 +669,12 @@ pub fn decode_order<'a>(
         TS_STANDARD => decode_primary(control, cur, history),
         0x03 => decode_secondary(cur),
         TS_SECONDARY => match control >> 2 {
+            TS_ALTSEC_SWITCH_SURFACE => Ok(DrawingOrder::SwitchSurface {
+                bitmap_id: cur.read_u16_le()?,
+            }),
+            TS_ALTSEC_CREATE_OFFSCR_BITMAP => Ok(DrawingOrder::CreateOffscreenBitmap(
+                decode_create_offscreen_bitmap(cur)?,
+            )),
             TS_ALTSEC_FRAME_MARKER => Ok(DrawingOrder::FrameMarker {
                 action: cur.read_u32_le()?,
             }),
@@ -1020,6 +1040,51 @@ impl Fields<'_, '_> {
         }
         Ok(())
     }
+}
+
+/// A Create Offscreen Bitmap order (2.2.2.2.1.3.2): an offscreen bitmap of `cx` × `cy` at
+/// `id`, and the entries to delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateOffscreenBitmap<'a> {
+    /// `offscreenBitmapId`.
+    pub id: u16,
+    /// `cx`.
+    pub cx: u16,
+    /// `cy`.
+    pub cy: u16,
+    /// The Offscreen Cache Delete List's `indices`, two bytes each; empty when absent.
+    delete_list: &'a [u8],
+}
+
+impl CreateOffscreenBitmap<'_> {
+    /// The offscreen bitmap entries to delete.
+    pub fn deleted(&self) -> impl Iterator<Item = u16> + '_ {
+        self.delete_list
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&index| u16::from_le_bytes(index))
+    }
+}
+
+fn decode_create_offscreen_bitmap<'a>(
+    cur: &mut ReadCursor<'a>,
+) -> Result<CreateOffscreenBitmap<'a>, DecodeError> {
+    let flags = cur.read_u16_le()?;
+    let cx = cur.read_u16_le()?;
+    let cy = cur.read_u16_le()?;
+    let delete_list = if flags & 0x8000 != 0 {
+        let count = cur.read_u16_le()?;
+        cur.read_slice(usize::from(count) * 2)?
+    } else {
+        &[]
+    };
+    Ok(CreateOffscreenBitmap {
+        id: flags & 0x7FFF,
+        cx,
+        cy,
+        delete_list,
+    })
 }
 
 /// Decode a secondary order after its `controlFlags` (2.2.2.2.1.2.1.1). The body is read from
@@ -1642,6 +1707,53 @@ mod tests {
             decode_all(bad, &mut history);
             assert_eq!(history.multi_opaque_rect_rects(), [[1, 2, 3, 4]]);
         }
+    }
+
+    /// The annotated Create Offscreen Bitmap (4.3.1) and Switch Surface (4.3.2).
+    #[test]
+    fn the_spec_offscreen_orders_decode() {
+        let bytes = [
+            0x06, 0x00, 0x80, 0x60, 0x01, 0x10, 0x00, 0x01, 0x00, 0x02, 0x00, 0x02, 0xff, 0xff,
+        ];
+        let mut history = OrderHistory::default();
+        let decoded = decode_all(&bytes, &mut history);
+        let [Ok(DrawingOrder::CreateOffscreenBitmap(create)), switch] = &decoded[..] else {
+            panic!("{decoded:?}");
+        };
+        assert_eq!((create.id, create.cx, create.cy), (0, 352, 16));
+        assert_eq!(create.deleted().collect::<Vec<_>>(), [2]);
+        assert_eq!(
+            *switch,
+            Ok(DrawingOrder::SwitchSurface {
+                bitmap_id: SCREEN_BITMAP_SURFACE
+            })
+        );
+    }
+
+    /// Without the `d` bit there is no delete list; a delete list past the order is malformed.
+    #[test]
+    fn a_create_offscreen_bitmap_without_a_delete_list_and_a_short_one() {
+        let without = [0x06, 0x05, 0x00, 0x08, 0x00, 0x04, 0x00];
+        let decoded = decode_all(&without, &mut OrderHistory::default());
+        let [Ok(DrawingOrder::CreateOffscreenBitmap(create))] = &decoded[..] else {
+            panic!("{decoded:?}");
+        };
+        assert_eq!((create.id, create.cx, create.cy), (5, 8, 4));
+        assert_eq!(create.deleted().count(), 0);
+        let truncated_switch = [0x02, 0xff];
+        let decoded = decode_all(&truncated_switch, &mut OrderHistory::default());
+        assert!(
+            matches!(decoded[..], [Err(OrderError::Decode(_))]),
+            "{decoded:?}"
+        );
+        let short = [
+            0x06, 0x05, 0x80, 0x08, 0x00, 0x04, 0x00, 0x02, 0x00, 0x01, 0x00,
+        ];
+        let decoded = decode_all(&short, &mut OrderHistory::default());
+        assert!(
+            matches!(decoded[..], [Err(OrderError::Decode(_))]),
+            "{decoded:?}"
+        );
     }
 
     /// DstBlt's five fields fit one field-flag byte, and carry over (2.2.2.2.1.1.2.1).

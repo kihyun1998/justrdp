@@ -248,6 +248,24 @@ fn check_orders(sets: &[CapabilitySet]) -> Result<(), ConnectConfigError> {
         _ => None,
     });
     let orders = support.is_some_and(|s| s.iter().any(|&order| order != 0));
+    let offscreen = sets.iter().find_map(|set| match set {
+        CapabilitySet::OffscreenCache(o) if o.offscreen_support_level != 0 => Some(o),
+        _ => None,
+    });
+    if let Some(o) = offscreen {
+        if o.offscreen_support_level != 1 {
+            return refuse(
+                capability::CAPSET_OFFSCREEN_CACHE,
+                "an offscreenSupportLevel other than FALSE and TRUE",
+            );
+        }
+        if !support.is_some_and(|s| s[capability::ORDER_NEG_MEMBLT_INDEX] != 0) {
+            return refuse(
+                capability::CAPSET_OFFSCREEN_CACHE,
+                "an offscreen cache without MemBlt (3.2.5.1.3.1.1)",
+            );
+        }
+    }
     let rev2 = sets.iter().find_map(|set| match set {
         CapabilitySet::BitmapCacheRev2(c) => Some(c),
         _ => None,
@@ -380,10 +398,6 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
                 "a glyph cache past 254 entries or 2048-byte cells (2.2.7.1.8.1)",
             )
         }
-        CapabilitySet::OffscreenCache(o) if o.offscreen_support_level != 0 => refuse(
-            capability::CAPSET_OFFSCREEN_CACHE,
-            "an offscreen cache invites offscreen bitmap orders",
-        ),
         CapabilitySet::VirtualChannel(v) if v.flags & !HONOURED_VIRTUAL_CHANNEL_FLAGS != 0 => {
             refuse(
                 capability::CAPSET_VIRTUAL_CHANNEL,
@@ -890,6 +904,37 @@ mod tests {
             }
         }
         assert_eq!(check(&config), Ok(()));
+    }
+
+    /// An offscreen cache passes with MemBlt (#489), and is refused without it or at a support
+    /// level other than TRUE.
+    #[test]
+    fn an_offscreen_cache_passes_with_memblt() {
+        let with = |level: u32, config: &mut ConnectConfig| {
+            config
+                .capabilities
+                .push(CapabilitySet::OffscreenCache(OffscreenCacheCapabilitySet {
+                    offscreen_support_level: level,
+                    offscreen_cache_size: 7680,
+                    offscreen_cache_entries: 2000,
+                }));
+        };
+        let mut config = orders_config();
+        with(1, &mut config);
+        assert_eq!(check(&config), Ok(()));
+        for (level, mut config) in [(2, orders_config()), (1, crate::connect::tests::config())] {
+            with(level, &mut config);
+            assert!(
+                matches!(
+                    check(&config),
+                    Err(ConnectConfigError::CapabilitySet {
+                        set_type: capability::CAPSET_OFFSCREEN_CACHE,
+                        ..
+                    })
+                ),
+                "level {level}"
+            );
+        }
     }
 
     /// Orders at 8 bpp pass: their colours resolve through the session palette (#477).

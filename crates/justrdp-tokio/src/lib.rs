@@ -8283,7 +8283,15 @@ mod tests {
                                 format!("ScrBlt rop {:#04x}", order.rop)
                             }
                             Ok(DrawingOrder::MemBlt { order, .. }) => {
-                                format!("MemBlt rop {:#04x}", order.rop)
+                                if order.cache_id & 0xFF == 0xFF {
+                                    format!("MemBlt from offscreen rop {:#04x}", order.rop)
+                                } else {
+                                    format!("MemBlt rop {:#04x}", order.rop)
+                                }
+                            }
+                            Ok(DrawingOrder::SwitchSurface { .. }) => "SwitchSurface".to_string(),
+                            Ok(DrawingOrder::CreateOffscreenBitmap(_)) => {
+                                "CreateOffscreenBitmap".to_string()
                             }
                             Ok(DrawingOrder::Mem3Blt { order, .. }) => {
                                 format!("Mem3Blt rop {:#04x}", order.blt.rop)
@@ -11646,9 +11654,11 @@ mod tests {
     }
 
     /// [`legacy_orders_config`] advertising every order the core honours, over FreeRDP's ten
-    /// default glyph caches.
+    /// default glyph caches and its default offscreen cache.
     fn honoured_orders_config() -> ConnectConfig {
-        use justrdp_pdu::capability::{self, CapabilitySet, GlyphCacheCapabilitySet};
+        use justrdp_pdu::capability::{
+            self, CapabilitySet, GlyphCacheCapabilitySet, OffscreenCacheCapabilitySet,
+        };
         let mut config = legacy_orders_config(&[
             capability::ORDER_NEG_DSTBLT_INDEX,
             capability::ORDER_NEG_PATBLT_INDEX,
@@ -11674,10 +11684,20 @@ mod tests {
             frag_cache: 0,
             glyph_support_level: capability::GLYPH_SUPPORT_FULL,
         };
+        config.capabilities.retain(|set| {
+            !matches!(
+                set,
+                CapabilitySet::GlyphCache(_) | CapabilitySet::OffscreenCache(_)
+            )
+        });
+        config.capabilities.push(CapabilitySet::GlyphCache(glyphs));
         config
             .capabilities
-            .retain(|set| !matches!(set, CapabilitySet::GlyphCache(_)));
-        config.capabilities.push(CapabilitySet::GlyphCache(glyphs));
+            .push(CapabilitySet::OffscreenCache(OffscreenCacheCapabilitySet {
+                offscreen_support_level: 1,
+                offscreen_cache_size: 7680,
+                offscreen_cache_entries: 2000,
+            }));
         config
     }
 
@@ -11917,7 +11937,14 @@ mod tests {
                 "the oracle is painted in bitmaps, not orders: {:?}",
                 oracle.census.orders
             );
-            for kind in ["MemBlt", "OpaqueRect"] {
+            for kind in [
+                "MemBlt rop",
+                "MemBlt from offscreen",
+                "OpaqueRect",
+                "MultiOpaqueRect",
+                "CreateOffscreenBitmap",
+                "SwitchSurface",
+            ] {
                 assert!(ordered.census.count(kind) > 0, "no {kind} arrived");
             }
             assert_eq!(

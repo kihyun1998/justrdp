@@ -49,6 +49,10 @@ pub const PDU_TYPE2_SET_KEYBOARD_INDICATORS: u8 = 0x29;
 pub const PDU_TYPE2_PLAY_SOUND: u8 = 0x22;
 /// `pduType2`: Set Error Info PDU (server → client, disconnect reasons).
 pub const PDU_TYPE2_SET_ERROR_INFO: u8 = 0x2F;
+/// `pduType2`: Offscreen Bitmap Cache Error PDU (`[MS-RDPEGDI]` 2.2.2.3.2).
+pub const PDU_TYPE2_OFFSCRCACHE_ERROR: u8 = 0x2E;
+/// Offscreen Bitmap Cache Error PDU `flags`: flush the offscreen cache and stop using it.
+pub const OC_ERR_FLUSH_AND_DISABLE_OFFSCREEN: u32 = 0x0000_0001;
 /// `pduType2`: Input Event PDU (client → server, the slow-path input fallback).
 pub const PDU_TYPE2_INPUT: u8 = 0x1C;
 /// `pduType2`: Refresh Rect PDU (client → server, areas to redraw; 2.2.11.2).

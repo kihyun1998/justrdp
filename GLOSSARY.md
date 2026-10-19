@@ -75,6 +75,12 @@ A frame the server started and has not yet ended: a drawing-order Frame Marker s
 Pipeline `StartFrame`. It holds back the Frame Updates of what it painted until its end, or until
 the host releases it.
 
+**Offscreen bitmap**:
+A surface the server creates on the client and draws on out of sight, then copies onto the screen
+with a MemBlt. Drawing orders paint the current target, the screen or one offscreen bitmap, and
+only paint on the screen becomes a Frame Update.
+_Avoid_: offscreen surface (the spec's "surface" is the target, either kind)
+
 **Legacy graphics**:
 The graphics path of a session without the Graphics Pipeline: bitmap updates and surface commands
 decoded straight into the framebuffer.
