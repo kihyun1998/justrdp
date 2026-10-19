@@ -330,8 +330,9 @@ was checked against.
   not cold starts as such. The lane now seeds from committed fixtures where one exists,
   which is a **derivation, not a second corpus**: `.github/scripts/seed_fuzz_corpus.py`
   splits the fixture at run time rather than duplicating ~900 KB into `fuzz/`.
-- **One VM is one server, and there are two.** The audio input VM (#404) drives only the audio
-  input tests; see its bullet among the VM-configuration dependencies. The WS2019 box advertises a fixed cap set; paths it does
+- **One VM is one server, and there are three.** The audio input VM (#404) drives only the audio
+  input tests, and the GDI orders VM (#484) only the drawing-order tests; see their bullets among
+  the VM-configuration dependencies. The WS2019 box advertises a fixed cap set; paths it does
   not advertise have never been exercised against anything.
 - **A test can pass on pixels another test's session painted, and only a working teardown
   exposes it.** `progressive_assembles`' live-framebuffer floor (≥ 1/8 of the screen
@@ -450,6 +451,49 @@ was checked against.
     Run dialog can `Start-Process -Verb RunAs` without a prompt (#416, the maintainer's change,
     2026-10-12). Killing a test mid-session once left the VM's next logons on a black screen
     with no rdpdr "User Logged On"; a reboot cleared it, so stop a VM test only between runs.
+- **A third VM, for drawing orders: Windows Server 2008 R2 Standard at `192.168.136.164`**
+  (#484, set up by the maintainer 2026-10-16). It is the only measured server that sends
+  MultiOpaqueRect, FastGlyph, the offscreen orders, Cache Brush and Polyline
+  ([Drawing orders](drawing-orders.md), Reference behaviour). Tests reach it through
+  `with_vm_session_on(Target::GdiOrders, …)`, the audio input VM's shape: its own address and
+  lock, the same `JUSTRDP_TEST_*` credentials. Its configuration, none of it in the repo:
+  - Remote Desktop allows connections from **any version** of the client, so a TLS-only connect
+    is accepted. `rdptest` is in Administrators, its password does not expire, and the monitor
+    and standby timeouts are off. Windows is **not activated**, so the grace period runs out on
+    its own.
+  - **Out of the box it speaks TLS 1.0 only**, and rustls speaks 1.2 and up. The installation
+    image is RTM (build 7600), so the fix runs in order: SP1 (KB976932, whose installer wants
+    KB2533552 first), then KB3080079 (TLS 1.1 and 1.2 for Remote Desktop), then the SCHANNEL
+    `Protocols\TLS 1.2\Server` (and `Client`) keys `Enabled = 1`, `DisabledByDefault = 0`, and
+    a reboot. The updates came from the Microsoft Update Catalog, each checked against the SHA-1
+    in its file name, and reached the VM on an ISO, since it has no VMware Tools.
+  - **That TLS 1.2 shared no cipher suite with rustls**, which offers ECDHE key exchange with
+    AES-GCM or ChaCha20 only. A probe that sends the X.224 request itself and then handshakes
+    found only CBC suites and RSA key exchange; every GCM suite was reset. KB3042058 adds the
+    GCM suites, but Windows 7's list (`TLS Cipher Suites in Windows 7`) pairs ECDHE with GCM only
+    for an ECDSA certificate. So the RDP certificate was replaced by a self-signed ECDSA P-256
+    one (`certreq`, Microsoft Software Key Storage Provider), bound to `RDP-Tcp` through
+    `Win32_TSGeneralSetting.SSLCertificateSHA1Hash`, with `NETWORK SERVICE` given read on its
+    key file. The suite measured since is `ECDHE-ECDSA-AES128-GCM-SHA256`; AES-256-GCM is still
+    reset, as the list offers it only on P-384. The VM's only snapshot, `justrdp-ok`
+    (2026-10-19), holds this state.
+  - **It selects `HYBRID`** for the default `SSL|HYBRID|HYBRID_EX`: it predates HYBRID_EX, so
+    there is no Early User Authorization Result.
+  - **Its Demand Active asks 16 bpp** and carries Share, General, Virtual Channel, Draw Nine
+    Grid Cache (0x16), Font, Bitmap, Bitmap Codecs, Order, Color Cache, Bitmap Cache Host
+    Support, Pointer, Large Pointer, Input, Draw GDI+ (0x17), RAIL, Window, Multifragment
+    Update and Surface Commands (`the_gdi_orders_vm_paints_its_desktop_in_orders` prints them).
+    It has no Frame Acknowledge set, which the main VM sends.
+  - **It signs out with `shutdown /l /f`**, typed into the Start menu's search box as on the main
+    VM; `Target::sign_out` shares it. Measured: the teardown after every #484 test run, a dozen
+    of them on 2026-10-19, signed the session out within its 150 s budget.
+  - Its Initial Configuration Tasks window opens at every logon. The logon screen, before any
+    credential, is the comparison screen: a TLS-only session sends no password, and the screen
+    holds no caret or clock, so two sessions paint it identically
+    (`the_gdi_orders_vm_logon_screen_is_the_same_in_two_sessions`).
+  - FreeRDP from WSL (OpenSSL 3.0.13) failed the TLS 1.0 handshake even at `/tls:seclevel:0`,
+    so the 2026-10-16 census ran with `/sec:rdp`. Since the certificate changed, `/sec:tls`
+    connects.
 - **Driving a desktop by synthesised keystrokes is open-loop, and the acknowledgement
   the harness needs is the one it already receives.** Every VM test that has to make
   something happen *inside* Windows — sign out, launch an app, run `tsdiscon` — types

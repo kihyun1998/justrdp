@@ -9873,6 +9873,9 @@ mod tests {
         /// The audio input VM, a Windows 11 Enterprise evaluation.
         const AUDIO_INPUT_VM_ADDR: &str = "192.168.136.163:3389";
 
+        /// The GDI orders VM, Windows Server 2008 R2.
+        const GDI_ORDERS_VM_ADDR: &str = "192.168.136.164:3389";
+
         /// Which VM a test drives. Each is its own Windows session, so each has its own lock.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub(super) enum Target {
@@ -9880,6 +9883,8 @@ mod tests {
             Main,
             /// [`AUDIO_INPUT_VM_ADDR`].
             AudioInput,
+            /// [`GDI_ORDERS_VM_ADDR`].
+            GdiOrders,
         }
 
         impl Target {
@@ -9887,6 +9892,7 @@ mod tests {
                 match self {
                     Target::Main => VM_ADDR,
                     Target::AudioInput => AUDIO_INPUT_VM_ADDR,
+                    Target::GdiOrders => GDI_ORDERS_VM_ADDR,
                 }
             }
 
@@ -9894,13 +9900,14 @@ mod tests {
                 match self {
                     Target::Main => &VM_SESSION,
                     Target::AudioInput => &AUDIO_INPUT_VM_SESSION,
+                    Target::GdiOrders => &GDI_ORDERS_VM_SESSION,
                 }
             }
 
             /// The command the teardown types into the Start menu to sign the session out.
             fn sign_out(self) -> &'static str {
                 match self {
-                    Target::Main => SIGN_OUT,
+                    Target::Main | Target::GdiOrders => SIGN_OUT,
                     Target::AudioInput => "logoff",
                 }
             }
@@ -9921,6 +9928,9 @@ mod tests {
 
         /// [`VM_SESSION`] for [`AUDIO_INPUT_VM_ADDR`].
         static AUDIO_INPUT_VM_SESSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        /// [`VM_SESSION`] for [`GDI_ORDERS_VM_ADDR`].
+        static GDI_ORDERS_VM_SESSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
         /// Credentials from the environment, so none is committed to the repo.
         fn credentials() -> Credentials {
@@ -10375,7 +10385,8 @@ mod tests {
         /// does cost is that everything after session-active now starts from a shell that is
         /// still coming up, which is what [`start_menu_run`] exists to survive (#198).
         ///
-        /// The command is the target's [`Target::sign_out`]: [`SIGN_OUT`] on the main VM.
+        /// The command is the target's [`Target::sign_out`]: [`SIGN_OUT`] on the main VM and the
+        /// GDI orders VM.
         async fn tidy_session(target: Target) -> () {
             let vm = Vm { target };
             let config = legacy_graphics_config();
@@ -11493,8 +11504,10 @@ mod tests {
         );
     }
 
-    /// What a session against the xrdp census server's login screen received.
-    struct XrdpLogin {
+    /// What a session received once it had painted and gone quiet.
+    struct Settled {
+        selected: SecurityProtocol,
+        server_capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
         framebuffer: justrdp::Framebuffer,
         frames: Vec<FrameUpdate>,
         stages: Vec<String>,
@@ -11506,7 +11519,7 @@ mod tests {
     /// painted and nothing has arrived for 2 s (20 s at most). xrdp refuses Client Info without
     /// `0x33` in its flags, so they are set here. No password is sent, so xrdp shows its login
     /// screen.
-    async fn xrdp_login(mut config: ConnectConfig) -> XrdpLogin {
+    async fn xrdp_login(mut config: ConnectConfig) -> Settled {
         let addr: SocketAddr = std::env::var("JUSTRDP_XRDP_ADDR")
             .expect("JUSTRDP_XRDP_ADDR names the xrdp census server, e.g. 172.27.236.70:3390")
             .parse()
@@ -11517,13 +11530,31 @@ mod tests {
             | client_info::ClientInfoFlags::LOGON_NOTIFY
             | client_info::ClientInfoFlags::LOGON_ERRORS
             | client_info::ClientInfoFlags::MOUSE_HAS_WHEEL;
+        login_screen(addr, config).await
+    }
+
+    /// Connect to `addr` with `config` and no password, so the server paints its logon screen,
+    /// then [`settle`].
+    async fn login_screen(addr: SocketAddr, config: ConnectConfig) -> Settled {
         let capabilities = config.capabilities.clone();
         let mut stages = Vec::new();
         let outcome = connect_danger(addr, config, test_credentials(), |stage| {
             stages.push(stage.to_string())
         })
         .await
-        .unwrap_or_else(|e| panic!("connecting to xrdp fails after {stages:?}: {e:?}"));
+        .unwrap_or_else(|e| panic!("connecting to {addr} fails after {stages:?}: {e:?}"));
+        settle(outcome, capabilities, stages).await
+    }
+
+    /// Read a session until something has painted and nothing has arrived for 2 s (20 s at
+    /// most).
+    async fn settle(
+        outcome: ConnectOutcome,
+        capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
+        stages: Vec<String>,
+    ) -> Settled {
+        let selected = outcome.mcs.selected;
+        let server_capabilities = outcome.activation.server_capabilities.clone();
         let mut census = OrderCensus::default();
         census.feed(&outcome.activation.leftover);
         let mut machine = SessionStateMachine::new(
@@ -11543,7 +11574,7 @@ mod tests {
                     SessionOutput::WriteBytes(bytes) => {
                         write_frame(&mut stream, &bytes)
                             .await
-                            .expect("write to xrdp");
+                            .expect("write to the server");
                     }
                     _ => {}
                 }
@@ -11552,21 +11583,26 @@ mod tests {
                 break;
             }
             match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut readbuf)).await {
-                Ok(Ok(0)) => panic!("xrdp closed the session after {} frames", frames.len()),
+                Ok(Ok(0)) => panic!(
+                    "the server closed the session after {} frames",
+                    frames.len()
+                ),
                 Ok(Err(e)) => panic!(
-                    "reading from xrdp failed after {} frames: {e}",
+                    "reading from the server failed after {} frames: {e}",
                     frames.len()
                 ),
                 Ok(Ok(n)) => {
                     census.feed(&readbuf[..n]);
                     pending = feed_session(&mut machine, &readbuf[..n])
-                        .expect("the session machine takes every byte xrdp sent");
+                        .expect("the session machine takes every byte the server sent");
                 }
                 Err(_) if !frames.is_empty() => break,
                 Err(_) => {}
             }
         }
-        XrdpLogin {
+        Settled {
+            selected,
+            server_capabilities,
             framebuffer: machine.framebuffer().clone(),
             frames,
             stages,
@@ -11604,27 +11640,11 @@ mod tests {
         );
     }
 
-    /// xrdp's login screen at `bpp`, painted in drawing orders and its text in glyphs, is the
-    /// screen xrdp paints in bitmap updates at that depth for a session that advertises no orders,
-    /// pixel for pixel.
-    async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_at(bpp: u16) {
+    /// [`legacy_orders_config`] advertising every order the core honours, over FreeRDP's ten
+    /// default glyph caches.
+    fn honoured_orders_config() -> ConnectConfig {
         use justrdp_pdu::capability::{self, CapabilitySet, GlyphCacheCapabilitySet};
-        let at_depth = |config: &mut ConnectConfig| {
-            config.core.high_color_depth = match bpp {
-                8 => gcc::HIGH_COLOR_DEPTH_8BPP,
-                16 => gcc::HIGH_COLOR_DEPTH_16BPP,
-                _ => panic!("the xrdp comparison runs at 8 or 16 bpp, not {bpp}"),
-            };
-            for set in &mut config.capabilities {
-                if let CapabilitySet::Bitmap(b) = set {
-                    b.preferred_bits_per_pixel = bpp;
-                }
-            }
-        };
-        let mut bitmaps = legacy_graphics_config();
-        at_depth(&mut bitmaps);
-        let oracle = xrdp_login(bitmaps).await;
-        let mut orders = legacy_orders_config(&[
+        let mut config = legacy_orders_config(&[
             capability::ORDER_NEG_DSTBLT_INDEX,
             capability::ORDER_NEG_PATBLT_INDEX,
             capability::ORDER_NEG_SCRBLT_INDEX,
@@ -11648,10 +11668,34 @@ mod tests {
             frag_cache: 0,
             glyph_support_level: capability::GLYPH_SUPPORT_FULL,
         };
-        orders
+        config
             .capabilities
             .retain(|set| !matches!(set, CapabilitySet::GlyphCache(_)));
-        orders.capabilities.push(CapabilitySet::GlyphCache(glyphs));
+        config.capabilities.push(CapabilitySet::GlyphCache(glyphs));
+        config
+    }
+
+    /// xrdp's login screen at `bpp`, painted in drawing orders and its text in glyphs, is the
+    /// screen xrdp paints in bitmap updates at that depth for a session that advertises no orders,
+    /// pixel for pixel.
+    async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_at(bpp: u16) {
+        use justrdp_pdu::capability::CapabilitySet;
+        let at_depth = |config: &mut ConnectConfig| {
+            config.core.high_color_depth = match bpp {
+                8 => gcc::HIGH_COLOR_DEPTH_8BPP,
+                16 => gcc::HIGH_COLOR_DEPTH_16BPP,
+                _ => panic!("the xrdp comparison runs at 8 or 16 bpp, not {bpp}"),
+            };
+            for set in &mut config.capabilities {
+                if let CapabilitySet::Bitmap(b) = set {
+                    b.preferred_bits_per_pixel = bpp;
+                }
+            }
+        };
+        let mut bitmaps = legacy_graphics_config();
+        at_depth(&mut bitmaps);
+        let oracle = xrdp_login(bitmaps).await;
+        let mut orders = honoured_orders_config();
         at_depth(&mut orders);
         let ordered = xrdp_login(orders).await;
         let tag = format!("xrdp {bpp} bpp");
@@ -11695,29 +11739,10 @@ mod tests {
             0,
             "an update was cut short"
         );
-        assert_eq!(
-            (oracle.framebuffer.width(), oracle.framebuffer.height()),
-            (ordered.framebuffer.width(), ordered.framebuffer.height())
-        );
-        let width = usize::from(ordered.framebuffer.width());
-        let rgb = |fb: &justrdp::Framebuffer, i: usize| {
-            let o = i * 4;
-            [fb.pixels()[o], fb.pixels()[o + 1], fb.pixels()[o + 2]]
-        };
-        let differing: Vec<(usize, usize)> = (0..width * usize::from(ordered.framebuffer.height()))
-            .filter(|&i| rgb(&ordered.framebuffer, i) != rgb(&oracle.framebuffer, i))
-            .map(|i| (i % width, i / width))
-            .collect();
+        let differing = differing_pixels(&oracle.framebuffer, &ordered.framebuffer);
         eprintln!("{tag}: {} pixels differ", differing.len());
-        let colours: std::collections::HashSet<_> = (0..width
-            * usize::from(oracle.framebuffer.height()))
-            .map(|i| rgb(&oracle.framebuffer, i))
-            .collect();
-        assert!(
-            colours.len() > 16,
-            "near-monochrome: {} colours",
-            colours.len()
-        );
+        let colours = colour_count(&oracle.framebuffer);
+        assert!(colours > 16, "near-monochrome: {colours} colours");
         assert_eq!(
             differing.get(..8.min(differing.len())),
             Some(&[][..]),
@@ -11738,6 +11763,200 @@ mod tests {
     #[ignore = "requires the xrdp census server and JUSTRDP_XRDP_ADDR"]
     async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_at_8_bpp() {
         xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_at(8).await;
+    }
+
+    /// Issue #484: on the GDI orders VM, a session advertising every order the core honours
+    /// reaches its desktop, and every order the server sends decodes.
+    #[tokio::test]
+    #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
+                JUSTRDP_TEST_* env vars"]
+    async fn the_gdi_orders_vm_paints_its_desktop_in_orders() {
+        vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
+            use justrdp_pdu::fastpath;
+            let config = honoured_orders_config();
+            let capabilities = config.capabilities.clone();
+            let mut stages = Vec::new();
+            let outcome = vm
+                .try_connect(config, |stage| stages.push(stage.to_string()))
+                .await
+                .unwrap_or_else(|e| panic!("connect fails after {stages:?}: {e:?}"));
+            let desktop = settle(outcome, capabilities, stages).await;
+            desktop.census.print("#484 desktop");
+            let server =
+                justrdp::ServerAnnouncement::from_capabilities(&desktop.server_capabilities);
+            eprintln!(
+                "#484: server bpp {}, capability sets {:?}",
+                server.bits_per_pixel,
+                desktop
+                    .server_capabilities
+                    .iter()
+                    .map(|set| match set {
+                        justrdp_pdu::capability::CapabilitySet::Unknown { set_type, .. } => {
+                            format!("{set_type:#04x}")
+                        }
+                        set => format!("{set:?}")
+                            .split(['(', ' ', '{'])
+                            .next()
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                    .collect::<Vec<_>>()
+            );
+            eprintln!(
+                "#484: selected {:?}, {} frames, stages {:?}, dump {}",
+                desktop.selected,
+                desktop.frames.len(),
+                desktop.stages,
+                dump_ppm(&desktop.framebuffer, "justrdp-484-desktop.ppm").display()
+            );
+            assert!(
+                desktop
+                    .census
+                    .updates
+                    .get(&fastpath::FP_UPDATE_ORDERS)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0,
+                "no Orders update arrived: {:?}",
+                desktop.census.updates
+            );
+            assert_eq!(
+                desktop.census.count("stopped"),
+                0,
+                "an update was cut short: {:?}",
+                desktop.census.orders
+            );
+            assert_eq!(desktop.selected, SecurityProtocol::HYBRID);
+            let colours = colour_count(&desktop.framebuffer);
+            assert!(colours > 16, "near-monochrome: {colours} colours");
+        })
+        .await
+    }
+
+    /// Issue #484: the GDI orders VM's logon screen, painted in bitmap updates for a TLS-only
+    /// session that advertises no order and sends no password, is the same in two sessions.
+    #[tokio::test]
+    #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
+                JUSTRDP_TEST_* env vars"]
+    async fn the_gdi_orders_vm_logon_screen_is_the_same_in_two_sessions() {
+        vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
+            let screen = || {
+                let mut config = legacy_graphics_config();
+                config.requested = SecurityProtocol::SSL;
+                login_screen(vm.addr(), config)
+            };
+            let first = screen().await;
+            let second = screen().await;
+            first.census.print("#484 logon screen");
+            eprintln!(
+                "#484: {} and {} frames, stages {:?}, dumps {} and {}",
+                first.frames.len(),
+                second.frames.len(),
+                first.stages,
+                dump_ppm(&first.framebuffer, "justrdp-484-logon-1.ppm").display(),
+                dump_ppm(&second.framebuffer, "justrdp-484-logon-2.ppm").display()
+            );
+            for screen in [&first, &second] {
+                assert_eq!(screen.selected, SecurityProtocol::SSL);
+                assert!(
+                    !screen.stages.iter().any(|s| s == "nla-credssp"),
+                    "no NLA under TLS-only security: {:?}",
+                    screen.stages
+                );
+                assert!(
+                    screen.census.orders.is_empty(),
+                    "the logon screen is painted in bitmaps, not orders: {:?}",
+                    screen.census.orders
+                );
+            }
+            let colours = colour_count(&first.framebuffer);
+            assert!(colours > 16, "near-monochrome: {colours} colours");
+            let differing = differing_pixels(&first.framebuffer, &second.framebuffer);
+            eprintln!("#484: {} pixels differ between the two", differing.len());
+            assert_eq!(
+                differing.get(..8.min(differing.len())),
+                Some(&[][..]),
+                "the two logon screens differ"
+            );
+        })
+        .await
+    }
+
+    /// Issue #484: the GDI orders VM's logon screen, painted in drawing orders for a TLS-only
+    /// session advertising every order the core honours, is the logon screen in bitmap updates,
+    /// pixel for pixel.
+    #[tokio::test]
+    #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
+                JUSTRDP_TEST_* env vars"]
+    async fn the_gdi_orders_vm_paints_its_logon_screen_in_orders_as_in_bitmaps() {
+        vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
+            let tls_only = |mut config: ConnectConfig| {
+                config.requested = SecurityProtocol::SSL;
+                login_screen(vm.addr(), config)
+            };
+            let oracle = tls_only(legacy_graphics_config()).await;
+            let ordered = tls_only(honoured_orders_config()).await;
+            ordered.census.print("#484 logon screen in orders");
+            eprintln!(
+                "#484: dumps {} and {}",
+                dump_ppm(&oracle.framebuffer, "justrdp-484-logon-oracle.ppm").display(),
+                dump_ppm(&ordered.framebuffer, "justrdp-484-logon-orders.ppm").display()
+            );
+            assert_eq!(
+                (oracle.selected, ordered.selected),
+                (SecurityProtocol::SSL, SecurityProtocol::SSL)
+            );
+            assert!(
+                oracle.census.orders.is_empty(),
+                "the oracle is painted in bitmaps, not orders: {:?}",
+                oracle.census.orders
+            );
+            for kind in ["MemBlt", "OpaqueRect"] {
+                assert!(ordered.census.count(kind) > 0, "no {kind} arrived");
+            }
+            assert_eq!(
+                ordered.census.count("stopped"),
+                0,
+                "an update was cut short"
+            );
+            let colours = colour_count(&oracle.framebuffer);
+            assert!(colours > 16, "near-monochrome: {colours} colours");
+            let differing = differing_pixels(&oracle.framebuffer, &ordered.framebuffer);
+            eprintln!("#484: {} pixels differ", differing.len());
+            assert_eq!(
+                differing.get(..8.min(differing.len())),
+                Some(&[][..]),
+                "pixels differ"
+            );
+        })
+        .await
+    }
+
+    /// How many distinct colours `fb` holds, up to 17.
+    fn colour_count(fb: &justrdp::Framebuffer) -> usize {
+        let mut distinct = std::collections::HashSet::new();
+        for px in fb.pixels().as_chunks::<4>().0 {
+            distinct.insert([px[0], px[1], px[2]]);
+            if distinct.len() > 16 {
+                break;
+            }
+        }
+        distinct.len()
+    }
+
+    /// Every `(x, y)` where `a` and `b`, of the same size, hold different colours.
+    fn differing_pixels(a: &justrdp::Framebuffer, b: &justrdp::Framebuffer) -> Vec<(usize, usize)> {
+        assert_eq!((a.width(), a.height()), (b.width(), b.height()));
+        let width = usize::from(a.width());
+        a.pixels()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(b.pixels().as_chunks::<4>().0)
+            .enumerate()
+            .filter(|(_, (pa, pb))| pa[..3] != pb[..3])
+            .map(|(i, _)| (i % width, i / width))
+            .collect()
     }
 
     #[tokio::test]
