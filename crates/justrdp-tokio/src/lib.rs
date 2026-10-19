@@ -8199,10 +8199,21 @@ mod tests {
         /// rectangle, `[left, top, right, bottom]`.
         glyph_rects: Vec<[i16; 4]>,
         /// The surface the next order paints: the last Switch Surface's `bitmapId`, the screen
-        /// (`0xFFFF`) before any.
+        /// before any.
         surface: Option<u16>,
-        /// Every Polyline's surface, start and points, each point a delta from the one before.
-        polylines: Vec<(u16, [i16; 2], Vec<[i16; 2]>)>,
+        /// Every Polyline, in arrival order.
+        polylines: Vec<PolylineSeen>,
+    }
+
+    /// One Polyline a census saw.
+    #[derive(Debug)]
+    struct PolylineSeen {
+        /// The surface it painted: an offscreen bitmap's id, or `SCREEN_BITMAP_SURFACE`.
+        surface: u16,
+        /// `(xStart, yStart)`.
+        start: [i16; 2],
+        /// Its points, each a delta from the one before.
+        points: Vec<[i16; 2]>,
     }
 
     impl OrderCensus {
@@ -8276,11 +8287,11 @@ mod tests {
                                 "OpaqueRect".to_string()
                             }
                             Ok(DrawingOrder::Polyline { order, .. }) => {
-                                self.polylines.push((
-                                    self.surface.unwrap_or(0xFFFF),
-                                    [order.x_start, order.y_start],
-                                    self.history.polyline_points().to_vec(),
-                                ));
+                                self.polylines.push(PolylineSeen {
+                                    surface: self.surface.unwrap_or(orders::SCREEN_BITMAP_SURFACE),
+                                    start: [order.x_start, order.y_start],
+                                    points: self.history.polyline_points().to_vec(),
+                                });
                                 format!("Polyline rop2 {}", order.rop2)
                             }
                             Ok(DrawingOrder::MultiOpaqueRect { .. }) => {
@@ -12080,7 +12091,7 @@ mod tests {
 
     /// Issue #493: on the GDI orders VM, Server Manager opened from the taskbar and maximised
     /// is drawn with Polyline, on the screen, and equals the same desktop the server repaints
-    /// for a session that advertises no Polyline, above the taskbar.
+    /// for a session that advertises no Polyline, outside the taskbar's clock.
     #[tokio::test]
     #[traced_test]
     #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
@@ -12118,7 +12129,10 @@ mod tests {
                 session.framebuffer().height(),
             );
             session
-                .send(&click(SERVER_MANAGER_ON_TASKBAR, height - 22))
+                .send(&click(
+                    SERVER_MANAGER_ON_TASKBAR,
+                    height - TASKBAR_HEIGHT / 2,
+                ))
                 .await;
             let mut caption = session
                 .read_until(Duration::from_secs(60), |fb| {
@@ -12155,7 +12169,7 @@ mod tests {
                     .census
                     .polylines
                     .iter()
-                    .any(|&(surface, ..)| surface == justrdp_pdu::orders::SCREEN_BITMAP_SURFACE),
+                    .any(|seen| seen.surface == justrdp_pdu::orders::SCREEN_BITMAP_SURFACE),
                 "no Polyline arrived on the screen"
             );
 
@@ -12178,14 +12192,28 @@ mod tests {
                 0,
                 "Polyline arrived unadvertised"
             );
-            // The taskbar holds the clock.
-            let above_taskbar = usize::from(height) - 40;
+            let clock = (
+                usize::from(width - CLOCK_FROM_RIGHT),
+                usize::from(height - TASKBAR_HEIGHT),
+            );
+            for seen in &polylined.census.polylines {
+                let end = seen
+                    .points
+                    .iter()
+                    .fold(seen.start, |[x, y], [dx, dy]| [x + dx, y + dy]);
+                for [x, y] in [seen.start, end] {
+                    assert!(
+                        (x as usize) < clock.0 || (y as usize) < clock.1,
+                        "a Polyline in the clock, out of the comparison: {seen:?}"
+                    );
+                }
+            }
             let differing: Vec<_> =
                 differing_pixels(&polylined.framebuffer, &repainted.framebuffer)
                     .into_iter()
-                    .filter(|&(_, y)| y < above_taskbar)
+                    .filter(|&(x, y)| x < clock.0 || y < clock.1)
                     .collect();
-            eprintln!("#493: {} pixels differ above the taskbar", differing.len());
+            eprintln!("#493: {} pixels differ outside the clock", differing.len());
             assert_eq!(
                 differing.get(..8.min(differing.len())),
                 Some(&[][..]),
@@ -12195,8 +12223,14 @@ mod tests {
         .await
     }
 
-    /// Server Manager's button on the GDI orders VM's taskbar, its x; the taskbar is 40 px high.
+    /// Server Manager's button on the GDI orders VM's taskbar, its x.
     const SERVER_MANAGER_ON_TASKBAR: u16 = 88;
+
+    /// The GDI orders VM's taskbar, its height at the desktop's bottom.
+    const TASKBAR_HEIGHT: u16 = 40;
+
+    /// The taskbar's clock, how far its left edge is from the desktop's right.
+    const CLOCK_FROM_RIGHT: u16 = 88;
 
     /// The active window's caption, in the classic theme's active caption colour.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12219,7 +12253,7 @@ mod tests {
     fn active_caption(fb: &justrdp::Framebuffer) -> Option<Caption> {
         const ACTIVE_CAPTION: [u8; 3] = [0x08, 0x24, 0x6B];
         let width = usize::from(fb.width());
-        let above_taskbar = usize::from(fb.height()).saturating_sub(40);
+        let above_taskbar = usize::from(fb.height().saturating_sub(TASKBAR_HEIGHT));
         for (y, row) in fb
             .pixels()
             .chunks_exact(width * 4)

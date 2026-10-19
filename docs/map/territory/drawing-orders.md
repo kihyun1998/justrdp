@@ -504,7 +504,8 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
   a brush, and the only level that turns it on also advertises colour brushes no server has sent.
 - **Polyline is proven against a server, but not its end pixel** (#493).
   - **What is proven.** Server Manager maximised, drawn with Polyline, equals the server's
-    repaint for a session without it: 0 px above the taskbar, in three runs out of three. With
+    repaint for a session without it: 0 px outside the taskbar's clock, in three runs out of
+    three. With
     the lines not drawn, 2,150 px differ. So the lines' place, colour and `bRop2` are the
     server's.
   - **What is not.** Whether a segment's end pixel is drawn cannot be told from this comparison.

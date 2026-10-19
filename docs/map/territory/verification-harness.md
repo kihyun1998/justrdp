@@ -462,6 +462,9 @@ was checked against.
     run of `0x08246B`, and `active_caption` finds it in the framebuffer. The maximise button is
     28 px left of its right end.
   - **Server Manager is a fixed taskbar button**, at x 88.
+  - **The comparison leaves out only the taskbar's clock**, the bottom 40 px from 88 px left of
+    the desktop's right edge, because it can tick between the two sessions. The tray icons end
+    at x 1191 at 1280 wide, so they stay in the comparison.
   - **A maximise click can miss** while the window is still coming up. That happened once in
     four runs, so the test clicks up to three times until the caption spans the desktop.
 
