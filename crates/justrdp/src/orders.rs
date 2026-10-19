@@ -505,7 +505,10 @@ impl Orders {
             self.deliver(&mut painted, frames);
             match outcome {
                 Ok(()) => {}
-                Err(NotApplied::Skipped(Skip::OverBudget)) => over_budget += 1,
+                Err(NotApplied::Skipped(Skip::OverBudget)) => {
+                    over_budget += 1;
+                    budget = 0;
+                }
                 Err(NotApplied::Skipped(reason)) => {
                     tracing::debug!(target: "rdp_orders", ?reason, "drawing order skipped");
                 }
@@ -653,9 +656,10 @@ impl Orders {
 
     /// A Create Offscreen Bitmap: a black bitmap at its id, then its delete list. The size,
     /// counted at `bits_per_pixel`, leaves out what the Create replaces and deletes. One past the
-    /// advertised entries or size, past the update's paint budget, or one this client cannot
-    /// allocate, flushes the cache and owes the server an Offscreen Bitmap Cache Error PDU; the
-    /// cache is not kept after.
+    /// update's paint budget empties its entry. One past the advertised entries or size, or one
+    /// this client cannot allocate, flushes the cache and owes the server an Offscreen Bitmap
+    /// Cache Error PDU; the cache is not kept after, and a target that was a bitmap paints
+    /// nothing until the next Switch.
     fn create_offscreen(
         &mut self,
         order: &CreateOffscreenBitmap<'_>,
@@ -689,7 +693,7 @@ impl Orders {
                     .saturating_mul(usize::from(order.cy))
                     .saturating_mul(4),
             ) {
-                None
+                Some(Err(Skip::OverBudget))
             } else {
                 Framebuffer::new(order.cx, order.cy).ok().map(Ok)
             }
@@ -706,7 +710,6 @@ impl Orders {
             );
             offscreen.flush();
             offscreen.error_owed = true;
-            self.target = Target::Screen;
             return Err(NotApplied::Skipped(Skip::OffscreenRefused));
         };
         let outcome = created.map(|surface| {
@@ -1786,7 +1789,8 @@ pub(crate) mod tests {
 
     /// A Create past the advertised size, counted at the session depth, or past the advertised
     /// entries asks for the Offscreen Bitmap Cache Error PDU once, flushes every offscreen
-    /// bitmap, paints the screen, and ends offscreen caching (#489's decision (a)).
+    /// bitmap, and ends offscreen caching (#489's decision (a)). A target that was a bitmap is
+    /// unknown until the next Switch (#494).
     #[test]
     fn a_create_past_the_advertised_cache_flushes_and_disables_it() {
         // 1 KB at 16 bpp is 512 pixels.
@@ -1809,11 +1813,14 @@ pub(crate) mod tests {
             );
             assert!(orders.take_offscreen_error());
             assert!(!orders.take_offscreen_error(), "asked for once");
-            assert_eq!(
-                frames,
-                [frame(0, 0, 1, 1)],
-                "the target is the screen again"
+            assert_eq!(frames, [], "the flushed target paints nothing");
+            assert_eq!(pixel(&fb, 0, 0), BLACK);
+            let frames = run(
+                &mut orders,
+                &mut fb,
+                &[switch_surface(SCREEN), opaque_rect([0, 0, 1, 1], RED)],
             );
+            assert_eq!(frames, [frame(0, 0, 1, 1)], "a Switch to the screen paints");
             // Flushed, and no longer kept.
             let frames = run(
                 &mut orders,
@@ -1863,9 +1870,9 @@ pub(crate) mod tests {
     }
 
     /// A Create of no pixels empties its entry and owes nothing; one the update's paint budget
-    /// cannot buy is refused as one past the cache is (#489).
+    /// cannot buy empties its entry too, and the cache is kept (#494).
     #[test]
-    fn a_create_of_no_pixels_empties_its_entry_and_one_over_budget_flushes() {
+    fn a_create_of_no_pixels_or_over_the_budget_empties_only_its_entry() {
         let mut orders = Orders::new(&offscreen_capabilities(100, 4));
         let mut fb = Framebuffer::new(2, 1).unwrap();
         let blit = |id: u16| {
@@ -1891,9 +1898,64 @@ pub(crate) mod tests {
         run_with(&mut orders, &mut fb, &[create_offscreen(0, 4, 4, &[])], 64);
         assert_eq!(run(&mut orders, &mut fb, &blit(0)), [frame(0, 0, 1, 1)]);
         assert!(!orders.take_offscreen_error());
+        run(&mut orders, &mut fb, &[create_offscreen(1, 1, 1, &[])]);
         run_with(&mut orders, &mut fb, &[create_offscreen(0, 4, 4, &[])], 63);
-        assert!(orders.take_offscreen_error());
-        assert_eq!(run(&mut orders, &mut fb, &blit(0)), [], "flushed");
+        assert!(!orders.take_offscreen_error(), "the server is not told");
+        assert_eq!(
+            run(&mut orders, &mut fb, &blit(0)),
+            [],
+            "the entry is emptied"
+        );
+        assert_eq!(
+            run(&mut orders, &mut fb, &blit(1)),
+            [frame(1, 0, 1, 1)],
+            "the others are kept"
+        );
+        run(&mut orders, &mut fb, &[create_offscreen(0, 1, 1, &[])]);
+        assert_eq!(
+            run(&mut orders, &mut fb, &blit(0)),
+            [frame(0, 0, 1, 1)],
+            "the cache still makes bitmaps"
+        );
+    }
+
+    /// A Create the budget cannot buy is counted with the update's other over-budget orders,
+    /// not as one past the advertised cache.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_create_over_the_budget_is_reported_as_over_the_budget() {
+        let mut orders = Orders::new(&offscreen_capabilities(100, 4));
+        let mut fb = Framebuffer::new(2, 1).unwrap();
+        run_with(&mut orders, &mut fb, &[create_offscreen(0, 4, 4, &[])], 63);
+        assert!(logs_contain("paint budget reached"));
+        assert!(!logs_contain("past the advertised cache"));
+    }
+
+    /// The shape of the largest update measured on WS2008 R2 (#494): a desktop-sized bitmap
+    /// made, cleared, filled and filled again in part, then copied to the screen, is just over
+    /// four desktops, and the session's budget buys it.
+    #[test]
+    fn a_double_buffered_desktop_paint_fits_the_session_budget() {
+        let mut orders = Orders::new(&offscreen_capabilities(100, 4));
+        let mut fb = Framebuffer::new(4, 2).unwrap();
+        let desktop = 4 * 2 * 4;
+        let frames = run_with(
+            &mut orders,
+            &mut fb,
+            &[
+                create_offscreen(0, 4, 2, &[]),
+                switch_surface(0),
+                dstblt([0, 0, 4, 2], 0x00),
+                opaque_rect([0, 0, 4, 2], RED),
+                opaque_rect([0, 0, 1, 1], GREEN),
+                switch_surface(SCREEN),
+                memblt((OFFSCREEN, 0), [0, 0, 4, 2], SRCCOPY, [0, 0]),
+            ],
+            desktop * crate::session::PAINT_BUDGET_FRAMEBUFFERS,
+        );
+        assert_eq!(frames, [frame(0, 0, 4, 2)]);
+        assert_eq!(pixel(&fb, 0, 0), rgba(GREEN));
+        assert_eq!(pixel(&fb, 3, 1), rgba(RED));
     }
 
     /// A Create's delete list frees room before its size is checked, and applies even to a
@@ -3275,6 +3337,27 @@ pub(crate) mod tests {
             &[memblt((0, 0), [2, 0, 1, 1], SRCCOPY, [0, 0])],
         );
         assert!(frames.is_empty(), "the refused entry misses");
+    }
+
+    /// The first order past the budget ends the update's painting: a smaller one after it,
+    /// which would fit, is not painted either.
+    #[test]
+    fn an_update_paints_nothing_after_its_first_order_past_the_budget() {
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(4, 1).unwrap();
+        let frames = run_with(
+            &mut orders,
+            &mut fb,
+            // 4 bytes, then 12 past the 8 left, then 4, which even half of what is left buys.
+            &[
+                opaque_rect([0, 0, 1, 1], RED),
+                opaque_rect([0, 0, 3, 1], RED),
+                opaque_rect([3, 0, 1, 1], RED),
+            ],
+            12,
+        );
+        assert_eq!(frames, [frame(0, 0, 1, 1)]);
+        assert_eq!(pixel(&fb, 3, 0), BLACK);
     }
 
     /// TS_COLOR at 16 bpp is the pixel itself, at 24 and 32 the red, green, blue bytes.

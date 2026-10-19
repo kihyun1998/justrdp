@@ -153,15 +153,30 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   and since #368 a FIRST or SINGLE arriving while a sequence is open are all the same
   `TS_FP_UPDATE.fragmentation` error. Until then the FIRST case replaced the open buffer
   silently and the SINGLE case left it behind for the next continuation to extend.
-- **One graphics update buys at most `PAINT_BUDGET_FRAMEBUFFERS` desktops of decoding** (#367).
-  A bitmap update's rectangles and a Surface Commands update's surface bits are charged their
-  decoded size, not their clipped one, before they decode; past the budget the rest of the update
-  is skipped with an `rdp_paint_budget` warning and the session continues, on ADR-0009 row 3's
-  ground (a resource ceiling that is ours, against well-formed traffic). The budget is per update,
-  so it bounds how long one `process_bytes` holds the adapter's loop, and the host's cancellation
-  with it; it does not bound what a stream of updates can cost, which no budget can without
-  refusing real RLE and NSCodec traffic. The real server's largest update decodes exactly one
-  desktop (4 of the 20 Surface Commands updates in the #150 capture), so 2 leaves it untouched.
+- **One graphics update buys at most `PAINT_BUDGET_FRAMEBUFFERS` desktops of decoding, 8**
+  (#367, #494). Each paint is charged before it is made:
+  - a bitmap update's rectangles, a Surface Commands update's surface bits and an Orders update's
+    paints are charged their decoded size, not their clipped one;
+  - past the budget, the rest of the update is skipped with an `rdp_paint_budget` warning;
+  - the session continues, on ADR-0009 row 3's ground: a resource ceiling that is ours, against
+    well-formed traffic.
+- **The budget bounds one update, and nothing larger.** It is issued afresh for each fast-path
+  section, so it bounds neither a PDU nor a `process_bytes` call, nor a stream of updates.
+  - Measured, `--release`, 1280 × 800, desktop-sized empty-plane NSCodec commands: one update of
+    700 costs 18 ms at a budget of 2 and 73 ms at 8. One 32 KB PDU of 728 one-command sections
+    costs 6.0 s at 2 and 5.2 s at 8.
+  - What it does bound is how long one update takes. Whether `process_bytes` should be bounded
+    too is #496.
+- **The value is headroom over the largest real update.** The values below are in desktops.
+  - The 2 came from #367: the largest Surface Commands update in the #150 capture (WS2019)
+    decoded 1 desktop.
+  - That capture held no drawing orders. On WS2008 R2, Server Manager maximised sends an Orders
+    update of 4.16, a double-buffered window paint: an offscreen bitmap the size of the desktop
+    made (1.00), cleared (1.00) and filled (1.05), then copied to the screen (1.01). 7 of the
+    session's 64 Orders updates spent more than 2.
+  - At 2 the session skipped 417 orders, and the screen stayed wrong. 8 is the same ratio over
+    the measurement as #367's 2 over 1 (the maintainer's call, 2026-10-19).
+  - The server sends one Orders section per PDU, so its PDUs spend the same.
 - **Static-channel traffic goes three ways** (#307): `drdynvc` to the dynamic-channel
   manager, a granted host channel to its reassembler and out as `ChannelData`, and a channel
   ID that was never granted is skipped with an `rdp_svc` record. Inside `drdynvc`, a channel

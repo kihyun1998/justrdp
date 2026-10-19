@@ -111,8 +111,8 @@ pub struct SessionConfig {
     pub egfx: crate::EgfxConfig,
 }
 
-/// How many desktops' worth of decoded pixels one graphics update may buy (#367).
-pub(crate) const PAINT_BUDGET_FRAMEBUFFERS: usize = 2;
+/// How many desktops' worth of decoded pixels one graphics update may buy (#367, #494).
+pub(crate) const PAINT_BUDGET_FRAMEBUFFERS: usize = 8;
 
 /// What one bitmap rectangle or surface-bits command did.
 enum Painted {
@@ -2430,7 +2430,7 @@ mod tests {
     #[test]
     fn surface_bits_past_the_paint_budget_are_skipped() {
         let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
-        let body: Vec<u8> = (0..5)
+        let body: Vec<u8> = (0..PAINT_BUDGET_FRAMEBUFFERS + 3)
             .flat_map(|_| {
                 set_surface_bits(
                     0,
@@ -2457,7 +2457,7 @@ mod tests {
     #[test]
     fn the_paint_budget_charges_what_is_decoded_not_what_is_clipped() {
         let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
-        let body: Vec<u8> = (0..5)
+        let body: Vec<u8> = (0..PAINT_BUDGET_FRAMEBUFFERS + 3)
             .flat_map(|_| {
                 set_surface_bits(
                     15,
@@ -2478,8 +2478,8 @@ mod tests {
     fn bitmap_rectangles_past_the_paint_budget_are_skipped() {
         let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
         let mut body = update::UPDATETYPE_BITMAP.to_le_bytes().to_vec();
-        body.extend_from_slice(&5u16.to_le_bytes());
-        for _ in 0..5 {
+        body.extend_from_slice(&(PAINT_BUDGET_FRAMEBUFFERS as u16 + 3).to_le_bytes());
+        for _ in 0..PAINT_BUDGET_FRAMEBUFFERS + 3 {
             for v in [0u16, 0, 15, 7, 16, 8, 24, 0] {
                 body.extend_from_slice(&v.to_le_bytes());
             }
