@@ -43,7 +43,7 @@ deciding the exchange itself.
   the client cannot complete; xrdp selects `SSL` from that request. That the path exists is the
   maintainer's call (2026-10-16), made over keeping NLA mandatory and dropping `SSL` from the
   default request, or deferring both. The test VM refuses a TLS-only connect
-  (`HYBRID_REQUIRED_BY_SERVER`), so xrdp is its only proof. Standard RDP Security (RC4) is not
+  (`HYBRID_REQUIRED_BY_SERVER`); xrdp and the Windows Server 2008 R2 VM accept one (#484). Standard RDP Security (RC4) is not
   supported at all.
 - **The request is checked twice against a downgrade.** The Connection Request and Confirm are
   plaintext, so an attacker can strip `HYBRID` from the request and a server that allows TLS-only
@@ -51,9 +51,10 @@ deciding the exchange itself.
   requested it. And the Server Core Data's `clientRequestedProtocols`, which travels inside TLS,
   must equal the request sent (`[MS-RDPBCGR]` 3.2.5.3.4, a SHOULD taken as a MUST on ADR-0009's
   strict side); otherwise the connect fails with `ConnectError::RequestedProtocolsMismatch`.
-  An absent echo counts as `PROTOCOL_RDP`. Both measured servers echo the request:
-  xrdp 0.9.24 sent `0x0B` for justrdp's `0x0B` (a capture on 2026-10-16), and the WS2019 VM's
-  connect still reaches session-active.
+  An absent echo counts as `PROTOCOL_RDP`. Every measured server echoes the request:
+  xrdp 0.9.24 sent `0x0B` for justrdp's `0x0B` (a capture on 2026-10-16), and the WS2019 and
+  Windows Server 2008 R2 VMs' connects reach session-active. The 2008 R2 VM selects `HYBRID`
+  from `0x0B`, since it predates HYBRID_EX (#484).
 - **A correlation id is the host's, and the flag and the structure travel together** (#441).
   `ConnectConfig::correlation_id` puts a 16-byte id in an `RDP_NEG_CORRELATION_INFO` after the
   request (2.2.1.1.2), which a server or broker records for diagnostics. 2.2.1.1 makes

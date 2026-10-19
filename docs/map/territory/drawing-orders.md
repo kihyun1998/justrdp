@@ -226,9 +226,35 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   Cache Glyph, 16 GlyphIndex and 8 PatBlt (all PATCOPY). The counts are the same at 16, 24 and
   32 bpp. At 8 bpp there is also 1 Cache Color Table, as on the 8 bpp desktop (5,024 MemBlt and
   350 Cache Bitmap V2 in 20 s).
-- **Still sent by neither server**: DstBlt, LineTo, the Multi* orders, polygons, ellipses,
-  SaveBitmap, Cache Brush, the offscreen orders and Cache Bitmap revisions 1 and 3. xrdp has
-  encoders for several of them (`libxrdp/xrdp_orders.c`), and none appeared.
+- **Sent by neither of these two servers**: DstBlt, LineTo, the Multi* orders, polygons,
+  ellipses, SaveBitmap, Cache Brush, the offscreen orders and Cache Bitmap revisions 1 and 3.
+  xrdp has encoders for several of them (`libxrdp/xrdp_orders.c`), and none appeared. The third
+  census below found several.
+
+**A third census: Windows Server 2008 R2 (#22, 2026-10-16).** FreeRDP 3.32.1 against the GDI
+orders VM ([Verification harness](verification-harness.md)) with `/sec:rdp`, every cache
+advertised, 180 s of mspaint shapes, window drags and Explorer: 96,442 Frame Marker, 90,006
+MemBlt, 71,080 OpaqueRect, 22,095 compressed and 47 uncompressed Cache Bitmap V2, 11,652
+MultiOpaqueRect, 4,858 Switch Surface, 1,280 Create Offscreen Bitmap, 1,280 DstBlt (all
+BLACKNESS), 1,064 FastGlyph, 535 ScrBlt (all SRCCOPY), 241 PatBlt (178 PATCOPY, 63 PATINVERT),
+114 Polyline, 49 Mem3Blt (rop 0xB8) and 3 Cache Brush. A 20 s logon with no input already
+carried every kind but ScrBlt, Polyline, Mem3Blt and the uncompressed Cache Bitmap. mspaint's
+shapes arrived as MemBlt; no LineTo, polygon or ellipse came.
+
+**Its logon screen in orders against bitmaps (#484, 2026-10-19).** justrdp advertising every
+order the core honours, over a TLS-only session that sends no password, received 382 MemBlt
+(SRCCOPY), 2 OpaqueRect and 49 Cache Bitmap (Revision 2), and the screen equals the same screen
+in bitmap updates with no pixel differing
+(`the_gdi_orders_vm_paints_its_logon_screen_in_orders_as_in_bitmaps`). The bitmap screen is the
+same in two sessions, and a session naming another user moves 288 pixels of it, all on the
+user tile. The logged-in desktop under the same advertisement, read until it went quiet, carried
+616 MemBlt, 33 OpaqueRect and 69 Cache Bitmap, and no order it did not advertise
+(`the_gdi_orders_vm_paints_its_desktop_in_orders`). That session was idle, and justrdp advertises
+none of the orders this server is the only source of. FreeRDP, which advertises them, got them
+on the logon screen too: a TLS-only session with an empty password, 25 s, received 1,498
+OpaqueRect, 576 FastGlyph, 255 MemBlt, 35 Switch Surface, 10 Create Offscreen Bitmap, 10 DstBlt,
+4 MultiOpaqueRect, 2 PatBlt and 1 Cache Brush (2026-10-19). An empty password may have taken it
+through the failed-logon screen rather than the one the tests compare, which was not checked.
 
 **xrdp's login screen in orders against bitmaps (#475, #476, 2026-10-16).** A session
 advertising DstBlt, PatBlt, ScrBlt, MemBlt, Mem3Blt and GlyphIndex over FreeRDP's ten default
