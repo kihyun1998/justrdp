@@ -8198,6 +8198,11 @@ mod tests {
         /// Every GlyphIndex's text background rectangle and, when it has one, its opaque
         /// rectangle, `[left, top, right, bottom]`.
         glyph_rects: Vec<[i16; 4]>,
+        /// The surface the next order paints: the last Switch Surface's `bitmapId`, the screen
+        /// (`0xFFFF`) before any.
+        surface: Option<u16>,
+        /// Every Polyline's surface, start and points, each point a delta from the one before.
+        polylines: Vec<(u16, [i16; 2], Vec<[i16; 2]>)>,
     }
 
     impl OrderCensus {
@@ -8271,6 +8276,11 @@ mod tests {
                                 "OpaqueRect".to_string()
                             }
                             Ok(DrawingOrder::Polyline { order, .. }) => {
+                                self.polylines.push((
+                                    self.surface.unwrap_or(0xFFFF),
+                                    [order.x_start, order.y_start],
+                                    self.history.polyline_points().to_vec(),
+                                ));
                                 format!("Polyline rop2 {}", order.rop2)
                             }
                             Ok(DrawingOrder::MultiOpaqueRect { .. }) => {
@@ -8292,7 +8302,10 @@ mod tests {
                                     format!("MemBlt rop {:#04x}", order.rop)
                                 }
                             }
-                            Ok(DrawingOrder::SwitchSurface { .. }) => "SwitchSurface".to_string(),
+                            Ok(DrawingOrder::SwitchSurface { bitmap_id }) => {
+                                self.surface = Some(bitmap_id);
+                                "SwitchSurface".to_string()
+                            }
                             Ok(DrawingOrder::CreateOffscreenBitmap(_)) => {
                                 "CreateOffscreenBitmap".to_string()
                             }
@@ -11569,60 +11582,113 @@ mod tests {
         capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
         stages: Vec<String>,
     ) -> Settled {
-        let selected = outcome.mcs.selected;
-        let server_capabilities = outcome.activation.server_capabilities.clone();
-        let mut census = OrderCensus::default();
-        census.feed(&outcome.activation.leftover);
-        let mut machine = SessionStateMachine::new(
-            session_config_from(&outcome, capabilities),
-            outcome.activation.leftover.clone(),
-        )
-        .expect("the desktop size is within MAX_DESKTOP_DIM");
-        let mut stream = outcome.stream;
-        let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
-        let mut frames = Vec::new();
-        let mut readbuf = vec![0u8; 64 * 1024];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            for output in pending.drain(..) {
-                match output {
-                    SessionOutput::Frame(frame) => frames.push(frame),
-                    SessionOutput::WriteBytes(bytes) => {
-                        write_frame(&mut stream, &bytes)
-                            .await
-                            .expect("write to the server");
-                    }
-                    _ => {}
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut readbuf)).await {
-                Ok(Ok(0)) => panic!(
-                    "the server closed the session after {} frames",
-                    frames.len()
-                ),
-                Ok(Err(e)) => panic!(
-                    "reading from the server failed after {} frames: {e}",
-                    frames.len()
-                ),
-                Ok(Ok(n)) => {
-                    census.feed(&readbuf[..n]);
-                    pending = feed_session(&mut machine, &readbuf[..n])
-                        .expect("the session machine takes every byte the server sent");
-                }
-                Err(_) if !frames.is_empty() => break,
-                Err(_) => {}
+        let mut session = Driven::new(outcome, capabilities, stages);
+        session.read_until_quiet(Duration::from_secs(20), true).await;
+        session.settled()
+    }
+
+    /// A session read in steps: input sent between reads, the census and the frames kept.
+    struct Driven {
+        selected: SecurityProtocol,
+        server_capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
+        machine: SessionStateMachine,
+        stream: TlsStream<TcpStream>,
+        pending: Vec<SessionOutput>,
+        frames: Vec<FrameUpdate>,
+        stages: Vec<String>,
+        census: OrderCensus,
+    }
+
+    impl Driven {
+        fn new(
+            outcome: ConnectOutcome,
+            capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
+            stages: Vec<String>,
+        ) -> Self {
+            let mut census = OrderCensus::default();
+            census.feed(&outcome.activation.leftover);
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, capabilities),
+                outcome.activation.leftover.clone(),
+            )
+            .expect("the desktop size is within MAX_DESKTOP_DIM");
+            let pending = machine.process_bytes(&[]).expect("leftover bytes process");
+            Driven {
+                selected: outcome.mcs.selected,
+                server_capabilities: outcome.activation.server_capabilities.clone(),
+                machine,
+                stream: outcome.stream,
+                pending,
+                frames: Vec::new(),
+                stages,
+                census,
             }
         }
-        Settled {
-            selected,
-            server_capabilities,
-            framebuffer: machine.framebuffer().clone(),
-            frames,
-            stages,
-            census,
+
+        /// Read until nothing has arrived for 2 s, or for `most` in all; with `need_frame`, a
+        /// quiet spell ends the read only once something has painted.
+        async fn read_until_quiet(&mut self, most: Duration, need_frame: bool) {
+            let mut readbuf = vec![0u8; 64 * 1024];
+            let deadline = tokio::time::Instant::now() + most;
+            loop {
+                for output in self.pending.drain(..) {
+                    match output {
+                        SessionOutput::Frame(frame) => self.frames.push(frame),
+                        SessionOutput::WriteBytes(bytes) => {
+                            write_frame(&mut self.stream, &bytes)
+                                .await
+                                .expect("write to the server");
+                        }
+                        _ => {}
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_secs(2), self.stream.read(&mut readbuf))
+                    .await
+                {
+                    Ok(Ok(0)) => panic!(
+                        "the server closed the session after {} frames",
+                        self.frames.len()
+                    ),
+                    Ok(Err(e)) => panic!(
+                        "reading from the server failed after {} frames: {e}",
+                        self.frames.len()
+                    ),
+                    Ok(Ok(n)) => {
+                        self.census.feed(&readbuf[..n]);
+                        self.pending = feed_session(&mut self.machine, &readbuf[..n])
+                            .expect("the session machine takes every byte the server sent");
+                    }
+                    Err(_) if !need_frame || !self.frames.is_empty() => break,
+                    Err(_) => {}
+                }
+            }
+        }
+
+        /// Send `events` to the server.
+        async fn send(&mut self, events: &[InputEvent]) {
+            for bytes in self.machine.encode_input(events) {
+                write_frame(&mut self.stream, &bytes)
+                    .await
+                    .expect("write to the server");
+            }
+        }
+
+        fn framebuffer(&self) -> &justrdp::Framebuffer {
+            self.machine.framebuffer()
+        }
+
+        fn settled(self) -> Settled {
+            Settled {
+                selected: self.selected,
+                server_capabilities: self.server_capabilities,
+                framebuffer: self.machine.framebuffer().clone(),
+                frames: self.frames,
+                stages: self.stages,
+                census: self.census,
+            }
         }
     }
 
@@ -11988,6 +12054,80 @@ mod tests {
         "reason=CacheMiss",
         "past the advertised cache",
     ];
+
+    /// PROBE #493 (throwaway).
+    #[tokio::test]
+    #[ignore = "probe"]
+    #[tracing_test::traced_test]
+    async fn probe_493() {
+        vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
+            use justrdp_pdu::capability::{self, CapabilitySet};
+            use justrdp_pdu::input::{PTRFLAGS_BUTTON1, PTRFLAGS_DOWN, PTRFLAGS_MOVE};
+            let mouse = |flags, x, y| InputEvent::Mouse { flags, wheel_units: 0, x, y };
+            let caption = |fb: &justrdp::Framebuffer| -> Option<(u16, u16, u16)> {
+                let w = usize::from(fb.width());
+                for y in 0..usize::from(fb.height()) - 40 {
+                    let row = &fb.pixels()[y * w * 4..(y + 1) * w * 4];
+                    let (mut best, mut run, mut end) = (0, 0, 0);
+                    for x in 0..w {
+                        if row[x * 4..x * 4 + 3] == [0x08, 0x24, 0x6b] { run += 1; if run > best { best = run; end = x; } } else { run = 0; }
+                    }
+                    if best >= 200 { return Some(((y + 8) as u16, (end + 1 - best) as u16, end as u16)); }
+                }
+                None
+            };
+            let click = |x, y| vec![mouse(PTRFLAGS_MOVE, x, y), mouse(PTRFLAGS_DOWN | PTRFLAGS_BUTTON1, x, y), mouse(PTRFLAGS_BUTTON1, x, y)];
+            let t0 = tokio::time::Instant::now();
+            let config = honoured_orders_config();
+            let caps = config.capabilities.clone();
+            let mut s = Driven::new(vm.connect(config).await, caps, Vec::new());
+            s.read_until_quiet(Duration::from_secs(20), true).await;
+            while t0.elapsed() < Duration::from_secs(60) && caption(s.framebuffer()).is_none() {
+                s.read_until_quiet(Duration::from_secs(3), false).await;
+            }
+            s.read_until_quiet(Duration::from_secs(20), false).await;
+            let before = caption(s.framebuffer());
+            s.send(&click(88, 778)).await;
+            let t1 = tokio::time::Instant::now();
+            while t1.elapsed() < Duration::from_secs(60) && caption(s.framebuffer()) == before {
+                s.read_until_quiet(Duration::from_secs(3), false).await;
+            }
+            s.read_until_quiet(Duration::from_secs(20), false).await;
+            let c = caption(s.framebuffer()).expect("server manager");
+            s.send(&click(c.2 - 28, c.0)).await;
+            s.read_until_quiet(Duration::from_secs(20), false).await;
+            eprintln!("P493 A polyline {} caption {:?} at {:?}", s.census.count("Polyline"), caption(s.framebuffer()), t0.elapsed());
+            for p in &s.census.polylines { eprintln!("P493 polyline {p:?}"); }
+            dump_ppm(s.framebuffer(), "p493-A0.ppm");
+            let t2 = tokio::time::Instant::now();
+            while t2.elapsed() < Duration::from_secs(30) { s.read_until_quiet(Duration::from_secs(30), false).await; }
+            eprintln!("P493 A after 30 s more polyline {}", s.census.count("Polyline"));
+            let a = s.settled();
+            dump_ppm(&a.framebuffer, "p493-A.ppm");
+            logs_assert(|lines: &[&str]| { for l in lines.iter().filter(|l| l.contains("rdp_orders") || l.contains("rdp_paint_budget")) { eprintln!("P493 LOG A {}", &l[..l.len().min(300)]); } Ok(()) });
+            drop(a.census);
+
+            let mut config = honoured_orders_config();
+            for set in &mut config.capabilities {
+                if let CapabilitySet::Order(o) = set { o.order_support[capability::ORDER_NEG_POLYLINE_INDEX] = 0; }
+            }
+            let caps = config.capabilities.clone();
+            let mut s = Driven::new(vm.connect(config).await, caps, Vec::new());
+            s.read_until_quiet(Duration::from_secs(20), true).await;
+            eprintln!("P493 B polyline {} frames {}", s.census.count("Polyline"), s.frames.len());
+            let b = s.settled();
+            dump_ppm(&b.framebuffer, "p493-B.ppm");
+            let d = differing_pixels(&a.framebuffer, &b.framebuffer);
+            eprintln!("P493 differ {}", d.len());
+            let mut rows = std::collections::BTreeMap::<usize, (usize, usize, usize)>::new();
+            for &(x, y) in &d { let e = rows.entry(y).or_insert((x, x, 0)); e.0 = e.0.min(x); e.1 = e.1.max(x); e.2 += 1; }
+            for (y, (l, r, n)) in rows.iter().take(80) { eprintln!("P493 row {y}: {n} px x {l}..={r}"); }
+            b.census.print("P493 B");
+            let d0 = differing_pixels(&a.framebuffer, &b.framebuffer).len();
+            eprintln!("P493 differ A(+30s) vs B {d0}");
+        })
+        .await
+    }
 
     /// How many distinct colours `fb` holds, up to 17.
     fn colour_count(fb: &justrdp::Framebuffer) -> usize {
