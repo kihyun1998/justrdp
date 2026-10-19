@@ -1428,6 +1428,15 @@ impl SessionStateMachine {
             &mut frames,
         );
         outputs.extend(frames.into_iter().map(SessionOutput::Frame));
+        if self.orders.take_offscreen_error() {
+            outputs.push(self.send_io(&share::encode_share_data(
+                self.config.user_channel_id,
+                self.config.share_id,
+                share::STREAM_MED,
+                share::PDU_TYPE2_OFFSCRCACHE_ERROR,
+                &share::OC_ERR_FLUSH_AND_DISABLE_OFFSCREEN.to_le_bytes(),
+            )));
+        }
         result
     }
 
@@ -3648,6 +3657,56 @@ mod tests {
         assert_eq!(
             frame_pixels(&sm, &frame),
             crate::orders::tests::rgba(crate::orders::tests::RED)
+        );
+    }
+
+    /// A Create Offscreen Bitmap past the advertised cache sends one Offscreen Bitmap Cache
+    /// Error PDU, `OC_ERR_FLUSH_AND_DISABLE_OFFSCREEN` (#489, `[MS-RDPEGDI]` 2.2.2.3.2).
+    #[test]
+    fn an_offscreen_bitmap_past_the_cache_sends_the_error_pdu_once() {
+        use crate::orders::tests::create_offscreen;
+        let mut config = orders_config();
+        config.capabilities.push(CapabilitySet::OffscreenCache(
+            justrdp_pdu::capability::OffscreenCacheCapabilitySet {
+                offscreen_support_level: 1,
+                offscreen_cache_size: 1,
+                offscreen_cache_entries: 4,
+            },
+        ));
+        let mut sm = SessionStateMachine::new(config, Vec::new()).unwrap();
+        let update = |orders: &[Vec<u8>]| {
+            fastpath::encode_pdu(&[(
+                fastpath::FP_UPDATE_ORDERS,
+                fastpath::FP_FRAGMENT_SINGLE,
+                &orders_body(orders),
+            )])
+        };
+        // 1 KB at 16 bpp is 512 pixels; one update's budget on this 16 x 8 desktop buys 256.
+        for id in [0, 1] {
+            let fits = sm
+                .process_bytes(&update(&[create_offscreen(id, 16, 16, &[])]))
+                .unwrap();
+            assert_eq!(fits, []);
+        }
+        let outputs = sm
+            .process_bytes(&update(&[create_offscreen(2, 1, 1, &[])]))
+            .unwrap();
+        let expected = sm.wrap_io(&share::encode_share_data(
+            sm.config.user_channel_id,
+            sm.config.share_id,
+            share::STREAM_MED,
+            share::PDU_TYPE2_OFFSCRCACHE_ERROR,
+            &1u32.to_le_bytes(),
+        ));
+        assert_eq!(outputs, [SessionOutput::WriteBytes(expected.clone())]);
+        assert_eq!(expected[expected.len() - 4..], [1, 0, 0, 0]);
+        let again = sm
+            .process_bytes(&update(&[create_offscreen(3, 1, 1, &[])]))
+            .unwrap();
+        assert_eq!(
+            again,
+            [],
+            "the cache is no longer kept, and no second PDU is sent"
         );
     }
 

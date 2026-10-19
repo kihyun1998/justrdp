@@ -63,6 +63,14 @@ fuzz_target!(|input: &[u8]| {
             o.order_support_ex_flags = capability::ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT;
         }
     }
+    capabilities.retain(|set| !matches!(set, CapabilitySet::OffscreenCache(_)));
+    capabilities.push(CapabilitySet::OffscreenCache(
+        capability::OffscreenCacheCapabilitySet {
+            offscreen_support_level: 1,
+            offscreen_cache_size: 512,
+            offscreen_cache_entries: 8,
+        },
+    ));
     capabilities.push(CapabilitySet::BitmapCacheRev2(
         capability::BitmapCacheRev2CapabilitySet {
             cache_flags: capability::ALLOW_CACHE_WAITING_LIST_FLAG,
