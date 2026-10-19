@@ -456,7 +456,16 @@ was checked against.
   MultiOpaqueRect, FastGlyph, the offscreen orders, Cache Brush and Polyline
   ([Drawing orders](drawing-orders.md), Reference behaviour). Tests reach it through
   `with_vm_session_on(Target::GdiOrders, …)`, the audio input VM's shape: its own address and
-  lock, the same `JUSTRDP_TEST_*` credentials. Its configuration, none of it in the repo:
+  lock, the same `JUSTRDP_TEST_*` credentials. Its tests capture tracing and fail on a skipped
+  paint (`SKIPPED_PAINT_LOGS`, #494).
+  - **Driving a window there (#493).** The theme is classic, so the active window's caption is a
+    run of `0x08246B`, and `active_caption` finds it in the framebuffer. The maximise button is
+    28 px left of its right end.
+  - **Server Manager is a fixed taskbar button**, at x 88.
+  - **A maximise click can miss** while the window is still coming up. That happened once in
+    four runs, so the test clicks up to three times until the caption spans the desktop.
+
+  Its configuration, none of it in the repo:
   - Remote Desktop allows connections from **any version** of the client, so a TLS-only connect
     is accepted. `rdptest` is in Administrators, its password does not expire, and the monitor
     and standby timeouts are off. Windows is **not activated**, so the grace period runs out on

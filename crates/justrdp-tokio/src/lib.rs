@@ -11583,7 +11583,9 @@ mod tests {
         stages: Vec<String>,
     ) -> Settled {
         let mut session = Driven::new(outcome, capabilities, stages);
-        session.read_until_quiet(Duration::from_secs(20), true).await;
+        session
+            .read_until_quiet(Duration::from_secs(20), true)
+            .await;
         session.settled()
     }
 
@@ -11664,6 +11666,27 @@ mod tests {
                     Err(_) if !need_frame || !self.frames.is_empty() => break,
                     Err(_) => {}
                 }
+            }
+        }
+
+        /// Read in quiet spells until `done` finds something in the framebuffer, for `most` in
+        /// all.
+        async fn read_until<T>(
+            &mut self,
+            most: Duration,
+            done: impl Fn(&justrdp::Framebuffer) -> Option<T>,
+        ) -> Option<T> {
+            let deadline = tokio::time::Instant::now() + most;
+            loop {
+                if let Some(found) = done(self.framebuffer()) {
+                    return Some(found);
+                }
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                self.read_until_quiet(left.min(Duration::from_secs(3)), false)
+                    .await;
             }
         }
 
@@ -12055,78 +12078,174 @@ mod tests {
         "past the advertised cache",
     ];
 
-    /// PROBE #493 (throwaway).
+    /// Issue #493: on the GDI orders VM, Server Manager opened from the taskbar and maximised
+    /// is drawn with Polyline, on the screen, and equals the same desktop the server repaints
+    /// for a session that advertises no Polyline, above the taskbar.
     #[tokio::test]
-    #[ignore = "probe"]
-    #[tracing_test::traced_test]
-    async fn probe_493() {
+    #[traced_test]
+    #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
+                JUSTRDP_TEST_* env vars"]
+    async fn the_gdi_orders_vm_paints_a_maximised_window_in_polylines_as_without() {
         vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
             use justrdp_pdu::capability::{self, CapabilitySet};
             use justrdp_pdu::input::{PTRFLAGS_BUTTON1, PTRFLAGS_DOWN, PTRFLAGS_MOVE};
-            let mouse = |flags, x, y| InputEvent::Mouse { flags, wheel_units: 0, x, y };
-            let caption = |fb: &justrdp::Framebuffer| -> Option<(u16, u16, u16)> {
-                let w = usize::from(fb.width());
-                for y in 0..usize::from(fb.height()) - 40 {
-                    let row = &fb.pixels()[y * w * 4..(y + 1) * w * 4];
-                    let (mut best, mut run, mut end) = (0, 0, 0);
-                    for x in 0..w {
-                        if row[x * 4..x * 4 + 3] == [0x08, 0x24, 0x6b] { run += 1; if run > best { best = run; end = x; } } else { run = 0; }
-                    }
-                    if best >= 200 { return Some(((y + 8) as u16, (end + 1 - best) as u16, end as u16)); }
-                }
-                None
+            let click = |x, y| {
+                [
+                    PTRFLAGS_MOVE,
+                    PTRFLAGS_DOWN | PTRFLAGS_BUTTON1,
+                    PTRFLAGS_BUTTON1,
+                ]
+                .map(|flags| InputEvent::Mouse {
+                    flags,
+                    wheel_units: 0,
+                    x,
+                    y,
+                })
             };
-            let click = |x, y| vec![mouse(PTRFLAGS_MOVE, x, y), mouse(PTRFLAGS_DOWN | PTRFLAGS_BUTTON1, x, y), mouse(PTRFLAGS_BUTTON1, x, y)];
-            let t0 = tokio::time::Instant::now();
             let config = honoured_orders_config();
-            let caps = config.capabilities.clone();
-            let mut s = Driven::new(vm.connect(config).await, caps, Vec::new());
-            s.read_until_quiet(Duration::from_secs(20), true).await;
-            while t0.elapsed() < Duration::from_secs(60) && caption(s.framebuffer()).is_none() {
-                s.read_until_quiet(Duration::from_secs(3), false).await;
+            let capabilities = config.capabilities.clone();
+            let mut session = Driven::new(vm.connect(config).await, capabilities, Vec::new());
+            session
+                .read_until_quiet(Duration::from_secs(20), true)
+                .await;
+            // The Initial Configuration Tasks window comes up after the shell.
+            let logon = session
+                .read_until(Duration::from_secs(120), active_caption)
+                .await
+                .expect("a window comes up after logon");
+            let (width, height) = (
+                session.framebuffer().width(),
+                session.framebuffer().height(),
+            );
+            session
+                .send(&click(SERVER_MANAGER_ON_TASKBAR, height - 22))
+                .await;
+            let mut caption = session
+                .read_until(Duration::from_secs(60), |fb| {
+                    active_caption(fb).filter(|caption| *caption != logon)
+                })
+                .await
+                .expect("Server Manager opens");
+            let full_width = |fb: &justrdp::Framebuffer| {
+                active_caption(fb).filter(|c| c.left == 0 && c.right == width - 1)
+            };
+            let mut maximised = None;
+            for _ in 0..3 {
+                session.send(&click(caption.maximise_x(), caption.y)).await;
+                maximised = session
+                    .read_until(Duration::from_secs(20), full_width)
+                    .await;
+                if maximised.is_some() {
+                    break;
+                }
+                caption = active_caption(session.framebuffer()).unwrap_or(caption);
             }
-            s.read_until_quiet(Duration::from_secs(20), false).await;
-            let before = caption(s.framebuffer());
-            s.send(&click(88, 778)).await;
-            let t1 = tokio::time::Instant::now();
-            while t1.elapsed() < Duration::from_secs(60) && caption(s.framebuffer()) == before {
-                s.read_until_quiet(Duration::from_secs(3), false).await;
+            assert!(maximised.is_some(), "Server Manager never maximised");
+            session
+                .read_until_quiet(Duration::from_secs(20), false)
+                .await;
+            let polylined = session.settled();
+            polylined.census.print("#493 maximised with Polyline");
+            for skip in SKIPPED_PAINT_LOGS {
+                assert!(!logs_contain(skip), "a paint was skipped: {skip}");
             }
-            s.read_until_quiet(Duration::from_secs(20), false).await;
-            let c = caption(s.framebuffer()).expect("server manager");
-            s.send(&click(c.2 - 28, c.0)).await;
-            s.read_until_quiet(Duration::from_secs(20), false).await;
-            eprintln!("P493 A polyline {} caption {:?} at {:?}", s.census.count("Polyline"), caption(s.framebuffer()), t0.elapsed());
-            for p in &s.census.polylines { eprintln!("P493 polyline {p:?}"); }
-            dump_ppm(s.framebuffer(), "p493-A0.ppm");
-            let t2 = tokio::time::Instant::now();
-            while t2.elapsed() < Duration::from_secs(30) { s.read_until_quiet(Duration::from_secs(30), false).await; }
-            eprintln!("P493 A after 30 s more polyline {}", s.census.count("Polyline"));
-            let a = s.settled();
-            dump_ppm(&a.framebuffer, "p493-A.ppm");
-            logs_assert(|lines: &[&str]| { for l in lines.iter().filter(|l| l.contains("rdp_orders") || l.contains("rdp_paint_budget")) { eprintln!("P493 LOG A {}", &l[..l.len().min(300)]); } Ok(()) });
-            drop(a.census);
+            eprintln!("#493: Polyline {:?}", polylined.census.polylines);
+            assert!(
+                polylined
+                    .census
+                    .polylines
+                    .iter()
+                    .any(|&(surface, ..)| surface == justrdp_pdu::orders::SCREEN_BITMAP_SURFACE),
+                "no Polyline arrived on the screen"
+            );
 
             let mut config = honoured_orders_config();
             for set in &mut config.capabilities {
-                if let CapabilitySet::Order(o) = set { o.order_support[capability::ORDER_NEG_POLYLINE_INDEX] = 0; }
+                if let CapabilitySet::Order(o) = set {
+                    o.order_support[capability::ORDER_NEG_POLYLINE_INDEX] = 0;
+                }
             }
-            let caps = config.capabilities.clone();
-            let mut s = Driven::new(vm.connect(config).await, caps, Vec::new());
-            s.read_until_quiet(Duration::from_secs(20), true).await;
-            eprintln!("P493 B polyline {} frames {}", s.census.count("Polyline"), s.frames.len());
-            let b = s.settled();
-            dump_ppm(&b.framebuffer, "p493-B.ppm");
-            let d = differing_pixels(&a.framebuffer, &b.framebuffer);
-            eprintln!("P493 differ {}", d.len());
-            let mut rows = std::collections::BTreeMap::<usize, (usize, usize, usize)>::new();
-            for &(x, y) in &d { let e = rows.entry(y).or_insert((x, x, 0)); e.0 = e.0.min(x); e.1 = e.1.max(x); e.2 += 1; }
-            for (y, (l, r, n)) in rows.iter().take(80) { eprintln!("P493 row {y}: {n} px x {l}..={r}"); }
-            b.census.print("P493 B");
-            let d0 = differing_pixels(&a.framebuffer, &b.framebuffer).len();
-            eprintln!("P493 differ A(+30s) vs B {d0}");
+            let capabilities = config.capabilities.clone();
+            let repainted = settle(vm.connect(config).await, capabilities, Vec::new()).await;
+            repainted.census.print("#493 repainted without Polyline");
+            eprintln!(
+                "#493: dumps {} and {}",
+                dump_ppm(&polylined.framebuffer, "justrdp-493-polylined.ppm").display(),
+                dump_ppm(&repainted.framebuffer, "justrdp-493-repainted.ppm").display()
+            );
+            assert_eq!(
+                repainted.census.count("Polyline"),
+                0,
+                "Polyline arrived unadvertised"
+            );
+            // The taskbar holds the clock.
+            let above_taskbar = usize::from(height) - 40;
+            let differing: Vec<_> =
+                differing_pixels(&polylined.framebuffer, &repainted.framebuffer)
+                    .into_iter()
+                    .filter(|&(_, y)| y < above_taskbar)
+                    .collect();
+            eprintln!("#493: {} pixels differ above the taskbar", differing.len());
+            assert_eq!(
+                differing.get(..8.min(differing.len())),
+                Some(&[][..]),
+                "pixels differ"
+            );
         })
         .await
+    }
+
+    /// Server Manager's button on the GDI orders VM's taskbar, its x; the taskbar is 40 px high.
+    const SERVER_MANAGER_ON_TASKBAR: u16 = 88;
+
+    /// The active window's caption, in the classic theme's active caption colour.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Caption {
+        /// The caption's middle row.
+        y: u16,
+        left: u16,
+        right: u16,
+    }
+
+    impl Caption {
+        /// The maximise button's x: the middle of three, at the caption's right end.
+        fn maximise_x(self) -> u16 {
+            self.right - 28
+        }
+    }
+
+    /// The topmost run of at least 200 pixels in the classic active caption colour, above the
+    /// taskbar.
+    fn active_caption(fb: &justrdp::Framebuffer) -> Option<Caption> {
+        const ACTIVE_CAPTION: [u8; 3] = [0x08, 0x24, 0x6B];
+        let width = usize::from(fb.width());
+        let above_taskbar = usize::from(fb.height()).saturating_sub(40);
+        for (y, row) in fb
+            .pixels()
+            .chunks_exact(width * 4)
+            .take(above_taskbar)
+            .enumerate()
+        {
+            let (mut best, mut run, mut end) = (0, 0, 0);
+            for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
+                if px[..3] == ACTIVE_CAPTION {
+                    run += 1;
+                    if run > best {
+                        (best, end) = (run, x);
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+            if best >= 200 {
+                return Some(Caption {
+                    y: (y + 8) as u16,
+                    left: (end + 1 - best) as u16,
+                    right: end as u16,
+                });
+            }
+        }
+        None
     }
 
     /// How many distinct colours `fb` holds, up to 17.
