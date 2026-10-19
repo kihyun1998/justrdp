@@ -82,11 +82,12 @@ pub const HONOURED_SOUND_FLAGS: u16 = capability::SOUND_FLAG_BEEPS;
 pub const HONOURED_SURFACE_COMMANDS: u32 = capability::SURFCMDS_SET_SURFACE_BITS;
 
 /// The `orderSupport` entries the session paints: DstBlt, PatBlt with OpaqueRect (one index),
-/// ScrBlt, MemBlt, Mem3Blt and GlyphIndex (`crate::orders`).
-pub const HONOURED_ORDERS: [usize; 6] = [
+/// MultiOpaqueRect, ScrBlt, MemBlt, Mem3Blt and GlyphIndex (`crate::orders`).
+pub const HONOURED_ORDERS: [usize; 7] = [
     capability::ORDER_NEG_INDEX_INDEX,
     capability::ORDER_NEG_DSTBLT_INDEX,
     capability::ORDER_NEG_PATBLT_INDEX,
+    capability::ORDER_NEG_MULTIOPAQUERECT_INDEX,
     capability::ORDER_NEG_SCRBLT_INDEX,
     capability::ORDER_NEG_MEMBLT_INDEX,
     capability::ORDER_NEG_MEM3BLT_INDEX,
@@ -315,7 +316,7 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
         {
             refuse(
                 capability::CAPSET_ORDER,
-                "orderSupport enables a drawing order other than DstBlt, PatBlt, OpaqueRect, ScrBlt, MemBlt, Mem3Blt and GlyphIndex",
+                "orderSupport enables a drawing order other than DstBlt, PatBlt, OpaqueRect, MultiOpaqueRect, ScrBlt, MemBlt, Mem3Blt and GlyphIndex",
             )
         }
         CapabilitySet::Order(o) if o.order_flags & !HONOURED_ORDER_FLAGS != 0 => refuse(
@@ -904,7 +905,8 @@ mod tests {
     }
 
     /// DstBlt's index and PatBlt's, which also negotiates OpaqueRect, pass alone and with the
-    /// blts (#475); an index the session does not paint, LineTo's, is refused.
+    /// blts (#475), and MultiOpaqueRect's (#485); an index the session does not paint, LineTo's,
+    /// is refused.
     #[test]
     fn patblt_passes_and_an_unpainted_order_is_refused() {
         let with = |index: usize| {
@@ -918,6 +920,7 @@ mod tests {
         };
         assert_eq!(with(capability::ORDER_NEG_PATBLT_INDEX), Ok(()));
         assert_eq!(with(capability::ORDER_NEG_DSTBLT_INDEX), Ok(()));
+        assert_eq!(with(capability::ORDER_NEG_MULTIOPAQUERECT_INDEX), Ok(()));
         let mut patblt = OrderCapabilitySet::default();
         patblt.order_support[capability::ORDER_NEG_PATBLT_INDEX] = 1;
         let mut config = crate::connect::tests::config();

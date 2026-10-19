@@ -8270,6 +8270,11 @@ mod tests {
                                     .push([order.left, order.top, order.width, order.height]);
                                 "OpaqueRect".to_string()
                             }
+                            Ok(DrawingOrder::MultiOpaqueRect { .. }) => {
+                                self.fills
+                                    .extend_from_slice(self.history.multi_opaque_rect_rects());
+                                "MultiOpaqueRect".to_string()
+                            }
                             Ok(DrawingOrder::ScrBlt { order, .. }) => {
                                 self.scrblts.push((
                                     [order.left, order.top, order.width, order.height],
@@ -11647,6 +11652,7 @@ mod tests {
         let mut config = legacy_orders_config(&[
             capability::ORDER_NEG_DSTBLT_INDEX,
             capability::ORDER_NEG_PATBLT_INDEX,
+            capability::ORDER_NEG_MULTIOPAQUERECT_INDEX,
             capability::ORDER_NEG_SCRBLT_INDEX,
             capability::ORDER_NEG_MEMBLT_INDEX,
             capability::ORDER_NEG_MEM3BLT_INDEX,
