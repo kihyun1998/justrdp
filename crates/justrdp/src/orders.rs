@@ -71,6 +71,7 @@ pub(crate) struct Orders {
     dstblt: bool,
     /// PatBlt and OpaqueRect, which one `orderSupport` index negotiates.
     patblt: bool,
+    multi_opaque_rect: bool,
     scrblt: bool,
     memblt: bool,
     mem3blt: bool,
@@ -125,6 +126,8 @@ impl Orders {
             glyphs,
             dstblt: support.is_some_and(|s| s[capability::ORDER_NEG_DSTBLT_INDEX] != 0),
             patblt: support.is_some_and(|s| s[capability::ORDER_NEG_PATBLT_INDEX] != 0),
+            multi_opaque_rect: support
+                .is_some_and(|s| s[capability::ORDER_NEG_MULTIOPAQUERECT_INDEX] != 0),
             scrblt: support.is_some_and(|s| s[capability::ORDER_NEG_SCRBLT_INDEX] != 0),
             memblt: support.is_some_and(|s| s[capability::ORDER_NEG_MEMBLT_INDEX] != 0),
             mem3blt: support.is_some_and(|s| s[capability::ORDER_NEG_MEM3BLT_INDEX] != 0),
@@ -317,6 +320,28 @@ impl Orders {
                             &mut budget,
                             &mut painted,
                         )
+                    })
+                }
+                DrawingOrder::MultiOpaqueRect { order, clip } => {
+                    order_color(order.color, palette, bits_per_pixel).and_then(|color| {
+                        if !self.multi_opaque_rect {
+                            tracing::warn!(
+                                target: "rdp_orders",
+                                "a drawing order this client did not advertise, painted anyway"
+                            );
+                        }
+                        self.history
+                            .multi_opaque_rect_rects()
+                            .iter()
+                            .try_for_each(|&dest| {
+                                let rect = Fill {
+                                    dest,
+                                    rop: PATCOPY,
+                                    brush: Pattern::Solid(color),
+                                    clip,
+                                };
+                                fill(true, rect, framebuffer, &mut budget, &mut painted)
+                            })
                     })
                 }
                 DrawingOrder::ScrBlt { order, clip } => {
@@ -1194,6 +1219,91 @@ pub(crate) mod tests {
         assert_ne!(pixel(&fb, 2, 0), rgba(RED), "DSTINVERT changed it");
         assert_eq!(pixel(&fb, 3, 0), rgba(BLUE));
         assert_eq!(pixel(&fb, 3, 1), rgba(WHITE));
+    }
+
+    /// A MultiOpaqueRect of a 16 bpp `color` over `rects` (`[left, top, width, height]`), each
+    /// component a one-byte delta, inside the inclusive `bounds` when there are some.
+    pub(crate) fn multi_opaque_rect(
+        bounds: Option<[i16; 4]>,
+        color: u16,
+        rects: &[[i16; 4]],
+    ) -> Vec<u8> {
+        let control = TS_STANDARD | TS_TYPE_CHANGE | if bounds.is_some() { TS_BOUNDS } else { 0 };
+        let mut order = vec![
+            control,
+            justrdp_pdu::orders::TS_ENC_MULTIOPAQUERECT_ORDER,
+            0xB0,
+            0x01,
+        ];
+        if let Some(edges) = bounds {
+            order.push(0x0F);
+            for edge in edges {
+                order.extend_from_slice(&edge.to_le_bytes());
+            }
+        }
+        order.extend_from_slice(&color.to_le_bytes());
+        order.push(rects.len() as u8);
+        let mut list = vec![0u8; rects.len().div_ceil(2)];
+        let mut previous = [0i16; 2];
+        for rect in rects {
+            for value in [
+                rect[0] - previous[0],
+                rect[1] - previous[1],
+                rect[2],
+                rect[3],
+            ] {
+                assert!((-64..64).contains(&value), "a one-byte delta");
+                list.push((value as i8 as u8) & 0x7F);
+            }
+            previous = [rect[0], rect[1]];
+        }
+        order.extend_from_slice(&(list.len() as u16).to_le_bytes());
+        order.extend_from_slice(&list);
+        order
+    }
+
+    /// MultiOpaqueRect fills each of its rectangles with its colour, a frame each, and paints
+    /// nothing for an empty one; the bounds clip every rectangle (#485).
+    #[test]
+    fn multi_opaque_rect_fills_each_rectangle() {
+        let mut sets = capabilities(4, true);
+        if let CapabilitySet::Order(o) = &mut sets[0] {
+            o.order_support[capability::ORDER_NEG_MULTIOPAQUERECT_INDEX] = 1;
+        }
+        let mut orders = Orders::new(&sets);
+        let mut fb = Framebuffer::new(6, 3).unwrap();
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[multi_opaque_rect(
+                None,
+                RED,
+                &[[0, 0, 2, 1], [4, 1, 2, 1], [1, 2, 0, 1]],
+            )],
+        );
+        assert_eq!(frames, [frame(0, 0, 2, 1), frame(4, 1, 2, 1)]);
+        for (x, y) in [(0, 0), (1, 0), (4, 1), (5, 1)] {
+            assert_eq!(pixel(&fb, x, y), rgba(RED), "({x}, {y})");
+        }
+        for (x, y) in [(2, 0), (3, 1), (1, 2)] {
+            assert_eq!(pixel(&fb, x, y), BLACK, "({x}, {y})");
+        }
+
+        // Bounds of columns 0..=4, rows 0..=1: the first rectangle lies below them, the second
+        // keeps its first column.
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[multi_opaque_rect(
+                Some([0, 0, 4, 1]),
+                GREEN,
+                &[[0, 2, 6, 1], [4, 1, 2, 1]],
+            )],
+        );
+        assert_eq!(frames, [frame(4, 1, 1, 1)]);
+        assert_eq!(pixel(&fb, 4, 1), rgba(GREEN));
+        assert_eq!(pixel(&fb, 5, 1), rgba(RED));
+        assert_eq!(pixel(&fb, 0, 2), BLACK);
     }
 
     /// A DstBlt with every field.

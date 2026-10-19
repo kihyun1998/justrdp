@@ -40,6 +40,10 @@ pub const TS_ENC_OPAQUERECT_ORDER: u8 = 0x0A;
 pub const TS_ENC_MEMBLT_ORDER: u8 = 0x0D;
 /// `orderType` (primary): Mem3Blt.
 pub const TS_ENC_MEM3BLT_ORDER: u8 = 0x0E;
+/// `orderType` of the MultiOpaqueRect primary drawing order.
+pub const TS_ENC_MULTIOPAQUERECT_ORDER: u8 = 0x12;
+/// The most rectangles a Delta-Encoded Rectangles field holds (2.2.2.2.1.1.1.5).
+pub const MAX_DELTA_RECTS: usize = 45;
 /// `orderType` of the GlyphIndex primary drawing order.
 pub const TS_ENC_INDEX_ORDER: u8 = 0x1B;
 
@@ -311,6 +315,24 @@ pub struct OpaqueRect {
     pub color: u32,
 }
 
+/// The fields of a MultiOpaqueRect order (2.2.2.2.1.1.2.6), as the history holds them. Its
+/// rectangles are [`OrderHistory::multi_opaque_rect_rects`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MultiOpaqueRect {
+    /// `nLeftRect`.
+    pub left: i16,
+    /// `nTopRect`.
+    pub top: i16,
+    /// `nWidth`.
+    pub width: i16,
+    /// `nHeight`.
+    pub height: i16,
+    /// `RedOrPaletteIndex`, `Green` and `Blue`, as [`OpaqueRect::color`].
+    pub color: u32,
+    /// `nDeltaEntries`.
+    pub delta_entries: u8,
+}
+
 /// An 8×8 brush (2.2.2.2.1.1.2.3 `BrushOrgX` … `BrushExtra`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Brush {
@@ -495,6 +517,13 @@ pub enum DrawingOrder<'a> {
         /// Its clip.
         clip: Clip,
     },
+    /// MultiOpaqueRect.
+    MultiOpaqueRect {
+        /// The order.
+        order: MultiOpaqueRect,
+        /// Its clip.
+        clip: Clip,
+    },
     /// ScrBlt.
     ScrBlt {
         /// The order.
@@ -554,6 +583,10 @@ pub struct OrderHistory {
     dstblt: DstBlt,
     patblt: PatBlt,
     opaque_rect: OpaqueRect,
+    multi_opaque_rect: MultiOpaqueRect,
+    /// The last MultiOpaqueRect's `CodedDeltaList`: how many rectangles it held, then each
+    /// `[left, top, width, height]`.
+    multi_opaque_rect_rects: (u8, [[i16; 4]; MAX_DELTA_RECTS]),
     scrblt: ScrBlt,
     memblt: MemBlt,
     mem3blt: Mem3Blt,
@@ -572,6 +605,8 @@ impl Default for OrderHistory {
             dstblt: DstBlt::default(),
             patblt: PatBlt::default(),
             opaque_rect: OpaqueRect::default(),
+            multi_opaque_rect: MultiOpaqueRect::default(),
+            multi_opaque_rect_rects: (0, [[0; 4]; MAX_DELTA_RECTS]),
             scrblt: ScrBlt::default(),
             memblt: MemBlt::default(),
             mem3blt: Mem3Blt::default(),
@@ -586,6 +621,12 @@ impl OrderHistory {
     pub fn glyph_index_data(&self) -> &[u8] {
         &self.glyph_index_data.1[..usize::from(self.glyph_index_data.0)]
     }
+
+    /// The last MultiOpaqueRect's rectangles, `[left, top, width, height]`: the first
+    /// `nDeltaEntries` of the list its history holds.
+    pub fn multi_opaque_rect_rects(&self) -> &[[i16; 4]] {
+        &self.multi_opaque_rect_rects.1[..usize::from(self.multi_opaque_rect.delta_entries)]
+    }
 }
 
 /// The number of field-flag bytes of a primary order type (2.2.2.2.1.1.2), for the types
@@ -596,6 +637,7 @@ fn field_bytes(order_type: u8) -> Option<usize> {
         TS_ENC_PATBLT_ORDER => Some(2),
         TS_ENC_SCRBLT_ORDER => Some(1),
         TS_ENC_OPAQUERECT_ORDER => Some(1),
+        TS_ENC_MULTIOPAQUERECT_ORDER => Some(2),
         TS_ENC_MEMBLT_ORDER => Some(2),
         TS_ENC_MEM3BLT_ORDER => Some(3),
         TS_ENC_INDEX_ORDER => Some(3),
@@ -714,6 +756,50 @@ fn decode_primary<'a>(
                 clip,
             }
         }
+        TS_ENC_MULTIOPAQUERECT_ORDER => {
+            let order = &mut history.multi_opaque_rect;
+            fields.coord(0x001, &mut order.left)?;
+            fields.coord(0x002, &mut order.top)?;
+            fields.coord(0x004, &mut order.width)?;
+            fields.coord(0x008, &mut order.height)?;
+            for (index, flag) in [0x010, 0x020, 0x040].into_iter().enumerate() {
+                let mut byte = order.color.to_le_bytes()[index];
+                fields.u8(flag, &mut byte)?;
+                let shift = 8 * index;
+                order.color = order.color & !(0xFF << shift) | u32::from(byte) << shift;
+            }
+            let mut count = order.delta_entries;
+            fields.u8(0x080, &mut count)?;
+            let entries = usize::from(count);
+            if entries > MAX_DELTA_RECTS {
+                return Err(DecodeError::InvalidField {
+                    field: "MULTI_OPAQUERECT_ORDER.nDeltaEntries",
+                    reason: "more than 45 rectangles",
+                }
+                .into());
+            }
+            let stored = &mut history.multi_opaque_rect_rects;
+            if fields.present(0x100) {
+                let length = fields.cur.read_u16_le()?;
+                let list = fields.cur.read_slice(usize::from(length))?;
+                let mut list = ReadCursor::new(list, "MULTI_OPAQUERECT_ORDER.CodedDeltaList");
+                let mut rects = [[0; 4]; MAX_DELTA_RECTS];
+                read_delta_rects(&mut list, &mut rects[..entries])?;
+                stored.1 = rects;
+                stored.0 = count;
+            } else if entries > usize::from(stored.0) {
+                return Err(DecodeError::InvalidField {
+                    field: "MULTI_OPAQUERECT_ORDER.nDeltaEntries",
+                    reason: "more rectangles than the list the history holds",
+                }
+                .into());
+            }
+            order.delta_entries = count;
+            DrawingOrder::MultiOpaqueRect {
+                order: *order,
+                clip,
+            }
+        }
         TS_ENC_INDEX_ORDER => {
             let order = &mut history.glyph_index;
             fields.u8(0x00_0001, &mut order.cache_id)?;
@@ -812,6 +898,47 @@ fn read_bounds(cur: &mut ReadCursor<'_>, history: &mut OrderHistory) -> Result<(
         history.bounds_known = true;
     }
     Ok(())
+}
+
+/// Read a Delta-Encoded Rectangles field (2.2.2.2.1.1.1.5) of `rects.len()` rectangles. A
+/// rectangle's left and top are deltas from the rectangle before, the first from `(0, 0)`; its
+/// width and height are values, and an absent one is the previous rectangle's.
+fn read_delta_rects(cur: &mut ReadCursor<'_>, rects: &mut [[i16; 4]]) -> Result<(), DecodeError> {
+    let zero_bits = cur.read_slice(rects.len().div_ceil(2))?;
+    let mut previous = [0i16; 4];
+    for (index, rect) in rects.iter_mut().enumerate() {
+        let flags = zero_bits[index / 2] << (4 * (index % 2));
+        let mut next = previous;
+        if flags & 0x80 == 0 {
+            next[0] = previous[0].wrapping_add(read_delta(cur)?);
+        }
+        if flags & 0x40 == 0 {
+            next[1] = previous[1].wrapping_add(read_delta(cur)?);
+        }
+        if flags & 0x20 == 0 {
+            next[2] = read_delta(cur)?;
+        }
+        if flags & 0x10 == 0 {
+            next[3] = read_delta(cur)?;
+        }
+        *rect = next;
+        previous = next;
+    }
+    Ok(())
+}
+
+/// One packed signed value of a Delta-Encoded Rectangles field: 7 bits in one byte, or 15 in
+/// two when the first byte's high bit is set, the sign in its 0x40 bit.
+fn read_delta(cur: &mut ReadCursor<'_>) -> Result<i16, DecodeError> {
+    let first = cur.read_u8()?;
+    let mut value = i32::from(first & 0x3F);
+    if first & 0x40 != 0 {
+        value -= 0x40;
+    }
+    if first & 0x80 != 0 {
+        value = value * 0x100 + i32::from(cur.read_u8()?);
+    }
+    Ok(value as i16)
 }
 
 /// The present fields of one primary order, read in order.
@@ -1361,6 +1488,160 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    /// The annotated MultiOpaqueRect of 4.1.6: four rectangles whose left and top are deltas
+    /// from the rectangle before, and whose width and height are values, the second one's left
+    /// and the third one's top absent.
+    #[test]
+    fn the_spec_multi_opaque_rect_decodes() {
+        let bytes = [
+            0x09, 0x12, 0xbf, 0x01, 0x87, 0x01, 0x1c, 0x01, 0xf1, 0x00, 0x12, 0x00, 0x5c, 0xef,
+            0x04, 0x16, 0x00, 0x08, 0x40, 0x81, 0x87, 0x81, 0x1c, 0x80, 0xf1, 0x01, 0x01, 0x01,
+            0x10, 0x80, 0xf0, 0x01, 0x10, 0xff, 0x10, 0x10, 0x80, 0xf1, 0x01,
+        ];
+        let mut history = OrderHistory::default();
+        assert_eq!(
+            decode_all(&bytes, &mut history),
+            [Ok(DrawingOrder::MultiOpaqueRect {
+                order: MultiOpaqueRect {
+                    left: 391,
+                    top: 284,
+                    width: 241,
+                    height: 18,
+                    color: 0x00_EF5C,
+                    delta_entries: 4,
+                },
+                clip: Clip::None
+            })]
+        );
+        assert_eq!(
+            history.multi_opaque_rect_rects(),
+            [
+                [391, 284, 241, 1],
+                [391, 285, 1, 16],
+                [631, 285, 1, 16],
+                [391, 301, 241, 1]
+            ]
+        );
+    }
+
+    /// A delta is one byte of 7 signed bits, or two of 15 when the first has its high bit; an
+    /// absent width or height is the previous rectangle's, and the first's is 0.
+    #[test]
+    fn delta_rects_sign_extend_and_carry_width_and_height() {
+        // Two rectangles in one zero-bits byte: the first's four components present, the
+        // second's width and height absent.
+        let list = [0x03, 0x0A, 0x14, 0x05, 0x06, 0x7F, 0xFF, 0xF0];
+        let mut bytes = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            TS_ENC_MULTIOPAQUERECT_ORDER,
+            0x80,
+            0x01,
+        ];
+        bytes.push(2);
+        bytes.extend_from_slice(&(list.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&list);
+        let mut history = OrderHistory::default();
+        let decoded = decode_all(&bytes, &mut history);
+        assert!(
+            matches!(decoded[..], [Ok(DrawingOrder::MultiOpaqueRect { .. })]),
+            "{decoded:?}"
+        );
+        // 0x7F is -1; 0xFF 0xF0 is the 15-bit -16.
+        assert_eq!(
+            history.multi_opaque_rect_rects(),
+            [[10, 20, 5, 6], [9, 4, 5, 6]]
+        );
+    }
+
+    /// An order without a CodedDeltaList paints the first `nDeltaEntries` of the list the
+    /// history holds; asking for more than it holds is malformed.
+    #[test]
+    fn an_absent_list_reuses_the_history() {
+        let list = [0x00, 1, 1, 1, 1, 1, 1, 1, 1];
+        let mut bytes = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            TS_ENC_MULTIOPAQUERECT_ORDER,
+            0x80,
+            0x01,
+        ];
+        bytes.push(2);
+        bytes.extend_from_slice(&(list.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&list);
+        // nDeltaEntries 1 alone, then 3 alone.
+        bytes.extend_from_slice(&[TS_STANDARD, 0x80, 0x00, 1]);
+        let mut history = OrderHistory::default();
+        assert_eq!(decode_all(&bytes, &mut history).len(), 2);
+        assert_eq!(history.multi_opaque_rect_rects(), [[1, 1, 1, 1]]);
+        let mut more = OrderHistory::default();
+        let mut bytes_more = bytes[..bytes.len() - 4].to_vec();
+        bytes_more.extend_from_slice(&[TS_STANDARD, 0x80, 0x00, 3]);
+        let decoded = decode_all(&bytes_more, &mut more);
+        assert!(
+            matches!(decoded[..], [Ok(_), Err(OrderError::Decode(_))]),
+            "{decoded:?}"
+        );
+    }
+
+    /// More than 45 rectangles, or a list longer than its `cbData`, is malformed, and leaves the
+    /// history's list as it was.
+    #[test]
+    fn a_list_past_its_bounds_is_malformed() {
+        let mut too_many = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            TS_ENC_MULTIOPAQUERECT_ORDER,
+            0x80,
+            0x01,
+        ];
+        too_many.push(46);
+        too_many.extend_from_slice(&23u16.to_le_bytes());
+        too_many.extend_from_slice(&[0xF0; 23]);
+        let decoded = decode_all(&too_many, &mut OrderHistory::default());
+        assert!(
+            matches!(decoded[..], [Err(OrderError::Decode(_))]),
+            "{decoded:?}"
+        );
+        // One rectangle, all four components present, in a 3-byte list: one byte short.
+        let mut short = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            TS_ENC_MULTIOPAQUERECT_ORDER,
+            0x80,
+            0x01,
+        ];
+        short.push(1);
+        short.extend_from_slice(&4u16.to_le_bytes());
+        short.extend_from_slice(&[0x00, 1, 1, 1, 1]);
+        let decoded = decode_all(&short, &mut OrderHistory::default());
+        assert!(
+            matches!(decoded[..], [Err(OrderError::Decode(_)), ..]),
+            "{decoded:?}"
+        );
+
+        // A good list of one, then each malformed order: the one rectangle survives both.
+        let mut good = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            TS_ENC_MULTIOPAQUERECT_ORDER,
+            0x80,
+            0x01,
+        ];
+        good.extend_from_slice(&[1, 5, 0, 0x00, 1, 2, 3, 4]);
+        // Two rectangles, the first whole and the second one byte short of its list.
+        let mut half = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            TS_ENC_MULTIOPAQUERECT_ORDER,
+            0x80,
+            0x01,
+        ];
+        half.push(2);
+        half.extend_from_slice(&7u16.to_le_bytes());
+        half.extend_from_slice(&[0x00, 9, 9, 9, 9, 1, 1]);
+        for bad in [&too_many, &short, &half] {
+            let mut history = OrderHistory::default();
+            decode_all(&good, &mut history);
+            decode_all(bad, &mut history);
+            assert_eq!(history.multi_opaque_rect_rects(), [[1, 2, 3, 4]]);
+        }
     }
 
     /// DstBlt's five fields fit one field-flag byte, and carry over (2.2.2.2.1.1.2.1).

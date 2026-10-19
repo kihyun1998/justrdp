@@ -61,6 +61,28 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   `update_read_opaque_rect_order` merges them; it fills with that colour as PATCOPY. PatBlt runs
   its brush through its ROP with no source, sharing Mem3Blt's brush; a cached brush is skipped,
   as for Mem3Blt, unless the ROP never reads the brush.
+- **MultiOpaqueRect is OpaqueRect's colour over a list of rectangles** (#485), up to 45, in a
+  Delta-Encoded Rectangles field (2.2.2.2.1.1.1.5). A rectangle's left and top are deltas from
+  the rectangle before, the first from `(0, 0)`; its width and height are values, not deltas,
+  and an absent one is the previous rectangle's (0 for the first). The spec's prose reads as if
+  all four were deltas; its own example (4.1.6) and FreeRDP's `update_read_delta_rects` agree on
+  this reading, which is followed. The list lives in the history: an order without one paints the
+  first `nDeltaEntries` of the last, and asking for more than it holds is a typed error, as in
+  FreeRDP, as is a count past 45. The list is read inside its `cbData`, where FreeRDP reads it
+  from the stream and ignores `cbData`; the two differ only on a server whose `cbData` is wrong,
+  which none has been seen to send. Each rectangle is filled as OpaqueRect is, through the
+  bounds, a frame each; an empty one paints nothing, as FreeRDP skips the empty rectangles
+  "older windows servers tend to send". The order's own `nLeftRect` … `nHeight` is the union of
+  the list in the spec's example and is not painted, as in FreeRDP. It has its own
+  `orderSupport` index, 0x12.
+- **The 2008 R2 VM sends MultiOpaqueRect only to a client advertising the offscreen bitmap
+  cache** (2026-10-19). FreeRDP on its logon screen got 2 with every cache, 2 without the glyph
+  or the brush cache, and none without the offscreen cache, when it got what justrdp gets: 382
+  MemBlt and 4 OpaqueRect. The server draws its shapes on offscreen surfaces and blits them to
+  the screen. So MultiOpaqueRect is proven against the spec's example and FreeRDP only, and
+  advertised; that it ship so, with its real-server proof left to the offscreen orders (#489),
+  was the maintainer's call (2026-10-19), made over holding the branch until #489 and folding it
+  into #489.
 - **DstBlt runs only destination ROPs.** 2.2.2.2.1.1.2.1 says its ROP MUST depend on the
   destination alone, which leaves BLACKNESS, DSTINVERT, the no-op and WHITENESS; any other is a
   server self-inconsistency and the order is skipped (ADR-0009 §2). That is a derivation, not a
@@ -179,11 +201,12 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
 ## Code
 
 - `justrdp-pdu/src/orders.rs` — `decode_order`, `OrderHistory`, `OrdersUpdate`, `DrawingOrder`,
-  `Clip`, `DstBlt`, `PatBlt`, `OpaqueRect`, `ScrBlt`, `MemBlt`, `Mem3Blt`, `GlyphIndex`, `Brush`,
+  `Clip`, `DstBlt`, `PatBlt`, `OpaqueRect`, `MultiOpaqueRect`, `MAX_DELTA_RECTS`, `ScrBlt`,
+  `MemBlt`, `Mem3Blt`, `GlyphIndex`, `Brush`,
   `CacheBitmapRev2`, `CacheGlyph`, `GlyphData`, `OrderError`, `TS_ALTSEC_FRAME_MARKER`
 - `justrdp-pdu/src/capability.rs` — `BitmapCacheRev2CapabilitySet`, `BitmapCacheCellInfo`,
   `GlyphCacheCapabilitySet`, `ORDER_NEG_INDEX_INDEX`, `ORDER_NEG_DSTBLT_INDEX`,
-  `ORDER_NEG_PATBLT_INDEX`, `ORDER_NEG_SCRBLT_INDEX`,
+  `ORDER_NEG_PATBLT_INDEX`, `ORDER_NEG_MULTIOPAQUERECT_INDEX`, `ORDER_NEG_SCRBLT_INDEX`,
   `ORDER_NEG_MEMBLT_INDEX`, `ORDER_NEG_MEM3BLT_INDEX`,
   `BITMAP_CACHE_REV2_MAX_ENTRIES`, `ORDER_FLAGS_EXTRA_FLAGS`,
   `ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT`
@@ -362,10 +385,13 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 
 ## Known holes / open
 
-- **Unbuilt:** LineTo, the Multi* orders, polygons, ellipses, SaveBitmap, FastIndex and
-  FastGlyph, Cache Glyph Revision 2, glyph fragments, Cache Brush, Cache Bitmap
-  revisions 1 and 3, and every alternate secondary order but Frame Marker. No measured server
-  sent any of them.
+- **Unbuilt:** LineTo, MultiDstBlt, MultiPatBlt, MultiScrBlt, polygons, ellipses, SaveBitmap,
+  FastIndex and FastGlyph, Cache Glyph Revision 2, glyph fragments, Cache Brush, Cache Bitmap
+  revisions 1 and 3, and every alternate secondary order but Frame Marker. The 2008 R2 VM sends
+  FastGlyph, Cache Brush, Polyline and the offscreen orders (#486 to #489); no measured server
+  sent the rest.
+- **MultiOpaqueRect is proven only against the spec and FreeRDP**: the one server that sends it
+  does so only with the offscreen cache advertised (#489).
 - **Glyph advances by `ulCharInc`, vertical and reversed text are proven only against the spec**:
   xrdp's text is horizontal with per-glyph deltas.
 - **DstBlt is proven only against the spec and FreeRDP's decoder**, since no server has sent one.

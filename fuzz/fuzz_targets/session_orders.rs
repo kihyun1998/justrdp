@@ -54,6 +54,7 @@ fuzz_target!(|input: &[u8]| {
         if let CapabilitySet::Order(o) = set {
             o.order_support[capability::ORDER_NEG_DSTBLT_INDEX] = 1;
             o.order_support[capability::ORDER_NEG_PATBLT_INDEX] = 1;
+            o.order_support[capability::ORDER_NEG_MULTIOPAQUERECT_INDEX] = 1;
             o.order_support[capability::ORDER_NEG_SCRBLT_INDEX] = 1;
             o.order_support[capability::ORDER_NEG_MEMBLT_INDEX] = 1;
             o.order_support[capability::ORDER_NEG_MEM3BLT_INDEX] = 1;
