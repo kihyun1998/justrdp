@@ -11813,11 +11813,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("connect fails after {stages:?}: {e:?}"));
             let desktop = settle(outcome, capabilities, stages).await;
             desktop.census.print("#484 desktop");
-            for skip in [
-                "paint budget reached",
-                "reason=CacheMiss",
-                "past the advertised cache",
-            ] {
+            for skip in SKIPPED_PAINT_LOGS {
                 assert!(!logs_contain(skip), "a paint was skipped: {skip}");
             }
             let server =
@@ -11887,11 +11883,7 @@ mod tests {
             let first = screen().await;
             let second = screen().await;
             first.census.print("#484 logon screen");
-            for skip in [
-                "paint budget reached",
-                "reason=CacheMiss",
-                "past the advertised cache",
-            ] {
+            for skip in SKIPPED_PAINT_LOGS {
                 assert!(!logs_contain(skip), "a paint was skipped: {skip}");
             }
             eprintln!(
@@ -11944,11 +11936,7 @@ mod tests {
             let oracle = tls_only(legacy_graphics_config()).await;
             let ordered = tls_only(honoured_orders_config()).await;
             ordered.census.print("#484 logon screen in orders");
-            for skip in [
-                "paint budget reached",
-                "reason=CacheMiss",
-                "past the advertised cache",
-            ] {
+            for skip in SKIPPED_PAINT_LOGS {
                 assert!(!logs_contain(skip), "a paint was skipped: {skip}");
             }
             eprintln!(
@@ -11992,6 +11980,14 @@ mod tests {
         })
         .await
     }
+
+    /// What the core logs when it skips a paint: past the paint budget, on a cache miss, or for a
+    /// Create Offscreen Bitmap past the advertised cache (`justrdp::orders`).
+    const SKIPPED_PAINT_LOGS: [&str; 3] = [
+        "paint budget reached",
+        "reason=CacheMiss",
+        "past the advertised cache",
+    ];
 
     /// How many distinct colours `fb` holds, up to 17.
     fn colour_count(fb: &justrdp::Framebuffer) -> usize {

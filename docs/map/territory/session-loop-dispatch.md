@@ -172,7 +172,8 @@ one of its outputs. Neither says what the loop dispatches or in what order.
     decoded 1 desktop.
   - That capture held no drawing orders. On WS2008 R2, Server Manager maximised sends an Orders
     update of 4.16, a double-buffered window paint: an offscreen bitmap the size of the desktop
-    made (1.00), cleared (1.00) and filled (1.05), then copied to the screen (1.01). 7 of the
+    made (1.00), cleared (1.00) and filled (1.05), then copied to the screen (1.01), with 0.10 in
+    smaller orders. 7 of the
     session's 64 Orders updates spent more than 2.
   - At 2 the session skipped 417 orders, and the screen stayed wrong. 8 is the same ratio over
     the measurement as #367's 2 over 1 (the maintainer's call, 2026-10-19).

@@ -137,8 +137,6 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   - **Each Create's `cx × cy × 4` bytes are charged to the update's paint budget.** A Create the
     budget cannot buy empties its entry and nothing else (the maintainer's call, #494,
     2026-10-19). There is no flush, no error PDU, and the cache is kept.
-    - **What it replaces.** #489's call refused such a Create as one past the cache, with the
-      error PDU. That call was made on the size of a single Create alone.
     - **What the new call was shown.** At a budget of 1, the server went on switching to the
       flushed bitmaps after the error PDU: 14 Switches and 176 paints skipped.
     - **The consequence.** The id misses until the server makes it again.
