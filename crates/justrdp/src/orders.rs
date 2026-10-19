@@ -15,7 +15,7 @@ use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::orders::{
     self, BITMAPCACHE_WAITING_LIST_INDEX, Bounds, Brush, CacheBitmapRev2, CacheColorTable,
     CacheGlyph, Clip, CreateOffscreenBitmap, DrawingOrder, GlyphIndex, Mem3Blt, MemBlt, OrderError,
-    OrderHistory, OrdersUpdate, ScrBlt, TS_BITMAPCACHE_SCREEN_ID,
+    OrderHistory, OrdersUpdate, Polyline, ScrBlt, TS_BITMAPCACHE_SCREEN_ID,
 };
 
 /// ROP3 SRCCOPY: the source, unchanged.
@@ -55,6 +55,8 @@ enum Skip {
     OutsideColorTables,
     /// The update's paint budget is spent.
     OverBudget,
+    /// A `bRop2` outside the sixteen binary raster operations (2.2.2.2.1.1.1.6).
+    UnknownRop2,
     /// The target is an offscreen bitmap that does not exist.
     UnknownSurface,
     /// A Create Offscreen Bitmap past the advertised cache.
@@ -120,6 +122,7 @@ pub(crate) struct Orders {
     /// PatBlt and OpaqueRect, which one `orderSupport` index negotiates.
     patblt: bool,
     multi_opaque_rect: bool,
+    polyline: bool,
     scrblt: bool,
     memblt: bool,
     mem3blt: bool,
@@ -191,6 +194,7 @@ impl Orders {
             patblt: support.is_some_and(|s| s[capability::ORDER_NEG_PATBLT_INDEX] != 0),
             multi_opaque_rect: support
                 .is_some_and(|s| s[capability::ORDER_NEG_MULTIOPAQUERECT_INDEX] != 0),
+            polyline: support.is_some_and(|s| s[capability::ORDER_NEG_POLYLINE_INDEX] != 0),
             scrblt: support.is_some_and(|s| s[capability::ORDER_NEG_SCRBLT_INDEX] != 0),
             memblt: support.is_some_and(|s| s[capability::ORDER_NEG_MEMBLT_INDEX] != 0),
             mem3blt: support.is_some_and(|s| s[capability::ORDER_NEG_MEM3BLT_INDEX] != 0),
@@ -330,6 +334,7 @@ impl Orders {
                     | DrawingOrder::PatBlt { .. }
                     | DrawingOrder::OpaqueRect { .. }
                     | DrawingOrder::MultiOpaqueRect { .. }
+                    | DrawingOrder::Polyline { .. }
                     | DrawingOrder::ScrBlt { .. }
                     | DrawingOrder::MemBlt { .. }
                     | DrawingOrder::Mem3Blt { .. }
@@ -444,6 +449,15 @@ impl Orders {
                             })
                     })
                 }
+                DrawingOrder::Polyline { order, clip } => self.polyline(
+                    &order,
+                    clip,
+                    target,
+                    palette,
+                    bits_per_pixel,
+                    &mut budget,
+                    &mut painted,
+                ),
                 DrawingOrder::ScrBlt { order, clip } => {
                     self.scrblt(&order, clip, screen, target, &mut budget, &mut painted)
                 }
@@ -506,6 +520,106 @@ impl Orders {
                 skipped = over_budget,
                 "paint budget reached; the remaining orders of this update were decoded, not painted",
             );
+        }
+        Ok(())
+    }
+
+    /// Paint a Polyline: from `(xStart, yStart)`, each point a segment that leaves out its end,
+    /// walked by Bresenham as FreeRDP's `gdi_LineTo` walks it, through the pen and `bRop2`, a
+    /// frame for each segment's pixels. Each segment charges the budget the larger of the steps
+    /// it walks and its box inside the clip.
+    #[allow(clippy::too_many_arguments)]
+    fn polyline(
+        &self,
+        order: &Polyline,
+        clip: Clip,
+        target: &mut Framebuffer,
+        palette: &Palette,
+        bits_per_pixel: u16,
+        budget: &mut usize,
+        frames: &mut Vec<FrameUpdate>,
+    ) -> Result<(), NotApplied> {
+        if !self.polyline {
+            tracing::warn!(
+                target: "rdp_orders",
+                rop2 = order.rop2,
+                "a drawing order this client did not advertise, painted anyway"
+            );
+        }
+        // A binary raster operation is the ternary one of the pen as its source.
+        let rop = match order.rop2 {
+            1..=16 => (order.rop2 - 1) * 0x11,
+            _ => return Err(NotApplied::Skipped(Skip::UnknownRop2)),
+        };
+        let mut edges = [
+            0,
+            0,
+            i32::from(target.width()) - 1,
+            i32::from(target.height()) - 1,
+        ];
+        match clip {
+            Clip::None => {}
+            Clip::Bounds(bounds) => {
+                edges[0] = edges[0].max(i32::from(bounds.left));
+                edges[1] = edges[1].max(i32::from(bounds.top));
+                edges[2] = edges[2].min(i32::from(bounds.right));
+                edges[3] = edges[3].min(i32::from(bounds.bottom));
+            }
+            Clip::Unknown => return Err(NotApplied::Skipped(Skip::UnknownClip)),
+        }
+        let pen = order_color(order.pen_color, palette, bits_per_pixel)?;
+        let mut from = [i32::from(order.x_start), i32::from(order.y_start)];
+        for &[dx, dy] in self.history.polyline_points() {
+            let to = [from[0] + i32::from(dx), from[1] + i32::from(dy)];
+            let (x1, y1) = (from[0], from[1]);
+            from = to;
+            let (w, h) = ((to[0] - x1).abs(), (to[1] - y1).abs());
+            // The steps walked, or the frame the host copies: its box inside the clip.
+            let [left, top] = [x1.min(to[0]).max(edges[0]), y1.min(to[1]).max(edges[1])];
+            let [right, bottom] = [x1.max(to[0]).min(edges[2]), y1.max(to[1]).min(edges[3])];
+            let area = if left <= right && top <= bottom {
+                (right - left + 1) as usize * (bottom - top + 1) as usize
+            } else {
+                0
+            };
+            if !charge(budget, (w.max(h) as usize).max(area) * 4) {
+                return Err(NotApplied::Skipped(Skip::OverBudget));
+            }
+            let (sx, sy) = ((to[0] - x1).signum(), (to[1] - y1).signum());
+            let (mut x, mut y, mut e) = (x1, y1, w - h);
+            let mut drawn: Option<[i32; 4]> = None;
+            while [x, y] != to {
+                if (edges[0]..=edges[2]).contains(&x) && (edges[1]..=edges[3]).contains(&y) {
+                    let at = (y as usize * usize::from(target.width()) + x as usize) * 4;
+                    let d = word(&target.pixels()[at..at + 4]);
+                    let out = rop::rop3(rop, 0, pen, d).to_le_bytes();
+                    target.blit(x as u16, y as u16, 1, 1, &out, 1);
+                    let box_ = drawn.get_or_insert([x, y, x, y]);
+                    *box_ = [
+                        box_[0].min(x),
+                        box_[1].min(y),
+                        box_[2].max(x),
+                        box_[3].max(y),
+                    ];
+                }
+                let e2 = 2 * e;
+                if e2 > -h {
+                    e -= h;
+                    x += sx;
+                }
+                if e2 < w {
+                    e += w;
+                    y += sy;
+                }
+            }
+            if let Some([left, top, right, bottom]) = drawn {
+                frames.push(FrameUpdate {
+                    x: left as u16,
+                    y: top as u16,
+                    width: (right - left + 1) as u16,
+                    height: (bottom - top + 1) as u16,
+                });
+            }
         }
         Ok(())
     }
@@ -1857,6 +1971,152 @@ pub(crate) mod tests {
         );
         assert_eq!(frames, [frame(0, 0, 1, 1)]);
         assert!(!orders.take_offscreen_error());
+    }
+
+    /// A Polyline from `start` through `deltas` (one-byte deltas) in a 16 bpp `pen`, inside the
+    /// inclusive `bounds` when there are some.
+    pub(crate) fn polyline(
+        bounds: Option<[i16; 4]>,
+        start: [i16; 2],
+        rop2: u8,
+        pen: u16,
+        deltas: &[[i16; 2]],
+    ) -> Vec<u8> {
+        let control = TS_STANDARD | TS_TYPE_CHANGE | if bounds.is_some() { TS_BOUNDS } else { 0 };
+        let mut order = vec![control, justrdp_pdu::orders::TS_ENC_POLYLINE_ORDER, 0x7F];
+        if let Some(edges) = bounds {
+            order.push(0x0F);
+            for edge in edges {
+                order.extend_from_slice(&edge.to_le_bytes());
+            }
+        }
+        for value in start {
+            order.extend_from_slice(&value.to_le_bytes());
+        }
+        order.push(rop2);
+        order.extend_from_slice(&[0, 0]);
+        order.extend_from_slice(&pen.to_le_bytes());
+        order.push(0);
+        order.push(deltas.len() as u8);
+        let mut list = vec![0u8; deltas.len().div_ceil(4)];
+        for delta in deltas {
+            for value in delta {
+                assert!((-64..64).contains(value), "a one-byte delta");
+                list.push((*value as i8 as u8) & 0x7F);
+            }
+        }
+        order.push(list.len() as u8);
+        order.extend_from_slice(&list);
+        order
+    }
+
+    const R2_BLACK: u8 = 1;
+    const R2_NOT: u8 = 6;
+    const R2_XORPEN: u8 = 7;
+    const R2_COPYPEN: u8 = 13;
+
+    fn lit(fb: &Framebuffer, color: [u8; 4]) -> Vec<(usize, usize)> {
+        let width = usize::from(fb.width());
+        (0..width * usize::from(fb.height()))
+            .filter(|&i| pixel(fb, i % width, i / width) == color)
+            .map(|i| (i % width, i / width))
+            .collect()
+    }
+
+    /// Each segment is a Bresenham line that leaves out its end, as FreeRDP's `gdi_LineTo`
+    /// draws it, and delivers its bounding box (#488).
+    #[test]
+    fn a_polyline_draws_each_segment_without_its_end() {
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(6, 4).unwrap();
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[polyline(None, [0, 1], R2_COPYPEN, RED, &[[3, 2], [2, -2]])],
+        );
+        // (0,1)-(3,3): (0,1), (1,2), (2,2); (3,3)-(5,1): (3,3), (4,2).
+        assert_eq!(
+            lit(&fb, rgba(RED)),
+            [(0, 1), (1, 2), (2, 2), (4, 2), (3, 3)]
+        );
+        assert_eq!(frames, [frame(0, 1, 3, 2), frame(3, 2, 2, 2)]);
+    }
+
+    /// The vertex between two segments is drawn once, so an XOR pen does not cancel it; ROP2
+    /// runs through the ROP3 table with the pen as the source.
+    #[test]
+    fn a_polyline_draws_each_vertex_once_through_its_rop2() {
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(4, 4).unwrap();
+        run(
+            &mut orders,
+            &mut fb,
+            &[polyline(None, [0, 0], R2_XORPEN, WHITE, &[[2, 0], [0, 2]])],
+        );
+        assert_eq!(lit(&fb, rgba(WHITE)), [(0, 0), (1, 0), (2, 0), (2, 1)]);
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                polyline(None, [0, 3], R2_NOT, RED, &[[2, 0]]),
+                polyline(None, [0, 0], R2_BLACK, RED, &[[1, 0]]),
+            ],
+        );
+        let word = |p: [u8; 4]| u32::from_le_bytes(p);
+        assert_eq!(word(pixel(&fb, 0, 3)), rop::rop3(0x55, 0, 0, word(BLACK)));
+        assert_eq!(pixel(&fb, 0, 0), BLACK);
+        assert_eq!(pixel(&fb, 1, 0), rgba(WHITE));
+    }
+
+    /// The bounds (inclusive) and the framebuffer clip a line; one outside them delivers
+    /// nothing; a ROP2 outside the table's sixteen paints nothing.
+    #[test]
+    fn a_polyline_is_clipped_and_an_unknown_rop2_paints_nothing() {
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(4, 2).unwrap();
+        let frames = run(
+            &mut orders,
+            &mut fb,
+            &[
+                polyline(Some([1, 0, 2, 1]), [0, 0], R2_COPYPEN, RED, &[[10, 0]]),
+                polyline(None, [-5, 1], R2_COPYPEN, GREEN, &[[20, 0]]),
+                polyline(None, [0, 5], R2_COPYPEN, BLUE, &[[3, 0]]),
+                polyline(None, [0, 1], 0, BLUE, &[[3, 0]]),
+                polyline(None, [0, 1], 17, BLUE, &[[3, 0]]),
+            ],
+        );
+        assert_eq!(lit(&fb, rgba(RED)), [(1, 0), (2, 0)]);
+        assert_eq!(lit(&fb, rgba(GREEN)), [(0, 1), (1, 1), (2, 1), (3, 1)]);
+        assert_eq!(lit(&fb, rgba(BLUE)), []);
+        assert_eq!(frames, [frame(1, 0, 2, 1), frame(0, 1, 4, 1)]);
+    }
+
+    /// The update's paint budget pays for every step a segment walks, inside the clip or not,
+    /// and for a diagonal's box, which its frame covers.
+    #[test]
+    fn a_polyline_charges_the_steps_it_walks() {
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(2, 1).unwrap();
+        // 60 steps, 4 bytes each, one byte short.
+        let frames = run_with(
+            &mut orders,
+            &mut fb,
+            &[polyline(None, [0, 0], R2_COPYPEN, RED, &[[60, 0]])],
+            239,
+        );
+        assert_eq!(frames, []);
+        let frames = run_with(
+            &mut orders,
+            &mut fb,
+            &[polyline(None, [0, 0], R2_COPYPEN, RED, &[[60, 0]])],
+            240,
+        );
+        assert_eq!(frames, [frame(0, 0, 2, 1)]);
+        // A 10-step diagonal over a 10 x 10 framebuffer: its box is 10 x 10, 400 bytes.
+        let mut fb = Framebuffer::new(10, 10).unwrap();
+        let diagonal = || vec![polyline(None, [0, 0], R2_COPYPEN, RED, &[[10, 10]])];
+        assert_eq!(run_with(&mut orders, &mut fb, &diagonal(), 399), []);
+        assert_eq!(run_with(&mut orders, &mut fb, &diagonal(), 400).len(), 1);
     }
 
     /// A DstBlt with every field.

@@ -42,8 +42,12 @@ pub const TS_ENC_MEMBLT_ORDER: u8 = 0x0D;
 pub const TS_ENC_MEM3BLT_ORDER: u8 = 0x0E;
 /// `orderType` of the MultiOpaqueRect primary drawing order.
 pub const TS_ENC_MULTIOPAQUERECT_ORDER: u8 = 0x12;
+/// `orderType` of the Polyline primary drawing order.
+pub const TS_ENC_POLYLINE_ORDER: u8 = 0x16;
 /// The most rectangles a Delta-Encoded Rectangles field holds (2.2.2.2.1.1.1.5).
 pub const MAX_DELTA_RECTS: usize = 45;
+/// The most points a Polyline's `NumDeltaEntries` counts (2.2.2.2.1.1.2.18, one byte).
+pub const MAX_DELTA_POINTS: usize = 255;
 /// `orderType` of the GlyphIndex primary drawing order.
 pub const TS_ENC_INDEX_ORDER: u8 = 0x1B;
 
@@ -339,6 +343,24 @@ pub struct MultiOpaqueRect {
     pub delta_entries: u8,
 }
 
+/// The fields of a Polyline order (2.2.2.2.1.1.2.18), as the history holds them. Its points are
+/// [`OrderHistory::polyline_points`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Polyline {
+    /// `xStart`.
+    pub x_start: i16,
+    /// `yStart`.
+    pub y_start: i16,
+    /// `bRop2`.
+    pub rop2: u8,
+    /// `BrushCacheEntry`.
+    pub brush_cache_entry: u16,
+    /// `PenColor`, the three wire bytes little-endian (TS_COLOR).
+    pub pen_color: u32,
+    /// `NumDeltaEntries`.
+    pub delta_entries: u8,
+}
+
 /// An 8×8 brush (2.2.2.2.1.1.2.3 `BrushOrgX` … `BrushExtra`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Brush {
@@ -530,6 +552,13 @@ pub enum DrawingOrder<'a> {
         /// Its clip.
         clip: Clip,
     },
+    /// Polyline.
+    Polyline {
+        /// The order.
+        order: Polyline,
+        /// Its clip.
+        clip: Clip,
+    },
     /// ScrBlt.
     ScrBlt {
         /// The order.
@@ -601,6 +630,10 @@ pub struct OrderHistory {
     /// The last MultiOpaqueRect's `CodedDeltaList`: how many rectangles it held, then each
     /// `[left, top, width, height]`.
     multi_opaque_rect_rects: (u8, [[i16; 4]; MAX_DELTA_RECTS]),
+    polyline: Polyline,
+    /// The last Polyline's `CodedDeltaList`: how many points it held, then each `[dx, dy]` from
+    /// the point before.
+    polyline_points: (u8, [[i16; 2]; MAX_DELTA_POINTS]),
     scrblt: ScrBlt,
     memblt: MemBlt,
     mem3blt: Mem3Blt,
@@ -621,6 +654,8 @@ impl Default for OrderHistory {
             opaque_rect: OpaqueRect::default(),
             multi_opaque_rect: MultiOpaqueRect::default(),
             multi_opaque_rect_rects: (0, [[0; 4]; MAX_DELTA_RECTS]),
+            polyline: Polyline::default(),
+            polyline_points: (0, [[0; 2]; MAX_DELTA_POINTS]),
             scrblt: ScrBlt::default(),
             memblt: MemBlt::default(),
             mem3blt: Mem3Blt::default(),
@@ -634,6 +669,12 @@ impl OrderHistory {
     /// The last GlyphIndex's `VariableBytes`: glyph indices and fragment operations.
     pub fn glyph_index_data(&self) -> &[u8] {
         &self.glyph_index_data.1[..usize::from(self.glyph_index_data.0)]
+    }
+
+    /// The last Polyline's points, each `[dx, dy]` from the point before, the first from
+    /// `(xStart, yStart)`: the first `NumDeltaEntries` of the list its history holds.
+    pub fn polyline_points(&self) -> &[[i16; 2]] {
+        &self.polyline_points.1[..usize::from(self.polyline.delta_entries)]
     }
 
     /// The last MultiOpaqueRect's rectangles, `[left, top, width, height]`: the first
@@ -652,6 +693,7 @@ fn field_bytes(order_type: u8) -> Option<usize> {
         TS_ENC_SCRBLT_ORDER => Some(1),
         TS_ENC_OPAQUERECT_ORDER => Some(1),
         TS_ENC_MULTIOPAQUERECT_ORDER => Some(2),
+        TS_ENC_POLYLINE_ORDER => Some(1),
         TS_ENC_MEMBLT_ORDER => Some(2),
         TS_ENC_MEM3BLT_ORDER => Some(3),
         TS_ENC_INDEX_ORDER => Some(3),
@@ -820,6 +862,44 @@ fn decode_primary<'a>(
                 clip,
             }
         }
+        TS_ENC_POLYLINE_ORDER => {
+            let order = &mut history.polyline;
+            fields.coord(0x01, &mut order.x_start)?;
+            fields.coord(0x02, &mut order.y_start)?;
+            fields.u8(0x04, &mut order.rop2)?;
+            fields.u16(0x08, &mut order.brush_cache_entry)?;
+            fields.color(0x10, &mut order.pen_color)?;
+            let mut count = order.delta_entries;
+            fields.u8(0x20, &mut count)?;
+            let stored = &mut history.polyline_points;
+            if fields.present(0x40) {
+                if count == 0 {
+                    return Err(DecodeError::InvalidField {
+                        field: "POLYLINE_ORDER.NumDeltaEntries",
+                        reason: "a CodedDeltaList of no points",
+                    }
+                    .into());
+                }
+                let length = fields.cur.read_u8()?;
+                let list = fields.cur.read_slice(usize::from(length))?;
+                let mut list = ReadCursor::new(list, "POLYLINE_ORDER.CodedDeltaList");
+                let mut points = [[0; 2]; MAX_DELTA_POINTS];
+                read_delta_points(&mut list, &mut points[..usize::from(count)])?;
+                stored.1 = points;
+                stored.0 = count;
+            } else if count > stored.0 {
+                return Err(DecodeError::InvalidField {
+                    field: "POLYLINE_ORDER.NumDeltaEntries",
+                    reason: "more points than the list the history holds",
+                }
+                .into());
+            }
+            order.delta_entries = count;
+            DrawingOrder::Polyline {
+                order: *order,
+                clip,
+            }
+        }
         TS_ENC_INDEX_ORDER => {
             let order = &mut history.glyph_index;
             fields.u8(0x00_0001, &mut order.cache_id)?;
@@ -943,6 +1023,23 @@ fn read_delta_rects(cur: &mut ReadCursor<'_>, rects: &mut [[i16; 4]]) -> Result<
         }
         *rect = next;
         previous = next;
+    }
+    Ok(())
+}
+
+/// Read a Delta-Encoded Points field (2.2.2.2.1.1.1.4) of `points.len()` points, each
+/// `[dx, dy]` from the point before; an absent component is 0.
+fn read_delta_points(cur: &mut ReadCursor<'_>, points: &mut [[i16; 2]]) -> Result<(), DecodeError> {
+    let zero_bits = cur.read_slice(points.len().div_ceil(4))?;
+    for (index, point) in points.iter_mut().enumerate() {
+        let flags = zero_bits[index / 4] << (2 * (index % 4));
+        for (component, bit) in point.iter_mut().zip([0x80, 0x40]) {
+            *component = if flags & bit == 0 {
+                read_delta(cur)?
+            } else {
+                0
+            };
+        }
     }
     Ok(())
 }
@@ -1706,6 +1803,86 @@ mod tests {
             decode_all(&good, &mut history);
             decode_all(bad, &mut history);
             assert_eq!(history.multi_opaque_rect_rects(), [[1, 2, 3, 4]]);
+        }
+    }
+
+    /// The annotated Polyline of 4.1.18: 32 points within its 108-byte list, the 23rd's y absent,
+    /// and the last bounds.
+    #[test]
+    fn the_spec_polyline_decodes() {
+        let bytes = [
+            0x2d, 0x16, 0x73, 0xf8, 0x01, 0xb8, 0x02, 0x00, 0xc0, 0x00, 0x20, 0x6c, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0xff, 0x7e, 0x76, 0xff, 0x41, 0x6c, 0xff, 0x24,
+            0x62, 0xff, 0x2b, 0x59, 0xff, 0x55, 0x51, 0xff, 0x9c, 0x49, 0x73, 0x43, 0x80, 0x4d,
+            0xff, 0xbe, 0x80, 0x99, 0xff, 0xba, 0x80, 0xcd, 0xff, 0xb7, 0x80, 0xde, 0xff, 0xb6,
+            0x80, 0xca, 0xff, 0xb6, 0x80, 0x96, 0xff, 0xb7, 0x80, 0x48, 0xff, 0xba, 0x6f, 0xff,
+            0xbe, 0xff, 0x97, 0x43, 0xff, 0x52, 0x4a, 0xff, 0x2b, 0x51, 0xff, 0x24, 0x59, 0xff,
+            0x44, 0x63, 0xff, 0x81, 0x6c, 0x56, 0x76, 0x2f, 0x80, 0x82, 0x0a, 0x80, 0xbf, 0x14,
+            0x80, 0xdd, 0x1e, 0x80, 0xd4, 0x27, 0x80, 0xab, 0x2f, 0x80, 0x64, 0x37, 0x0d, 0x3d,
+            0xff, 0xb3, 0x80, 0x42, 0xff, 0x67, 0x80, 0x46,
+        ];
+        let mut history = OrderHistory::default();
+        let decoded = decode_all(&bytes, &mut history);
+        assert_eq!(
+            decoded,
+            [Ok(DrawingOrder::Polyline {
+                order: Polyline {
+                    x_start: 504,
+                    y_start: 696,
+                    rop2: 0,
+                    brush_cache_entry: 0,
+                    pen_color: 0x00_C000,
+                    delta_entries: 32,
+                },
+                clip: Clip::Bounds(Bounds::default()),
+            })]
+        );
+        let points = history.polyline_points();
+        assert_eq!(points.len(), 32);
+        assert_eq!(
+            points[..5],
+            [
+                [-130, -10],
+                [-191, -20],
+                [-220, -30],
+                [-213, -39],
+                [-171, -47]
+            ]
+        );
+        assert_eq!(points[22][1], 0, "the 23rd point's y is absent");
+        assert_eq!(points[31], [-153, 70]);
+    }
+
+    /// A Polyline without a list paints the first `NumDeltaEntries` the history holds; more
+    /// than it holds, or a list of no points, is malformed and leaves the history's list as it
+    /// was.
+    #[test]
+    fn an_absent_polyline_list_reuses_the_history() {
+        // Fields 0x20 and 0x40: two points of (1, 2) each.
+        let mut bytes = vec![
+            TS_STANDARD | TS_TYPE_CHANGE,
+            TS_ENC_POLYLINE_ORDER,
+            0x60,
+            2,
+            5,
+        ];
+        bytes.extend_from_slice(&[0x00, 1, 2, 1, 2]);
+        bytes.extend_from_slice(&[TS_STANDARD, 0x20, 1]);
+        let mut history = OrderHistory::default();
+        assert_eq!(decode_all(&bytes, &mut history).len(), 2);
+        assert_eq!(history.polyline_points(), [[1, 2]]);
+        for bad in [
+            vec![TS_STANDARD, 0x20, 3],
+            vec![TS_STANDARD, 0x60, 0, 1, 0x00],
+        ] {
+            let mut history = OrderHistory::default();
+            decode_all(&bytes[..bytes.len() - 3], &mut history);
+            let decoded = decode_all(&bad, &mut history);
+            assert!(
+                matches!(decoded[..], [Err(OrderError::Decode(_)), ..]),
+                "{decoded:?}"
+            );
+            assert_eq!(history.polyline_points(), [[1, 2], [1, 2]]);
         }
     }
 

@@ -83,6 +83,21 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   offscreen orders (#489), was the maintainer's call (2026-10-19), made over holding the branch
   until #489 and folding it into #489. #489 then brought one on the logon screen, inside the
   comparison below.
+- **Polyline draws a pen through its points as FreeRDP's `gdi_LineTo` does** (#488). The spec
+  does not say which pixels a line covers, so FreeRDP's rule is followed:
+  - Each segment is a Bresenham walk (`e = dx - dy`) that leaves out its end, so each vertex is
+    drawn once, as the start of the next segment, and the last is not drawn.
+  - `bRop2` runs through the ROP3 table with the pen as the source, code `(bRop2 - 1) × 0x11`.
+    A value outside the sixteen paints nothing, as FreeRDP's `gdi_rop_color` writes nothing for
+    one.
+  - The points are deltas from the point before, kept in the history, which an order without a
+    list reuses. A list of no points, or a count past the list held, is a typed error, as in
+    FreeRDP.
+  - Each segment charges the paint budget the larger of the steps it walks, inside the clip or
+    not, and its box inside the clip, which its frame covers; that bounds both a hostile line's
+    walk and what the host copies. Each segment delivers the bounding box of the pixels it drew.
+  - FreeRDP's `R2_MERGEPENNOT` computes `src | ~pen`, the same as `R2_MERGENOTPEN`; the spec's
+    PDno is `pen | ~dst`, which the ROP3 table gives.
 - **Offscreen bitmaps are held in the core, as RGBA framebuffers** (#489). The surface model, its
   bounds and the out-of-range Switch were the maintainer's calls of 2026-10-19, recorded with what
   they were decided on in #489's body:
@@ -237,14 +252,15 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
 
 - `justrdp-pdu/src/orders.rs` — `decode_order`, `OrderHistory`, `OrdersUpdate`, `DrawingOrder`,
   `Clip`, `DstBlt`, `PatBlt`, `OpaqueRect`, `MultiOpaqueRect`, `MAX_DELTA_RECTS`, `ScrBlt`,
-  `MemBlt`, `Mem3Blt`, `GlyphIndex`, `Brush`,
+  `MemBlt`, `Mem3Blt`, `GlyphIndex`, `Polyline`, `Brush`,
   `CacheBitmapRev2`, `CacheGlyph`, `GlyphData`, `CreateOffscreenBitmap`, `OrderError`,
   `TS_ALTSEC_FRAME_MARKER`, `TS_ALTSEC_SWITCH_SURFACE`, `TS_ALTSEC_CREATE_OFFSCR_BITMAP`,
   `SCREEN_BITMAP_SURFACE`
 - `justrdp-pdu/src/share.rs` — `PDU_TYPE2_OFFSCRCACHE_ERROR`, `OC_ERR_FLUSH_AND_DISABLE_OFFSCREEN`
 - `justrdp-pdu/src/capability.rs` — `BitmapCacheRev2CapabilitySet`, `BitmapCacheCellInfo`,
   `GlyphCacheCapabilitySet`, `ORDER_NEG_INDEX_INDEX`, `ORDER_NEG_DSTBLT_INDEX`,
-  `ORDER_NEG_PATBLT_INDEX`, `ORDER_NEG_MULTIOPAQUERECT_INDEX`, `ORDER_NEG_SCRBLT_INDEX`,
+  `ORDER_NEG_PATBLT_INDEX`, `ORDER_NEG_MULTIOPAQUERECT_INDEX`, `ORDER_NEG_POLYLINE_INDEX`,
+  `ORDER_NEG_SCRBLT_INDEX`,
   `ORDER_NEG_MEMBLT_INDEX`, `ORDER_NEG_MEM3BLT_INDEX`,
   `BITMAP_CACHE_REV2_MAX_ENTRIES`, `ORDER_FLAGS_EXTRA_FLAGS`,
   `ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT`
@@ -350,6 +366,23 @@ With the cache built, the logon screen in orders (10 Create Offscreen Bitmap, 29
 bitmap screen with no pixel differing (`the_gdi_orders_vm_paints_its_logon_screen_in_orders_as_in_bitmaps`).
 A MemBlt from offscreen that misses moves 11,169 pixels of it.
 
+**What sends Polyline on the 2008 R2 VM (#488, 2026-10-19).** FreeRDP, every order advertised,
+one untimed session per action, the maintainer acting:
+
+| Action | Polyline |
+|---|---|
+| Drawing in mspaint (pencil, line, curve) | 8 |
+| Moving, resizing and minimising windows | 1,068 |
+| Moving a window by its title bar only | 52 |
+| Resizing a window only | 752 |
+
+So resizing a window sends them; mspaint's shapes arrive as MemBlt. An earlier set of timed
+sessions, too short to act in, was discarded. Three attempts to drive a resize from a justrdp
+test did not get one: a session reattached to one already open, a keyboard resize (Alt+Space,
+Size) that opened Internet Explorer from the Initial Configuration Tasks window instead, and a
+mouse drag on that window's right edge that did not move it. One of those sessions (the
+reattached one) brought 8 Polyline (`bRop2` 13, COPYPEN).
+
 **justrdp's own advertisement (#460):** MemBlt and Mem3Blt, caches of 120, 120 and 2553 entries,
 no waiting list, 16 bpp, no Surface Commands. The server sent only compressed 16 bpp Cache Bitmap
 (Revision 2) into cache 2 and SRCCOPY MemBlt, on the fast path; the fixture
@@ -446,8 +479,17 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 - **Unbuilt:** LineTo, MultiDstBlt, MultiPatBlt, MultiScrBlt, polygons, ellipses, SaveBitmap,
   FastIndex and FastGlyph, Cache Glyph Revision 2, glyph fragments, Cache Brush, Cache Bitmap
   revisions 1 and 3, and every alternate secondary order but Frame Marker, Switch Surface and
-  Create Offscreen Bitmap. The 2008 R2 VM sends FastGlyph (to a client advertising it), Cache
-  Brush and Polyline (#486 to #488); no measured server sent the rest.
+  Create Offscreen Bitmap. The 2008 R2 VM sends FastGlyph to a client advertising it (#486, which
+  saves only bandwidth, since that server sends GlyphIndex otherwise); no measured server sent
+  the rest.
+- **Cache Brush is not built, the maintainer's call** (#487, 2026-10-19). Advertised at either
+  colour level, the 2008 R2 VM sent one mono brush, used by PatBlt, and no colour brush. Without
+  the brush set it sends the same brushes inline, which already paint. Caching would save 8 bytes
+  a brush, and the only level that turns it on also advertises colour brushes no server has sent.
+- **Polyline's painting is untested against a server** (#488). Its decoding is proven against
+  the spec's example; its pixels follow FreeRDP's line rule, read from `gdi_LineTo`, in tests
+  derived from that reading. The one server that sends it does so on a window resize, which no
+  justrdp test has yet driven.
 - **The Offscreen Bitmap Cache Error PDU is proven only by unit tests**: the measured server
   keeps to the advertised size, so nothing real reaches it.
 - **Glyph advances by `ulCharInc`, vertical and reversed text are proven only against the spec**:

@@ -8270,6 +8270,9 @@ mod tests {
                                     .push([order.left, order.top, order.width, order.height]);
                                 "OpaqueRect".to_string()
                             }
+                            Ok(DrawingOrder::Polyline { order, .. }) => {
+                                format!("Polyline rop2 {}", order.rop2)
+                            }
                             Ok(DrawingOrder::MultiOpaqueRect { .. }) => {
                                 self.fills
                                     .extend_from_slice(self.history.multi_opaque_rect_rects());
@@ -11663,6 +11666,7 @@ mod tests {
             capability::ORDER_NEG_DSTBLT_INDEX,
             capability::ORDER_NEG_PATBLT_INDEX,
             capability::ORDER_NEG_MULTIOPAQUERECT_INDEX,
+            capability::ORDER_NEG_POLYLINE_INDEX,
             capability::ORDER_NEG_SCRBLT_INDEX,
             capability::ORDER_NEG_MEMBLT_INDEX,
             capability::ORDER_NEG_MEM3BLT_INDEX,
