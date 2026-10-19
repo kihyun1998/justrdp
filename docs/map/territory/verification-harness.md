@@ -451,7 +451,7 @@ was checked against.
     Run dialog can `Start-Process -Verb RunAs` without a prompt (#416, the maintainer's change,
     2026-10-12). Killing a test mid-session once left the VM's next logons on a black screen
     with no rdpdr "User Logged On"; a reboot cleared it, so stop a VM test only between runs.
-- **A third VM, for drawing orders: Windows Server 2008 R2 Standard at `192.168.136.164`**
+- **A third VM, for drawing orders: Windows Server 2008 R2 Standard at `192.168.136.167`**
   (#484, set up by the maintainer 2026-10-16). It is the only measured server that sends
   MultiOpaqueRect, FastGlyph, the offscreen orders, Cache Brush and Polyline
   ([Drawing orders](drawing-orders.md), Reference behaviour). Tests reach it through

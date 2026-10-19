@@ -9914,7 +9914,7 @@ mod tests {
         const AUDIO_INPUT_VM_ADDR: &str = "192.168.136.163:3389";
 
         /// The GDI orders VM, Windows Server 2008 R2.
-        const GDI_ORDERS_VM_ADDR: &str = "192.168.136.164:3389";
+        const GDI_ORDERS_VM_ADDR: &str = "192.168.136.167:3389";
 
         /// Which VM a test drives. Each is its own Windows session, so each has its own lock.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11899,7 +11899,7 @@ mod tests {
     /// reaches its desktop, and every order the server sends decodes.
     #[tokio::test]
     #[traced_test]
-    #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
+    #[ignore = "requires the GDI orders VM at 192.168.136.167:3389 (Windows Server 2008 R2) and \
                 JUSTRDP_TEST_* env vars"]
     async fn the_gdi_orders_vm_paints_its_desktop_in_orders() {
         vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
@@ -11971,7 +11971,7 @@ mod tests {
     /// session that advertises no order and sends no password, is the same in two sessions.
     #[tokio::test]
     #[traced_test]
-    #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
+    #[ignore = "requires the GDI orders VM at 192.168.136.167:3389 (Windows Server 2008 R2) and \
                 JUSTRDP_TEST_* env vars"]
     async fn the_gdi_orders_vm_logon_screen_is_the_same_in_two_sessions() {
         vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
@@ -12025,7 +12025,7 @@ mod tests {
     /// pixel for pixel.
     #[tokio::test]
     #[traced_test]
-    #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
+    #[ignore = "requires the GDI orders VM at 192.168.136.167:3389 (Windows Server 2008 R2) and \
                 JUSTRDP_TEST_* env vars"]
     async fn the_gdi_orders_vm_paints_its_logon_screen_in_orders_as_in_bitmaps() {
         vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
@@ -12094,7 +12094,7 @@ mod tests {
     /// for a session that advertises no Polyline, outside the taskbar's clock.
     #[tokio::test]
     #[traced_test]
-    #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
+    #[ignore = "requires the GDI orders VM at 192.168.136.167:3389 (Windows Server 2008 R2) and \
                 JUSTRDP_TEST_* env vars"]
     async fn the_gdi_orders_vm_paints_a_maximised_window_in_polylines_as_without() {
         vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
