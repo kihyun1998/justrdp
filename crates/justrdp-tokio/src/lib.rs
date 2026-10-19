@@ -8198,6 +8198,22 @@ mod tests {
         /// Every GlyphIndex's text background rectangle and, when it has one, its opaque
         /// rectangle, `[left, top, right, bottom]`.
         glyph_rects: Vec<[i16; 4]>,
+        /// The surface the next order paints: the last Switch Surface's `bitmapId`, the screen
+        /// before any.
+        surface: Option<u16>,
+        /// Every Polyline, in arrival order.
+        polylines: Vec<PolylineSeen>,
+    }
+
+    /// One Polyline a census saw.
+    #[derive(Debug)]
+    struct PolylineSeen {
+        /// The surface it painted: an offscreen bitmap's id, or `SCREEN_BITMAP_SURFACE`.
+        surface: u16,
+        /// `(xStart, yStart)`.
+        start: [i16; 2],
+        /// Its points, each a delta from the one before.
+        points: Vec<[i16; 2]>,
     }
 
     impl OrderCensus {
@@ -8271,6 +8287,11 @@ mod tests {
                                 "OpaqueRect".to_string()
                             }
                             Ok(DrawingOrder::Polyline { order, .. }) => {
+                                self.polylines.push(PolylineSeen {
+                                    surface: self.surface.unwrap_or(orders::SCREEN_BITMAP_SURFACE),
+                                    start: [order.x_start, order.y_start],
+                                    points: self.history.polyline_points().to_vec(),
+                                });
                                 format!("Polyline rop2 {}", order.rop2)
                             }
                             Ok(DrawingOrder::MultiOpaqueRect { .. }) => {
@@ -8292,7 +8313,10 @@ mod tests {
                                     format!("MemBlt rop {:#04x}", order.rop)
                                 }
                             }
-                            Ok(DrawingOrder::SwitchSurface { .. }) => "SwitchSurface".to_string(),
+                            Ok(DrawingOrder::SwitchSurface { bitmap_id }) => {
+                                self.surface = Some(bitmap_id);
+                                "SwitchSurface".to_string()
+                            }
                             Ok(DrawingOrder::CreateOffscreenBitmap(_)) => {
                                 "CreateOffscreenBitmap".to_string()
                             }
@@ -9890,7 +9914,7 @@ mod tests {
         const AUDIO_INPUT_VM_ADDR: &str = "192.168.136.163:3389";
 
         /// The GDI orders VM, Windows Server 2008 R2.
-        const GDI_ORDERS_VM_ADDR: &str = "192.168.136.164:3389";
+        const GDI_ORDERS_VM_ADDR: &str = "192.168.136.167:3389";
 
         /// Which VM a test drives. Each is its own Windows session, so each has its own lock.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11569,60 +11593,136 @@ mod tests {
         capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
         stages: Vec<String>,
     ) -> Settled {
-        let selected = outcome.mcs.selected;
-        let server_capabilities = outcome.activation.server_capabilities.clone();
-        let mut census = OrderCensus::default();
-        census.feed(&outcome.activation.leftover);
-        let mut machine = SessionStateMachine::new(
-            session_config_from(&outcome, capabilities),
-            outcome.activation.leftover.clone(),
-        )
-        .expect("the desktop size is within MAX_DESKTOP_DIM");
-        let mut stream = outcome.stream;
-        let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
-        let mut frames = Vec::new();
-        let mut readbuf = vec![0u8; 64 * 1024];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            for output in pending.drain(..) {
-                match output {
-                    SessionOutput::Frame(frame) => frames.push(frame),
-                    SessionOutput::WriteBytes(bytes) => {
-                        write_frame(&mut stream, &bytes)
-                            .await
-                            .expect("write to the server");
-                    }
-                    _ => {}
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut readbuf)).await {
-                Ok(Ok(0)) => panic!(
-                    "the server closed the session after {} frames",
-                    frames.len()
-                ),
-                Ok(Err(e)) => panic!(
-                    "reading from the server failed after {} frames: {e}",
-                    frames.len()
-                ),
-                Ok(Ok(n)) => {
-                    census.feed(&readbuf[..n]);
-                    pending = feed_session(&mut machine, &readbuf[..n])
-                        .expect("the session machine takes every byte the server sent");
-                }
-                Err(_) if !frames.is_empty() => break,
-                Err(_) => {}
+        let mut session = Driven::new(outcome, capabilities, stages);
+        session
+            .read_until_quiet(Duration::from_secs(20), true)
+            .await;
+        session.settled()
+    }
+
+    /// A session read in steps: input sent between reads, the census and the frames kept.
+    struct Driven {
+        selected: SecurityProtocol,
+        server_capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
+        machine: SessionStateMachine,
+        stream: TlsStream<TcpStream>,
+        pending: Vec<SessionOutput>,
+        frames: Vec<FrameUpdate>,
+        stages: Vec<String>,
+        census: OrderCensus,
+    }
+
+    impl Driven {
+        fn new(
+            outcome: ConnectOutcome,
+            capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
+            stages: Vec<String>,
+        ) -> Self {
+            let mut census = OrderCensus::default();
+            census.feed(&outcome.activation.leftover);
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, capabilities),
+                outcome.activation.leftover.clone(),
+            )
+            .expect("the desktop size is within MAX_DESKTOP_DIM");
+            let pending = machine.process_bytes(&[]).expect("leftover bytes process");
+            Driven {
+                selected: outcome.mcs.selected,
+                server_capabilities: outcome.activation.server_capabilities.clone(),
+                machine,
+                stream: outcome.stream,
+                pending,
+                frames: Vec::new(),
+                stages,
+                census,
             }
         }
-        Settled {
-            selected,
-            server_capabilities,
-            framebuffer: machine.framebuffer().clone(),
-            frames,
-            stages,
-            census,
+
+        /// Read until nothing has arrived for 2 s, or for `most` in all; with `need_frame`, a
+        /// quiet spell ends the read only once something has painted.
+        async fn read_until_quiet(&mut self, most: Duration, need_frame: bool) {
+            let mut readbuf = vec![0u8; 64 * 1024];
+            let deadline = tokio::time::Instant::now() + most;
+            loop {
+                for output in self.pending.drain(..) {
+                    match output {
+                        SessionOutput::Frame(frame) => self.frames.push(frame),
+                        SessionOutput::WriteBytes(bytes) => {
+                            write_frame(&mut self.stream, &bytes)
+                                .await
+                                .expect("write to the server");
+                        }
+                        _ => {}
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_secs(2), self.stream.read(&mut readbuf))
+                    .await
+                {
+                    Ok(Ok(0)) => panic!(
+                        "the server closed the session after {} frames",
+                        self.frames.len()
+                    ),
+                    Ok(Err(e)) => panic!(
+                        "reading from the server failed after {} frames: {e}",
+                        self.frames.len()
+                    ),
+                    Ok(Ok(n)) => {
+                        self.census.feed(&readbuf[..n]);
+                        self.pending = feed_session(&mut self.machine, &readbuf[..n])
+                            .expect("the session machine takes every byte the server sent");
+                    }
+                    Err(_) if !need_frame || !self.frames.is_empty() => break,
+                    Err(_) => {}
+                }
+            }
+        }
+
+        /// Read in quiet spells until `done` finds something in the framebuffer, for `most` in
+        /// all.
+        async fn read_until<T>(
+            &mut self,
+            most: Duration,
+            done: impl Fn(&justrdp::Framebuffer) -> Option<T>,
+        ) -> Option<T> {
+            let deadline = tokio::time::Instant::now() + most;
+            loop {
+                if let Some(found) = done(self.framebuffer()) {
+                    return Some(found);
+                }
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                self.read_until_quiet(left.min(Duration::from_secs(3)), false)
+                    .await;
+            }
+        }
+
+        /// Send `events` to the server.
+        async fn send(&mut self, events: &[InputEvent]) {
+            for bytes in self.machine.encode_input(events) {
+                write_frame(&mut self.stream, &bytes)
+                    .await
+                    .expect("write to the server");
+            }
+        }
+
+        fn framebuffer(&self) -> &justrdp::Framebuffer {
+            self.machine.framebuffer()
+        }
+
+        fn settled(self) -> Settled {
+            Settled {
+                selected: self.selected,
+                server_capabilities: self.server_capabilities,
+                framebuffer: self.machine.framebuffer().clone(),
+                frames: self.frames,
+                stages: self.stages,
+                census: self.census,
+            }
         }
     }
 
@@ -11799,7 +11899,7 @@ mod tests {
     /// reaches its desktop, and every order the server sends decodes.
     #[tokio::test]
     #[traced_test]
-    #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
+    #[ignore = "requires the GDI orders VM at 192.168.136.167:3389 (Windows Server 2008 R2) and \
                 JUSTRDP_TEST_* env vars"]
     async fn the_gdi_orders_vm_paints_its_desktop_in_orders() {
         vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
@@ -11871,7 +11971,7 @@ mod tests {
     /// session that advertises no order and sends no password, is the same in two sessions.
     #[tokio::test]
     #[traced_test]
-    #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
+    #[ignore = "requires the GDI orders VM at 192.168.136.167:3389 (Windows Server 2008 R2) and \
                 JUSTRDP_TEST_* env vars"]
     async fn the_gdi_orders_vm_logon_screen_is_the_same_in_two_sessions() {
         vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
@@ -11925,7 +12025,7 @@ mod tests {
     /// pixel for pixel.
     #[tokio::test]
     #[traced_test]
-    #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
+    #[ignore = "requires the GDI orders VM at 192.168.136.167:3389 (Windows Server 2008 R2) and \
                 JUSTRDP_TEST_* env vars"]
     async fn the_gdi_orders_vm_paints_its_logon_screen_in_orders_as_in_bitmaps() {
         vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
@@ -11988,6 +12088,199 @@ mod tests {
         "reason=CacheMiss",
         "past the advertised cache",
     ];
+
+    /// Issue #493: on the GDI orders VM, Server Manager opened from the taskbar and maximised
+    /// is drawn with Polyline, on the screen, and equals the same desktop the server repaints
+    /// for a session that advertises no Polyline, outside the taskbar's clock.
+    #[tokio::test]
+    #[traced_test]
+    #[ignore = "requires the GDI orders VM at 192.168.136.167:3389 (Windows Server 2008 R2) and \
+                JUSTRDP_TEST_* env vars"]
+    async fn the_gdi_orders_vm_paints_a_maximised_window_in_polylines_as_without() {
+        vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
+            use justrdp_pdu::capability::{self, CapabilitySet};
+            use justrdp_pdu::input::{PTRFLAGS_BUTTON1, PTRFLAGS_DOWN, PTRFLAGS_MOVE};
+            let click = |x, y| {
+                [
+                    PTRFLAGS_MOVE,
+                    PTRFLAGS_DOWN | PTRFLAGS_BUTTON1,
+                    PTRFLAGS_BUTTON1,
+                ]
+                .map(|flags| InputEvent::Mouse {
+                    flags,
+                    wheel_units: 0,
+                    x,
+                    y,
+                })
+            };
+            let config = honoured_orders_config();
+            let capabilities = config.capabilities.clone();
+            let mut session = Driven::new(vm.connect(config).await, capabilities, Vec::new());
+            session
+                .read_until_quiet(Duration::from_secs(20), true)
+                .await;
+            // The Initial Configuration Tasks window comes up after the shell.
+            let logon = session
+                .read_until(Duration::from_secs(120), active_caption)
+                .await
+                .expect("a window comes up after logon");
+            let (width, height) = (
+                session.framebuffer().width(),
+                session.framebuffer().height(),
+            );
+            session
+                .send(&click(
+                    SERVER_MANAGER_ON_TASKBAR,
+                    height - TASKBAR_HEIGHT / 2,
+                ))
+                .await;
+            let mut caption = session
+                .read_until(Duration::from_secs(60), |fb| {
+                    active_caption(fb).filter(|caption| *caption != logon)
+                })
+                .await
+                .expect("Server Manager opens");
+            let full_width = |fb: &justrdp::Framebuffer| {
+                active_caption(fb).filter(|c| c.left == 0 && c.right == width - 1)
+            };
+            let mut maximised = None;
+            for _ in 0..3 {
+                session.send(&click(caption.maximise_x(), caption.y)).await;
+                maximised = session
+                    .read_until(Duration::from_secs(20), full_width)
+                    .await;
+                if maximised.is_some() {
+                    break;
+                }
+                caption = active_caption(session.framebuffer()).unwrap_or(caption);
+            }
+            assert!(maximised.is_some(), "Server Manager never maximised");
+            session
+                .read_until_quiet(Duration::from_secs(20), false)
+                .await;
+            let polylined = session.settled();
+            polylined.census.print("#493 maximised with Polyline");
+            for skip in SKIPPED_PAINT_LOGS {
+                assert!(!logs_contain(skip), "a paint was skipped: {skip}");
+            }
+            eprintln!("#493: Polyline {:?}", polylined.census.polylines);
+            assert!(
+                polylined
+                    .census
+                    .polylines
+                    .iter()
+                    .any(|seen| seen.surface == justrdp_pdu::orders::SCREEN_BITMAP_SURFACE),
+                "no Polyline arrived on the screen"
+            );
+
+            let mut config = honoured_orders_config();
+            for set in &mut config.capabilities {
+                if let CapabilitySet::Order(o) = set {
+                    o.order_support[capability::ORDER_NEG_POLYLINE_INDEX] = 0;
+                }
+            }
+            let capabilities = config.capabilities.clone();
+            let repainted = settle(vm.connect(config).await, capabilities, Vec::new()).await;
+            repainted.census.print("#493 repainted without Polyline");
+            eprintln!(
+                "#493: dumps {} and {}",
+                dump_ppm(&polylined.framebuffer, "justrdp-493-polylined.ppm").display(),
+                dump_ppm(&repainted.framebuffer, "justrdp-493-repainted.ppm").display()
+            );
+            assert_eq!(
+                repainted.census.count("Polyline"),
+                0,
+                "Polyline arrived unadvertised"
+            );
+            let clock = (
+                usize::from(width - CLOCK_FROM_RIGHT),
+                usize::from(height - TASKBAR_HEIGHT),
+            );
+            for seen in &polylined.census.polylines {
+                let end = seen
+                    .points
+                    .iter()
+                    .fold(seen.start, |[x, y], [dx, dy]| [x + dx, y + dy]);
+                for [x, y] in [seen.start, end] {
+                    assert!(
+                        (x as usize) < clock.0 || (y as usize) < clock.1,
+                        "a Polyline in the clock, out of the comparison: {seen:?}"
+                    );
+                }
+            }
+            let differing: Vec<_> =
+                differing_pixels(&polylined.framebuffer, &repainted.framebuffer)
+                    .into_iter()
+                    .filter(|&(x, y)| x < clock.0 || y < clock.1)
+                    .collect();
+            eprintln!("#493: {} pixels differ outside the clock", differing.len());
+            assert_eq!(
+                differing.get(..8.min(differing.len())),
+                Some(&[][..]),
+                "pixels differ"
+            );
+        })
+        .await
+    }
+
+    /// Server Manager's button on the GDI orders VM's taskbar, its x.
+    const SERVER_MANAGER_ON_TASKBAR: u16 = 88;
+
+    /// The GDI orders VM's taskbar, its height at the desktop's bottom.
+    const TASKBAR_HEIGHT: u16 = 40;
+
+    /// The taskbar's clock, how far its left edge is from the desktop's right.
+    const CLOCK_FROM_RIGHT: u16 = 88;
+
+    /// The active window's caption, in the classic theme's active caption colour.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Caption {
+        /// The caption's middle row.
+        y: u16,
+        left: u16,
+        right: u16,
+    }
+
+    impl Caption {
+        /// The maximise button's x: the middle of three, at the caption's right end.
+        fn maximise_x(self) -> u16 {
+            self.right - 28
+        }
+    }
+
+    /// The topmost run of at least 200 pixels in the classic active caption colour, above the
+    /// taskbar.
+    fn active_caption(fb: &justrdp::Framebuffer) -> Option<Caption> {
+        const ACTIVE_CAPTION: [u8; 3] = [0x08, 0x24, 0x6B];
+        let width = usize::from(fb.width());
+        let above_taskbar = usize::from(fb.height().saturating_sub(TASKBAR_HEIGHT));
+        for (y, row) in fb
+            .pixels()
+            .chunks_exact(width * 4)
+            .take(above_taskbar)
+            .enumerate()
+        {
+            let (mut best, mut run, mut end) = (0, 0, 0);
+            for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
+                if px[..3] == ACTIVE_CAPTION {
+                    run += 1;
+                    if run > best {
+                        (best, end) = (run, x);
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+            if best >= 200 {
+                return Some(Caption {
+                    y: (y + 8) as u16,
+                    left: (end + 1 - best) as u16,
+                    right: end as u16,
+                });
+            }
+        }
+        None
+    }
 
     /// How many distinct colours `fb` holds, up to 17.
     fn colour_count(fb: &justrdp::Framebuffer) -> usize {

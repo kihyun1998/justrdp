@@ -391,6 +391,14 @@ Size) that opened Internet Explorer from the Initial Configuration Tasks window 
 mouse drag on that window's right edge that did not move it. One of those sessions (the
 reattached one) brought 8 Polyline (`bRop2` 13, COPYPEN).
 
+The drag missed because x 1147 is inside the window; the sizing border is x 1148 to 1151. The
+Initial Configuration Tasks window sends no Polyline when it opens, maximises, restores or is
+resized (#493).
+
+**What justrdp drives (#493, 2026-10-20).** Clicking Server Manager on the taskbar after a fresh
+logon, then its maximise button, brings 7 Polyline, all on the screen, all one horizontal segment
+(`bRop2` 13): 3 as the window opens, 4 as it maximises. The same 7 arrived in each of three runs.
+
 **justrdp's own advertisement (#460):** MemBlt and Mem3Blt, caches of 120, 120 and 2553 entries,
 no waiting list, 16 bpp, no Surface Commands. The server sent only compressed 16 bpp Cache Bitmap
 (Revision 2) into cache 2 and SRCCOPY MemBlt, on the fast path; the fixture
@@ -494,10 +502,18 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
   colour level, the 2008 R2 VM sent one mono brush, used by PatBlt, and no colour brush. Without
   the brush set it sends the same brushes inline, which already paint. Caching would save 8 bytes
   a brush, and the only level that turns it on also advertises colour brushes no server has sent.
-- **Polyline's painting is untested against a server** (#488). Its decoding is proven against
-  the spec's example; its pixels follow FreeRDP's line rule, read from `gdi_LineTo`, in tests
-  derived from that reading. The one server that sends it does so on a window resize, which no
-  justrdp test has yet driven.
+- **Polyline is proven against a server, but not its end pixel** (#493).
+  - **What is proven.** Server Manager maximised, drawn with Polyline, equals the server's
+    repaint for a session without it: 0 px outside the taskbar's clock, in three runs out of
+    three. With
+    the lines not drawn, 2,150 px differ. So the lines' place, colour and `bRop2` are the
+    server's.
+  - **What is not.** Whether a segment's end pixel is drawn cannot be told from this comparison.
+    Drawing it leaves the comparison at 0 px, because every end pixel there is painted over
+    later or is the line's colour already: the end of the line at y 160, x 1277, is `d6d3d6`
+    either way.
+  - **The consequence.** The end pixel still rests on FreeRDP's `gdi_LineTo`, which leaves it
+    out (the maintainer's call to merge on that, 2026-10-20).
 - **The Offscreen Bitmap Cache Error PDU is proven only by unit tests**: the measured server
   keeps to the advertised size, so nothing real reaches it.
 - **Glyph advances by `ulCharInc`, vertical and reversed text are proven only against the spec**:

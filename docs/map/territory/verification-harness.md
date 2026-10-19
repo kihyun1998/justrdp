@@ -451,12 +451,24 @@ was checked against.
     Run dialog can `Start-Process -Verb RunAs` without a prompt (#416, the maintainer's change,
     2026-10-12). Killing a test mid-session once left the VM's next logons on a black screen
     with no rdpdr "User Logged On"; a reboot cleared it, so stop a VM test only between runs.
-- **A third VM, for drawing orders: Windows Server 2008 R2 Standard at `192.168.136.164`**
+- **A third VM, for drawing orders: Windows Server 2008 R2 Standard at `192.168.136.167`**
   (#484, set up by the maintainer 2026-10-16). It is the only measured server that sends
   MultiOpaqueRect, FastGlyph, the offscreen orders, Cache Brush and Polyline
   ([Drawing orders](drawing-orders.md), Reference behaviour). Tests reach it through
   `with_vm_session_on(Target::GdiOrders, …)`, the audio input VM's shape: its own address and
-  lock, the same `JUSTRDP_TEST_*` credentials. Its configuration, none of it in the repo:
+  lock, the same `JUSTRDP_TEST_*` credentials. Its tests capture tracing and fail on a skipped
+  paint (`SKIPPED_PAINT_LOGS`, #494).
+  - **Driving a window there (#493).** The theme is classic, so the active window's caption is a
+    run of `0x08246B`, and `active_caption` finds it in the framebuffer. The maximise button is
+    28 px left of its right end.
+  - **Server Manager is a fixed taskbar button**, at x 88.
+  - **The comparison leaves out only the taskbar's clock**, the bottom 40 px from 88 px left of
+    the desktop's right edge, because it can tick between the two sessions. The tray icons end
+    at x 1191 at 1280 wide, so they stay in the comparison.
+  - **A maximise click can miss** while the window is still coming up. That happened once in
+    four runs, so the test clicks up to three times until the caption spans the desktop.
+
+  Its configuration, none of it in the repo:
   - Remote Desktop allows connections from **any version** of the client, so a TLS-only connect
     is accepted. `rdptest` is in Administrators, its password does not expire, and the monitor
     and standby timeouts are off. Windows is **not activated**, so the grace period runs out on
