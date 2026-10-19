@@ -132,6 +132,8 @@ pub const ORDER_NEG_MEM3BLT_INDEX: usize = 0x04;
 /// `orderSupport` index of the MultiOpaqueRect primary drawing order
 /// (`TS_NEG_MULTIOPAQUERECT_INDEX`).
 pub const ORDER_NEG_MULTIOPAQUERECT_INDEX: usize = 0x12;
+/// `orderSupport` index of the Polyline primary drawing order (`TS_NEG_POLYLINE_INDEX`).
+pub const ORDER_NEG_POLYLINE_INDEX: usize = 0x16;
 
 /// `CacheFlags` (Bitmap Cache revision 2): the client sends a Persistent Key List PDU.
 pub const PERSISTENT_KEYS_EXPECTED_FLAG: u16 = 0x0001;
