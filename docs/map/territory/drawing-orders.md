@@ -36,6 +36,9 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
 - **The history keeps decoding past what is not painted.** A cache miss, an out-of-range cache
   id or index, a brush that cannot be drawn and the paint budget skip the paint, never the decode,
   so the field records stay in step with the server's (3.2.5.1.1.1 step 4: ignore the order).
+- **The first order past the paint budget ends the update's painting** (#494). Every order after
+  it is decoded and nothing after it paints, not even a smaller one that would fit, as the bitmap
+  and Surface Commands paths stop. A cache fill after it empties its entry (#498).
 - **An undecoded order may have moved the bounds.** When one carries `TS_BOUNDS` without
   `TS_ZERO_BOUNDS_DELTAS`, the history marks the rectangle unknown, every later bounded order
   decodes with `Clip::Unknown` and is not painted, until a `bounds` field gives all four edges
@@ -115,10 +118,14 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   - **The advertised size is enforced**, in KB counted at the session's depth as the server
     counts it, and so is the entry count. The size leaves out the entries the Create replaces and
     deletes, since a delete list is how the server makes room. The bitmaps are RGBA, so they hold
-    twice the advertised size at 16 bpp and four times at 8 bpp. A Create past either flushes every bitmap, returns the
-    target to the screen and turns offscreen off for the session. The session sends one
-    Offscreen Bitmap Cache Error PDU (`OC_ERR_FLUSH_AND_DISABLE_OFFSCREEN`, 2.2.2.3.2). FreeRDP
-    enforces only the count.
+    twice the advertised size at 16 bpp and four times at 8 bpp.
+  - **A Create past either flushes every bitmap and turns offscreen off for the session.** The
+    session sends one Offscreen Bitmap Cache Error PDU (`OC_ERR_FLUSH_AND_DISABLE_OFFSCREEN`,
+    2.2.2.3.2). FreeRDP enforces only the count.
+  - **A target that was a bitmap paints nothing** until the next Switch, as a Switch to a
+    flushed bitmap would (#494). Orders the server meant for the bitmap do not land on the
+    screen. Whether the server stops using offscreen after the PDU is unmeasured (#497): at a
+    budget of 1 it went on switching to the flushed bitmaps.
   - **A Switch to an entry never created, or past the entries, makes the target unknown.** Paint
     orders are then skipped until the next Switch, as a cache index out of range is (ADR-0009
     §2). The spec says to drop the connection.
@@ -127,11 +134,12 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   - **A Deactivation-Reactivation keeps the bitmaps and returns the target to the screen**, as
     the bitmap caches are kept. FreeRDP's `update_reset_state` resets only the order history, and
     its caches live for the connection.
-  - **Each Create's `cx × cy × 4` bytes are charged to the update's paint budget**, two
-    framebuffers. A Create the budget cannot buy is refused as one past the cache is, with the
-    error PDU, so the server resends what it drew rather than leaving the blitted area wrong (the
-    maintainer's call, 2026-10-19). A bitmap larger than two screens can therefore never be
-    made; the largest measured is one screen.
+  - **Each Create's `cx × cy × 4` bytes are charged to the update's paint budget.** A Create the
+    budget cannot buy empties its entry and nothing else (the maintainer's call, #494,
+    2026-10-19). There is no flush, no error PDU, and the cache is kept.
+    - **What the new call was shown.** At a budget of 1, the server went on switching to the
+      flushed bitmaps after the error PDU: 14 Switches and 176 paints skipped.
+    - **The consequence.** The id misses until the server makes it again.
   - The allow-list accepts `offscreenSupportLevel` TRUE only, and only with MemBlt (3.2.5.1.3.1.1).
 - **DstBlt runs only destination ROPs.** 2.2.2.2.1.1.2.1 says its ROP MUST depend on the
   destination alone, which leaves BLACKNESS, DSTINVERT, the no-op and WHITENESS; any other is a

@@ -11798,6 +11798,7 @@ mod tests {
     /// Issue #484: on the GDI orders VM, a session advertising every order the core honours
     /// reaches its desktop, and every order the server sends decodes.
     #[tokio::test]
+    #[traced_test]
     #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
                 JUSTRDP_TEST_* env vars"]
     async fn the_gdi_orders_vm_paints_its_desktop_in_orders() {
@@ -11812,6 +11813,9 @@ mod tests {
                 .unwrap_or_else(|e| panic!("connect fails after {stages:?}: {e:?}"));
             let desktop = settle(outcome, capabilities, stages).await;
             desktop.census.print("#484 desktop");
+            for skip in SKIPPED_PAINT_LOGS {
+                assert!(!logs_contain(skip), "a paint was skipped: {skip}");
+            }
             let server =
                 justrdp::ServerAnnouncement::from_capabilities(&desktop.server_capabilities);
             eprintln!(
@@ -11866,6 +11870,7 @@ mod tests {
     /// Issue #484: the GDI orders VM's logon screen, painted in bitmap updates for a TLS-only
     /// session that advertises no order and sends no password, is the same in two sessions.
     #[tokio::test]
+    #[traced_test]
     #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
                 JUSTRDP_TEST_* env vars"]
     async fn the_gdi_orders_vm_logon_screen_is_the_same_in_two_sessions() {
@@ -11878,6 +11883,9 @@ mod tests {
             let first = screen().await;
             let second = screen().await;
             first.census.print("#484 logon screen");
+            for skip in SKIPPED_PAINT_LOGS {
+                assert!(!logs_contain(skip), "a paint was skipped: {skip}");
+            }
             eprintln!(
                 "#484: {} and {} frames, stages {:?}, dumps {} and {}",
                 first.frames.len(),
@@ -11916,6 +11924,7 @@ mod tests {
     /// session advertising every order the core honours, is the logon screen in bitmap updates,
     /// pixel for pixel.
     #[tokio::test]
+    #[traced_test]
     #[ignore = "requires the GDI orders VM at 192.168.136.164:3389 (Windows Server 2008 R2) and \
                 JUSTRDP_TEST_* env vars"]
     async fn the_gdi_orders_vm_paints_its_logon_screen_in_orders_as_in_bitmaps() {
@@ -11927,6 +11936,9 @@ mod tests {
             let oracle = tls_only(legacy_graphics_config()).await;
             let ordered = tls_only(honoured_orders_config()).await;
             ordered.census.print("#484 logon screen in orders");
+            for skip in SKIPPED_PAINT_LOGS {
+                assert!(!logs_contain(skip), "a paint was skipped: {skip}");
+            }
             eprintln!(
                 "#484: dumps {} and {}",
                 dump_ppm(&oracle.framebuffer, "justrdp-484-logon-oracle.ppm").display(),
@@ -11968,6 +11980,14 @@ mod tests {
         })
         .await
     }
+
+    /// What the core logs when it skips a paint: past the paint budget, on a cache miss, or for a
+    /// Create Offscreen Bitmap past the advertised cache (`justrdp::orders`).
+    const SKIPPED_PAINT_LOGS: [&str; 3] = [
+        "paint budget reached",
+        "reason=CacheMiss",
+        "past the advertised cache",
+    ];
 
     /// How many distinct colours `fb` holds, up to 17.
     fn colour_count(fb: &justrdp::Framebuffer) -> usize {
