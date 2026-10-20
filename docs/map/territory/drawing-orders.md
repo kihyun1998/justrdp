@@ -119,13 +119,18 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
     counts it, and so is the entry count. The size leaves out the entries the Create replaces and
     deletes, since a delete list is how the server makes room. The bitmaps are RGBA, so they hold
     twice the advertised size at 16 bpp and four times at 8 bpp.
-  - **A Create past either flushes every bitmap and turns offscreen off for the session.** The
-    session sends one Offscreen Bitmap Cache Error PDU (`OC_ERR_FLUSH_AND_DISABLE_OFFSCREEN`,
-    2.2.2.3.2). FreeRDP enforces only the count.
-  - **A target that was a bitmap paints nothing** until the next Switch, as a Switch to a
-    flushed bitmap would (#494). Orders the server meant for the bitmap do not land on the
-    screen. Whether the server stops using offscreen after the PDU is unmeasured (#497): at a
-    budget of 1 it went on switching to the flushed bitmaps.
+  - **A Create past either empties its entry and nothing else** (the maintainer's call, #497,
+    2026-10-20). The target, the other bitmaps and the cache are kept, and no Offscreen Bitmap
+    Cache Error PDU is sent, though 3.2.5.2.2 says the client SHOULD send one. FreeRDP enforces
+    only the count and sends no such PDU.
+    - **The server ignores the PDU.** A probe on WS2008 R2 refused Create #70 and sent the PDU,
+      which matched 2.2.2.3.2.1 byte for byte, with `streamId` MED or LOW. The server went on
+      using the offscreen cache: 41 more Creates, 42 Switches to bitmaps and 39 MemBlts from
+      them. Nothing was resent, though 3.3.5.2.2 says the server MUST disable the cache and
+      resend.
+    - **What each behaviour cost.** Flushing and disabling left 4,948 px wrong against the
+      server's repaint. Emptying only the refused entry left 0 px, twice: the server made the id
+      again.
   - **A Switch to an entry never created, or past the entries, makes the target unknown.** Paint
     orders are then skipped until the next Switch, as a cache index out of range is (ADR-0009
     §2). The spec says to drop the connection.
@@ -135,11 +140,8 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
     the bitmap caches are kept. FreeRDP's `update_reset_state` resets only the order history, and
     its caches live for the connection.
   - **Each Create's `cx × cy × 4` bytes are charged to the update's paint budget.** A Create the
-    budget cannot buy empties its entry and nothing else (the maintainer's call, #494,
-    2026-10-19). There is no flush, no error PDU, and the cache is kept.
-    - **What the new call was shown.** At a budget of 1, the server went on switching to the
-      flushed bitmaps after the error PDU: 14 Switches and 176 paints skipped.
-    - **The consequence.** The id misses until the server makes it again.
+    budget cannot buy empties its entry and nothing else, as one past the advertised cache does
+    (the maintainer's call, #494, 2026-10-19). The id misses until the server makes it again.
   - The allow-list accepts `offscreenSupportLevel` TRUE only, and only with MemBlt (3.2.5.1.3.1.1).
 - **DstBlt runs only destination ROPs.** 2.2.2.2.1.1.2.1 says its ROP MUST depend on the
   destination alone, which leaves BLACKNESS, DSTINVERT, the no-op and WHITENESS; any other is a
@@ -264,7 +266,6 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   `CacheBitmapRev2`, `CacheGlyph`, `GlyphData`, `CreateOffscreenBitmap`, `OrderError`,
   `TS_ALTSEC_FRAME_MARKER`, `TS_ALTSEC_SWITCH_SURFACE`, `TS_ALTSEC_CREATE_OFFSCR_BITMAP`,
   `SCREEN_BITMAP_SURFACE`
-- `justrdp-pdu/src/share.rs` — `PDU_TYPE2_OFFSCRCACHE_ERROR`, `OC_ERR_FLUSH_AND_DISABLE_OFFSCREEN`
 - `justrdp-pdu/src/capability.rs` — `BitmapCacheRev2CapabilitySet`, `BitmapCacheCellInfo`,
   `GlyphCacheCapabilitySet`, `ORDER_NEG_INDEX_INDEX`, `ORDER_NEG_DSTBLT_INDEX`,
   `ORDER_NEG_PATBLT_INDEX`, `ORDER_NEG_MULTIOPAQUERECT_INDEX`, `ORDER_NEG_POLYLINE_INDEX`,
@@ -519,8 +520,8 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
     either way.
   - **The consequence.** The end pixel still rests on FreeRDP's `gdi_LineTo`, which leaves it
     out (the maintainer's call to merge on that, 2026-10-20).
-- **The Offscreen Bitmap Cache Error PDU is proven only by unit tests**: the measured server
-  keeps to the advertised size, so nothing real reaches it.
+- **A Create past the advertised cache is proven only by a forced refusal** (#497): the measured
+  server keeps to the advertised size, so none arrives unforced.
 - **Glyph advances by `ulCharInc`, vertical and reversed text are proven only against the spec**:
   xrdp's text is horizontal with per-glyph deltas.
 - **DstBlt's real-server proof is BLACKNESS on an offscreen bitmap** (#489): the 2008 R2 logon
