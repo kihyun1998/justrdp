@@ -54,7 +54,7 @@ pub trait DvcProcessor {
     /// Start a session call: what this call may still paint, in decoded bytes. A processor that
     /// pauses stops a message there ([`Self::has_pending`]).
     fn begin_call(&mut self, _allowance: usize) {}
-    /// What this processor painted since [`Self::begin_call`].
+    /// What this processor painted, or otherwise spent, since [`Self::begin_call`].
     fn call_spent(&self) -> usize {
         0
     }
@@ -675,7 +675,7 @@ impl Drdynvc {
         }
     }
 
-    /// What every processor painted since [`Self::begin_call`].
+    /// What every processor painted, or otherwise spent, since [`Self::begin_call`].
     pub(crate) fn call_spent(&self) -> usize {
         self.processors.iter().map(|p| p.call_spent()).sum()
     }

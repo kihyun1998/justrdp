@@ -183,11 +183,11 @@ one of its outputs. Neither says what the loop dispatches or in what order.
     so a skipped section would desynchronise it;
   - **What it costs legitimate traffic:** a compressed bitmap update is charged its decompressed
     bytes and its paint, so a call of them pauses up to twice as early;
-  - **What stays uncharged:**
-    - a section sent uncompressed, a slow-path frame that paints nothing, and drdynvc reassembly:
-      each copies at most the bytes the call was handed. That is derived, not measured;
-    - a Graphics Pipeline message's ZGFX decompression, which the issue did not cover: its
-      processor charges what it paints only. Unmeasured.
+  - **What stays uncharged:** a section sent uncompressed, a slow-path frame that paints
+    nothing, and drdynvc reassembly. Each copies at most the bytes the call was handed; that is
+    derived, not measured;
+  - **The Graphics Pipeline charges its own ZGFX decompression** (#509,
+    [Graphics Pipeline](egfx-graphics-pipeline.md)).
 - **Why it is charged.** #507 set the rule: above about 300 ms a call, charge it. Measured
   uncharged (`--release`), the cost does not depend on the desktop size. A 32 KB PDU fell under
   the line, and the 49 KB a call can be handed crossed it:
