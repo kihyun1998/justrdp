@@ -322,21 +322,26 @@ pub fn decode_all(blob: &[u8]) -> Result<Vec<EgfxPdu<'_>>, DecodeError> {
     let mut pdus = Vec::new();
     let mut rest = blob;
     while !rest.is_empty() {
-        let mut cur = ReadCursor::new(rest, "RDPGFX_HEADER");
-        let cmd_id = cur.read_u16_le()?;
-        let _flags = cur.read_u16_le()?;
-        let pdu_length = cur.read_u32_le()? as usize;
-        if pdu_length < 8 || pdu_length > rest.len() {
-            return Err(DecodeError::InvalidField {
-                field: "RDPGFX_HEADER.pduLength",
-                reason: "length does not cover the header or exceeds the blob",
-            });
-        }
-        let body = &rest[8..pdu_length];
-        pdus.push(decode_body(cmd_id, body)?);
-        rest = &rest[pdu_length..];
+        let (pdu, length) = decode_first(rest)?;
+        pdus.push(pdu);
+        rest = &rest[length..];
     }
     Ok(pdus)
+}
+
+/// Decode the first PDU of a non-empty `RDPGFX_HEADER` chain, and its `pduLength`.
+pub fn decode_first(blob: &[u8]) -> Result<(EgfxPdu<'_>, usize), DecodeError> {
+    let mut cur = ReadCursor::new(blob, "RDPGFX_HEADER");
+    let cmd_id = cur.read_u16_le()?;
+    let _flags = cur.read_u16_le()?;
+    let pdu_length = cur.read_u32_le()? as usize;
+    if pdu_length < 8 || pdu_length > blob.len() {
+        return Err(DecodeError::InvalidField {
+            field: "RDPGFX_HEADER.pduLength",
+            reason: "length does not cover the header or exceeds the blob",
+        });
+    }
+    Ok((decode_body(cmd_id, &blob[8..pdu_length])?, pdu_length))
 }
 
 fn decode_body(cmd_id: u16, body: &[u8]) -> Result<EgfxPdu<'_>, DecodeError> {
