@@ -97,5 +97,8 @@ fuzz_target!(|input: &[u8]| {
             fastpath::FP_FRAGMENT_SINGLE,
             body,
         )]));
+        while sm.has_pending_input() {
+            let _ = sm.process_bytes(&[]);
+        }
     }
 });

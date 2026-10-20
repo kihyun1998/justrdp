@@ -66,7 +66,7 @@ Host integration (application-specific):
 **Negative:**
 
 - **More boilerplate.** The adapter loop is straightforward (~30 lines per runtime) but non-trivial. A naive async-coupled design would be 10 lines shorter. This cost is acceptable for the testing + portability + isolation wins.
-- **Explicit state threading.** Each state machine transition must be explicit: `(new_state, actions) = state.process(bytes)`. The machine does not maintain internal position across a buffer (e.g., "read 5 bytes, pause, wait for more"). The adapter must buffer partial frames and retry `process` on each new byte batch. This is a one-time design cost per machine, not a per-call cost; it is well-understood (see ironrdp's `ClientConnectorState::step` or FreeRDP's state machine).
+- **Explicit state threading.** Each state machine transition must be explicit: `(new_state, actions) = state.process(bytes)`. The machine does not maintain internal position across a buffer (e.g., "read 5 bytes, pause, wait for more"). *(Superseded for the session machine — see the 2026-10-20 Amendment.)* The adapter must buffer partial frames and retry `process` on each new byte batch. This is a one-time design cost per machine, not a per-call cost; it is well-understood (see ironrdp's `ClientConnectorState::step` or FreeRDP's state machine).
 - **Cannot await within the machines.** Any I/O (socket, timer, KDC lookup) must happen in the adapter layer, not the machines. For CredSSP/NLA (which yields KDC network requests to the caller — SSPI's design), this is a natural fit; for custom channel processors, it means a processor cannot directly spawn a blocking syscall. This constraint is intentional and aligns with ADR-0005 (channels use plain seams).
 
 ## Alternatives considered
@@ -184,3 +184,20 @@ only when a boundary has actually hardened** — a dependency that must not reac
 consumer that needs the part alone — never upfront to mirror IronRDP's crate-per-channel
 layout. Every channel shipped so far (clipboard, device redirection, audio, Display Control,
 EGFX) is a module, under the tree rule above.
+
+---
+
+## Amendment (2026-10-20): the session machine keeps its position across calls
+
+**What changed.** The Negative bullet's "the machine does not maintain internal position
+across a buffer" no longer holds for `SessionStateMachine`:
+
+- since #86 it keeps its own inbox of unprocessed bytes;
+- since #496 a `process_bytes` call stops starting PDUs and fast-path sections once it has bought
+  one update's paint budget, keeps the next section of its first PDU, and reports
+  `has_pending_input()`; a call with no bytes resumes.
+
+**Why.** A hostile server could make one call take minutes (#496). The bound needs a pause
+point inside the machine, and a sans-IO machine has no clock, so the pause is counted in work
+done. It is not a step back from sans-IO: the machine still performs no I/O, and the adapter
+decides when to resume. The maintainer chose pausing over skipping (#496, 2026-10-20).

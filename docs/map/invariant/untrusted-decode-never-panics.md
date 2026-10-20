@@ -462,8 +462,9 @@ charge each command its *decoded* size against a per-update budget before decodi
 (`PAINT_BUDGET_FRAMEBUFFERS` desktops), and the same update costs 18 ms at a budget of 2, and
 73 ms at 8 (#494).
 **The budget is issued per fast-path section, so the same commands, one per section, still cost
-6.0 s in a single 32 KB PDU at a budget of 2, and 5.2 s at 8** (#494, measured). It bounds one update, not one PDU or one
-`process_bytes` call (#496). EGFX's `CACHE_TO_SURFACE` runs a
+6.0 s in a single 32 KB PDU at a budget of 2, and 5.2 s at 8** (#494, measured). Since #496 a
+`process_bytes` call stops starting sections once it has spent one update's budget and resumes
+on the next call, so a call costs at most two updates' budgets. EGFX's `CACHE_TO_SURFACE` runs a
 wire count where each entry is **4 bytes** and its cost is a bitmap the server established in an
 *earlier* message, so 262 KB bought ~505–540 s (#268). Neither of the two questions above sees
 this: the trip count is `usize::from(<u16>)` and every arithmetic guard passes. Where the answer
