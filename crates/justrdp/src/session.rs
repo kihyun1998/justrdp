@@ -1428,15 +1428,6 @@ impl SessionStateMachine {
             &mut frames,
         );
         outputs.extend(frames.into_iter().map(SessionOutput::Frame));
-        if self.orders.take_offscreen_error() {
-            outputs.push(self.send_io(&share::encode_share_data(
-                self.config.user_channel_id,
-                self.config.share_id,
-                share::STREAM_MED,
-                share::PDU_TYPE2_OFFSCRCACHE_ERROR,
-                &share::OC_ERR_FLUSH_AND_DISABLE_OFFSCREEN.to_le_bytes(),
-            )));
-        }
         result
     }
 
@@ -3660,10 +3651,9 @@ mod tests {
         );
     }
 
-    /// A Create Offscreen Bitmap past the advertised cache sends one Offscreen Bitmap Cache
-    /// Error PDU, `OC_ERR_FLUSH_AND_DISABLE_OFFSCREEN` (#489, `[MS-RDPEGDI]` 2.2.2.3.2).
+    /// A Create Offscreen Bitmap past the advertised cache sends the server nothing (#497).
     #[test]
-    fn an_offscreen_bitmap_past_the_cache_sends_the_error_pdu_once() {
+    fn an_offscreen_bitmap_past_the_cache_sends_nothing() {
         use crate::orders::tests::create_offscreen;
         let mut config = orders_config();
         config.capabilities.push(CapabilitySet::OffscreenCache(
@@ -3681,7 +3671,7 @@ mod tests {
                 &orders_body(orders),
             )])
         };
-        // 1 KB at 16 bpp is 512 pixels; one update's budget on this 16 x 8 desktop buys 256.
+        // 1 KB at 16 bpp is 512 pixels; one update's budget on this 16 x 8 desktop buys 2048.
         for id in [0, 1] {
             let fits = sm
                 .process_bytes(&update(&[create_offscreen(id, 16, 16, &[])]))
@@ -3691,23 +3681,7 @@ mod tests {
         let outputs = sm
             .process_bytes(&update(&[create_offscreen(2, 1, 1, &[])]))
             .unwrap();
-        let expected = sm.wrap_io(&share::encode_share_data(
-            sm.config.user_channel_id,
-            sm.config.share_id,
-            share::STREAM_MED,
-            share::PDU_TYPE2_OFFSCRCACHE_ERROR,
-            &1u32.to_le_bytes(),
-        ));
-        assert_eq!(outputs, [SessionOutput::WriteBytes(expected.clone())]);
-        assert_eq!(expected[expected.len() - 4..], [1, 0, 0, 0]);
-        let again = sm
-            .process_bytes(&update(&[create_offscreen(3, 1, 1, &[])]))
-            .unwrap();
-        assert_eq!(
-            again,
-            [],
-            "the cache is no longer kept, and no second PDU is sent"
-        );
+        assert_eq!(outputs, []);
     }
 
     /// A fast-path Orders Update paints (#460).

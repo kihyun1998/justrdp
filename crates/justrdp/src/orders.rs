@@ -72,13 +72,6 @@ impl Offscreen {
             self.used -= u64::from(surface.width()) * u64::from(surface.height());
         }
     }
-
-    /// Drop every bitmap and stop keeping them.
-    fn flush(&mut self) {
-        self.surfaces.clear();
-        self.used = 0;
-        self.disabled = true;
-    }
 }
 
 /// Where orders paint (2.2.2.2.1.3.3).
@@ -99,10 +92,6 @@ struct Offscreen {
     size_kb: u32,
     /// The pixels of every bitmap held.
     used: u64,
-    /// The cache was flushed after a Create it could not hold, and is no longer kept.
-    disabled: bool,
-    /// An Offscreen Bitmap Cache Error PDU is owed to the server.
-    error_owed: bool,
 }
 
 /// The connection's drawing-order state: the primary order history, the bitmap caches and which
@@ -219,11 +208,6 @@ impl Orders {
     /// frame stays open, so its end still closes it.
     pub(crate) fn discard_held(&mut self) {
         self.held.clear();
-    }
-
-    /// Whether an Offscreen Bitmap Cache Error PDU is owed; true once.
-    pub(crate) fn take_offscreen_error(&mut self) -> bool {
-        core::mem::take(&mut self.offscreen.error_owed)
     }
 
     /// Whether a `TS_FRAME_START` is waiting for its `TS_FRAME_END`.
@@ -631,7 +615,7 @@ impl Orders {
     /// target nothing paints until the next Switch. Ignored with no offscreen cache advertised
     /// (3.2.5.1.3.1.2).
     fn switch_surface(&mut self, bitmap_id: u16) {
-        if self.offscreen.surfaces.is_empty() && !self.offscreen.disabled {
+        if self.offscreen.surfaces.is_empty() {
             return;
         }
         self.target = if bitmap_id == orders::SCREEN_BITMAP_SURFACE {
@@ -656,10 +640,8 @@ impl Orders {
 
     /// A Create Offscreen Bitmap: a black bitmap at its id, then its delete list. The size,
     /// counted at `bits_per_pixel`, leaves out what the Create replaces and deletes. One past the
-    /// update's paint budget empties its entry. One past the advertised entries or size, or one
-    /// this client cannot allocate, flushes the cache and owes the server an Offscreen Bitmap
-    /// Cache Error PDU; the cache is not kept after, and a target that was a bitmap paints
-    /// nothing until the next Switch.
+    /// update's paint budget, past the advertised entries or size, or one this client cannot
+    /// allocate empties its entry and nothing else.
     fn create_offscreen(
         &mut self,
         order: &CreateOffscreenBitmap<'_>,
@@ -683,35 +665,30 @@ impl Orders {
         let depth = u64::from(bits_per_pixel.div_ceil(8).max(1));
         let fits = id < offscreen.surfaces.len()
             && (offscreen.used - freed + wanted) * depth <= u64::from(offscreen.size_kb) * 1024;
-        let created = if fits {
-            offscreen.remove(id);
-            if wanted == 0 {
-                Some(Err(Skip::OffscreenEmpty))
-            } else if !charge(
-                budget,
-                usize::from(order.cx)
-                    .saturating_mul(usize::from(order.cy))
-                    .saturating_mul(4),
-            ) {
-                Some(Err(Skip::OverBudget))
-            } else {
-                Framebuffer::new(order.cx, order.cy).ok().map(Ok)
-            }
+        offscreen.remove(id);
+        let created = if !fits {
+            Err(Skip::OffscreenRefused)
+        } else if wanted == 0 {
+            Err(Skip::OffscreenEmpty)
+        } else if !charge(
+            budget,
+            usize::from(order.cx)
+                .saturating_mul(usize::from(order.cy))
+                .saturating_mul(4),
+        ) {
+            Err(Skip::OverBudget)
         } else {
-            None
+            Framebuffer::new(order.cx, order.cy).map_err(|_| Skip::OffscreenRefused)
         };
-        let Some(created) = created else {
+        if matches!(created, Err(Skip::OffscreenRefused)) {
             tracing::warn!(
                 target: "rdp_orders",
                 id = order.id,
                 cx = order.cx,
                 cy = order.cy,
-                "a Create Offscreen Bitmap past the advertised cache; it is flushed and no longer kept"
+                "a Create Offscreen Bitmap past the advertised cache; its entry is emptied"
             );
-            offscreen.flush();
-            offscreen.error_owed = true;
-            return Err(NotApplied::Skipped(Skip::OffscreenRefused));
-        };
+        }
         let outcome = created.map(|surface| {
             offscreen.used += wanted;
             offscreen.surfaces[id] = Some(surface);
@@ -1788,56 +1765,82 @@ pub(crate) mod tests {
     }
 
     /// A Create past the advertised size, counted at the session depth, or past the advertised
-    /// entries asks for the Offscreen Bitmap Cache Error PDU once, flushes every offscreen
-    /// bitmap, and ends offscreen caching (#489's decision (a)). A target that was a bitmap is
-    /// unknown until the next Switch (#494).
+    /// entries empties its own entry and nothing else: the target, the other bitmaps and the
+    /// cache are kept (#497).
     #[test]
-    fn a_create_past_the_advertised_cache_flushes_and_disables_it() {
+    fn a_create_past_the_advertised_cache_empties_only_its_entry() {
         // 1 KB at 16 bpp is 512 pixels.
-        for overflow in [
-            create_offscreen(1, 1, 1, &[]),
-            create_offscreen(4, 1, 1, &[]),
+        for (id, overflow) in [
+            (1, create_offscreen(1, 1, 1, &[])),
+            (4, create_offscreen(4, 1, 1, &[])),
         ] {
             let mut orders = Orders::new(&offscreen_capabilities(1, 4));
             let mut fb = Framebuffer::new(2, 1).unwrap();
+            let blit = |id: u16, x: i16| memblt((OFFSCREEN, id), [x, 0, 1, 1], SRCCOPY, [0, 0]);
             run(
                 &mut orders,
                 &mut fb,
-                &[create_offscreen(0, 32, 16, &[]), switch_surface(0)],
+                &[
+                    create_offscreen(0, 32, 16, &[]),
+                    switch_surface(0),
+                    opaque_rect([0, 0, 1, 1], GREEN),
+                ],
             );
-            assert!(!orders.take_offscreen_error(), "512 pixels fit");
             let frames = run(
                 &mut orders,
                 &mut fb,
                 &[overflow.clone(), opaque_rect([0, 0, 1, 1], RED)],
             );
-            assert!(orders.take_offscreen_error());
-            assert!(!orders.take_offscreen_error(), "asked for once");
-            assert_eq!(frames, [], "the flushed target paints nothing");
-            assert_eq!(pixel(&fb, 0, 0), BLACK);
+            assert_eq!(frames, [], "the target is still the bitmap");
             let frames = run(
                 &mut orders,
                 &mut fb,
-                &[switch_surface(SCREEN), opaque_rect([0, 0, 1, 1], RED)],
+                &[switch_surface(SCREEN), blit(0, 0), blit(id, 1)],
             );
-            assert_eq!(frames, [frame(0, 0, 1, 1)], "a Switch to the screen paints");
-            // Flushed, and no longer kept.
+            assert_eq!(
+                frames,
+                [frame(0, 0, 1, 1)],
+                "Create {id}: only its entry misses"
+            );
+            assert_eq!(pixel(&fb, 0, 0), rgba(RED));
+            // The cache still makes bitmaps.
             let frames = run(
                 &mut orders,
                 &mut fb,
                 &[
-                    create_offscreen(0, 1, 1, &[]),
-                    switch_surface(0),
-                    opaque_rect([1, 0, 1, 1], RED),
+                    create_offscreen(2, 1, 1, &[0]),
+                    switch_surface(2),
+                    opaque_rect([0, 0, 1, 1], GREEN),
+                    switch_surface(SCREEN),
+                    blit(2, 1),
                 ],
             );
-            assert_eq!(frames, []);
-            assert_eq!(pixel(&fb, 1, 0), BLACK);
-            assert!(
-                !orders.take_offscreen_error(),
-                "later errors are not reported"
-            );
+            assert_eq!(frames, [frame(1, 0, 1, 1)]);
+            assert_eq!(pixel(&fb, 1, 0), rgba(GREEN));
         }
+    }
+
+    /// A Create past the advertised cache still empties the entry it names and applies its
+    /// delete list, as the server has.
+    #[test]
+    fn a_refused_create_empties_its_id_and_its_delete_list() {
+        // 1 KB at 16 bpp is 512 pixels.
+        let mut orders = Orders::new(&offscreen_capabilities(1, 4));
+        let mut fb = Framebuffer::new(3, 1).unwrap();
+        let blit = |id: u16| memblt((OFFSCREEN, id), [id as i16, 0, 1, 1], SRCCOPY, [0, 0]);
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                create_offscreen(0, 16, 16, &[]),
+                create_offscreen(1, 1, 1, &[]),
+                create_offscreen(2, 1, 1, &[]),
+            ],
+        );
+        // 32 x 17 is past 512 pixels even with entries 0 and 1 freed.
+        run(&mut orders, &mut fb, &[create_offscreen(0, 32, 17, &[1])]);
+        let frames = run(&mut orders, &mut fb, &[blit(0), blit(1), blit(2)]);
+        assert_eq!(frames, [frame(2, 0, 1, 1)], "entries 0 and 1 are emptied");
     }
 
     /// A Create replaces the bitmap at its id, the new one black; its delete list empties
@@ -1893,14 +1896,11 @@ pub(crate) mod tests {
         );
         run(&mut orders, &mut fb, &[create_offscreen(1, 0, 3, &[])]);
         assert_eq!(run(&mut orders, &mut fb, &blit(1)), []);
-        assert!(!orders.take_offscreen_error());
         // Exactly 4 x 4 x 4 bytes buys it again; one short is refused.
         run_with(&mut orders, &mut fb, &[create_offscreen(0, 4, 4, &[])], 64);
         assert_eq!(run(&mut orders, &mut fb, &blit(0)), [frame(0, 0, 1, 1)]);
-        assert!(!orders.take_offscreen_error());
         run(&mut orders, &mut fb, &[create_offscreen(1, 1, 1, &[])]);
         run_with(&mut orders, &mut fb, &[create_offscreen(0, 4, 4, &[])], 63);
-        assert!(!orders.take_offscreen_error(), "the server is not told");
         assert_eq!(
             run(&mut orders, &mut fb, &blit(0)),
             [],
@@ -1975,10 +1975,6 @@ pub(crate) mod tests {
                 create_offscreen(3, 0, 1, &[1]),
             ],
         );
-        assert!(
-            !orders.take_offscreen_error(),
-            "deleting entry 0 made room for entry 2"
-        );
         let frames = run(
             &mut orders,
             &mut fb,
@@ -2032,7 +2028,6 @@ pub(crate) mod tests {
             ],
         );
         assert_eq!(frames, [frame(0, 0, 1, 1)]);
-        assert!(!orders.take_offscreen_error());
     }
 
     /// A Polyline from `start` through `deltas` (one-byte deltas) in a 16 bpp `pen`, inside the
