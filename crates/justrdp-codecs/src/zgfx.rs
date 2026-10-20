@@ -12,7 +12,7 @@
 //!
 //! **Outermost on the EGFX path.** Every byte the server sends on
 //! `Microsoft::Windows::RDS::Graphics` arrives as `RDP_SEGMENTED_DATA` and is decompressed
-//! here *before* `justrdp_pdu::egfx::decode_all` sees a single command. A defect here does not
+//! here *before* `justrdp_pdu::egfx` decodes a single command. A defect here does not
 //! look like a zgfx defect — it looks like a corrupt surface command, which is the shape
 //! [`a-later-stage-can-hide-an-earlier-defect`] names.
 //!

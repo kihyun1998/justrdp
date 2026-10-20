@@ -144,6 +144,24 @@ acknowledge frames. It is server→client only, and it is reachable only if
   - **What the call is charged.** The three list-bearing commands are charged to both budgets. A
     SurfaceToCache copy, up to a surface per PDU, is charged to the call only, so a message of
     copies pauses too. The per-frame budget is #268's and stays on the list-bearing commands.
+  - **What ZGFX adds is charged to the call** (#509). A message is decompressed, then every PDU
+    decoded, before any PDU is handled, and neither step can stop part-way. So the bytes
+    decompression added beyond those received are charged to the call at once, as #507 charges
+    bulk decompression, and the message stops after its first PDU when they pass the
+    allowance. A message sent uncompressed adds nothing and is not charged.
+  - **Why.** Measured (`--release`), a multipart message of about 12 KB can decompress to the
+    64 MiB cap, here into 4,194,304 SolidFills of no rects. Uncharged, it took 419 to 634 ms in
+    one call: 101 to 146 ms of ZGFX, 199 to 237 ms decoding every PDU into a list, and the rest
+    handling them. The decoding pass now decodes each PDU and drops it, 82 ms where the list
+    took 199 to 237.
+  - **What a call costs now.** Through the session at 1280 × 800, three such messages in one
+    37.5 KB delivery took one call of 897 to 911 ms before. Charged, they take three calls of
+    157 to 209 ms. A message's charge stops the call after its first PDU. Its tail paints nothing
+    and charges nothing, so the next call handles the tail and the next message's
+    decompression and decoding pass too.
+  - **The cap stays at 64 MiB.** Neither the spec (3.1.9.1.2.1) nor FreeRDP bounds a message's
+    `uncompressedSize`. The largest message over five WS2019 EGFX sessions decompressed to
+    48,897 bytes.
   - **What is not charged.** A CreateSurface's zeroed allocation is not charged.
 - **One number answers two different questions here, and the shared derivation is the reason
   — not the convenience.** `MAX_TOTAL_SURFACE_BYTES` is *also* the **per-frame paint budget**
