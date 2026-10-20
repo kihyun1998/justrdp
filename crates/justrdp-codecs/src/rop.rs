@@ -50,6 +50,11 @@ pub fn uses_pattern(rop: u8) -> bool {
     rop >> 4 != rop & 0x0F
 }
 
+/// Whether the result of `rop` depends on the destination.
+pub fn uses_dest(rop: u8) -> bool {
+    rop >> 1 & 0x55 != rop & 0x55
+}
+
 /// The rows of a [`BS_PATTERN`] brush, top row first: `BrushExtra` holds the top seven in
 /// reverse order and `BrushHatch` the bottom one (2.2.2.2.1.1.2.3).
 pub fn pattern_rows(hatch: u8, extra: &[u8; 7]) -> [u8; 8] {
@@ -102,6 +107,12 @@ impl Pattern {
                 }
             }
         }
+    }
+
+    /// The eight pixels of row `y` from column `left`. A pattern repeats every eight pixels
+    /// across and every eight rows down.
+    pub fn period(&self, left: i32, y: i32) -> [u32; 8] {
+        core::array::from_fn(|column| self.pixel(left + column as i32, y))
     }
 }
 
@@ -173,5 +184,40 @@ mod tests {
         assert_eq!(pattern.pixel(-5, -9), 2);
         assert_eq!(pattern.pixel(4, -1), 1);
         assert_eq!(pattern.pixel(3, 0), 1);
+    }
+
+    /// `uses_dest` says whether the destination can change [`rop3`]'s result, for every ROP3.
+    #[test]
+    fn uses_dest_says_whether_the_destination_changes_the_result() {
+        let ones = 0x00FF_FFFF;
+        for rop in 0..=255u8 {
+            let reads = [(0, 0), (0, ones), (ones, 0), (ones, ones)]
+                .iter()
+                .any(|&(p, s)| rop3(rop, p, s, 0) != rop3(rop, p, s, ones));
+            assert_eq!(uses_dest(rop), reads, "rop {rop:#04x}");
+        }
+    }
+
+    /// A pattern's period is its pixels, and repeats every eight pixels across and down.
+    #[test]
+    fn a_pattern_repeats_its_period_every_eight_pixels() {
+        let mono = Pattern::Mono {
+            rows: HATCH_PATTERNS[2],
+            fore: 1,
+            back: 2,
+            org_x: -3,
+            org_y: 5,
+        };
+        for pattern in [Pattern::Solid(7), mono] {
+            for (left, y) in [(0, 0), (-5, 3), (13, -9)] {
+                let period = pattern.period(left, y);
+                for column in 0..24 {
+                    let x = left + column;
+                    assert_eq!(period[column as usize % 8], pattern.pixel(x, y));
+                    assert_eq!(pattern.pixel(x, y + 8), pattern.pixel(x, y));
+                }
+            }
+        }
+        assert_ne!(mono.period(0, 0), mono.period(0, 1));
     }
 }

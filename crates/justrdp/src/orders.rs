@@ -1069,6 +1069,18 @@ struct Area {
 }
 
 impl Area {
+    fn region_mut<'a>(
+        &self,
+        framebuffer: &'a mut Framebuffer,
+    ) -> Option<(FrameUpdate, impl Iterator<Item = &'a mut [u8]>)> {
+        framebuffer.region_mut(
+            self.left as u16,
+            self.top as u16,
+            self.width as u16,
+            self.height as u16,
+        )
+    }
+
     fn blit(&self, framebuffer: &mut Framebuffer, block: &[u8]) -> Option<FrameUpdate> {
         framebuffer.blit(
             self.left as u16,
@@ -1210,6 +1222,28 @@ fn fill(
     };
     if !charge(budget, area.width * area.height * 4) {
         return Err(NotApplied::Skipped(Skip::OverBudget));
+    }
+    if !rop::uses_dest(rop) {
+        // Each row is its pattern row's eight painted pixels, repeated, written in place.
+        let periods: [[u8; 32]; 8] = core::array::from_fn(|row| {
+            let mut period = [0u8; 32];
+            let pattern = brush.period(area.left, area.top + row as i32);
+            for (out, p) in period.as_chunks_mut::<4>().0.iter_mut().zip(pattern) {
+                *out = rop::rop3(rop, p, 0, 0).to_le_bytes();
+            }
+            period
+        });
+        if let Some((frame, rows)) = area.region_mut(framebuffer) {
+            for (period, row) in periods.iter().cycle().zip(rows) {
+                let (whole, rest) = row.as_chunks_mut::<32>();
+                for chunk in whole {
+                    chunk.copy_from_slice(period);
+                }
+                rest.copy_from_slice(&period[..rest.len()]);
+            }
+            frames.push(frame);
+        }
+        return Ok(());
     }
     let stride = usize::from(framebuffer.width()) * 4;
     let mut block = vec![0u8; area.width * area.height * 4];
@@ -1534,6 +1568,64 @@ pub(crate) mod tests {
         assert_ne!(pixel(&fb, 2, 0), rgba(RED), "DSTINVERT changed it");
         assert_eq!(pixel(&fb, 3, 0), rgba(BLUE));
         assert_eq!(pixel(&fb, 3, 1), rgba(WHITE));
+    }
+
+    /// Issue #506: every ROP3 fills as its truth table says, with a solid brush and with a
+    /// pattern whose origin and rectangle are off its eight-pixel period, inside a clip.
+    #[test]
+    fn every_rop_fills_as_its_truth_table_says() {
+        let (width, height) = (21u16, 21u16);
+        let before: Vec<u8> = (0..usize::from(width) * usize::from(height))
+            .flat_map(|i| [(i * 37) as u8, (i * 11) as u8, (i * 5) as u8, 0xFF])
+            .collect();
+        let brushes = [
+            Pattern::Solid(0xFF12_3456),
+            Pattern::Mono {
+                rows: rop::HATCH_PATTERNS[5],
+                fore: 0xFF00_80FF,
+                back: 0xFFFF_2000,
+                org_x: 3,
+                org_y: -2,
+            },
+        ];
+        let clip = Bounds {
+            left: 2,
+            top: 1,
+            right: 18,
+            bottom: 17,
+        };
+        for brush in brushes {
+            for rop in 0..=255u8 {
+                let mut fb = Framebuffer::new(width, height).unwrap();
+                fb.blit(0, 0, width, height, &before, usize::from(width));
+                let (mut budget, mut frames) = (usize::MAX, Vec::new());
+                let order = Fill {
+                    dest: [1, 0, 19, 21],
+                    rop,
+                    brush,
+                    clip: Clip::Bounds(clip),
+                };
+                assert!(fill(true, order, &mut fb, &mut budget, &mut frames).is_ok());
+                assert_eq!(frames, [frame(2, 1, 17, 17)], "rop {rop:#04x}");
+                assert_eq!(usize::MAX - budget, 17 * 17 * 4, "rop {rop:#04x}");
+                for y in 0..height {
+                    for x in 0..width {
+                        let at = (usize::from(y) * usize::from(width) + usize::from(x)) * 4;
+                        let d = word(&before[at..at + 4]);
+                        let expected = if (2..19).contains(&x) && (1..18).contains(&y) {
+                            rop::rop3(rop, brush.pixel(x.into(), y.into()), 0, d)
+                        } else {
+                            d
+                        };
+                        assert_eq!(
+                            word(&fb.pixels()[at..at + 4]),
+                            expected,
+                            "rop {rop:#04x} at ({x}, {y}) with {brush:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A MultiOpaqueRect of a 16 bpp `color` over `rects` (`[left, top, width, height]`), each

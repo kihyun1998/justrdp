@@ -168,8 +168,12 @@ one of its outputs. Neither says what the loop dispatches or in what order.
     Sections already handled are skipped, never decompressed twice;
   - **Progress is guaranteed:** a call always handles its first PDU, and a resumed call its
     first remaining section, even with a budget of nothing (an empty desktop). One call costs at
-    most two updates' budgets: the one-byte OpaqueRect burst below takes 149 ms a call at
-    1280 × 800 (`--release`), where the whole PDU took about 286 s in one call.
+    most two updates' budgets. The one-byte OpaqueRect burst below, at 1280 × 800
+    (`--release`), resumes over 2,520 calls:
+    - **Before #506:** a median call of 112 ms and one call of 800 ms, and 296 s for the whole
+      PDU. When #496 measured it, a call was 149 ms and the PDU 286 s;
+    - **After #506**, whose fills paint in place: a median call of 0.72 to 0.86 ms, at most
+      1.5 ms, and 1.8 to 2.2 s for the whole PDU, over three runs.
 - **Why it pauses rather than skips.** An update's budget is issued afresh per section, so
   without the pause one call was bounded only by the bytes it was handed (#494, `--release`,
   1280 × 800):

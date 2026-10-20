@@ -40,7 +40,8 @@ renderer begins.
 ## Code
 
 - `justrdp/src/framebuffer.rs` — `Framebuffer`, `FrameUpdate`, `Framebuffer::blit`,
-  `copy_rect_into`, `pixels`, `full_frame`, `resize`
+  `region_mut` (the crate's in-place paint, which a drawing-order fill uses), `copy_rect_into`,
+  `pixels`, `full_frame`, `resize`
 - `justrdp/src/session.rs` — `SessionOutput::Frame`
 - Module doc: mirrors ironrdp-session's decode-complete image-buffer model
 
@@ -78,6 +79,9 @@ the exact shape the map's *reference behaviour* section exists to make visible.
   conformance suite exercises 32766 on one axis in two positive tests; justrdp fails both, at the
   `ResetGraphics`. Kept rather than raised, as a judgement, in
   [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)'s 2026-09-16 amendment.
+- **`region_mut` clips to the edge.** A region past the edge yields only the rows and columns on
+  the framebuffer, and one wholly off it yields `None`. Its one caller, a drawing-order fill,
+  passes an area `clip_blt` already clipped.
 - **`blit` and `copy_rect_into` are refusals, not clips, and neither is wire-reachable.** Both
   are `pub` and both had a total-arithmetic hole (`src_stride_px * 4` overflowing on *every*
   target; an out-of-range slice index on a rect outside the buffer). Their callers pass values
@@ -90,6 +94,8 @@ the exact shape the map's *reference behaviour* section exists to make visible.
   and owns their ordering.
 - [EGFX graphics pipeline](egfx-graphics-pipeline.md) — surfaces blit straight into
   this buffer (#163); a change to the blit signature is a change there.
+- [Drawing orders](drawing-orders.md) — a fill whose ROP reads no destination paints this
+  buffer in place through `region_mut` (#506); every other order blits.
 - [Bitmap codecs](bitmap-codecs.md) — decoders write into this buffer's stride and
   colour order; a codec that returns its own `Vec` reintroduces the copy ADR-0010
   removed.

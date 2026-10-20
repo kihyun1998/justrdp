@@ -24,7 +24,7 @@ live above all four or it gets re-litigated at each new decoder.
 ## Territories it holds in
 
 - [Framebuffer & frame delivery](../territory/framebuffer-frame-delivery.md) — where
-  the contract is defined (`blit`, `copy_rect_into`, `pixels`).
+  the contract is defined (`blit`, `region_mut`, `copy_rect_into`, `pixels`).
 - [Session loop & PDU dispatch](../territory/session-loop-dispatch.md) —
   `SessionOutput::Frame(FrameUpdate)` carries the rectangle.
 - [EGFX graphics pipeline](../territory/egfx-graphics-pipeline.md) — surfaces blit

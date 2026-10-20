@@ -196,6 +196,38 @@ impl Framebuffer {
         })
     }
 
+    /// The rows of the `width × height` region at `(x, y)`, clipped to the framebuffer, to paint
+    /// in place, with the dirty [`FrameUpdate`] they make; `None` when the region is empty.
+    pub(crate) fn region_mut(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<(FrameUpdate, impl Iterator<Item = &mut [u8]>)> {
+        let width = width.min(self.width.saturating_sub(x));
+        let height = height.min(self.height.saturating_sub(y));
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let (left, right) = (usize::from(x) * 4, usize::from(x + width) * 4);
+        let rows = self
+            .pixels
+            .chunks_exact_mut(usize::from(self.width) * 4)
+            .skip(usize::from(y))
+            .take(usize::from(height))
+            .map(move |row| &mut row[left..right]);
+        Some((
+            FrameUpdate {
+                x,
+                y,
+                width,
+                height,
+            },
+            rows,
+        ))
+    }
+
     /// The whole framebuffer as one [`FrameUpdate`] rect (the full-screen re-emit after
     /// reactivation). The pixels stay in the framebuffer; the host reads them via
     /// [`Self::pixels`] / [`Self::copy_rect_into`].
@@ -303,6 +335,30 @@ mod tests {
         assert_eq!((update.width, update.height), (1, 1));
         // Entirely outside → no update.
         assert!(fb.blit(4, 0, 2, 2, &src, 4).is_none());
+    }
+
+    #[test]
+    fn region_mut_clips_to_the_framebuffer_edge() {
+        let mut fb =
+            Framebuffer::new(4, 3).expect("the test desktop size is within MAX_DESKTOP_DIM");
+        let (update, rows) = fb.region_mut(2, 1, 5, 5).unwrap();
+        assert_eq!(
+            (update.x, update.y, update.width, update.height),
+            (2, 1, 2, 2)
+        );
+        for row in rows {
+            assert_eq!(row.len(), 2 * 4);
+            row.fill(7);
+        }
+        let painted: Vec<bool> = fb.pixels().chunks(4).map(|p| p[0] == 7).collect();
+        let expected = [
+            false, false, false, false, //
+            false, false, true, true, //
+            false, false, true, true,
+        ];
+        assert_eq!(painted, expected);
+        assert!(fb.region_mut(4, 0, 2, 2).is_none());
+        assert!(fb.region_mut(0, 3, 2, 2).is_none());
     }
 
     #[test]
