@@ -290,9 +290,10 @@ impl Orders {
         framebuffer: &mut Framebuffer,
         palette: &Palette,
         bits_per_pixel: u16,
-        mut budget: usize,
+        budget_left: &mut usize,
         frames: &mut Vec<FrameUpdate>,
     ) -> Result<(), crate::SessionError> {
+        let mut budget = *budget_left;
         let mut cur = ReadCursor::new(update.order_data, "orderData");
         let mut over_budget = 0usize;
         let mut painted = Vec::new();
@@ -508,6 +509,7 @@ impl Orders {
                 "paint budget reached; the remaining orders of this update were decoded, not painted",
             );
         }
+        *budget_left = budget;
         Ok(())
     }
 
@@ -2579,7 +2581,7 @@ pub(crate) mod tests {
                 fb,
                 &Palette::default(),
                 16,
-                budget,
+                &mut { budget },
                 &mut frames,
             )
             .unwrap();
@@ -2604,7 +2606,7 @@ pub(crate) mod tests {
                 fb,
                 palette,
                 8,
-                1 << 20,
+                &mut (1 << 20),
                 &mut frames,
             )
             .unwrap();
@@ -3387,7 +3389,7 @@ pub(crate) mod tests {
                 &mut fb,
                 &Palette::default(),
                 16,
-                16 * 8 * 4 * 2,
+                &mut (16 * 8 * 4 * 2),
                 &mut frames,
             );
         }

@@ -160,13 +160,27 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   - past the budget, the rest of the update is skipped with an `rdp_paint_budget` warning;
   - the session continues, on ADR-0009 row 3's ground: a resource ceiling that is ours, against
     well-formed traffic.
-- **The budget bounds one update, and nothing larger.** It is issued afresh for each fast-path
-  section, so it bounds neither a PDU nor a `process_bytes` call, nor a stream of updates.
-  - Measured, `--release`, 1280 × 800, desktop-sized empty-plane NSCodec commands: one update of
-    700 costs 18 ms at a budget of 2 and 73 ms at 8. One 32 KB PDU of 728 one-command sections
-    costs 6.0 s at 2 and 5.2 s at 8.
-  - What it does bound is how long one update takes. Whether `process_bytes` should be bounded
-    too is #496.
+- **A call pauses once it has bought one update's budget** (#496, the maintainer's call,
+  2026-10-20). `process_bytes` starts no further PDU or fast-path section once the call's paint
+  spending reaches `paint_budget()`, and keeps the rest:
+  - **What it keeps:** the inbox, and the next section of its first PDU;
+  - **How it resumes:** `has_pending_input()` says so, and `process_bytes(&[])` continues.
+    Sections already handled are skipped, never decompressed twice;
+  - **Progress is guaranteed:** a call always handles its first PDU or section, so one call
+    costs at most two updates' budgets.
+- **Why it pauses rather than skips.** An update's budget is issued afresh per section, so
+  without the pause one call was bounded only by the bytes it was handed (#494, `--release`,
+  1280 × 800):
+  - NSCodec, desktop-sized empty planes: one 32 KB PDU of 728 one-command sections cost 6.3 s;
+  - orders: a 32 KB PDU of 2,520 sections of eight one-byte repeated OpaqueRects cost 361 s;
+  - a call can be handed about 49 KB of complete PDUs, so up to about 540 s, with the adapter's
+    cancellation, input and timers stalled meanwhile.
+
+  Skipping past a per-call budget would lose paints of a legitimate burst; pausing keeps every
+  pixel and only moves the work to the next call.
+- **The pause covers PDUs and sections, not the inside of a Graphics Pipeline message.** One
+  EGFX message of tiny frames costs 0.62 s at 60 KB and 16 s at 1 MiB (about 64 s at the 4 MiB
+  DVC cap), measured for #496, so the Graphics Pipeline needs its own pause point.
 - **The value is headroom over the largest real update.** The values below are in desktops.
   - The 2 came from #367: the largest Surface Commands update in the #150 capture (WS2019)
     decoded 1 desktop.

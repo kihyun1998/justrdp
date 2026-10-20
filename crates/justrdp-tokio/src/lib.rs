@@ -916,7 +916,11 @@ pub async fn run_session_with_input(
             }
         }
         open_frames.track(machine);
+        let resume = machine.has_pending_input();
         tokio::select! {
+            () = tokio::task::yield_now(), if resume => {
+                pending = feed_session(machine, &[])?;
+            }
             () = open_frames.due(), if open_frames.armed() => {
                 pending = open_frames.release(machine);
             }
@@ -1185,10 +1189,14 @@ pub async fn run_session_with_commands(
             }
         }
         open_frames.track(machine);
+        let resume = machine.has_pending_input();
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::debug!("session cancelled by the host");
                 return Ok(DisconnectReason::LocalClosed);
+            }
+            () = tokio::task::yield_now(), if resume => {
+                pending = feed_session(machine, &[])?;
             }
             () = open_frames.due(), if open_frames.armed() => {
                 pending = open_frames.release(machine);
@@ -8042,7 +8050,7 @@ mod tests {
             let (width, height) = (usize::from(width), usize::from(height));
             let mut painted = vec![false; width * height];
             let mut frames = 0usize;
-            let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
+            let mut pending = feed_drained(&mut machine, &[]).expect("leftover bytes process");
             let mut fed = 0usize;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
@@ -8084,7 +8092,7 @@ mod tests {
                     Ok(Ok(n)) => {
                         inbox.extend_from_slice(&readbuf[..n]);
                         fed += n;
-                        pending = feed_session(&mut machine, &readbuf[..n])
+                        pending = feed_drained(&mut machine, &readbuf[..n])
                             .expect("every surface command decodes");
                     }
                     Ok(Err(e)) => panic!("read failed: {e}"),
@@ -8410,7 +8418,7 @@ mod tests {
             let (width, height) = (usize::from(width), usize::from(height));
             let mut painted = vec![false; width * height];
             let mut frames = 0usize;
-            let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
+            let mut pending = feed_drained(&mut machine, &[]).expect("leftover bytes process");
             let mut fed = 0usize;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
@@ -8434,7 +8442,7 @@ mod tests {
                     Ok(Ok(n)) => {
                         census.feed(&readbuf[..n]);
                         fed += n;
-                        pending = feed_session(&mut machine, &readbuf[..n])
+                        pending = feed_drained(&mut machine, &readbuf[..n])
                             .expect("every drawing order decodes");
                     }
                     Ok(Err(e)) => panic!("read failed: {e}"),
@@ -8534,7 +8542,7 @@ mod tests {
                     Ok(Ok(0)) => panic!("the server closed the session: {:?}", self.census.orders),
                     Ok(Ok(n)) => {
                         self.census.feed(&readbuf[..n]);
-                        let outputs = feed_session(&mut self.machine, &readbuf[..n])
+                        let outputs = feed_drained(&mut self.machine, &readbuf[..n])
                             .expect("every drawing order decodes");
                         self.handle(outputs).await;
                     }
@@ -8650,7 +8658,7 @@ mod tests {
         census.feed(&outcome.activation.leftover);
         let mut frames = 0usize;
         let mut closed = false;
-        let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
+        let mut pending = feed_drained(&mut machine, &[]).expect("leftover bytes process");
         let mut readbuf = [0u8; 16 * 1024];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -8670,7 +8678,7 @@ mod tests {
                 Ok(Ok(0)) | Ok(Err(_)) => closed = true,
                 Ok(Ok(n)) => {
                     census.feed(&readbuf[..n]);
-                    pending = feed_session(&mut machine, &readbuf[..n])
+                    pending = feed_drained(&mut machine, &readbuf[..n])
                         .expect("the session machine takes every byte the server sent");
                 }
                 Err(_) if frames > 0 => break,
@@ -8825,10 +8833,7 @@ mod tests {
                 delivered: Vec::new(),
             };
             drive.census.feed(&outcome.activation.leftover);
-            let first = drive
-                .machine
-                .process_bytes(&[])
-                .expect("leftover bytes process");
+            let first = feed_drained(&mut drive.machine, &[]).expect("leftover bytes process");
             drive.handle(first).await;
             drive.settle("the logon", true).await;
             drive.click_start().await;
@@ -8935,10 +8940,7 @@ mod tests {
                 delivered: Vec::new(),
             };
             drive.census.feed(&outcome.activation.leftover);
-            let first = drive
-                .machine
-                .process_bytes(&[])
-                .expect("leftover bytes process");
+            let first = feed_drained(&mut drive.machine, &[]).expect("leftover bytes process");
             drive.handle(first).await;
             drive.settle("the logon", true).await;
             let before_click = drive.machine.framebuffer().pixels().to_vec();
@@ -9067,10 +9069,7 @@ mod tests {
                 delivered: Vec::new(),
             };
             drive.census.feed(&outcome.activation.leftover);
-            let first = drive
-                .machine
-                .process_bytes(&[])
-                .expect("leftover bytes process");
+            let first = feed_drained(&mut drive.machine, &[]).expect("leftover bytes process");
             drive.handle(first).await;
             drive.settle("the logon", true).await;
 
@@ -9197,7 +9196,7 @@ mod tests {
         let (width, height) = outcome.activation.desktop_size;
         let (width, height) = (usize::from(width), usize::from(height));
         let mut painted = vec![false; width * height];
-        let mut pending = machine.process_bytes(&[]).expect("leftover bytes process");
+        let mut pending = feed_drained(&mut machine, &[]).expect("leftover bytes process");
         let mut fed = 0usize;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -9237,7 +9236,7 @@ mod tests {
                 Ok(Ok(n)) => {
                     inbox.extend_from_slice(&readbuf[..n]);
                     fed += n;
-                    pending = feed_session(&mut machine, &readbuf[..n])
+                    pending = feed_drained(&mut machine, &readbuf[..n])
                         .expect("every compressed update decompresses and decodes");
                 }
                 Ok(Err(e)) => panic!("read failed: {e}"),
@@ -11335,6 +11334,17 @@ mod tests {
         script: Vec<(Duration, Vec<u8>)>,
         frames: usize,
     ) -> Vec<(Duration, FrameUpdate)> {
+        frames_delivered_until(runner, script, frames, None).await.0
+    }
+
+    /// [`frames_delivered_by`], cancelling the session when the frame sink has received
+    /// `cancel_at` rects (`run_session_with_commands` only), and with how the runner ended.
+    async fn frames_delivered_until(
+        runner: &str,
+        script: Vec<(Duration, Vec<u8>)>,
+        frames: usize,
+        cancel_at: Option<usize>,
+    ) -> (Vec<(Duration, FrameUpdate)>, DisconnectReason) {
         use justrdp_pdu::capability;
         let done = Arc::new(tokio::sync::Notify::new());
         let addr = scripted_session_server(script, done.clone()).await;
@@ -11372,10 +11382,14 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let mut delivered = Vec::new();
+        let cancel = CancellationToken::new();
         let on_frame = |frame: &FrameUpdate, _: &Framebuffer| {
             delivered.push((started.elapsed(), *frame));
             if delivered.len() == frames {
                 done.notify_one();
+            }
+            if Some(delivered.len()) == cancel_at {
+                cancel.cancel();
             }
         };
         let ended = match runner {
@@ -11393,13 +11407,59 @@ mod tests {
                     |_| {},
                     |_| {},
                     &mut commands,
-                    &CancellationToken::new(),
+                    &cancel,
                 )
                 .await
             }
         };
-        assert!(ended.is_ok(), "{runner}: {ended:?}");
-        delivered
+        let ended = ended.unwrap_or_else(|e| panic!("{runner}: {e:?}"));
+        done.notify_one();
+        (delivered, ended)
+    }
+
+    /// One fast-path PDU of `sections` Orders sections, each `rows` full-width ScrBlt rows:
+    /// 128 bytes of the 4096-byte budget a row on the 16 x 8 desktop.
+    fn scrblt_burst(sections: usize, rows: usize) -> Vec<u8> {
+        use justrdp_pdu::fastpath;
+        let mut body = (rows as u16).to_le_bytes().to_vec();
+        body.extend((0..rows).flat_map(|_| scrblt_order(0, 16)));
+        fastpath::encode_pdu(&vec![
+            (
+                fastpath::FP_UPDATE_ORDERS,
+                fastpath::FP_FRAGMENT_SINGLE,
+                &body[..]
+            );
+            sections
+        ])
+    }
+
+    /// Issue #496: a burst past one call's budget still reaches the frame sink whole: the
+    /// runner resumes the paused machine though the server sends nothing more.
+    async fn a_burst_is_delivered_whole_by(runner: &str) {
+        let script = vec![(Duration::ZERO, scrblt_burst(6, 30))];
+        let delivered = frames_delivered_by(runner, script, 180).await;
+        assert_eq!(delivered.len(), 180, "{runner}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_session_with_input_delivers_a_burst_whole() {
+        a_burst_is_delivered_whole_by("run_session_with_input").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_session_with_commands_delivers_a_burst_whole() {
+        a_burst_is_delivered_whole_by("run_session_with_commands").await;
+    }
+
+    /// Issue #496: a cancellation lands between the calls of a burst, not after the whole
+    /// burst: the first call paints two sections, and the session ends before the third.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancellation_lands_mid_burst() {
+        let script = vec![(Duration::ZERO, scrblt_burst(6, 30))];
+        let (delivered, ended) =
+            frames_delivered_until("run_session_with_commands", script, 180, Some(1)).await;
+        assert_eq!(ended, DisconnectReason::LocalClosed);
+        assert_eq!(delivered.len(), 60, "one call's two sections");
     }
 
     /// Whether `at` is the runners' 1 s interval past `since`, give or take the timer's tick.
@@ -11544,6 +11604,19 @@ mod tests {
         );
     }
 
+    /// [`feed_session`], then resume until nothing is pending: for a reader that does nothing
+    /// between calls.
+    fn feed_drained(
+        machine: &mut SessionStateMachine,
+        bytes: &[u8],
+    ) -> Result<Vec<SessionOutput>, SessionFailure> {
+        let mut outputs = feed_session(machine, bytes)?;
+        while machine.has_pending_input() {
+            outputs.extend(feed_session(machine, &[])?);
+        }
+        Ok(outputs)
+    }
+
     /// What a session received once it had painted and gone quiet.
     struct Settled {
         selected: SecurityProtocol,
@@ -11625,7 +11698,7 @@ mod tests {
                 outcome.activation.leftover.clone(),
             )
             .expect("the desktop size is within MAX_DESKTOP_DIM");
-            let pending = machine.process_bytes(&[]).expect("leftover bytes process");
+            let pending = feed_drained(&mut machine, &[]).expect("leftover bytes process");
             Driven {
                 selected: outcome.mcs.selected,
                 server_capabilities: outcome.activation.server_capabilities.clone(),
@@ -11671,7 +11744,7 @@ mod tests {
                     ),
                     Ok(Ok(n)) => {
                         self.census.feed(&readbuf[..n]);
-                        self.pending = feed_session(&mut self.machine, &readbuf[..n])
+                        self.pending = feed_drained(&mut self.machine, &readbuf[..n])
                             .expect("the session machine takes every byte the server sent");
                     }
                     Err(_) if !need_frame || !self.frames.is_empty() => break,
