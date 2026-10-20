@@ -3671,7 +3671,7 @@ mod tests {
                 &orders_body(orders),
             )])
         };
-        // 1 KB at 16 bpp is 512 pixels; one update's budget on this 16 x 8 desktop buys 2048.
+        // 1 KB at 16 bpp is 512 pixels; one update's budget on this 16 x 8 desktop buys 1024.
         for id in [0, 1] {
             let fits = sm
                 .process_bytes(&update(&[create_offscreen(id, 16, 16, &[])]))
