@@ -64,10 +64,18 @@ fn a_real_desktop_sent_xcrush_compressed_replays() {
         for update in fastpath::decode_updates(pdu).expect("a fast-path PDU") {
             *flags.entry(update.compression_flags).or_default() += 1;
         }
-        for output in sm
-            .process_bytes(pdu)
-            .expect("every update this server sent decompresses and decodes")
-        {
+        for output in {
+            let mut outputs = sm
+                .process_bytes(pdu)
+                .expect("every update this server sent decompresses and decodes");
+            while sm.has_pending_input() {
+                outputs.extend(
+                    sm.process_bytes(&[])
+                        .expect("every update this server sent decompresses and decodes"),
+                );
+            }
+            outputs
+        } {
             if let SessionOutput::Frame(frame) = output {
                 covered += u64::from(frame.width) * u64::from(frame.height);
             }

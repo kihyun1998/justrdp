@@ -98,12 +98,21 @@ fn a_real_desktop_painted_in_memblt_orders_replays() {
         for update in fastpath::decode_updates(pdu).expect("a fast-path PDU") {
             *updates.entry(update.code).or_default() += 1;
         }
-        frames += sm
-            .process_bytes(pdu)
-            .expect("every order this server sent decodes")
-            .iter()
-            .filter(|output| matches!(output, SessionOutput::Frame(_)))
-            .count();
+        frames += {
+            let mut outputs = sm
+                .process_bytes(pdu)
+                .expect("every order this server sent decodes");
+            while sm.has_pending_input() {
+                outputs.extend(
+                    sm.process_bytes(&[])
+                        .expect("every order this server sent decodes"),
+                );
+            }
+            outputs
+        }
+        .iter()
+        .filter(|output| matches!(output, SessionOutput::Frame(_)))
+        .count();
     }
     // Orders, the default pointer, and one new pointer.
     assert_eq!(

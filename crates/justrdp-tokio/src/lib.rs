@@ -924,7 +924,7 @@ pub async fn run_session_with_input(
             () = open_frames.due(), if open_frames.armed() => {
                 pending = open_frames.release(machine);
             }
-            received = stream.read(&mut readbuf) => {
+            received = stream.read(&mut readbuf), if !resume => {
                 match received {
                     // Orderly server close: surface whatever the server attributed.
                     Ok(0) => return Ok(machine.disconnect_reason()),
@@ -1201,7 +1201,7 @@ pub async fn run_session_with_commands(
             () = open_frames.due(), if open_frames.armed() => {
                 pending = open_frames.release(machine);
             }
-            received = stream.read(&mut readbuf) => {
+            received = stream.read(&mut readbuf), if !resume => {
                 match received {
                     Ok(0) => return Ok(machine.disconnect_reason()), // orderly server close
                     Ok(n) => {
@@ -11449,6 +11449,55 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn run_session_with_commands_delivers_a_burst_whole() {
         a_burst_is_delivered_whole_by("run_session_with_commands").await;
+    }
+
+    /// Issue #496: a paused runner reads nothing, so a server that closes right after a burst
+    /// still has the whole burst painted before the close is seen.
+    #[tokio::test]
+    async fn a_close_after_a_burst_is_read_after_the_burst() {
+        use justrdp_pdu::capability;
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(
+            ck.cert.der().clone(),
+            ck.signing_key.serialize_der(),
+        )));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            tls.write_all(&scrblt_burst(6, 30)).await.unwrap();
+            let _ = tls.shutdown().await;
+        });
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let connector = TlsConnector::from(Arc::new(
+            client_config(&TrustPolicy::DangerAcceptAny, "localhost").unwrap(),
+        ));
+        let mut stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), sock)
+            .await
+            .unwrap();
+        let mut machine = SessionStateMachine::new(
+            justrdp::SessionConfig {
+                user_channel_id: 1007,
+                io_channel_id: 1003,
+                share_id: 0x0001_03EA,
+                desktop_size: (16, 8),
+                capabilities: legacy_orders_config(&[capability::ORDER_NEG_SCRBLT_INDEX])
+                    .capabilities,
+                server: justrdp::ServerAnnouncement::default(),
+                drdynvc_channel_id: None,
+                static_channels: Vec::new(),
+                dynamic_channels: Vec::new(),
+                egfx: Default::default(),
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let mut frames = 0;
+        let ended = run_session(&mut stream, &mut machine, |_, _| frames += 1, |_| {}).await;
+        assert!(ended.is_ok(), "{ended:?}");
+        assert_eq!(frames, 180, "the whole burst before the close");
     }
 
     /// Issue #496: a cancellation lands between the calls of a burst, not after the whole

@@ -43,8 +43,10 @@ read as the adapter growing a third of its size.
 - **A paused machine resumes through the select loop** (#496). When the machine reports
   `has_pending_input()`, the runners arm a `yield_now()` branch that resumes it with no bytes.
   The yield first returns to the scheduler, so a cancellation, input or the open-frame timer
-  already due wins over the resume. A reader that does nothing between calls drains instead
-  (the test harness's `feed_drained`).
+  already due wins over the resume. The socket is not read while the machine is paused, so a
+  server sending faster than the client paints is held back by TCP rather than growing the
+  inbox. A reader that does nothing between calls drains instead (the test harness's
+  `feed_drained`, the `real_server_*` tests, the session fuzz targets).
 - **Each connect stage is a tracing span** — a no-op without a subscriber, so observability
   does not compromise portability. Core records use `rdp_<area>` targets
   (`rdp_finalization`, `rdp_drdynvc`, …), so `RUST_LOG=rdp_drdynvc=debug` isolates one area.

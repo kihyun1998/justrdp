@@ -789,6 +789,7 @@ impl SessionStateMachine {
         let mut outputs = Vec::new();
         let mut consumed = 0;
         let mut error = None;
+        let mut handled_one = false;
         while let Some(&first) = inbox.get(consumed) {
             let rest = &inbox[consumed..];
             let result = if fastpath::is_fastpath(first) {
@@ -807,10 +808,11 @@ impl SessionStateMachine {
             if rest.len() < frame_len {
                 break;
             }
-            if self.call_spent >= self.paint_budget() {
+            if handled_one && self.call_spent >= self.paint_budget() {
                 self.paused = true;
                 break;
             }
+            handled_one = true;
             let frame = &rest[..frame_len];
             let handled = if fastpath::is_fastpath(first) {
                 self.on_fastpath_pdu(frame, &mut outputs)
@@ -3666,9 +3668,49 @@ mod tests {
         };
         let mut calls = vec![frames(sm.process_bytes(bytes).unwrap())];
         while sm.has_pending_input() {
+            assert!(calls.len() < 1000, "resuming makes no progress");
             calls.push(frames(sm.process_bytes(&[]).unwrap()));
         }
         calls
+    }
+
+    /// The framebuffer after feeding `sections` one PDU a call, which never pauses.
+    fn unpaused(config: SessionConfig, code: u8, sections: &[&[u8]]) -> Framebuffer {
+        let mut sm = SessionStateMachine::new(config, Vec::new()).unwrap();
+        for section in sections {
+            sm.process_bytes(&fastpath::encode_pdu(&[(
+                code,
+                fastpath::FP_FRAGMENT_SINGLE,
+                section,
+            )]))
+            .unwrap();
+            assert!(!sm.has_pending_input());
+        }
+        sm.framebuffer().clone()
+    }
+
+    /// Issue #496: a call handles its first PDU even when the budget is nothing, as on an empty
+    /// desktop, so resuming always makes progress.
+    #[test]
+    fn a_call_on_an_empty_desktop_still_makes_progress() {
+        let mut config = orders_config();
+        config.desktop_size = (0, 0);
+        let mut sm = SessionStateMachine::new(config, Vec::new()).unwrap();
+        let section = desktop_fills(2);
+        let pdu = fastpath::encode_pdu(&[(
+            fastpath::FP_UPDATE_ORDERS,
+            fastpath::FP_FRAGMENT_SINGLE,
+            &section[..],
+        )]);
+        assert_eq!(frames_per_call(&mut sm, &pdu.repeat(3)).len(), 3);
+    }
+
+    /// [`desktop_fills`] in `color`, then the last pixel in `color + 1`.
+    fn desktop_fills_in(n: usize, color: u16) -> Vec<u8> {
+        use crate::orders::tests::opaque_rect;
+        let mut fills = vec![opaque_rect([0, 0, 16, 8], color); n];
+        fills.push(opaque_rect([15, 7, 1, 1], color.wrapping_add(1)));
+        orders_body(&fills)
     }
 
     /// One Orders section of `n` OpaqueRects over the whole 16 x 8 desktop: `n` desktops.
@@ -3682,15 +3724,20 @@ mod tests {
     #[test]
     fn a_call_pauses_between_sections_once_it_has_spent_a_budget() {
         let mut sm = SessionStateMachine::new(orders_config(), Vec::new()).unwrap();
-        let section = desktop_fills(7);
+        let sections: Vec<Vec<u8>> = (0..6u16).map(|i| desktop_fills_in(7, 0x1000 * i)).collect();
+        let sections: Vec<&[u8]> = sections.iter().map(|s| &s[..]).collect();
         let pdu = fastpath::encode_pdu(
-            &[(
-                fastpath::FP_UPDATE_ORDERS,
-                fastpath::FP_FRAGMENT_SINGLE,
-                &section[..],
-            ); 6],
+            &sections
+                .iter()
+                .map(|s| (fastpath::FP_UPDATE_ORDERS, fastpath::FP_FRAGMENT_SINGLE, *s))
+                .collect::<Vec<_>>(),
         );
-        assert_eq!(frames_per_call(&mut sm, &pdu), [14, 14, 14]);
+        assert_eq!(frames_per_call(&mut sm, &pdu), [16, 16, 16]);
+        assert_eq!(
+            sm.framebuffer(),
+            &unpaused(orders_config(), fastpath::FP_UPDATE_ORDERS, &sections),
+            "the same pixels as without pausing"
+        );
         // The PDU after a resumed one starts at its first section.
         let small = desktop_fills(3);
         let next = fastpath::encode_pdu(&[(
@@ -3700,7 +3747,7 @@ mod tests {
         )]);
         assert_eq!(
             frames_per_call(&mut sm, &[pdu, next].concat()),
-            [14, 14, 14, 3]
+            [16, 16, 16, 3]
         );
     }
 

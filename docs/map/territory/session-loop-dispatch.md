@@ -166,8 +166,10 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   - **What it keeps:** the inbox, and the next section of its first PDU;
   - **How it resumes:** `has_pending_input()` says so, and `process_bytes(&[])` continues.
     Sections already handled are skipped, never decompressed twice;
-  - **Progress is guaranteed:** a call always handles its first PDU or section, so one call
-    costs at most two updates' budgets.
+  - **Progress is guaranteed:** a call always handles its first PDU, and a resumed call its
+    first remaining section, even with a budget of nothing (an empty desktop). One call costs at
+    most two updates' budgets: the one-byte OpaqueRect burst below takes 149 ms a call at
+    1280 × 800 (`--release`), where the whole PDU took about 286 s in one call.
 - **Why it pauses rather than skips.** An update's budget is issued afresh per section, so
   without the pause one call was bounded only by the bytes it was handed (#494, `--release`,
   1280 × 800):

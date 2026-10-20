@@ -61,10 +61,18 @@ fn a_real_desktop_painted_in_nscodec_surface_bits_replays() {
             .iter()
             .filter(|update| update.code == fastpath::FP_UPDATE_SURFCMDS)
             .count();
-        for output in sm
-            .process_bytes(pdu)
-            .expect("every update this server sent decodes")
-        {
+        for output in {
+            let mut outputs = sm
+                .process_bytes(pdu)
+                .expect("every update this server sent decodes");
+            while sm.has_pending_input() {
+                outputs.extend(
+                    sm.process_bytes(&[])
+                        .expect("every update this server sent decodes"),
+                );
+            }
+            outputs
+        } {
             if let SessionOutput::Frame(frame) = output {
                 frames += 1;
                 covered += u64::from(frame.width) * u64::from(frame.height);
