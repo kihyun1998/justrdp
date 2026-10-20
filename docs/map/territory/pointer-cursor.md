@@ -23,6 +23,10 @@ pixels in the frame — but nothing records that as a decision.
 - **Pointer caching is server-driven**: a cached pointer arrives once and is
   referenced by index later, so dropping a cache entry silently shows the wrong
   cursor rather than failing.
+- **A pointer's RGBA bytes are charged to the call as painted bytes are** (#507), whether
+  decoded or re-emitted from the cache. A cursor never dirties the framebuffer, but each
+  `CursorImage` is an owned copy: uncharged, 6,552 Cached Pointers in one 32 KB PDU held 236 MB
+  of them in one call's outputs ([Session loop](session-loop-dispatch.md)).
 - **The XOR/AND mask arithmetic is the same shape as a bitmap decoder's**, which is
   precisely why the 32-bit overflow was found here first (#151) and only then in the
   bitmap decoders (#155).
@@ -66,7 +70,8 @@ shape to decode.
 ## Blast radius
 
 - [Session loop & PDU dispatch](session-loop-dispatch.md) — pointer updates are
-  dispatched there and become one of the session outputs (`SessionOutput::Cursor`).
+  dispatched there and become one of the session outputs (`SessionOutput::Cursor`), and are
+  charged to the call's pause.
 - [Bitmap codecs](bitmap-codecs.md) — shares the mask/stride arithmetic and the
   colour conversion helpers.
 - [Capability exchange & activation](capability-exchange-activation.md) —

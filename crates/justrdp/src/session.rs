@@ -871,6 +871,9 @@ impl SessionStateMachine {
                 .decompress(section.data, section.compression_flags)
                 .map_err(SessionError::Bulk)?
                 .to_vec();
+            if section.compression_flags & share::PACKET_COMPRESSED != 0 {
+                self.call_spent += data.len();
+            }
             let starts = matches!(
                 section.fragmentation,
                 fastpath::FP_FRAGMENT_SINGLE | fastpath::FP_FRAGMENT_FIRST
@@ -1035,6 +1038,7 @@ impl SessionStateMachine {
                             reason: "cache index beyond the advertised cache or an unfilled slot",
                         },
                     ))?;
+                self.call_spent += image.rgba.len();
                 outputs.push(SessionOutput::Cursor(cursor_event_for(image.clone())));
             }
         }
@@ -1076,6 +1080,7 @@ impl SessionStateMachine {
                 },
             ))?;
         *slot = Some(image.clone());
+        self.call_spent += image.rgba.len();
         outputs.push(SessionOutput::Cursor(cursor_event_for(image)));
         Ok(())
     }
@@ -1161,6 +1166,7 @@ impl SessionStateMachine {
             .decompress(src, data.compressed_type)
             .map_err(SessionError::Bulk)?
             .to_vec();
+        self.call_spent += body.len();
         self.on_share_data(
             data,
             &mut ReadCursor::new(&body, "decompressed share data"),
@@ -3694,18 +3700,15 @@ mod tests {
 
     /// Each call's frames, from `bytes` and then from resuming until nothing is pending.
     fn frames_per_call(sm: &mut SessionStateMachine, bytes: &[u8]) -> Vec<usize> {
-        let frames = |outputs: Vec<SessionOutput>| {
-            outputs
-                .iter()
-                .filter(|o| matches!(o, SessionOutput::Frame(_)))
-                .count()
-        };
-        let mut calls = vec![frames(sm.process_bytes(bytes).unwrap())];
-        while sm.has_pending_input() {
-            assert!(calls.len() < 1000, "resuming makes no progress");
-            calls.push(frames(sm.process_bytes(&[]).unwrap()));
-        }
-        calls
+        outputs_per_call(sm, bytes)
+            .iter()
+            .map(|outputs| {
+                outputs
+                    .iter()
+                    .filter(|o| matches!(o, SessionOutput::Frame(_)))
+                    .count()
+            })
+            .collect()
     }
 
     /// The framebuffer after feeding `sections` one PDU a call, which never pauses.
@@ -4237,18 +4240,141 @@ mod tests {
 
     /// A fast-path PDU with one unfragmented update carrying `compression_flags`.
     fn fastpath_compressed_update(code: u8, compression_flags: u8, data: &[u8]) -> Vec<u8> {
-        let mut body = vec![code | 0x80, compression_flags];
-        body.extend_from_slice(&(data.len() as u16).to_le_bytes());
-        body.extend_from_slice(data);
-        // fpOutputHeader, then the two-byte length form, which counts itself and the header.
+        fastpath_compressed_pdu(&[(code, compression_flags, data)])
+    }
+
+    const COMPRESSED_64K: u8 = 0x21;
+    const FIRST_64K: u8 = 0x80 | 0x40 | COMPRESSED_64K;
+
+    /// One budget of the 16 x 8 test desktop, in bytes.
+    const TEST_BUDGET: usize = 16 * 8 * 4 * PAINT_BUDGET_FRAMEBUFFERS;
+
+    /// RDP 5.0 bits that decompress to `len` zero bytes: a zero literal, then a copy of it from
+    /// offset 1 (3.1.8.4.2.2.1, 3.1.8.4.2.2.2).
+    fn mppc5_zeros(len: usize) -> Vec<u8> {
+        let copy = len - 1;
+        assert!((4..=65535).contains(&copy));
+        let width = (usize::BITS - 1 - copy.leading_zeros()) as usize;
+        let bits = format!(
+            "00000000 11111 000001 {}0 {:0width$b}",
+            "1".repeat(width - 1),
+            copy - (1 << width),
+        );
+        let mut bits: String = bits.chars().filter(|c| !c.is_whitespace()).collect();
+        bits.push_str(&"0".repeat((8 - bits.len() % 8) % 8));
+        pack_bits(&bits)
+    }
+
+    /// A fast-path PDU of unfragmented updates, each `(code, compression_flags, data)`.
+    fn fastpath_compressed_pdu(updates: &[(u8, u8, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for &(code, flags, data) in updates {
+            body.extend_from_slice(&[code | 0x80, flags]);
+            body.extend_from_slice(&(data.len() as u16).to_le_bytes());
+            body.extend_from_slice(data);
+        }
         let total = 3 + body.len();
         let mut pdu = vec![0x00, 0x80 | (total >> 8) as u8, total as u8];
         pdu.extend_from_slice(&body);
         pdu
     }
 
-    const COMPRESSED_64K: u8 = 0x21;
-    const FIRST_64K: u8 = 0x80 | 0x40 | COMPRESSED_64K;
+    /// Each call's outputs, from `bytes` and then from resuming until nothing is pending.
+    fn outputs_per_call(sm: &mut SessionStateMachine, bytes: &[u8]) -> Vec<Vec<SessionOutput>> {
+        let mut calls = vec![sm.process_bytes(bytes).unwrap()];
+        while sm.has_pending_input() {
+            assert!(calls.len() < 1000, "resuming makes no progress");
+            calls.push(sm.process_bytes(&[]).unwrap());
+        }
+        calls
+    }
+
+    /// Issue #507: a fast-path section's decompressed bytes are charged to the call as painted
+    /// bytes are, so sections that each decompress to a budget pause the call after each. The
+    /// bitmap after them still paints, from a history every section reached once.
+    #[test]
+    fn decompressed_fast_path_bytes_are_charged_to_the_call() {
+        let zeros = mppc5_zeros(TEST_BUDGET);
+        let bitmap = mppc_literals(&bitmap_update_body(0, 0, 4, 4, [9, 8, 7]));
+        let pdu = fastpath_compressed_pdu(&[
+            (fastpath::FP_UPDATE_SYNCHRONIZE, FIRST_64K, &zeros),
+            (fastpath::FP_UPDATE_SYNCHRONIZE, COMPRESSED_64K, &zeros),
+            (fastpath::FP_UPDATE_SYNCHRONIZE, COMPRESSED_64K, &zeros),
+            (fastpath::FP_UPDATE_BITMAP, COMPRESSED_64K, &bitmap),
+        ]);
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let frames = frames_per_call(&mut sm, &pdu);
+        assert_eq!(frames, [0, 0, 0, 1]);
+        assert_eq!(&sm.framebuffer().pixels()[..4], &[7, 8, 9, 255]);
+
+        // A section sent uncompressed decompresses nothing and is not charged.
+        let plain = vec![0; TEST_BUDGET];
+        let bitmap = bitmap_update_body(0, 0, 4, 4, [1, 2, 3]);
+        let pdu = fastpath_compressed_pdu(&[
+            (fastpath::FP_UPDATE_SYNCHRONIZE, 0, &plain),
+            (fastpath::FP_UPDATE_BITMAP, 0, &bitmap),
+        ]);
+        let frames = frames_per_call(&mut sm, &pdu);
+        assert_eq!(frames, [1]);
+    }
+
+    /// Issue #507: a Share Data PDU's decompressed bytes are charged to the call too.
+    #[test]
+    fn decompressed_share_data_bytes_are_charged_to_the_call() {
+        let zeros = mppc5_zeros(TEST_BUDGET);
+        let bitmap = mppc_literals(&bitmap_update_body(0, 0, 4, 4, [9, 8, 7]));
+        let stream = [
+            server_compressed_data_pdu(share::PDU_TYPE2_SYNCHRONIZE, FIRST_64K, &zeros),
+            server_compressed_data_pdu(share::PDU_TYPE2_SYNCHRONIZE, COMPRESSED_64K, &zeros),
+            server_compressed_data_pdu(share::PDU_TYPE2_UPDATE, COMPRESSED_64K, &bitmap),
+        ]
+        .concat();
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let frames = frames_per_call(&mut sm, &stream);
+        assert_eq!(frames, [0, 0, 1]);
+        assert_eq!(&sm.framebuffer().pixels()[..4], &[7, 8, 9, 255]);
+    }
+
+    /// Issue #507: a pointer's RGBA bytes are charged to the call, decoded or re-emitted from
+    /// the cache, so pointers of a budget each pause the call after each.
+    #[test]
+    fn pointer_bytes_are_charged_to_the_call() {
+        let side = 32u16;
+        let rgba = usize::from(side) * usize::from(side) * 4;
+        assert_eq!(rgba, TEST_BUDGET);
+        let mut new_pointer = Vec::new();
+        for v in [32u16, 0, 0, 0, side, side, side / 8 * side, side * side * 4] {
+            new_pointer.extend_from_slice(&v.to_le_bytes());
+        }
+        new_pointer.resize(new_pointer.len() + rgba + usize::from(side / 8 * side), 0);
+        let cached = 0u16.to_le_bytes();
+        let pdu = fastpath::encode_pdu(&[
+            (
+                fastpath::FP_UPDATE_NEW_POINTER,
+                fastpath::FP_FRAGMENT_SINGLE,
+                &new_pointer,
+            ),
+            (
+                fastpath::FP_UPDATE_CACHED_POINTER,
+                fastpath::FP_FRAGMENT_SINGLE,
+                &cached,
+            ),
+            (
+                fastpath::FP_UPDATE_CACHED_POINTER,
+                fastpath::FP_FRAGMENT_SINGLE,
+                &cached,
+            ),
+        ]);
+        let mut sm = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        let calls = outputs_per_call(&mut sm, &pdu);
+        assert_eq!(calls.len(), 3);
+        for call in &calls {
+            let [SessionOutput::Cursor(CursorEvent::Set(image))] = call.as_slice() else {
+                panic!("expected one SetCursor a call, got {call:?}");
+            };
+            assert_eq!((image.width, image.height), (side, side));
+        }
+    }
 
     /// #454: a Share Data PDU flagged `PACKET_COMPRESSED` decompresses through the session's
     /// bulk context and paints; a type the core does not decompress is a typed error.

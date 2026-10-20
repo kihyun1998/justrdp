@@ -174,6 +174,37 @@ one of its outputs. Neither says what the loop dispatches or in what order.
       PDU. When #496 measured it, a call was 149 ms and the PDU 286 s;
     - **After #506**, whose fills paint in place: a median call of 0.72 to 0.86 ms, at most
       1.5 ms, and 1.8 to 2.2 s for the whole PDU, over three runs.
+- **Work that paints nothing is charged to the call as painted bytes are** (#507, the
+  maintainer's call, 2026-10-20). Only to the call's pause, never to an update's budget:
+  - **What is charged:** a fast-path section's or a Share Data PDU's decompressed bytes, when it
+    was sent compressed; a pointer's RGBA bytes, decoded from a Color or New Pointer or re-emitted
+    from the cursor cache by a Cached Pointer;
+  - **Why it never skips:** decompression keeps the bulk history the server's compressor mirrors,
+    so a skipped section would desynchronise it;
+  - **What it costs legitimate traffic:** a compressed bitmap update is charged its decompressed
+    bytes and its paint, so a call of them pauses up to twice as early;
+  - **What stays uncharged:**
+    - a section sent uncompressed, a slow-path frame that paints nothing, and drdynvc reassembly:
+      each copies at most the bytes the call was handed. That is derived, not measured;
+    - a Graphics Pipeline message's ZGFX decompression, which the issue did not cover: its
+      processor charges what it paints only. Unmeasured.
+- **Why it is charged.** #507 set the rule: above about 300 ms a call, charge it. Measured
+  uncharged (`--release`), the cost does not depend on the desktop size. A 32 KB PDU fell under
+  the line, and the 49 KB a call can be handed crossed it:
+  - **MPPC 64K sections of about 7 bytes that each decompress to the 64 KB history**,
+    Synchronize updates otherwise: 241 to 273 ms a 32 KB PDU, and 367 to 380 ms for the 49 KB a
+    call can be handed;
+  - **pointers:** 96 × 96 is the largest pointer accepted. A Large Pointer is never advertised,
+    and one sent anyway is skipped. 1,213 compressed 96 × 96 New Pointers in 32 KB took 104 to 109 ms. 6,552
+    uncompressed Cached Pointers of a 96 × 96 shape took 70 to 77 ms, and that one call's
+    outputs held 236 MB of cursor images;
+  - **slow path:** 840 Share Data PDUs that each decompress to 64 KB took 68 to 70 ms.
+
+  Charged, at 1280 × 800, the worst call over three runs was 83 ms for the MPPC sections,
+  110 ms for the New Pointers, 18 ms for the Cached Pointers and 48 ms on the slow path. NCRUSH
+  and XCRUSH are charged by the same rule, but their worst case is unmeasured. Both are Huffman
+  coded, so a worst-case input cannot be written by hand as MPPC's was, and no compressor exists
+  here to build one.
 - **Why it pauses rather than skips.** An update's budget is issued afresh per section, so
   without the pause one call was bounded only by the bytes it was handed (#494, `--release`,
   1280 × 800):
@@ -230,7 +261,8 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 - `justrdp/src/session.rs` — `SessionStateMachine`, `SessionConfig`, `ServerAnnouncement`, `SessionOutput`,
   `SessionError`, `Phase`, `ResizeError`, `cursor_event_for`, `request_shutdown`,
   `apply_surface_bits` (#150), `PAINT_BUDGET_FRAMEBUFFERS`, `apply_bitmap_update`,
-  `note_paint_budget` (#367)
+  `note_paint_budget` (#367), `on_fastpath_pdu`, `on_data_pdu`, `on_pointer` and
+  `set_cursor_shape`, which charge work that paints nothing (#507)
 - `justrdp/src/disconnect.rs` — `classify`, `DisconnectClass`, `DisconnectReason`,
   `ServerDisconnectCause`
 - `justrdp-pdu/src/fastpath.rs` — `is_fastpath`, `frame_len`, `decode_updates`, `FastPathUpdate`
