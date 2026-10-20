@@ -1016,6 +1016,8 @@ impl GraphicsProcessor {
                         src_rect.width(),
                         src_rect.height(),
                     );
+                // The copy is charged to the call.
+                self.call_paint += rgba.len();
                 if let Some(old) = self.cache.remove(&cache_slot) {
                     self.cache_bytes -= old.rgba.len();
                 }
@@ -1096,7 +1098,6 @@ impl GraphicsProcessor {
         Ok(())
     }
 
-    /// Handle every EGFX PDU in one decompressed blob.
     /// Handle `blob`'s PDUs from byte `start`, stopping before one once the call's allowance is
     /// painted and at least one was handled: then the next PDU's offset.
     fn process_blob(
@@ -1550,6 +1551,28 @@ mod tests {
         assert!(!whole.has_pending());
         assert_eq!(outputs, expected);
         assert_eq!(p.surfaces[0].rgba, whole.surfaces[0].rgba);
+    }
+
+    /// Issue #496: copying a surface into the cache is charged to the call, so a message of
+    /// copies pauses too.
+    #[test]
+    fn a_message_of_cache_copies_pauses_at_its_allowance() {
+        let copy = header(
+            egfx::CMDID_SURFACE_TO_CACHE,
+            &surface_to_cache_body(1, 1, 16, 8),
+        );
+        let message = egfx::wrap_uncompressed(&copy.repeat(10));
+        let mut p = one_surface();
+        p.begin_call(3 * 16 * 8 * 4);
+        p.process(&message).unwrap();
+        let mut calls = 1;
+        while p.has_pending() {
+            assert!(calls < 100, "resuming makes no progress");
+            p.begin_call(3 * 16 * 8 * 4);
+            p.resume().unwrap();
+            calls += 1;
+        }
+        assert_eq!(calls, 4, "three copies a call");
     }
 
     /// Issue #496: with no allowance a message still handles one PDU a call.

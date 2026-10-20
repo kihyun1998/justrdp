@@ -220,6 +220,9 @@ struct Input {
     /// One `Vec<Cmd>` per `process` call — the manager's message boundary, and where state an
     /// earlier message established gets spent.
     messages: Vec<Vec<Cmd>>,
+    /// What each session call may paint, in 4 KiB units: small, so messages stop between PDUs
+    /// and resume (#496).
+    allowance: u8,
 }
 
 fn bootstrap() -> Vec<u8> {
@@ -255,7 +258,18 @@ fuzz_target!(|input: Input| {
         // `process` failed is a sequence the live path cannot produce. Two server-controlled
         // `u32`s — a `MapSurfaceToOutput` origin, narrowed to `u16` in `blit_dirty` — are
         // reachable only through the second call.
-        if p.process(&egfx::wrap_uncompressed(&blob)).is_ok() {
+        let allowance = usize::from(input.allowance) << 12;
+        p.begin_call(allowance);
+        if p.process(&egfx::wrap_uncompressed(&blob)).is_err() {
+            continue;
+        }
+        let _ = p.flush_frames(&mut fb);
+        while p.has_pending() {
+            p.begin_call(allowance);
+            // A processor error ends the session (ADR-0014).
+            if p.resume().is_err() {
+                return;
+            }
             let _ = p.flush_frames(&mut fb);
         }
     }

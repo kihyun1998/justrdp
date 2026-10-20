@@ -783,12 +783,15 @@ impl SessionStateMachine {
         self.call_spent = 0;
         self.paused = false;
         let mut outputs = Vec::new();
+        // A resumed message is the call's first unit of work.
+        let mut handled_one = false;
         if self.drdynvc.has_pending() {
             self.resume_drdynvc(&mut outputs)?;
             if self.drdynvc.has_pending() {
                 self.paused = true;
                 return Ok(outputs);
             }
+            handled_one = true;
         }
         // Take the inbox so complete frames are processed as borrowed slices — one drain at
         // the end instead of a per-frame allocate-and-shift (#86). The buffer must live
@@ -796,7 +799,6 @@ impl SessionStateMachine {
         let mut inbox = core::mem::take(&mut self.inbox);
         let mut consumed = 0;
         let mut error = None;
-        let mut handled_one = false;
         while let Some(&first) = inbox.get(consumed) {
             let rest = &inbox[consumed..];
             let result = if fastpath::is_fastpath(first) {
@@ -6020,6 +6022,64 @@ mod tests {
             green[..],
             "the update behind the message painted last"
         );
+    }
+
+    /// Issue #496: a call that finished a resumed message has done its work: the update
+    /// behind the message waits for the next call once the budget is spent.
+    #[test]
+    fn a_resumed_message_is_the_calls_first_work() {
+        use crate::orders::tests::{GREEN, opaque_rect};
+        use justrdp_pdu::egfx;
+        let mut sm = with_open_dvc(8, egfx::CHANNEL_NAME);
+        let create_surface = [1u16.to_le_bytes(), 16u16.to_le_bytes(), 8u16.to_le_bytes()]
+            .concat()
+            .into_iter()
+            .chain([egfx::PIXEL_FORMAT_XRGB_8888])
+            .collect::<Vec<u8>>();
+        let map = [&1u16.to_le_bytes()[..], &[0; 2], &[0; 4], &[0; 4]].concat();
+        for (cmd, body) in [
+            (egfx::CMDID_CREATE_SURFACE, create_surface),
+            (egfx::CMDID_MAP_SURFACE_TO_OUTPUT, map),
+        ] {
+            for frame in server_egfx(8, cmd, &body) {
+                sm.process_bytes(&frame).unwrap();
+            }
+        }
+        // 16 unbracketed whole-surface fills: two calls' budgets, the message ending on a fill.
+        let fill = [
+            &egfx::CMDID_SOLID_FILL.to_le_bytes()[..],
+            &[0, 0],
+            &24u32.to_le_bytes(),
+            &1u16.to_le_bytes(),
+            &[9, 0, 0, 0],
+            &1u16.to_le_bytes(),
+            &[0, 0, 0, 0, 16, 0, 8, 0],
+        ]
+        .concat();
+        let mut bytes: Vec<u8> = dvc::encode_data(8, &egfx::wrap_uncompressed(&fill.repeat(16)))
+            .iter()
+            .flat_map(|data| server_dvc_frames(data))
+            .flatten()
+            .collect();
+        let update = fastpath::encode_pdu(&[(
+            fastpath::FP_UPDATE_ORDERS,
+            fastpath::FP_FRAGMENT_SINGLE,
+            &orders_body(&[opaque_rect([0, 0, 1, 1], GREEN)]),
+        )]);
+        bytes.extend(&update);
+        let mut alone = SessionStateMachine::new(config(), Vec::new()).unwrap();
+        alone.process_bytes(&update).unwrap();
+        let green = alone.framebuffer().pixels()[..4].to_vec();
+        sm.process_bytes(&bytes).unwrap();
+        sm.process_bytes(&[]).unwrap();
+        assert!(
+            sm.has_pending_input(),
+            "the update waits behind a spent budget"
+        );
+        assert_ne!(sm.framebuffer().pixels()[..4], green[..]);
+        sm.process_bytes(&[]).unwrap();
+        assert!(!sm.has_pending_input());
+        assert_eq!(sm.framebuffer().pixels()[..4], green[..]);
     }
 
     /// An order frame and a Graphics Pipeline frame left open both reach the host through a

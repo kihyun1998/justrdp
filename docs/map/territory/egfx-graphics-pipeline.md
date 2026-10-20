@@ -138,7 +138,13 @@ acknowledge frames. It is server→client only, and it is reachable only if
     call ends it.
   - **What a call costs now.** A call handles at least one PDU, and one PDU is bounded by the
     per-frame budget below. The 1 MiB message of tiny frames now takes 1,887 calls of at most
-    78 ms each at 1280 × 800 (`--release`), where it took 16 s in one call.
+    78 ms each at 1280 × 800 (`--release`), where it took 16 s in one call. Each of those frames
+    is one SolidFill of 64 whole-surface rects, the whole per-frame budget in one PDU, so 78 ms
+    is that PDU's cost.
+  - **What the call is charged.** The three list-bearing commands are charged to both budgets. A
+    SurfaceToCache copy, up to a surface per PDU, is charged to the call only, so a message of
+    copies pauses too. The per-frame budget is #268's and stays on the list-bearing commands.
+  - **What is not charged.** A CreateSurface's zeroed allocation is not charged.
 - **One number answers two different questions here, and the shared derivation is the reason
   — not the convenience.** `MAX_TOTAL_SURFACE_BYTES` is *also* the **per-frame paint budget**
   (#268). The three list-bearing commands — `SOLID_FILL`, `SURFACE_TO_SURFACE`,

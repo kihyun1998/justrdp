@@ -187,7 +187,8 @@ one of its outputs. Neither says what the loop dispatches or in what order.
     paint, and adds what the processors painted to the call.
   - **Ordering.** A processor stops only once the call's whole budget is spent, so the call
     starts no later PDU either: what follows the message, on any channel or transport, waits. The
-    next call resumes the message first.
+    next call resumes the message first, and a resumed message is that call's first unit of
+    work.
 - **The value is headroom over the largest real update.** The values below are in desktops.
   - The 2 came from #367: the largest Surface Commands update in the #150 capture (WS2019)
     decoded 1 desktop.
