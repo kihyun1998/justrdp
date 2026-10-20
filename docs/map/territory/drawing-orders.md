@@ -229,6 +229,21 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
 - **ROP3 is one evaluator.** An index is its own truth table, so `rop3` covers all 256 bitwise
   over RGBA words, alpha forced opaque. MemBlt's ROP must not read the pattern (2.2.2.2.1.1.2.9);
   if one does, the pattern is black. ScrBlt has no brush either, and the same holds for it.
+- **A fill whose ROP reads no destination paints in place** (#506). The pattern alone then
+  decides each pixel, and a pattern repeats every eight pixels across and down
+  (`Pattern::period`). So `fill` evaluates `rop3` once for each of the 64 pixels of that period
+  and copies each row's eight across the framebuffer row, in place (`region_mut`). Every other
+  ROP still runs `rop3` per pixel into a block that is blitted. Measured at 1280 × 800,
+  `--release`:
+  - **Before, one whole-desktop OpaqueRect:** about 8.4 ms in `fill`, 8.0 ms through the
+    session. `rop3` per pixel took about 6 ms, `Pattern::pixel` about 1.4 ms, and first
+    touching the freshly allocated block most of the rest; the blit was 0.2 ms.
+  - **Before, in a burst:** 14.7 ms a fill, in the one-byte repeated OpaqueRects of #496's
+    probe, which #496 measured as about 17.9 ms. The burst adds the session's work for each
+    order.
+  - **After:** 0.19 ms in `fill` and 0.24 ms through the session, against 0.11 ms for an
+    in-place row fill of that buffer; EGFX's SolidFill is of that order. In the burst, 0.09 to
+    0.10 ms a fill.
 - **Every session decodes Orders Updates, advertised or not.** Before #460 an Orders Update fell
   to the dispatch's catch-all unread; now a malformed one is a `SessionError` even in a session
   that advertised no order (ADR-0009 §3(a): a tolerated order with a malformed body is still a
@@ -273,8 +288,8 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   `ORDER_NEG_MEMBLT_INDEX`, `ORDER_NEG_MEM3BLT_INDEX`,
   `BITMAP_CACHE_REV2_MAX_ENTRIES`, `ORDER_FLAGS_EXTRA_FLAGS`,
   `ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT`
-- `justrdp-codecs/src/rop.rs` — `rop3`, `uses_pattern`, `Pattern`, `pattern_rows`,
-  `HATCH_PATTERNS`
+- `justrdp-codecs/src/rop.rs` — `rop3`, `uses_pattern`, `uses_dest`, `Pattern`, `Pattern::period`,
+  `pattern_rows`, `HATCH_PATTERNS`
 - `justrdp/src/orders.rs` — `Orders`, `clip_blt`, `compose`, `pattern`, `order_color`,
   `MAX_HELD_RECTS`
 - `justrdp/src/advertise.rs` — `HONOURED_ORDERS`, `HONOURED_ORDER_FLAGS`,
