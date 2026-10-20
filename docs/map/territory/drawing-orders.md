@@ -495,9 +495,14 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 - **Unbuilt:** LineTo, MultiDstBlt, MultiPatBlt, MultiScrBlt, polygons, ellipses, SaveBitmap,
   FastIndex and FastGlyph, Cache Glyph Revision 2, glyph fragments, Cache Brush, Cache Bitmap
   revisions 1 and 3, and every alternate secondary order but Frame Marker, Switch Surface and
-  Create Offscreen Bitmap. The 2008 R2 VM sends FastGlyph to a client advertising it (#486, which
-  saves only bandwidth, since that server sends GlyphIndex otherwise); no measured server sent
-  the rest.
+  Create Offscreen Bitmap. The 2008 R2 VM sends FastGlyph to a client advertising it (#486); no
+  measured server sent the rest.
+- **FastGlyph is not built, the maintainer's call** (#486, 2026-10-20). Without it advertised the
+  2008 R2 VM sends its text as GlyphIndex, which already paints. With it, the bytes the server
+  sent changed either way (all bytes, two runs each):
+  - **the logon screen:** 83,953 grew to 112,908 (+34%), because the server sent twice the
+    bitmap updates;
+  - **the desktop, then Server Manager maximised:** about 489 KB fell to 410 KB (−16%).
 - **Cache Brush is not built, the maintainer's call** (#487, 2026-10-19). Advertised at either
   colour level, the 2008 R2 VM sent one mono brush, used by PatBlt, and no colour brush. Without
   the brush set it sends the same brushes inline, which already paint. Caching would save 8 bytes
