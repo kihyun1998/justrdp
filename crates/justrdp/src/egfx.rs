@@ -393,6 +393,13 @@ pub struct GraphicsProcessor {
     awaiting_confirm: bool,
     /// This channel binding has spent its one reset.
     reset_spent: bool,
+    /// What the session's current call may still paint, in decoded bytes.
+    allowance: usize,
+    /// RGBA bytes painted since the session's call began.
+    call_paint: usize,
+    /// The byte offset in [`Self::zgfx_blob`] of the next PDU of a message stopped at the
+    /// call's allowance.
+    resume_at: Option<usize>,
 }
 
 /// Why handling one EGFX PDU failed.
@@ -434,6 +441,9 @@ impl Default for GraphicsProcessor {
             frame_paint: 0,
             awaiting_confirm: false,
             reset_spent: false,
+            allowance: usize::MAX,
+            call_paint: 0,
+            resume_at: None,
         }
     }
 }
@@ -768,6 +778,7 @@ impl GraphicsProcessor {
                     return Ok(());
                 }
                 self.frame_paint += decoded;
+                self.call_paint += decoded;
                 if let Some(rgba) = self
                     .decode_wts1(codec_id, dest_rect, data)
                     .map_err(Failure::Miss)?
@@ -849,6 +860,7 @@ impl GraphicsProcessor {
                     painted += 1;
                 });
                 self.frame_paint += spent;
+                self.call_paint += spent;
                 note_budget("RDPGFX_WIRE_TO_SURFACE_PDU_2", painted + over, painted);
                 // The corpus-capture harness (ADR-0011's other half). It rode inside the
                 // bootstrap decoder until #172; the payload is what is being captured, not a
@@ -932,6 +944,7 @@ impl GraphicsProcessor {
                     done += 1;
                 }
                 self.frame_paint += painted;
+                self.call_paint += painted;
                 note_budget("RDPGFX_SOLIDFILL_PDU", declared, done);
             }
             EgfxPdu::SurfaceToSurface {
@@ -977,6 +990,7 @@ impl GraphicsProcessor {
                     done += 1;
                 }
                 self.frame_paint += painted;
+                self.call_paint += painted;
                 note_budget("RDPGFX_SURFACE_TO_SURFACE_PDU", declared, done);
             }
             EgfxPdu::SurfaceToCache {
@@ -1002,6 +1016,8 @@ impl GraphicsProcessor {
                         src_rect.width(),
                         src_rect.height(),
                     );
+                // The copy is charged to the call.
+                self.call_paint += rgba.len();
                 if let Some(old) = self.cache.remove(&cache_slot) {
                     self.cache_bytes -= old.rgba.len();
                 }
@@ -1064,6 +1080,7 @@ impl GraphicsProcessor {
                     done += 1;
                 }
                 self.frame_paint += painted;
+                self.call_paint += painted;
                 note_budget("RDPGFX_CACHE_TO_SURFACE_PDU", declared, done);
             }
             EgfxPdu::EvictCacheEntry { cache_slot } => {
@@ -1081,18 +1098,33 @@ impl GraphicsProcessor {
         Ok(())
     }
 
-    /// Handle every EGFX PDU in one decompressed blob.
-    fn process_blob(&mut self, blob: &[u8]) -> Result<Vec<ProcessorOutput>, DecodeError> {
+    /// Handle `blob`'s PDUs from byte `start`, stopping before one once the call's allowance is
+    /// painted and at least one was handled: then the next PDU's offset.
+    fn process_blob(
+        &mut self,
+        blob: &[u8],
+        start: usize,
+    ) -> Result<(Vec<ProcessorOutput>, Option<usize>), DecodeError> {
         // The paint budget is scoped to a frame, and draw commands do not require one: no arm
         // checks `in_frame` before painting, so a server that never sends StartFrame would sit
         // outside frame-scoped accounting forever. Charging unbracketed painting per *message*
         // closes that without narrowing the frame case. The real server measured for #268 sent
         // 0 unbracketed draws, so this guards a path nothing observed rather than a common one.
-        if !self.in_frame {
-            self.frame_paint = 0;
+        if start == 0 {
+            if !self.in_frame {
+                self.frame_paint = 0;
+            }
+            // Every PDU decodes before any is handled, as one message always has.
+            egfx::decode_all(blob)?;
         }
         let mut outputs = Vec::new();
-        for pdu in egfx::decode_all(blob)? {
+        let mut at = start;
+        while at < blob.len() {
+            if at > start && self.call_paint >= self.allowance {
+                return Ok((outputs, Some(at)));
+            }
+            let (pdu, length) = egfx::decode_first(&blob[at..])?;
+            at += length;
             if self.awaiting_confirm {
                 if !matches!(pdu, EgfxPdu::CapsConfirm { .. }) {
                     continue;
@@ -1115,6 +1147,16 @@ impl GraphicsProcessor {
                 }
             }
         }
+        Ok((outputs, None))
+    }
+
+    /// Handle the zgfx blob from `start`, keeping where it stopped.
+    fn run_blob(&mut self, start: usize) -> Result<Vec<ProcessorOutput>, DecodeError> {
+        let blob = core::mem::take(&mut self.zgfx_blob);
+        let result = self.process_blob(&blob, start);
+        self.zgfx_blob = blob;
+        let (outputs, resume_at) = result?;
+        self.resume_at = resume_at;
         Ok(outputs)
     }
 
@@ -1143,6 +1185,8 @@ impl GraphicsProcessor {
             zgfx_blob: core::mem::take(&mut self.zgfx_blob),
             awaiting_confirm: true,
             reset_spent: true,
+            allowance: self.allowance,
+            call_paint: self.call_paint,
             ..GraphicsProcessor::default()
         };
     }
@@ -1272,16 +1316,33 @@ impl DvcProcessor for GraphicsProcessor {
         // the blob is borrowed) and put back after, so one allocation serves every message
         // on the channel (#86).
         let mut blob = core::mem::take(&mut self.zgfx_blob);
-        let result = self
-            .zgfx
-            .decompress_into(message, &mut blob)
-            .map_err(|e| {
-                tracing::warn!(target: "rdp_egfx", error = %e, "zgfx decompression failed");
-                invalid("RDP_SEGMENTED_DATA", "zgfx decompression failed")
-            })
-            .and_then(|()| self.process_blob(&blob));
+        let decompressed = self.zgfx.decompress_into(message, &mut blob).map_err(|e| {
+            tracing::warn!(target: "rdp_egfx", error = %e, "zgfx decompression failed");
+            invalid("RDP_SEGMENTED_DATA", "zgfx decompression failed")
+        });
         self.zgfx_blob = blob;
-        result
+        decompressed?;
+        self.run_blob(0)
+    }
+
+    fn begin_call(&mut self, allowance: usize) {
+        self.allowance = allowance;
+        self.call_paint = 0;
+    }
+
+    fn call_spent(&self) -> usize {
+        self.call_paint
+    }
+
+    fn has_pending(&self) -> bool {
+        self.resume_at.is_some()
+    }
+
+    fn resume(&mut self) -> Result<Vec<ProcessorOutput>, DecodeError> {
+        match self.resume_at {
+            Some(at) => self.run_blob(at),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn flush_frames(&mut self, framebuffer: &mut Framebuffer) -> Vec<FrameUpdate> {
@@ -1437,6 +1498,98 @@ mod tests {
         body.extend_from_slice(&x.to_le_bytes());
         body.extend_from_slice(&y.to_le_bytes());
         feed(p, egfx::CMDID_MAP_SURFACE_TO_OUTPUT, &body)
+    }
+
+    /// `n` frames, each a fill of the whole 16 x 8 surface 1 in its own colour.
+    fn fill_frames(n: u8) -> Vec<u8> {
+        let mut blob = Vec::new();
+        for i in 0..n {
+            let mut start = vec![0u8; 8];
+            start[4..8].copy_from_slice(&u32::from(i).to_le_bytes());
+            blob.extend(header(egfx::CMDID_START_FRAME, &start));
+            blob.extend(header(
+                egfx::CMDID_SOLID_FILL,
+                &solid_fill_body(1, [i, 0, 0, 0], [0, 0, 16, 8]),
+            ));
+            blob.extend(header(egfx::CMDID_END_FRAME, &u32::from(i).to_le_bytes()));
+        }
+        blob
+    }
+
+    /// A processor with surface 1, 16 x 8, mapped at the origin.
+    fn one_surface() -> GraphicsProcessor {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 16, 8);
+        map_surface(&mut p, 1, 0, 0);
+        p
+    }
+
+    /// Issue #496: a message stops before its next PDU once a call's allowance is painted, and
+    /// resuming handles the rest, to the same pixels and outputs as one call.
+    #[test]
+    fn a_message_pauses_at_its_allowance_and_resumes() {
+        let message = egfx::wrap_uncompressed(&fill_frames(5));
+        let desktop = 16 * 8 * 4;
+        let mut p = one_surface();
+        p.begin_call(3 * desktop);
+        let mut outputs = p.process(&message).unwrap();
+        assert_eq!(
+            p.surfaces[0].rgba[2], 2,
+            "the third fill is the last of the first call"
+        );
+        let mut calls = 1;
+        while p.has_pending() {
+            assert!(calls < 100, "resuming makes no progress");
+            p.begin_call(3 * desktop);
+            outputs.extend(p.resume().unwrap());
+            calls += 1;
+        }
+        assert_eq!(calls, 2, "three fills, then two");
+
+        let mut whole = one_surface();
+        let expected = whole.process(&message).unwrap();
+        assert!(!whole.has_pending());
+        assert_eq!(outputs, expected);
+        assert_eq!(p.surfaces[0].rgba, whole.surfaces[0].rgba);
+    }
+
+    /// Issue #496: copying a surface into the cache is charged to the call, so a message of
+    /// copies pauses too.
+    #[test]
+    fn a_message_of_cache_copies_pauses_at_its_allowance() {
+        let copy = header(
+            egfx::CMDID_SURFACE_TO_CACHE,
+            &surface_to_cache_body(1, 1, 16, 8),
+        );
+        let message = egfx::wrap_uncompressed(&copy.repeat(10));
+        let mut p = one_surface();
+        p.begin_call(3 * 16 * 8 * 4);
+        p.process(&message).unwrap();
+        let mut calls = 1;
+        while p.has_pending() {
+            assert!(calls < 100, "resuming makes no progress");
+            p.begin_call(3 * 16 * 8 * 4);
+            p.resume().unwrap();
+            calls += 1;
+        }
+        assert_eq!(calls, 4, "three copies a call");
+    }
+
+    /// Issue #496: with no allowance a message still handles one PDU a call.
+    #[test]
+    fn a_message_with_no_allowance_still_makes_progress() {
+        let message = egfx::wrap_uncompressed(&fill_frames(2));
+        let mut p = one_surface();
+        p.begin_call(0);
+        p.process(&message).unwrap();
+        let mut calls = 1;
+        while p.has_pending() {
+            assert!(calls < 100, "resuming makes no progress");
+            p.begin_call(0);
+            p.resume().unwrap();
+            calls += 1;
+        }
+        assert_eq!(calls, 6, "one PDU a call");
     }
 
     fn solid_fill_body(id: u16, bgrx: [u8; 4], rect: [u16; 4]) -> Vec<u8> {

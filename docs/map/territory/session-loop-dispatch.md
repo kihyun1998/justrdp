@@ -180,9 +180,15 @@ one of its outputs. Neither says what the loop dispatches or in what order.
 
   Skipping past a per-call budget would lose paints of a legitimate burst; pausing keeps every
   pixel and only moves the work to the next call.
-- **The pause covers PDUs and sections, not the inside of a Graphics Pipeline message.** One
-  EGFX message of tiny frames costs 0.62 s at 60 KB and 16 s at 1 MiB (about 64 s at the 4 MiB
-  DVC cap), measured for #496, so the Graphics Pipeline needs its own pause point.
+- **A Graphics Pipeline message pauses between its PDUs too** ([Graphics Pipeline](egfx-graphics-pipeline.md)).
+  - **Why it needs its own point.** One EGFX message of tiny frames cost 0.62 s at 60 KB and
+    16 s at 1 MiB (about 64 s at the 4 MiB DVC cap), measured for #496.
+  - **The allowance.** The session hands the dynamic-channel manager what the call may still
+    paint, and adds what the processors painted to the call.
+  - **Ordering.** A processor stops only once the call's whole budget is spent, so the call
+    starts no later PDU either: what follows the message, on any channel or transport, waits. The
+    next call resumes the message first, and a resumed message is that call's first unit of
+    work.
 - **The value is headroom over the largest real update.** The values below are in desktops.
   - The 2 came from #367: the largest Surface Commands update in the #150 capture (WS2019)
     decoded 1 desktop.

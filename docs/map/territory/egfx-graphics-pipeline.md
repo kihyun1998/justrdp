@@ -124,6 +124,27 @@ acknowledge frames. It is server→client only, and it is reachable only if
   surface that can exist names a bitmap nothing could hold. A codec cannot write this
   bound: an *arithmetic* guard there closes only the 32-bit half, and the number that
   would make a magnitude cap principled belongs to the surface model (#263).
+- **A message stops between PDUs once the session's call has painted its budget** (#496, the
+  maintainer's call to pause rather than skip).
+  - **Why the frame budget is not enough.** The per-frame budget below bounds a frame, but a
+    message can hold many frames: one of tiny frames cost 16 s at 1 MiB.
+  - **How it stops.** The processor counts what it paints in the call, against the allowance the
+    session hands it. Before each PDU after the first it checks whether the allowance is spent,
+    and if so keeps the next PDU's offset in its zgfx blob. `resume` continues from there.
+  - **Validation is unchanged.** Every PDU still decodes before any is handled (`decode_all`);
+    handling then walks one PDU at a time (`decode_first`), so resuming never decodes the message
+    again.
+  - **The result can lag.** A frame left open at the stop holds its pixels back until a later
+    call ends it.
+  - **What a call costs now.** A call handles at least one PDU, and one PDU is bounded by the
+    per-frame budget below. The 1 MiB message of tiny frames now takes 1,887 calls of at most
+    78 ms each at 1280 × 800 (`--release`), where it took 16 s in one call. Each of those frames
+    is one SolidFill of 64 whole-surface rects, the whole per-frame budget in one PDU, so 78 ms
+    is that PDU's cost.
+  - **What the call is charged.** The three list-bearing commands are charged to both budgets. A
+    SurfaceToCache copy, up to a surface per PDU, is charged to the call only, so a message of
+    copies pauses too. The per-frame budget is #268's and stays on the list-bearing commands.
+  - **What is not charged.** A CreateSurface's zeroed allocation is not charged.
 - **One number answers two different questions here, and the shared derivation is the reason
   — not the convenience.** `MAX_TOTAL_SURFACE_BYTES` is *also* the **per-frame paint budget**
   (#268). The three list-bearing commands — `SOLID_FILL`, `SURFACE_TO_SURFACE`,

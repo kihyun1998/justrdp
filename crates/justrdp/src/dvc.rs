@@ -51,6 +51,21 @@ pub trait DvcProcessor {
     fn start(&mut self, channel_id: u32) -> Vec<ProcessorOutput>;
     /// One complete (reassembled) channel message.
     fn process(&mut self, message: &[u8]) -> Result<Vec<ProcessorOutput>, DecodeError>;
+    /// Start a session call: what this call may still paint, in decoded bytes. A processor that
+    /// pauses stops a message there ([`Self::has_pending`]).
+    fn begin_call(&mut self, _allowance: usize) {}
+    /// What this processor painted since [`Self::begin_call`].
+    fn call_spent(&self) -> usize {
+        0
+    }
+    /// Whether a message stopped at the call's allowance with PDUs left.
+    fn has_pending(&self) -> bool {
+        false
+    }
+    /// Continue the stopped message; returned outputs are processed like [`Self::process`]'s.
+    fn resume(&mut self) -> Result<Vec<ProcessorOutput>, DecodeError> {
+        Ok(Vec::new())
+    }
     /// Blit any pixels this processor accumulated during [`Self::process`] straight into the
     /// session framebuffer and return the dirty rects (ADR-0010 slice #163). Called by the
     /// manager after each SVC payload, so a processor that renders (EGFX) writes the framebuffer
@@ -314,6 +329,8 @@ pub(crate) struct Drdynvc {
     svc: crate::svc::Reassembler,
     /// The Display Control channel ID + server caps, recorded off the processor's output.
     display_control: Option<(u32, displaycontrol::Caps)>,
+    /// The processor and channel of a message stopped at the call's allowance.
+    paused: Option<(usize, u32)>,
 }
 
 impl core::fmt::Debug for Drdynvc {
@@ -355,6 +372,7 @@ impl Drdynvc {
             next_generation: 0,
             svc: crate::svc::Reassembler::new(SVC_MESSAGE_CAP),
             display_control: None,
+            paused: None,
         })
     }
 }
@@ -638,11 +656,48 @@ impl Drdynvc {
                 }]);
             }
         };
-        let processor = &mut self.processors[processor];
+        let index = processor;
+        let processor = &mut self.processors[index];
         let channel = processor.channel_name();
         let outputs = processor
             .process(&message)
             .map_err(|error| DvcError::Processor { channel, error })?;
+        if processor.has_pending() {
+            self.paused = Some((index, channel_id));
+        }
+        Ok(self.apply_outputs(channel_id, channel, outputs))
+    }
+
+    /// Give every processor what the session's call may still paint.
+    pub(crate) fn begin_call(&mut self, allowance: usize) {
+        for processor in &mut self.processors {
+            processor.begin_call(allowance);
+        }
+    }
+
+    /// What every processor painted since [`Self::begin_call`].
+    pub(crate) fn call_spent(&self) -> usize {
+        self.processors.iter().map(|p| p.call_spent()).sum()
+    }
+
+    /// Whether a message stopped at the call's allowance with PDUs left.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.paused.is_some()
+    }
+
+    /// Continue the stopped message.
+    pub(crate) fn resume(&mut self) -> Result<Vec<DvcEvent>, DvcError> {
+        let Some((index, channel_id)) = self.paused else {
+            return Ok(Vec::new());
+        };
+        let processor = &mut self.processors[index];
+        let channel = processor.channel_name();
+        let outputs = processor
+            .resume()
+            .map_err(|error| DvcError::Processor { channel, error })?;
+        if !processor.has_pending() {
+            self.paused = None;
+        }
         Ok(self.apply_outputs(channel_id, channel, outputs))
     }
 
