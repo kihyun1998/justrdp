@@ -357,6 +357,12 @@ during a session (#340).
   counts the requests instead, and allows 2.
 - A file the server held open across the removal: its later read is refused by the server
   itself, with no request sent.
+- **One `Set-Clipboard` can announce its text twice** (#519, 2026-10-22). The server sent an
+  empty Format List, then one with `CF_UNICODETEXT`, then the same list again; the test asks for
+  the text on every list, so the same verdict arrived twice. The test removes the drive on the
+  first `late seen` only: a second `remove_drive` of the same drive is `UnknownDrive`, the core's
+  contract, and failed the test in 2 of 2 runs on 2026-10-21. Seen together with a first run
+  on 2026-10-22 that never got the script typed (no Format List, no request), passed on rerun.
 
 **Measured against the WS2019 test VM (#349, 2026-09-29), before the flag was advertised:** a
 throwaway probe, not merged, set `ENABLE_ASYNCIO` from an environment variable. PowerShell

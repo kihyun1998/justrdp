@@ -222,8 +222,8 @@ in-session query.
 
 - **WS2019's one failure**, `a_drive_added_and_removed_mid_session_comes_and_goes_on_the_real_vm`,
   is the test's own: the `late seen` clipboard text arrives twice, and the second removal of the
-  same drive returns `UnknownDrive` (#519). It fails the same way on the default row, so it
-  predates the switch.
+  same drive returns `UnknownDrive`. It predated the switch; since #519 the test removes the
+  drive once, and passes on WS2019 (`device-redirection.md` has the measurement).
 - **The 2008 R2 run has not finished.** Twice the host ran out of memory mid-run and Claude
   Code's reaper killed it (once alongside the WS2019 suite, once alone): 7 of 22 passed before
   the kill, and libtest prints failure messages only at the end, so the 15 failures are unread.
