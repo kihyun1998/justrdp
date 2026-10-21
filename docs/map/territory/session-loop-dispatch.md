@@ -157,13 +157,16 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   (#367, #494). Each paint is charged before it is made:
   - a bitmap update's rectangles, a Surface Commands update's surface bits and an Orders update's
     paints are charged their decoded size, not their clipped one;
-  - past the budget, the rest of the update is skipped with an `rdp_paint_budget` warning;
+  - past the budget, the rest of a bitmap or Surface Commands update is skipped with an
+    `rdp_paint_budget` warning; an Orders update pauses between its orders instead (#498), and
+    skips, with the same warning, only an order that alone costs more than the budget;
   - the session continues, on ADR-0009 row 3's ground: a resource ceiling that is ours, against
     well-formed traffic.
 - **A call pauses once it has bought one update's budget** (#496, the maintainer's call,
-  2026-10-20). `process_bytes` starts no further PDU or fast-path section once the call's paint
-  spending reaches `paint_budget()`, and keeps the rest:
-  - **What it keeps:** the inbox, and the next section of its first PDU;
+  2026-10-20). `process_bytes` starts no further PDU, fast-path section or drawing order (#498)
+  once the call's paint spending reaches `paint_budget()`, and keeps the rest:
+  - **What it keeps:** the inbox, the next section of its first PDU, and the orders an Orders
+    Update has not reached (`Orders` keeps those; a resumed call starts with them);
   - **How it resumes:** `has_pending_input()` says so, and `process_bytes(&[])` continues.
     Sections already handled are skipped, never decompressed twice;
   - **Progress is guaranteed:** a call always handles its first PDU, and a resumed call its
@@ -362,7 +365,8 @@ Measured with throwaway probes and by mutating the adapter's command handler
   update lands there, and the frame-sink contract is shared.
 - [Bitmap codecs](bitmap-codecs.md) — slow-path bitmap updates route here by codec.
 - [Drawing orders](drawing-orders.md) — Orders Updates on both transports go to
-  `Orders::apply` within the update's paint budget, and a reactivation resets their history.
+  `Orders::apply`, charged to the call and pausing between orders, and a reactivation resets
+  their history.
 - [EGFX graphics pipeline](egfx-graphics-pipeline.md) — EGFX traffic arrives as DVC
   data through this loop.
 - [Virtual channels](virtual-channels.md) — `drdynvc` framing and display control

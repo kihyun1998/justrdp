@@ -36,9 +36,14 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
 - **The history keeps decoding past what is not painted.** A cache miss, an out-of-range cache
   id or index, a brush that cannot be drawn and the paint budget skip the paint, never the decode,
   so the field records stay in step with the server's (3.2.5.1.1.1 step 4: ignore the order).
-- **The first order past the paint budget ends the update's painting** (#494). Every order after
-  it is decoded and nothing after it paints, not even a smaller one that would fit, as the bitmap
-  and Surface Commands paths stop. A cache fill after it empties its entry (#498).
+- **An update pauses between its orders once the call has spent a budget** (#498, the
+  maintainer's call of 2026-10-21, over a cache-fill budget sized by the advertised caches and
+  over keeping #494's skip). The rest of the update waits for the next call, as a call already
+  waits between sections (#496), so no order is skipped for being late and every cache fill lands.
+  Each order may buy one update's budget; only an order that alone costs more is skipped, still
+  advancing the history. Measured before deciding (2026-10-21): on the 2008 R2 VM (logon, Server
+  Manager maximised, #500's window) and on WS2019 (#460), 1,209 cache fills in 123 updates, none
+  filling one slot twice within an update, and at most 0.21 desktops of fills in one update.
 - **An undecoded order may have moved the bounds.** When one carries `TS_BOUNDS` without
   `TS_ZERO_BOUNDS_DELTAS`, the history marks the rectangle unknown, every later bounded order
   decodes with `Clip::Unknown` and is not painted, until a `bounds` field gives all four edges
@@ -53,7 +58,7 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   3.1.1.1.1's table sizes each entry in bytes (the tile's pixels at the session's depth), not by
   side. So a cache's decoded size is bounded by the host's entry counts. A fill with more pixels
   is refused and its entry emptied, so a later MemBlt misses rather than painting the bitmap that
-  was there before. The budget does the same: past it a fill empties its entry. Until #475 each
+  was there before. So does a fill that alone costs more than one update's budget. Until #475 each
   side was held to the tile's, which no WS2019 fill ever crossed; xrdp puts the last 12 rows of a
   64-wide image in cache 1 as 64×12 and 48×12 tiles (768 and 576 pixels, under 1,024), and the
   side rule dropped them. Fixing it in #475 was the maintainer's call (2026-10-16).
