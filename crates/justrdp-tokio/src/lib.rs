@@ -12349,10 +12349,11 @@ mod tests {
     }
 
     /// The polylines [`GDI_POLYLINE_SCRIPT`] draws, in its window's client coordinates, as
-    /// `[x0, y0, x1, y1, …]`. Each starts at its smallest x and y, so the server's bounds hold
-    /// it, and each ends on white. Their x-major and their y-major segments each pass halfway
-    /// between two pixels running in all four diagonal directions.
-    const GDI_POLYLINES: [&[i16]; 9] = [
+    /// `[x0, y0, x1, y1, …]`, each ending on white. The first nine start at their smallest x and
+    /// y; their x-major and their y-major segments each pass halfway between two pixels running
+    /// in all four diagonal directions. The last six start at their largest x or y, which the
+    /// server's bounds leave out (#512).
+    const GDI_POLYLINES: [&[i16]; 15] = [
         &[10, 10, 60, 10, 60, 60, 10, 60],
         &[80, 10, 120, 30, 160, 10, 200, 30],
         &[80, 50, 120, 70, 80, 90, 120, 110],
@@ -12362,6 +12363,12 @@ mod tests {
         &[40, 180, 60, 260, 40, 220],
         &[100, 140, 150, 157, 200, 190],
         &[230, 140, 230, 200, 250, 140],
+        &[300, 70, 262, 70],
+        &[270, 120, 270, 80],
+        &[300, 130, 280, 90],
+        &[300, 140, 262, 160],
+        &[275, 230, 285, 170],
+        &[306, 175, 290, 175, 290, 235],
     ];
 
     /// A PowerShell 2.0 command line showing a topmost white window at (240, 200) whose paint
@@ -12379,7 +12386,10 @@ mod tests {
         "new int[]{80,50,120,70,80,90,120,110},new int[]{140,60,220,120,180,100},",
         "new int[]{240,10,260,50,280,10,300,50},new int[]{10,170,30,210,10,250},",
         "new int[]{40,180,60,260,40,220},",
-        "new int[]{100,140,150,157,200,190},new int[]{230,140,230,200,250,140}};",
+        "new int[]{100,140,150,157,200,190},new int[]{230,140,230,200,250,140},",
+        "new int[]{300,70,262,70},new int[]{270,120,270,80},new int[]{300,130,280,90},",
+        "new int[]{300,140,262,160},new int[]{275,230,285,170},",
+        "new int[]{306,175,290,175,290,235}};",
         "protected override void OnPaint(PaintEventArgs e){IntPtr h=e.Graphics.GetHdc();",
         "IntPtr pen=CreatePen(0,1,255);IntPtr old=SelectObject(h,pen);",
         "foreach(int[] p in L){Polyline(h,p,p.Length/2);}",
