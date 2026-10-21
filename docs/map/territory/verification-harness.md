@@ -205,6 +205,31 @@ that carries the session. FreeRDP logs `Network disconnect!`, reconnects through
 its reconnect Client Info carries its `ARC_CS_PRIVATE_PACKET` — the independent verifier #306
 was checked against.
 
+## Interop matrix
+
+Which server a claim was measured on (#428). `JUSTRDP_TEST_SERVER` (`ws2019`, the default;
+`ws2008r2`; `win11`) points the main suite at that VM; its address, lock and sign-out follow,
+so the run serialises with that VM's own tests. `interop_matrix_row_probe_against_real_vm`
+(`--nocapture`) prints a row's protocol, desktop, colour depth, Bitmap Codecs and EGFX
+version. The build is read from the NTLM CHALLENGE `Version` (sspi's TRACE log), so it needs no
+in-session query.
+
+| Row | Build | Selected | Desktop, bpp | Bitmap Codecs advertised | EGFX confirmed | Main suite |
+|---|---|---|---|---|---|---|
+| WS2019 Standard, .136 | 10.0.17763 | HYBRID_EX | 1280×800, 32 | NSCodec, RemoteFX, Ignore, Image RemoteFX | 10.4 (`0x000A0400`) | 52/53 (2026-10-21) |
+| WS2008 R2, .167 | — | HYBRID (#484) | 16 bpp (#484) | — | — | not finished |
+| Win11 Ent eval, .163 | — | — | — | — | — | not run |
+
+- **WS2019's one failure**, `a_drive_added_and_removed_mid_session_comes_and_goes_on_the_real_vm`,
+  is the test's own: the `late seen` clipboard text arrives twice, and the second removal of the
+  same drive returns `UnknownDrive`. It fails the same way on the default row, so it predates
+  the switch.
+- **The 2008 R2 run has not finished.** Twice the host ran out of memory mid-run and Claude
+  Code's reaper killed it (once alongside the WS2019 suite, once alone): 7 of 22 passed before
+  the kill, and libtest prints failure messages only at the end, so the 15 failures are unread.
+  Next: run it in small groups, logging the test process's memory, so a test that grows on a
+  server that never sends what it waits for is found by name.
+
 ## Cross-cutting invariants
 
 - [Oracle agreement is not independence](../invariant/oracle-agreement-is-not-independence.md)
