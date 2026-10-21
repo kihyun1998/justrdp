@@ -775,9 +775,9 @@ impl SessionStateMachine {
     /// The stream interleaves TPKT frames (slow-path) and fast-path PDUs; the first byte
     /// disambiguates (TPKT's version byte is `0x03`, a fast-path header has `action == 0`).
     ///
-    /// A call starts no further PDU or fast-path section once it has bought one update's paint
-    /// budget, and keeps the rest; [`Self::has_pending_input`] then says so, and a call with
-    /// no bytes continues.
+    /// A call starts no further PDU, fast-path section or drawing order once it has bought one
+    /// update's paint budget, and keeps the rest; [`Self::has_pending_input`] then says so, and
+    /// a call with no bytes continues.
     pub fn process_bytes(&mut self, bytes: &[u8]) -> Result<Vec<SessionOutput>, SessionError> {
         self.inbox.extend_from_slice(bytes);
         self.call_spent = 0;
@@ -788,6 +788,14 @@ impl SessionStateMachine {
         if self.drdynvc.has_pending() {
             self.resume_drdynvc(&mut outputs)?;
             if self.drdynvc.has_pending() {
+                self.paused = true;
+                return Ok(outputs);
+            }
+            handled_one = true;
+        }
+        if self.orders.has_pending() {
+            self.resume_orders(&mut outputs)?;
+            if self.orders.has_pending() {
                 self.paused = true;
                 return Ok(outputs);
             }
@@ -840,6 +848,11 @@ impl SessionStateMachine {
                 }
             }
             consumed += frame_len;
+            // A slow-path Orders Update stopped at the budget: its frame is spent.
+            if self.orders.has_pending() {
+                self.paused = true;
+                break;
+            }
         }
         inbox.drain(..consumed);
         self.inbox = inbox;
@@ -852,7 +865,8 @@ impl SessionStateMachine {
     /// Handle one complete fast-path output PDU from section [`Self::next_section`]: reassemble
     /// fragmented updates, then route bitmap/palette bodies through the same handlers as their
     /// slow-path twins, and surface commands to [`Self::apply_surface_bits`]. `false` when the
-    /// call's budget stopped it before a section, which is where the next call resumes.
+    /// call's budget stopped it before a section, or in an Orders Update with sections after
+    /// it; the next call resumes at the next section.
     fn on_fastpath_pdu(
         &mut self,
         frame: &[u8],
@@ -860,6 +874,7 @@ impl SessionStateMachine {
     ) -> Result<bool, SessionError> {
         let start = self.next_section;
         let sections = fastpath::decode_updates(frame).map_err(SessionError::Decode)?;
+        let count = sections.len();
         for (index, section) in sections.into_iter().enumerate().skip(start) {
             if index > start && self.call_spent >= self.paint_budget() {
                 self.next_section = index;
@@ -993,6 +1008,10 @@ impl SessionStateMachine {
                     let update = justrdp_pdu::orders::OrdersUpdate::decode_fast_path(&mut cur)
                         .map_err(SessionError::Decode)?;
                     self.apply_orders(update, outputs)?;
+                    if self.orders.has_pending() && index + 1 < count {
+                        self.next_section = index + 1;
+                        return Ok(false);
+                    }
                 }
                 // Synchronize, large pointers (capability never advertised): skipped.
                 _ => {}
@@ -1454,13 +1473,49 @@ impl SessionStateMachine {
         Ok(())
     }
 
-    /// Apply one Orders Update on either transport, within one paint budget.
+    /// Apply one Orders Update on either transport, charged to the call; it stops before an
+    /// order once the call has spent one update's budget, and [`Self::resume_orders`] continues.
     fn apply_orders(
         &mut self,
         update: justrdp_pdu::orders::OrdersUpdate<'_>,
         outputs: &mut Vec<SessionOutput>,
     ) -> Result<(), SessionError> {
-        let bits_per_pixel = match self.config.server.bits_per_pixel {
+        let bits_per_pixel = self.orders_bits_per_pixel();
+        let budget = self.paint_budget();
+        let mut frames = Vec::new();
+        let result = self.orders.apply(
+            update,
+            &mut self.framebuffer,
+            &self.palette,
+            bits_per_pixel,
+            &mut self.call_spent,
+            budget,
+            &mut frames,
+        );
+        outputs.extend(frames.into_iter().map(SessionOutput::Frame));
+        result
+    }
+
+    /// Continue an Orders Update stopped at the last call's budget.
+    fn resume_orders(&mut self, outputs: &mut Vec<SessionOutput>) -> Result<(), SessionError> {
+        let bits_per_pixel = self.orders_bits_per_pixel();
+        let budget = self.paint_budget();
+        let mut frames = Vec::new();
+        let result = self.orders.resume(
+            &mut self.framebuffer,
+            &self.palette,
+            bits_per_pixel,
+            &mut self.call_spent,
+            budget,
+            &mut frames,
+        );
+        outputs.extend(frames.into_iter().map(SessionOutput::Frame));
+        result
+    }
+
+    /// The color depth drawing orders name colors in: the server's, or the one advertised.
+    fn orders_bits_per_pixel(&self) -> u16 {
+        match self.config.server.bits_per_pixel {
             0 => self
                 .config
                 .capabilities
@@ -1471,21 +1526,7 @@ impl SessionStateMachine {
                 })
                 .unwrap_or(0),
             bpp => bpp,
-        };
-        let mut frames = Vec::new();
-        let bought = self.paint_budget();
-        let mut budget = bought;
-        let result = self.orders.apply(
-            update,
-            &mut self.framebuffer,
-            &self.palette,
-            bits_per_pixel,
-            &mut budget,
-            &mut frames,
-        );
-        self.call_spent += bought - budget;
-        outputs.extend(frames.into_iter().map(SessionOutput::Frame));
-        result
+        }
     }
 
     /// The decoded bytes one graphics update may buy.
@@ -3726,8 +3767,8 @@ mod tests {
         sm.framebuffer().clone()
     }
 
-    /// Issue #496: a call handles its first PDU even when the budget is nothing, as on an empty
-    /// desktop, so resuming always makes progress.
+    /// Issue #496: a call handles its first order even when the budget is nothing, as on an
+    /// empty desktop, so resuming always makes progress: two orders a PDU, one a call (#498).
     #[test]
     fn a_call_on_an_empty_desktop_still_makes_progress() {
         let mut config = orders_config();
@@ -3739,7 +3780,7 @@ mod tests {
             fastpath::FP_FRAGMENT_SINGLE,
             &section[..],
         )]);
-        assert_eq!(frames_per_call(&mut sm, &pdu.repeat(3)).len(), 3);
+        assert_eq!(frames_per_call(&mut sm, &pdu.repeat(3)).len(), 6);
     }
 
     /// [`desktop_fills`] in `color`, then the last pixel in `color + 1`.
@@ -3756,8 +3797,9 @@ mod tests {
         orders_body(&vec![opaque_rect([0, 0, 16, 8], RED); n])
     }
 
-    /// Issue #496: a call starts no further section once it has spent one update's budget, and
-    /// `process_bytes(&[])` resumes at the next section, until nothing is pending.
+    /// Issue #496: a call starts no further section, nor order (#498), once it has spent one
+    /// update's budget, and `process_bytes(&[])` resumes where it stopped, until nothing is
+    /// pending. Each section here is 7 desktops and a pixel, 8 orders.
     #[test]
     fn a_call_pauses_between_sections_once_it_has_spent_a_budget() {
         let mut sm = SessionStateMachine::new(orders_config(), Vec::new()).unwrap();
@@ -3769,7 +3811,7 @@ mod tests {
                 .map(|s| (fastpath::FP_UPDATE_ORDERS, fastpath::FP_FRAGMENT_SINGLE, *s))
                 .collect::<Vec<_>>(),
         );
-        assert_eq!(frames_per_call(&mut sm, &pdu), [16, 16, 16]);
+        assert_eq!(frames_per_call(&mut sm, &pdu), [9, 9, 9, 9, 9, 3]);
         assert_eq!(
             sm.framebuffer(),
             &unpaused(orders_config(), fastpath::FP_UPDATE_ORDERS, &sections),
@@ -3784,7 +3826,7 @@ mod tests {
         )]);
         assert_eq!(
             frames_per_call(&mut sm, &[pdu, next].concat()),
-            [16, 16, 16, 3]
+            [9, 9, 9, 9, 9, 6]
         );
     }
 
@@ -3809,7 +3851,8 @@ mod tests {
         assert_eq!(frames_per_call(&mut sm, &pdu), [8, 4]);
     }
 
-    /// Issue #496: the same between PDUs, and bytes fed while paused queue behind the rest.
+    /// Issue #496: the same across PDUs, and bytes fed while paused queue behind the rest. Each
+    /// PDU is 7 desktops, so a call stops one order into the second (#498).
     #[test]
     fn a_call_pauses_between_pdus_and_later_bytes_wait() {
         let mut sm = SessionStateMachine::new(orders_config(), Vec::new()).unwrap();
@@ -3821,9 +3864,9 @@ mod tests {
         )]);
         let burst = pdu.repeat(4);
         let first = sm.process_bytes(&burst).unwrap();
-        assert_eq!(first.len(), 14);
+        assert_eq!(first.len(), 8);
         assert!(sm.has_pending_input());
-        assert_eq!(frames_per_call(&mut sm, &pdu), [14, 7]);
+        assert_eq!(frames_per_call(&mut sm, &pdu), [8, 8, 8, 3]);
     }
 
     /// Issue #496: the two bursts the issue measured, one-command NSCodec sections and
@@ -3895,6 +3938,55 @@ mod tests {
         );
         assert_eq!(frames_per_call(&mut sm, &pdu), [6]);
         assert!(!sm.has_pending_input());
+    }
+
+    /// Issue #498: an Orders Update past one update's budget pauses between its orders and
+    /// skips none, so every order paints, the last one included.
+    #[test]
+    #[tracing_test::traced_test]
+    fn an_orders_update_past_the_budget_pauses_between_its_orders() {
+        let mut sm = SessionStateMachine::new(orders_config(), Vec::new()).unwrap();
+        let section = desktop_fills_in(19, 0x1234);
+        let pdu = fastpath::encode_pdu(&[(
+            fastpath::FP_UPDATE_ORDERS,
+            fastpath::FP_FRAGMENT_SINGLE,
+            &section[..],
+        )]);
+        assert_eq!(frames_per_call(&mut sm, &pdu), [8, 8, 4]);
+        let rgba = crate::orders::tests::rgba;
+        let fb = sm.framebuffer().pixels();
+        assert_eq!(fb[..4], rgba(0x1234));
+        assert_eq!(fb[fb.len() - 4..], rgba(0x1235));
+        assert!(!logs_contain("paint budget reached"));
+    }
+
+    /// Issue #498: a slow-path Orders Update pauses the same way; its frame is spent, the call
+    /// says input is pending though the inbox is empty, and the frame after it waits for the
+    /// update's last orders.
+    #[test]
+    fn a_slow_path_orders_update_pauses_and_the_next_frame_waits() {
+        use crate::orders::tests::{GREEN, RED, opaque_rect};
+        let mut sm = SessionStateMachine::new(orders_config(), Vec::new()).unwrap();
+        let fills = slow_path_orders(&vec![opaque_rect([0, 0, 16, 8], RED); 10]);
+        let pixel = slow_path_orders(&[opaque_rect([0, 0, 1, 1], GREEN)]);
+        assert_eq!(sm.process_bytes(&fills).unwrap().len(), 8);
+        assert!(sm.has_pending_input());
+        assert_eq!(frames_per_call(&mut sm, &pixel), [3]);
+        assert_eq!(
+            sm.framebuffer().pixels()[..4],
+            crate::orders::tests::rgba(GREEN)
+        );
+    }
+
+    /// A slow-path Orders Update of `orders`, as one Data PDU.
+    fn slow_path_orders(orders: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = update::UPDATETYPE_ORDERS.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad2OctetsA
+        let orders = orders_body(orders);
+        body.extend_from_slice(&orders[..2]);
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad2OctetsB
+        body.extend_from_slice(&orders[2..]);
+        server_data_pdu(share::PDU_TYPE2_UPDATE, &body)
     }
 
     /// One Orders Update body: `numberOrders` and the orders, on either transport.

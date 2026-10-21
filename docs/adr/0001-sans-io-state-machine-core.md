@@ -201,3 +201,6 @@ across a buffer" no longer holds for `SessionStateMachine`:
 point inside the machine, and a sans-IO machine has no clock, so the pause is counted in work
 done. It is not a step back from sans-IO: the machine still performs no I/O, and the adapter
 decides when to resume. The maintainer chose pausing over skipping (#496, 2026-10-20).
+
+**Since #498 (2026-10-21)** the pause also falls between the drawing orders of one Orders Update;
+the machine keeps the orders not yet reached, and a resumed call starts with them.

@@ -11504,14 +11504,15 @@ mod tests {
     }
 
     /// Issue #496: a cancellation lands between the calls of a burst, not after the whole
-    /// burst: the first call paints two sections, and the session ends before the third.
+    /// burst: the first call paints its first section and, pausing between orders (#498), two
+    /// orders of the second, and the session ends before the rest.
     #[tokio::test(start_paused = true)]
     async fn a_cancellation_lands_mid_burst() {
         let script = vec![(Duration::ZERO, scrblt_burst(6, 30))];
         let (delivered, ended) =
             frames_delivered_until("run_session_with_commands", script, 180, Some(1)).await;
         assert_eq!(ended, DisconnectReason::LocalClosed);
-        assert_eq!(delivered.len(), 60, "one call's two sections");
+        assert_eq!(delivered.len(), 32, "one call's budget");
     }
 
     /// Whether `at` is the runners' 1 s interval past `since`, give or take the timer's tick.

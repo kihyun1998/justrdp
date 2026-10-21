@@ -55,7 +55,7 @@ enum Skip {
     UncachedGlyph,
     /// A Cache Color Table entry past the six (2.2.2.2.1.2.4).
     OutsideColorTables,
-    /// The update's paint budget is spent.
+    /// The order alone costs more than one update's paint budget.
     OverBudget,
     /// A `bRop2` outside the sixteen binary raster operations (2.2.2.2.1.1.1.6).
     UnknownRop2,
@@ -123,6 +123,19 @@ pub(crate) struct Orders {
     held: Vec<FrameUpdate>,
     /// How many frames a `TS_FRAME_END` closed or a reactivation dropped.
     frames_ended: u64,
+    /// The update a call stopped in at its budget.
+    pending: Option<Pending>,
+}
+
+/// An Orders Update a call stopped in: the orders it had not reached.
+#[derive(Debug)]
+struct Pending {
+    /// Their bytes.
+    data: Vec<u8>,
+    /// How many there are.
+    left: u16,
+    /// The update's `numberOrders`.
+    declared: u16,
 }
 
 /// Above this many held rects a frame collapses to their bounding box.
@@ -192,12 +205,14 @@ impl Orders {
             in_frame: false,
             held: Vec::new(),
             frames_ended: 0,
+            pending: None,
         }
     }
 
     /// Forget the primary order history and any frame in flight (a Deactivation–Reactivation).
     pub(crate) fn reactivate(&mut self) {
         self.history = OrderHistory::default();
+        self.pending = None;
         self.target = Target::Screen;
         if self.in_frame {
             self.frames_ended += 1;
@@ -284,22 +299,93 @@ impl Orders {
 
     /// Apply one Orders Update, pushing a [`FrameUpdate`] for each order that painted, or, for
     /// an order inside a Frame Marker pair, when the pair ends.
-    /// `bits_per_pixel` is the session's color depth, `budget` the decoded bytes this update may
-    /// buy. Malformed bytes are an error; anything well formed is applied or skipped.
+    /// `bits_per_pixel` is the session's color depth. Each order may buy `budget` decoded bytes,
+    /// added to `spent`; once `spent` reaches `budget` the update stops before its next order and
+    /// keeps the rest for [`Self::resume`]. Malformed bytes are an error; anything well formed is
+    /// applied or skipped.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply(
         &mut self,
         update: OrdersUpdate<'_>,
         framebuffer: &mut Framebuffer,
         palette: &Palette,
         bits_per_pixel: u16,
-        budget_left: &mut usize,
+        spent: &mut usize,
+        budget: usize,
         frames: &mut Vec<FrameUpdate>,
     ) -> Result<(), crate::SessionError> {
-        let mut budget = *budget_left;
-        let mut cur = ReadCursor::new(update.order_data, "orderData");
+        let (data, count) = (update.order_data, update.number_orders);
+        self.run(
+            data,
+            count,
+            count,
+            framebuffer,
+            palette,
+            bits_per_pixel,
+            spent,
+            budget,
+            frames,
+        )
+    }
+
+    /// Whether an update stopped at a call's budget with orders left.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Continue the update [`Self::apply`] stopped in, as it would have.
+    pub(crate) fn resume(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        palette: &Palette,
+        bits_per_pixel: u16,
+        spent: &mut usize,
+        budget: usize,
+        frames: &mut Vec<FrameUpdate>,
+    ) -> Result<(), crate::SessionError> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
+        };
+        self.run(
+            &pending.data,
+            pending.left,
+            pending.declared,
+            framebuffer,
+            palette,
+            bits_per_pixel,
+            spent,
+            budget,
+            frames,
+        )
+    }
+
+    /// Apply `count` orders from `data`, the last of an update of `declared`; the first always.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &mut self,
+        data: &[u8],
+        count: u16,
+        declared: u16,
+        framebuffer: &mut Framebuffer,
+        palette: &Palette,
+        bits_per_pixel: u16,
+        spent: &mut usize,
+        limit: usize,
+        frames: &mut Vec<FrameUpdate>,
+    ) -> Result<(), crate::SessionError> {
+        let mut cur = ReadCursor::new(data, "orderData");
         let mut over_budget = 0usize;
         let mut painted = Vec::new();
-        for index in 0..update.number_orders {
+        for index in 0..count {
+            if index > 0 && *spent >= limit {
+                self.pending = Some(Pending {
+                    data: data[cur.position()..].to_vec(),
+                    left: count - index,
+                    declared,
+                });
+                break;
+            }
+            let mut budget = limit;
             let order = match orders::decode_order(&mut cur, &mut self.history) {
                 Ok(order) => order,
                 Err(OrderError::Unsupported { class, order_type }) => {
@@ -307,8 +393,8 @@ impl Orders {
                         target: "rdp_orders",
                         ?class,
                         order_type,
-                        declared = update.number_orders,
-                        applied = index,
+                        declared,
+                        applied = declared - count + index,
                         "a drawing order of a type not decoded; the rest of the update is skipped"
                     );
                     break;
@@ -490,12 +576,10 @@ impl Orders {
                 painted.clear();
             }
             self.deliver(&mut painted, frames);
+            *spent += limit - budget;
             match outcome {
                 Ok(()) => {}
-                Err(NotApplied::Skipped(Skip::OverBudget)) => {
-                    over_budget += 1;
-                    budget = 0;
-                }
+                Err(NotApplied::Skipped(Skip::OverBudget)) => over_budget += 1,
                 Err(NotApplied::Skipped(reason)) => {
                     tracing::debug!(target: "rdp_orders", ?reason, "drawing order skipped");
                 }
@@ -506,12 +590,11 @@ impl Orders {
             tracing::warn!(
                 target: "rdp_paint_budget",
                 update = "TS_UPDATE_ORDERS",
-                declared = update.number_orders,
+                declared,
                 skipped = over_budget,
-                "paint budget reached; the remaining orders of this update were decoded, not painted",
+                "paint budget reached by a drawing order alone; it was decoded, not painted",
             );
         }
-        *budget_left = budget;
         Ok(())
     }
 
@@ -2045,8 +2128,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// A Create the budget cannot buy is counted with the update's other over-budget orders,
-    /// not as one past the advertised cache.
+    /// A Create the budget cannot buy is reported as over the budget, not as one past the
+    /// advertised cache.
     #[test]
     #[tracing_test::traced_test]
     fn a_create_over_the_budget_is_reported_as_over_the_budget() {
@@ -2748,6 +2831,24 @@ pub(crate) mod tests {
         assert_eq!(pixel(&fb, 0, 0), rgba(GREEN));
     }
 
+    /// Each call's frames: [`run_with`]'s, then each resumption's while an update is pending.
+    fn run_calls(
+        orders: &mut Orders,
+        fb: &mut Framebuffer,
+        parts: &[Vec<u8>],
+        budget: usize,
+    ) -> Vec<Vec<FrameUpdate>> {
+        let mut calls = vec![run_with(orders, fb, parts, budget)];
+        while orders.has_pending() {
+            let mut frames = Vec::new();
+            orders
+                .resume(fb, &Palette::default(), 16, &mut 0, budget, &mut frames)
+                .unwrap();
+            calls.push(frames);
+        }
+        calls
+    }
+
     fn run_with(
         orders: &mut Orders,
         fb: &mut Framebuffer,
@@ -2765,7 +2866,8 @@ pub(crate) mod tests {
                 fb,
                 &Palette::default(),
                 16,
-                &mut { budget },
+                &mut 0,
+                budget,
                 &mut frames,
             )
             .unwrap();
@@ -2790,7 +2892,8 @@ pub(crate) mod tests {
                 fb,
                 palette,
                 8,
-                &mut (1 << 20),
+                &mut 0,
+                1 << 20,
                 &mut frames,
             )
             .unwrap();
@@ -3492,14 +3595,41 @@ pub(crate) mod tests {
         assert_eq!(frames, []);
     }
 
-    /// Past the budget nothing more is painted or decoded, but every order still advances the
-    /// history, and an entry the budget refused misses instead of keeping its old bitmap.
+    /// Once an update has spent the budget it pauses before its next order, and resuming paints
+    /// the rest: an order past what is left still paints, as one update's budget buys it (#498).
     #[test]
-    fn past_the_budget_orders_are_decoded_but_not_painted() {
+    fn an_update_pauses_before_its_next_order_once_the_budget_is_spent() {
         let mut orders = Orders::new(&capabilities(4, true));
         let mut fb = Framebuffer::new(4, 1).unwrap();
-        // 4 bytes per pixel: two cache fills and one MemBlt fit in 12.
-        let frames = run_with(
+        let calls = run_calls(
+            &mut orders,
+            &mut fb,
+            // 4 bytes, then 12 past the 8 left, then 4.
+            &[
+                opaque_rect([0, 0, 1, 1], RED),
+                opaque_rect([0, 0, 3, 1], RED),
+                opaque_rect([3, 0, 1, 1], RED),
+            ],
+            12,
+        );
+        assert_eq!(
+            calls,
+            [
+                vec![frame(0, 0, 1, 1), frame(0, 0, 3, 1)],
+                vec![frame(3, 0, 1, 1)]
+            ]
+        );
+        assert_eq!(pixel(&fb, 3, 0), rgba(RED));
+    }
+
+    /// A cache fill past the budget is not skipped: it waits for the next call and fills its
+    /// slot, so a later MemBlt naming the slot paints instead of missing (#498).
+    #[test]
+    fn a_cache_fill_past_the_budget_fills_after_the_pause() {
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(4, 1).unwrap();
+        // 4 bytes per pixel: two cache fills and one MemBlt spend 12.
+        let calls = run_calls(
             &mut orders,
             &mut fb,
             &[
@@ -3511,34 +3641,35 @@ pub(crate) mod tests {
             ],
             12,
         );
-        assert_eq!(frames, [frame(0, 0, 1, 1)]);
+        assert_eq!(calls, [vec![frame(0, 0, 1, 1)], vec![frame(1, 0, 1, 1)]]);
         let frames = run(
             &mut orders,
             &mut fb,
             &[memblt((0, 0), [2, 0, 1, 1], SRCCOPY, [0, 0])],
         );
-        assert!(frames.is_empty(), "the refused entry misses");
+        assert_eq!(frames, [frame(2, 0, 1, 1)]);
+        assert_eq!(pixel(&fb, 2, 0), rgba(BLUE), "the refill landed");
     }
 
-    /// The first order past the budget ends the update's painting: a smaller one after it,
-    /// which would fit, is not painted either.
+    /// An order that alone costs more than one update's budget is skipped, still advancing the
+    /// history, and the orders after it paint.
     #[test]
-    fn an_update_paints_nothing_after_its_first_order_past_the_budget() {
+    #[tracing_test::traced_test]
+    fn an_order_alone_past_the_budget_is_skipped_and_the_update_goes_on() {
         let mut orders = Orders::new(&capabilities(4, true));
         let mut fb = Framebuffer::new(4, 1).unwrap();
-        let frames = run_with(
+        let calls = run_calls(
             &mut orders,
             &mut fb,
-            // 4 bytes, then 12 past the 8 left, then 4, which even half of what is left buys.
             &[
-                opaque_rect([0, 0, 1, 1], RED),
                 opaque_rect([0, 0, 3, 1], RED),
-                opaque_rect([3, 0, 1, 1], RED),
+                opaque_rect([3, 0, 1, 1], GREEN),
             ],
-            12,
+            8,
         );
-        assert_eq!(frames, [frame(0, 0, 1, 1)]);
-        assert_eq!(pixel(&fb, 3, 0), BLACK);
+        assert_eq!(calls, [vec![frame(3, 0, 1, 1)]]);
+        assert_eq!(pixel(&fb, 0, 0), BLACK);
+        assert!(logs_contain("paint budget reached"));
     }
 
     /// TS_COLOR at 16 bpp is the pixel itself, at 24 and 32 the red, green, blue bytes.
@@ -3573,7 +3704,8 @@ pub(crate) mod tests {
                 &mut fb,
                 &Palette::default(),
                 16,
-                &mut (16 * 8 * 4 * 2),
+                &mut 0,
+                16 * 8 * 4 * 2,
                 &mut frames,
             );
         }
