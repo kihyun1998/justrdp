@@ -7320,6 +7320,7 @@ mod tests {
                                         clipboard_ready_in.store(true, Ordering::SeqCst);
                                     }
                                     ClipboardOutput::RemoteFormatList(formats) => {
+                                        eprintln!("clipboard: Format List {formats:?}");
                                         if formats.iter().any(|f| f.id == CF_UNICODETEXT)
                                             && let Ok(request) = clipboard.request(CF_UNICODETEXT)
                                         {
@@ -7328,8 +7329,11 @@ mod tests {
                                     }
                                     ClipboardOutput::FormatData { data, .. } => {
                                         let text = decode_unicode_text(&data.unwrap_or_default());
-                                        if text.starts_with("late seen") {
-                                            // The server saw the drive: the host removes it.
+                                        eprintln!("clipboard: text {text:?}");
+                                        if text.starts_with("late seen")
+                                            && removed_in.lock().unwrap().is_none()
+                                        {
+                                            // The server saw the drive: the host removes it, once.
                                             let outputs = redirection
                                                 .remove_drive(LATE)
                                                 .expect("the VM allows removing a drive");
