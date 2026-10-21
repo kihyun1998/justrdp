@@ -517,8 +517,9 @@ impl Orders {
 
     /// Paint a Polyline: from `(xStart, yStart)`, each point a segment that keeps its first pixel
     /// and leaves out its last, rasterised by GDI's diamond convention, through the pen and
-    /// `bRop2`, a frame for each segment's pixels. Each segment charges the budget the larger of the steps
-    /// it walks and its box inside the clip.
+    /// `bRop2`, inside the bounds widened to a start they leave one short, a frame for each
+    /// segment's pixels. Each segment charges the budget the larger of the steps it walks and its
+    /// box inside the clip.
     #[allow(clippy::too_many_arguments)]
     fn polyline(
         &self,
@@ -551,10 +552,31 @@ impl Orders {
         match clip {
             Clip::None => {}
             Clip::Bounds(bounds) => {
+                // A start that is the largest x (or y) of every point, one past the right (or
+                // bottom) edge, is the server's: its bounds leave out the start its GDI paints.
+                let start = [i32::from(order.x_start), i32::from(order.y_start)];
+                let mut others = [i32::MIN; 2];
+                let mut at = start;
+                for &[dx, dy] in self.history.polyline_points() {
+                    at = [at[0] + i32::from(dx), at[1] + i32::from(dy)];
+                    others = [others[0].max(at[0]), others[1].max(at[1])];
+                }
+                let mut far = [i32::from(bounds.right), i32::from(bounds.bottom)];
+                for axis in 0..2 {
+                    if far[axis] == start[axis] - 1 && start[axis] > others[axis] {
+                        far[axis] = start[axis];
+                        tracing::trace!(
+                            target: "rdp_orders",
+                            axis,
+                            edge = far[axis] - 1,
+                            "a Polyline's bounds end one short of its start, widened to it"
+                        );
+                    }
+                }
                 edges[0] = edges[0].max(i32::from(bounds.left));
                 edges[1] = edges[1].max(i32::from(bounds.top));
-                edges[2] = edges[2].min(i32::from(bounds.right));
-                edges[3] = edges[3].min(i32::from(bounds.bottom));
+                edges[2] = edges[2].min(far[0]);
+                edges[3] = edges[3].min(far[1]);
             }
             Clip::Unknown => return Err(NotApplied::Skipped(Skip::UnknownClip)),
         }
@@ -2278,6 +2300,38 @@ pub(crate) mod tests {
         assert_eq!(lit(&fb, rgba(GREEN)), [(0, 1), (1, 1), (2, 1), (3, 1)]);
         assert_eq!(lit(&fb, rgba(BLUE)), []);
         assert_eq!(frames, [frame(1, 0, 2, 1), frame(0, 1, 4, 1)]);
+    }
+
+    /// Bounds ending one short of a start that is the largest x or y of every point are widened
+    /// to it, as the server's bounds leave that start out though its own GDI paints it (#512).
+    /// Bounds ending further short, or short of a start another point shares, clip as sent.
+    #[test]
+    fn a_polyline_keeps_the_start_its_bounds_leave_one_short() {
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(8, 8).unwrap();
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                polyline(Some([0, 0, 3, 0]), [4, 0], R2_COPYPEN, RED, &[[-4, 0]]),
+                polyline(Some([7, 1, 7, 3]), [7, 4], R2_COPYPEN, GREEN, &[[0, -3]]),
+                polyline(Some([2, 2, 4, 2]), [6, 2], R2_COPYPEN, BLUE, &[[-4, 0]]),
+                polyline(
+                    Some([2, 5, 4, 7]),
+                    [5, 5],
+                    R2_COPYPEN,
+                    WHITE,
+                    &[[-3, 0], [3, 2]],
+                ),
+            ],
+        );
+        assert_eq!(lit(&fb, rgba(RED)), [(1, 0), (2, 0), (3, 0), (4, 0)]);
+        assert_eq!(lit(&fb, rgba(GREEN)), [(7, 2), (7, 3), (7, 4)]);
+        assert_eq!(lit(&fb, rgba(BLUE)), [(3, 2), (4, 2)]);
+        assert_eq!(
+            lit(&fb, rgba(WHITE)),
+            [(2, 5), (3, 5), (4, 5), (3, 6), (4, 6)]
+        );
     }
 
     /// The update's paint budget pays for every step a segment walks, inside the clip or not,

@@ -106,6 +106,21 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   - Each segment charges the paint budget the larger of the steps it walks, inside the clip or
     not, and its box inside the clip, which its frame covers; that bounds both a hostile line's
     walk and what the host copies. Each segment delivers the bounding box of the pixels it drew.
+  - **The bounds are widened to a start they leave one short** (#512, the maintainer's call of
+    2026-10-21). The 2008 R2 server's bounds are the box of every point, except that on an axis
+    where the start is the largest of all the points, the box ends at start − 1. Its own GDI
+    paints that start, and the pixels in its column or row: 1 px, or 2 for a steep line. So when
+    a bound ends exactly one short of a start that is the largest of all the points on that
+    axis, the clip reaches the start (a `trace` record on `rdp_orders`, under ADR-0009's
+    observable tolerance). A bound further short is a real clip: the client edge and a covering
+    window both arrive in the bounds. Measured on 27 orders: the box rule held for all 15 unclipped
+    ones.
+    - **Rejected, measured:** widening right and bottom by one for every Polyline paints the
+      window border where a forward line crosses the client edge; ignoring the bounds paints up
+      to 108 px past it. Excepting only the first pixel misses a steep line's second.
+    - **Its cost:** a line toward smaller x or y whose start is exactly one past a real clip edge
+      arrives with the same bounds, and the server does not paint that start. The widening then
+      paints it (1 px on each of three lines made to test it).
   - FreeRDP's `R2_MERGEPENNOT` computes `src | ~pen`, the same as `R2_MERGENOTPEN`; the spec's
     PDno is `pen | ~dst`, which the ROP3 table gives.
 - **Offscreen bitmaps are held in the core, as RGBA framebuffers** (#489). The surface model, its
@@ -547,19 +562,19 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
     session without it: 0 px outside the taskbar's clock, in three runs out of three. With the
     lines not drawn, 2,150 px differ. So the lines' place, colour and `bRop2` are the server's.
     It cannot see a line's ends (see *Which Polyline can show a line's ends*).
-  - **#500's GDI window**, 9 polylines whose x-major and y-major segments pass halfway between
-    two pixels in all four diagonal directions, equals the server's repaint: 0 px. In that
-    repaint every line's last pixel is white. Drawing each segment's end makes 9 px differ, and
-    Bresenham makes 156 px differ. The comparison covers the window's client area only (the
+  - **#500's GDI window** equals the server's repaint: 0 px. Its first 9 polylines pass halfway
+    between two pixels in all four diagonal directions, x-major and y-major; on those 9, drawing
+    each segment's end made 9 px differ and Bresenham 156 px. Its last 6 start at their largest
+    x or y (#512): without the widening, their 6 starts differ. In the repaint every line's last
+    pixel is white. The comparison covers the window's client area only (the
     maintainer's call, 2026-10-21): outside it the Initial Configuration Tasks window differs,
     because the server lays that window out again for a reattached session (#513,
     [Verification harness](verification-harness.md)).
-- **A line that runs toward smaller x or y loses its first pixel to the server's bounds** (#512,
-  measured on #500 2026-10-21). For `(304, 243)` to `(254, 243)` the server sends bounds 254 to 303 but
-  paints 255 to 304. Its own repaint has the pixel; justrdp clips it away. A line up from
-  `(334, 283)` loses `(334, 283)` the same way (bounds bottom 282). FreeRDP clips to the same
-  bounds (`gdi_set_bounds`, then `gdi_LineTo`), unrun. #500's scene starts every polyline at its
-  smallest x and y, so it does not meet this.
+- **A line toward smaller x or y that starts one past a real clip edge paints its start** (#512):
+  the bounds cannot tell it from the server's one-short bounds (see the widening above). Measured
+  only on the client edge; a window covering a line arrived as one clip rectangle, so bounds
+  split into several were not seen. FreeRDP clips strictly (`gdi_set_bounds`, then
+  `gdi_LineTo`), unrun, and loses those starts instead.
 - **A Create past the advertised cache is proven only by a forced refusal** (#497): the measured
   server keeps to the advertised size, so none arrives unforced.
 - **Glyph advances by `ulCharInc`, vertical and reversed text are proven only against the spec**:
