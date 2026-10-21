@@ -8222,6 +8222,8 @@ mod tests {
         start: [i16; 2],
         /// Its points, each a delta from the one before.
         points: Vec<[i16; 2]>,
+        /// `bRop2`.
+        rop2: u8,
     }
 
     impl OrderCensus {
@@ -8299,6 +8301,7 @@ mod tests {
                                     surface: self.surface.unwrap_or(orders::SCREEN_BITMAP_SURFACE),
                                     start: [order.x_start, order.y_start],
                                     points: self.history.polyline_points().to_vec(),
+                                    rop2: order.rop2,
                                 });
                                 format!("Polyline rop2 {}", order.rop2)
                             }
@@ -12336,6 +12339,217 @@ mod tests {
                     .filter(|&(x, y)| x < clock.0 || y < clock.1)
                     .collect();
             eprintln!("#493: {} pixels differ outside the clock", differing.len());
+            assert_eq!(
+                differing.get(..8.min(differing.len())),
+                Some(&[][..]),
+                "pixels differ"
+            );
+        })
+        .await
+    }
+
+    /// The polylines [`GDI_POLYLINE_SCRIPT`] draws, in its window's client coordinates, as
+    /// `[x0, y0, x1, y1, …]`. Each starts at its smallest x and y, so the server's bounds hold
+    /// it, and each ends on white. Their x-major and their y-major segments each pass halfway
+    /// between two pixels running in all four diagonal directions.
+    const GDI_POLYLINES: [&[i16]; 9] = [
+        &[10, 10, 60, 10, 60, 60, 10, 60],
+        &[80, 10, 120, 30, 160, 10, 200, 30],
+        &[80, 50, 120, 70, 80, 90, 120, 110],
+        &[140, 60, 220, 120, 180, 100],
+        &[240, 10, 260, 50, 280, 10, 300, 50],
+        &[10, 170, 30, 210, 10, 250],
+        &[40, 180, 60, 260, 40, 220],
+        &[100, 140, 150, 157, 200, 190],
+        &[230, 140, 230, 200, 250, 140],
+    ];
+
+    /// A PowerShell 2.0 command line showing a topmost white window at (240, 200) whose paint
+    /// calls gdi32 `Polyline` with a red pen through each of [`GDI_POLYLINES`].
+    const GDI_POLYLINE_SCRIPT: &str = concat!(
+        "Add-Type -ReferencedAssemblies System.Windows.Forms,System.Drawing -TypeDefinition '",
+        "using System;using System.Drawing;using System.Windows.Forms;",
+        "using System.Runtime.InteropServices;public class P500:Form{",
+        "[DllImport(\"gdi32.dll\")]static extern bool Polyline(IntPtr h,int[] p,int n);",
+        "[DllImport(\"gdi32.dll\")]static extern IntPtr CreatePen(int s,int w,int c);",
+        "[DllImport(\"gdi32.dll\")]static extern IntPtr SelectObject(IntPtr h,IntPtr o);",
+        "[DllImport(\"gdi32.dll\")]static extern bool DeleteObject(IntPtr o);",
+        "public static int[][] L=new int[][]{",
+        "new int[]{10,10,60,10,60,60,10,60},new int[]{80,10,120,30,160,10,200,30},",
+        "new int[]{80,50,120,70,80,90,120,110},new int[]{140,60,220,120,180,100},",
+        "new int[]{240,10,260,50,280,10,300,50},new int[]{10,170,30,210,10,250},",
+        "new int[]{40,180,60,260,40,220},",
+        "new int[]{100,140,150,157,200,190},new int[]{230,140,230,200,250,140}};",
+        "protected override void OnPaint(PaintEventArgs e){IntPtr h=e.Graphics.GetHdc();",
+        "IntPtr pen=CreatePen(0,1,255);IntPtr old=SelectObject(h,pen);",
+        "foreach(int[] p in L){Polyline(h,p,p.Length/2);}",
+        "SelectObject(h,old);DeleteObject(pen);e.Graphics.ReleaseHdc(h);}}';",
+        "$f=New-Object P500;$f.Text='500';$f.StartPosition='Manual';",
+        "$f.Location=New-Object Drawing.Point(240,200);$f.Size=New-Object Drawing.Size(320,320);",
+        "$f.BackColor='White';$f.TopMost=$true;[Windows.Forms.Application]::Run($f)",
+    );
+
+    /// The part of [`GDI_POLYLINE_SCRIPT`]'s client area the comparison covers, from its origin.
+    const GDI_POLYLINE_AREA: (usize, usize) = (310, 260);
+
+    /// Click Start, type `command` (letters, digits and dots) into its search box, then Enter.
+    async fn start_search_run(session: &mut Driven, command: &str) {
+        use justrdp_pdu::input::{PTRFLAGS_BUTTON1, PTRFLAGS_DOWN, PTRFLAGS_MOVE};
+        let (x, y) = (24u16, session.framebuffer().height() - 20);
+        let mouse = |flags| InputEvent::Mouse {
+            flags,
+            wheel_units: 0,
+            x,
+            y,
+        };
+        session.send(&tap(0x1B)).await;
+        session
+            .read_until_quiet(Duration::from_secs(4), false)
+            .await;
+        session
+            .send(&[
+                mouse(PTRFLAGS_MOVE),
+                mouse(PTRFLAGS_DOWN | PTRFLAGS_BUTTON1),
+                mouse(PTRFLAGS_BUTTON1),
+            ])
+            .await;
+        session
+            .read_until_quiet(Duration::from_secs(6), false)
+            .await;
+        for ch in command.chars() {
+            let vk = match ch {
+                'a'..='z' => ch.to_ascii_uppercase() as u16,
+                '0'..='9' => ch as u16,
+                '.' => 0xBE,
+                _ => panic!("no VK for {ch:?}"),
+            };
+            session.send(&tap(vk)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        session
+            .read_until_quiet(Duration::from_secs(6), false)
+            .await;
+        session.send(&tap(0x0D)).await;
+    }
+
+    /// Issue #500: on the GDI orders VM, a window whose paint calls gdi32 `Polyline` arrives as
+    /// Polyline orders. In the server's repaint for a session without Polyline every line's
+    /// last pixel is white, and the window equals the one painted from the orders.
+    #[tokio::test]
+    #[traced_test]
+    #[ignore = "requires the GDI orders VM at 192.168.136.167:3389 (Windows Server 2008 R2) and \
+                JUSTRDP_TEST_* env vars"]
+    async fn the_gdi_orders_vm_paints_a_gdi_polyline_as_the_server_does() {
+        vm::with_vm_session_on(vm::Target::GdiOrders, |vm| async move {
+            use justrdp_pdu::capability::{self, CapabilitySet};
+            let config = honoured_orders_config();
+            let capabilities = config.capabilities.clone();
+            let mut session = Driven::new(vm.connect(config).await, capabilities, Vec::new());
+            session
+                .read_until_quiet(Duration::from_secs(20), true)
+                .await;
+            session
+                .read_until(Duration::from_secs(120), active_caption)
+                .await
+                .expect("a window comes up after logon");
+            start_search_run(&mut session, "powershell").await;
+            session
+                .read_until_quiet(Duration::from_secs(15), false)
+                .await;
+            for chunk in GDI_POLYLINE_SCRIPT.as_bytes().chunks(64) {
+                let events: Vec<_> = chunk
+                    .iter()
+                    .flat_map(|&byte| {
+                        [false, true].map(|release| InputEvent::Unicode {
+                            code_unit: u16::from(byte),
+                            release,
+                        })
+                    })
+                    .collect();
+                session.send(&events).await;
+            }
+            session.send(&tap(0x0D)).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+            while session.census.polylines.len() < GDI_POLYLINES.len()
+                && tokio::time::Instant::now() < deadline
+            {
+                session
+                    .read_until_quiet(Duration::from_secs(3), false)
+                    .await;
+            }
+            session
+                .read_until_quiet(Duration::from_secs(20), false)
+                .await;
+            let polylined = session.settled();
+            polylined.census.print("#500 the GDI window with Polyline");
+            for skip in SKIPPED_PAINT_LOGS {
+                assert!(!logs_contain(skip), "a paint was skipped: {skip}");
+            }
+            let first = polylined
+                .census
+                .polylines
+                .first()
+                .expect("the window's paint arrives as Polyline");
+            let origin = [first.start[0] - 10, first.start[1] - 10];
+            for seen in &polylined.census.polylines {
+                let mut at = [seen.start[0] - origin[0], seen.start[1] - origin[1]];
+                let mut vertices = at.to_vec();
+                for [dx, dy] in &seen.points {
+                    at = [at[0] + dx, at[1] + dy];
+                    vertices.extend(at);
+                }
+                assert!(
+                    seen.surface == justrdp_pdu::orders::SCREEN_BITMAP_SURFACE
+                        && seen.rop2 == 13
+                        && GDI_POLYLINES.contains(&&vertices[..]),
+                    "a Polyline the window does not draw: {seen:?}"
+                );
+            }
+
+            let mut config = honoured_orders_config();
+            for set in &mut config.capabilities {
+                if let CapabilitySet::Order(o) = set {
+                    o.order_support[capability::ORDER_NEG_POLYLINE_INDEX] = 0;
+                }
+            }
+            let capabilities = config.capabilities.clone();
+            let repainted = settle(vm.connect(config).await, capabilities, Vec::new()).await;
+            repainted
+                .census
+                .print("#500 the GDI window repainted without Polyline");
+            eprintln!(
+                "#500: dumps {} and {}",
+                dump_ppm(&polylined.framebuffer, "justrdp-500-polylined.ppm").display(),
+                dump_ppm(&repainted.framebuffer, "justrdp-500-repainted.ppm").display()
+            );
+            assert_eq!(
+                repainted.census.count("Polyline"),
+                0,
+                "Polyline arrived unadvertised"
+            );
+            let width = usize::from(repainted.framebuffer.width());
+            let rgb = |fb: &justrdp::Framebuffer, x: i16, y: i16| {
+                let at = ((y + origin[1]) as usize * width + (x + origin[0]) as usize) * 4;
+                [fb.pixels()[at], fb.pixels()[at + 1], fb.pixels()[at + 2]]
+            };
+            for line in GDI_POLYLINES {
+                let [x, y] = [line[line.len() - 2], line[line.len() - 1]];
+                assert_eq!(
+                    rgb(&repainted.framebuffer, x, y),
+                    [0xFF; 3],
+                    "the server drew the last pixel of {line:?}"
+                );
+            }
+            let (left, top) = (origin[0] as usize, origin[1] as usize);
+            let differing: Vec<_> =
+                differing_pixels(&polylined.framebuffer, &repainted.framebuffer)
+                    .into_iter()
+                    .filter(|&(x, y)| {
+                        (left..left + GDI_POLYLINE_AREA.0).contains(&x)
+                            && (top..top + GDI_POLYLINE_AREA.1).contains(&y)
+                    })
+                    .collect();
+            eprintln!("#500: {} pixels differ in the window", differing.len());
             assert_eq!(
                 differing.get(..8.min(differing.len())),
                 Some(&[][..]),

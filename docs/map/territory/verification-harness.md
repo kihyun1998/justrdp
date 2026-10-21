@@ -467,6 +467,10 @@ was checked against.
     at x 1191 at 1280 wide, so they stay in the comparison.
   - **A maximise click can miss** while the window is still coming up. That happened once in
     four runs, so the test clicks up to three times until the caption spans the desktop.
+  - **A program of the test's own (#500).** `start_search_run` types `powershell` into the
+    Start search as VK taps; the console then takes a command line of any length as Unicode
+    keyboard events. PowerShell 2.0's `Add-Type` compiles C# 2.0 there, so a form can call gdi32
+    directly. The console stays open behind the form until the sign-out closes both.
 
   Its configuration, none of it in the repo:
   - Remote Desktop allows connections from **any version** of the client, so a TLS-only connect

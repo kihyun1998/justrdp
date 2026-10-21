@@ -86,10 +86,17 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   offscreen orders (#489), was the maintainer's call (2026-10-19), made over holding the branch
   until #489 and folding it into #489. #489 then brought one on the logon screen, inside the
   comparison below.
-- **Polyline draws a pen through its points as FreeRDP's `gdi_LineTo` does** (#488). The spec
-  does not say which pixels a line covers, so FreeRDP's rule is followed:
-  - Each segment is a Bresenham walk (`e = dx - dy`) that leaves out its end, so each vertex is
-    drawn once, as the start of the next segment, and the last is not drawn.
+- **Polyline draws a pen through its points as the server's GDI does** (#488, #500). `[MS-RDPEGDI]`
+  does not say which pixels a line covers; Microsoft's driver documentation does ("Cosmetic
+  Lines": the GIQ diamond convention), and the 2008 R2 server's own repaint matches it pixel for
+  pixel (730 of 730 on #500's first scene):
+  - Each segment keeps its first pixel and leaves out its last, so each vertex is drawn once, as
+    the start of the next segment, and the last is not drawn.
+  - It lights one pixel per column (x-major) or row (y-major), the nearest to the line. Halfway
+    between two lights the upper one for an x-major line and the left one for a y-major line,
+    whichever way the line runs. FreeRDP's `gdi_LineTo` walks Bresenham (`e = dx - dy`), whose
+    halfway choice follows the direction: computed over the same scene, 21 of those 730 pixels
+    differ. justrdp walked it until #500.
   - `bRop2` runs through the ROP3 table with the pen as the source, code `(bRop2 - 1) × 0x11`.
     A value outside the sixteen paints nothing, as FreeRDP's `gdi_rop_color` writes nothing for
     one.
@@ -415,6 +422,18 @@ resized (#493).
 logon, then its maximise button, brings 7 Polyline, all on the screen, all one horizontal segment
 (`bRop2` 13): 3 as the window opens, 4 as it maximises. The same 7 arrived in each of three runs.
 
+**Which Polyline can show a line's ends (#500, 2026-10-21).** None of the scenes driven so far:
+- Server Manager's lines (x 333 to 1145 at y 180 and 708, pen `d6d3d6`) end on a pixel something
+  else paints `d6d3d6`, opened, maximised or resized. Dragging its right edge from x 1147 to 848
+  brought 5 Polyline, against 3 for opening it, all of them these same lines.
+- Task Manager's Performance tab sends 83 Polyline, each a closed black rectangle around a gauge:
+  the last point is the first.
+
+So #500 draws its own: a PowerShell 2.0 line typed into a console opened from the Start search
+compiles a form (`Add-Type`) whose paint calls gdi32 `Polyline` with a red pen on white. Each call
+arrives as one Polyline (`bRop2` 13, on the screen), and a session without Polyline gets the
+server's repaint (`the_gdi_orders_vm_paints_a_gdi_polyline_as_the_server_does`).
+
 **justrdp's own advertisement (#460):** MemBlt and Mem3Blt, caches of 120, 120 and 2553 entries,
 no waiting list, 16 bpp, no Surface Commands. The server sent only compressed 16 bpp Cache Bitmap
 (Revision 2) into cache 2 and SRCCOPY MemBlt, on the fast path; the fixture
@@ -523,18 +542,24 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
   colour level, the 2008 R2 VM sent one mono brush, used by PatBlt, and no colour brush. Without
   the brush set it sends the same brushes inline, which already paint. Caching would save 8 bytes
   a brush, and the only level that turns it on also advertises colour brushes no server has sent.
-- **Polyline is proven against a server, but not its end pixel** (#493).
-  - **What is proven.** Server Manager maximised, drawn with Polyline, equals the server's
-    repaint for a session without it: 0 px outside the taskbar's clock, in three runs out of
-    three. With
-    the lines not drawn, 2,150 px differ. So the lines' place, colour and `bRop2` are the
-    server's.
-  - **What is not.** Whether a segment's end pixel is drawn cannot be told from this comparison.
-    Drawing it leaves the comparison at 0 px, because every end pixel there is painted over
-    later or is the line's colour already: the end of the line at y 160, x 1277, is `d6d3d6`
-    either way.
-  - **The consequence.** The end pixel still rests on FreeRDP's `gdi_LineTo`, which leaves it
-    out (the maintainer's call to merge on that, 2026-10-20).
+- **Polyline is proven against a server** (#493, #500).
+  - **Server Manager maximised** (#493), drawn with Polyline, equals the server's repaint for a
+    session without it: 0 px outside the taskbar's clock, in three runs out of three. With the
+    lines not drawn, 2,150 px differ. So the lines' place, colour and `bRop2` are the server's.
+    It cannot see a line's ends (see *Which Polyline can show a line's ends*).
+  - **#500's GDI window**, 9 polylines whose x-major and y-major segments pass halfway between
+    two pixels in all four diagonal directions, equals the server's repaint: 0 px. In that
+    repaint every line's last pixel is white. Drawing each segment's end makes 9 px differ, and
+    Bresenham makes 156 px differ. The comparison covers the window's client area only (the
+    maintainer's call, 2026-10-21): outside it the Initial Configuration Tasks window repaints
+    differently in the reattached session, its right column (x 1120 to 1200) and bottom rows,
+    with no Polyline there, cause unknown (#513).
+- **A line that runs toward smaller x or y loses its first pixel to the server's bounds** (#512,
+  measured on #500 2026-10-21). For `(304, 243)` to `(254, 243)` the server sends bounds 254 to 303 but
+  paints 255 to 304. Its own repaint has the pixel; justrdp clips it away. A line up from
+  `(334, 283)` loses `(334, 283)` the same way (bounds bottom 282). FreeRDP clips to the same
+  bounds (`gdi_set_bounds`, then `gdi_LineTo`), unrun. #500's scene starts every polyline at its
+  smallest x and y, so it does not meet this.
 - **A Create past the advertised cache is proven only by a forced refusal** (#497): the measured
   server keeps to the advertised size, so none arrives unforced.
 - **Glyph advances by `ulCharInc`, vertical and reversed text are proven only against the spec**:

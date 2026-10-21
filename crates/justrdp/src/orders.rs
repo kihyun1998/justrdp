@@ -6,6 +6,8 @@
 //! type the history cannot decode ends the update (it has no length to skip by); every order up
 //! to it has already been applied.
 
+use std::cmp::Ordering;
+
 use crate::framebuffer::{FrameUpdate, Framebuffer};
 use crate::session::{charge, decode_bitmap};
 use justrdp_codecs::color::{self, Palette};
@@ -513,9 +515,9 @@ impl Orders {
         Ok(())
     }
 
-    /// Paint a Polyline: from `(xStart, yStart)`, each point a segment that leaves out its end,
-    /// walked by Bresenham as FreeRDP's `gdi_LineTo` walks it, through the pen and `bRop2`, a
-    /// frame for each segment's pixels. Each segment charges the budget the larger of the steps
+    /// Paint a Polyline: from `(xStart, yStart)`, each point a segment that keeps its first pixel
+    /// and leaves out its last, rasterised by GDI's diamond convention, through the pen and
+    /// `bRop2`, a frame for each segment's pixels. Each segment charges the budget the larger of the steps
     /// it walks and its box inside the clip.
     #[allow(clippy::too_many_arguments)]
     fn polyline(
@@ -575,9 +577,26 @@ impl Orders {
                 return Err(NotApplied::Skipped(Skip::OverBudget));
             }
             let (sx, sy) = ((to[0] - x1).signum(), (to[1] - y1).signum());
-            let (mut x, mut y, mut e) = (x1, y1, w - h);
+            // One pixel per column (x-major) or row (y-major), the nearest to the line; halfway
+            // lights the upper one, or the left one.
+            let (major, minor, major_step, minor_step) = if w >= h {
+                (w, h, [sx, 0], [0, sy])
+            } else {
+                (h, w, [0, sy], [sx, 0])
+            };
+            let toward_low = (if w >= h { sy } else { sx }) > 0;
             let mut drawn: Option<[i32; 4]> = None;
-            while [x, y] != to {
+            for i in 0..major {
+                let exact = i64::from(i) * i64::from(minor);
+                let (q, r) = (exact / i64::from(major), exact % i64::from(major));
+                let offset = match (2 * r).cmp(&i64::from(major)) {
+                    Ordering::Less => q,
+                    Ordering::Greater => q + 1,
+                    Ordering::Equal if toward_low => q,
+                    Ordering::Equal => q + 1,
+                } as i32;
+                let x = x1 + i * major_step[0] + offset * minor_step[0];
+                let y = y1 + i * major_step[1] + offset * minor_step[1];
                 if (edges[0]..=edges[2]).contains(&x) && (edges[1]..=edges[3]).contains(&y) {
                     let at = (y as usize * usize::from(target.width()) + x as usize) * 4;
                     let d = word(&target.pixels()[at..at + 4]);
@@ -590,15 +609,6 @@ impl Orders {
                         box_[2].max(x),
                         box_[3].max(y),
                     ];
-                }
-                let e2 = 2 * e;
-                if e2 > -h {
-                    e -= h;
-                    x += sx;
-                }
-                if e2 < w {
-                    e += w;
-                    y += sy;
                 }
             }
             if let Some([left, top, right, bottom]) = drawn {
@@ -2174,8 +2184,7 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// Each segment is a Bresenham line that leaves out its end, as FreeRDP's `gdi_LineTo`
-    /// draws it, and delivers its bounding box (#488).
+    /// Each segment leaves out its end and delivers its bounding box (#488).
     #[test]
     fn a_polyline_draws_each_segment_without_its_end() {
         let mut orders = Orders::new(&capabilities(4, true));
@@ -2191,6 +2200,35 @@ pub(crate) mod tests {
             [(0, 1), (1, 2), (2, 2), (4, 2), (3, 3)]
         );
         assert_eq!(frames, [frame(0, 1, 3, 2), frame(3, 2, 2, 2)]);
+    }
+
+    /// A line passing halfway between two pixels lights the upper one when it is x-major and
+    /// the left one when it is y-major, whichever way it runs, as GDI's diamond convention does
+    /// (#500).
+    #[test]
+    fn a_polyline_breaks_a_tie_upward_or_leftward_in_either_direction() {
+        let segment = |start: [i16; 2], delta: [i16; 2]| {
+            let mut orders = Orders::new(&capabilities(4, true));
+            let mut fb = Framebuffer::new(5, 5).unwrap();
+            run(
+                &mut orders,
+                &mut fb,
+                &[polyline(None, start, R2_COPYPEN, RED, &[delta])],
+            );
+            let mut lit = lit(&fb, rgba(RED));
+            lit.sort();
+            lit
+        };
+        // x-major, slope 1/2: the tie at x 1 and x 3 lights the upper pixel.
+        assert_eq!(segment([0, 0], [4, 2]), [(0, 0), (1, 0), (2, 1), (3, 1)]);
+        assert_eq!(segment([0, 2], [4, -2]), [(0, 2), (1, 1), (2, 1), (3, 0)]);
+        assert_eq!(segment([4, 0], [-4, 2]), [(1, 1), (2, 1), (3, 0), (4, 0)]);
+        assert_eq!(segment([4, 2], [-4, -2]), [(1, 0), (2, 1), (3, 1), (4, 2)]);
+        // y-major, slope 2: the tie at y 1 and y 3 lights the left pixel.
+        assert_eq!(segment([0, 0], [2, 4]), [(0, 0), (0, 1), (1, 2), (1, 3)]);
+        assert_eq!(segment([2, 0], [-2, 4]), [(0, 3), (1, 1), (1, 2), (2, 0)]);
+        assert_eq!(segment([0, 4], [2, -4]), [(0, 3), (0, 4), (1, 1), (1, 2)]);
+        assert_eq!(segment([2, 4], [-2, -4]), [(0, 1), (1, 2), (1, 3), (2, 4)]);
     }
 
     /// The vertex between two segments is drawn once, so an XOR pen does not cancel it; ROP2
