@@ -7962,6 +7962,74 @@ mod tests {
         .await
     }
 
+    /// Prints one row of the interop matrix (#428) for the server `JUSTRDP_TEST_SERVER` names:
+    /// the selected security protocol, the negotiated desktop size and colour depth, the
+    /// Bitmap Codecs the server advertises, and the EGFX caps version it confirms. Advisory: it
+    /// asserts only that each session reached session-active. Run with `--nocapture`.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn interop_matrix_row_probe_against_real_vm() {
+        with_vm_session(|vm| async move {
+            use justrdp_pdu::capability::CapabilitySet;
+
+            let outcome = vm.connect(legacy_graphics_config()).await;
+            let caps = &outcome.activation.server_capabilities;
+            let bpp = caps.iter().find_map(|set| match set {
+                CapabilitySet::Bitmap(b) => Some(b.preferred_bits_per_pixel),
+                _ => None,
+            });
+            let codecs: Vec<String> = caps
+                .iter()
+                .filter_map(|set| match set {
+                    CapabilitySet::BitmapCodecs(b) => Some(&b.codecs),
+                    _ => None,
+                })
+                .flatten()
+                .map(|c| format!("id={} guid={:02x?}", c.id, c.guid))
+                .collect();
+            eprintln!(
+                "#428 row: selected={:?} desktop={:?} bpp={bpp:?} codecs={codecs:?}",
+                outcome.mcs.selected, outcome.activation.desktop_size
+            );
+            drop(outcome);
+
+            let config = test_config();
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+            let mut frames = 0usize;
+            let ended = tokio::time::timeout(
+                Duration::from_secs(10),
+                run_session(&mut stream, &mut machine, |_, _| frames += 1, |_| {}),
+            )
+            .await;
+            use justrdp_pdu::egfx::*;
+            let confirmed: Vec<String> = [
+                CAPVERSION_8,
+                CAPVERSION_8_1,
+                CAPVERSION_10,
+                CAPVERSION_101,
+                CAPVERSION_102,
+                CAPVERSION_103,
+                CAPVERSION_104,
+                CAPVERSION_105,
+                CAPVERSION_106,
+                CAPVERSION_106_ERR,
+                CAPVERSION_107,
+            ]
+            .into_iter()
+            .filter(|v| logs_contain(&format!("version={v} flags")))
+            .map(|v| format!("{v:#010x}"))
+            .collect();
+            eprintln!("#428 row: egfx_confirmed={confirmed:?} frames={frames} ended={ended:?}");
+        })
+        .await
+    }
+
     /// Prints the server's Demand Active capability sets, flagging the two Surface Bits with
     /// NSCodec needs: a Surface Commands set and NSCodec among the Bitmap Codecs. Advisory: it
     /// asserts only that session-active was reached. A server advertising both need not send
@@ -9930,6 +9998,20 @@ mod tests {
         }
 
         impl Target {
+            /// The VM the main suite drives: [`Target::Main`], or the server named by
+            /// `JUSTRDP_TEST_SERVER` (`ws2019`, `ws2008r2`, `win11`), so the suite can run
+            /// against each row of the interop matrix.
+            fn from_env() -> Target {
+                match std::env::var("JUSTRDP_TEST_SERVER").as_deref() {
+                    Err(std::env::VarError::NotPresent) | Ok("ws2019") => Target::Main,
+                    Ok("ws2008r2") => Target::GdiOrders,
+                    Ok("win11") => Target::AudioInput,
+                    other => {
+                        panic!("JUSTRDP_TEST_SERVER is ws2019, ws2008r2 or win11, not {other:?}")
+                    }
+                }
+            }
+
             fn addr(self) -> &'static str {
                 match self {
                     Target::Main => VM_ADDR,
@@ -10382,7 +10464,7 @@ mod tests {
             F: FnOnce(Vm) -> Fut,
             Fut: Future<Output = T>,
         {
-            with_vm_session_on(Target::Main, body).await
+            with_vm_session_on(Target::from_env(), body).await
         }
 
         /// [`with_vm_session`] against `target`.
