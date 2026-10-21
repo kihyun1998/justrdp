@@ -551,9 +551,9 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
     two pixels in all four diagonal directions, equals the server's repaint: 0 px. In that
     repaint every line's last pixel is white. Drawing each segment's end makes 9 px differ, and
     Bresenham makes 156 px differ. The comparison covers the window's client area only (the
-    maintainer's call, 2026-10-21): outside it the Initial Configuration Tasks window repaints
-    differently in the reattached session, its right column (x 1120 to 1200) and bottom rows,
-    with no Polyline there, cause unknown (#513).
+    maintainer's call, 2026-10-21): outside it the Initial Configuration Tasks window differs,
+    because the server lays that window out again for a reattached session (#513,
+    [Verification harness](verification-harness.md)).
 - **A line that runs toward smaller x or y loses its first pixel to the server's bounds** (#512,
   measured on #500 2026-10-21). For `(304, 243)` to `(254, 243)` the server sends bounds 254 to 303 but
   paints 255 to 304. Its own repaint has the pixel; justrdp clips it away. A line up from

@@ -471,6 +471,14 @@ was checked against.
     Start search as VK taps; the console then takes a command line of any length as Unicode
     keyboard events. PowerShell 2.0's `Add-Type` compiles C# 2.0 there, so a form can call gdi32
     directly. The console stays open behind the form until the sign-out closes both.
+  - **A reattached session gets a shorter Initial Configuration Tasks window** (#513, measured
+    2026-10-21 with justrdp only, three sessions with the same advertisement and no input).
+    After a fresh logon its bottom edge lies under the taskbar; after a reattach it ends at
+    y 755, just above the taskbar, and gains a vertical scrollbar, so its content reflows. The
+    caption (y 12, x 132 to 1147) stays put. The first session and the second differ in 51,144
+    px, all inside that window. The second and third differ in 21 px, all in the clock. So a
+    comparison between a fresh logon and its reattach leaves that window out or covers it, as
+    #493 (Server Manager maximised) and #500 (its own window only) do.
 
   Its configuration, none of it in the repo:
   - Remote Desktop allows connections from **any version** of the client, so a TLS-only connect
