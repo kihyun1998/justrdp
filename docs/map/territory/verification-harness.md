@@ -234,7 +234,13 @@ in-session query.
   - the scripted tests get no verdict. Their scripts use cmdlets newer than 2008 R2's
     PowerShell 2.0 (unverified).
   - `frame_markers_bracket_what_a_redraw_paints_on_the_real_vm` differs from the redraw by
-    647013 pixels. It is the one failure that may be justrdp's own; nothing is settled yet.
+    647013 pixels, every run. The test takes its snapshot before the logon has finished (#524).
+    The redraw holds the Initial Configuration Tasks window and the tray icons; the snapshot
+    has neither. Two probes, 2026-10-22, show justrdp paints what the server paints:
+    - wait 30 s after the Start click before the snapshot, and the whole test passes;
+    - wait 20 s after the redraw and send a second Refresh Rect, and it matches what the
+      session painted to 0 px.
+    The test's fix is #525's.
 - **2008 R2 pads its cliprdr PDUs by four bytes.** Seen three times:
   - a Capabilities PDU with `dataLen` 16 in 28 bytes.
   - a first PDU of 8 + `dataLen` + 4.
