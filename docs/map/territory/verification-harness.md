@@ -217,18 +217,43 @@ in-session query.
 | Row | Build | Selected | Desktop, bpp | Bitmap Codecs advertised | EGFX confirmed | Main suite |
 |---|---|---|---|---|---|---|
 | WS2019 Standard, .136 | 10.0.17763 | HYBRID_EX | 1280×800, 32 | NSCodec, RemoteFX, Ignore, Image RemoteFX | 10.4 (`0x000A0400`) | 52/53 (2026-10-21) |
-| WS2008 R2, .167 | — | HYBRID (#484) | 16 bpp (#484) | — | — | not finished |
-| Win11 Ent eval, .163 | — | — | — | — | — | not run |
+| WS2008 R2 Standard, .167 | 6.1.7601 | HYBRID | 1280×800, 16 | NSCodec | none | 23/55 (2026-10-22) |
+| Win11 Ent eval 24H2, .163 | 10.0.26100 | HYBRID_EX | 1280×800, 32 | NSCodec, RemoteFX, Ignore, Image RemoteFX | 10.4 (`0x000A0400`) | 32/45, 9 not run (2026-10-22) |
 
 - **WS2019's one failure**, `a_drive_added_and_removed_mid_session_comes_and_goes_on_the_real_vm`,
   is the test's own: the `late seen` clipboard text arrives twice, and the second removal of the
   same drive returns `UnknownDrive`. It predated the switch; since #519 the test removes the
   drive once, and passes on WS2019 (`device-redirection.md` has the measurement).
-- **The 2008 R2 run has not finished.** Twice the host ran out of memory mid-run and Claude
-  Code's reaper killed it (once alongside the WS2019 suite, once alone): 7 of 22 passed before
-  the kill, and libtest prints failure messages only at the end, so the 15 failures are unread.
-  Next: run it in small groups, logging the test process's memory, so a test that grows on a
-  server that never sends what it waits for is found by name.
+- **A row's failures are data, not defects.** Most of them are a test asserting what WS2019
+  does. On 2008 R2:
+  - no EGFX, Display Control or 32 bpp. The server answers 32 bpp with 16, so the 32 bpp
+    order tests stop at their depth check.
+  - no audio: 0 blocks in 60 s for every format.
+  - the desktop arrives as bitmap updates where the order tests wait for orders, and the
+    Start menu does not slide, so there is no ScrBlt.
+  - the scripted tests get no verdict. Their scripts use cmdlets newer than 2008 R2's
+    PowerShell 2.0 (unverified).
+  - `frame_markers_bracket_what_a_redraw_paints_on_the_real_vm` differs from the redraw by
+    647013 pixels. It is the one failure that may be justrdp's own; nothing is settled yet.
+- **2008 R2 pads its cliprdr PDUs by four bytes.** Seen three times:
+  - a Capabilities PDU with `dataLen` 16 in 28 bytes.
+  - a first PDU of 8 + `dataLen` + 4.
+  - image Format Data of 2048064 bytes where WS2019 sends 2048060.
+- **Win11's own differences.**
+  - The server skips Channel Join (`skip_channel_join=true`), so
+    `connect_reaches_session_active_against_real_vm` finds no `rdp_channel_join` record.
+  - Notepad is the new app, so `keyboard_and_mouse_input_drive_the_real_vm` finds no edit area.
+  - `display_control_resize_against_real_vm` fails on both 2008 R2 and Win11. A cliprdr
+    Capabilities PDU arrives mid-resize, and the test refuses it as an unexpected event.
+- **Win11 defeats the harness's settle wait.** `powershell` opens in Windows Terminal, and its
+  cursor blinks a frame every ~560 ms. `vm::await_desktop` never sees the desktop settle, so a
+  scripted test types nothing. Teardown then cannot reach Start, and the next test reattaches
+  to the session left behind. 2 of 13 audio and capture tests passed. The other 9
+  PowerShell-driven tests were not run, because they only repeat that cascade. A tracing-test
+  `PoisonError` after another test's panic also failed both EGFX tests; run alone, they pass.
+- **The host's memory is not the suite's.** The 2008 R2 run was reaped four times. A 5 s
+  sampler showed the test process at 30–62 MB while another workload took the host from
+  13.8 GB free to 0.1 GB. Check the host before a long VM run.
 
 ## Cross-cutting invariants
 
