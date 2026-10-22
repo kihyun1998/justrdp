@@ -94,6 +94,10 @@ defect), #689 (the maintainer's rework that fixed it).
   2026-10-06) passed the same gate. The first exact pin after the fork bridge (`=0.21.3`,
   2026-08-10) passed the same gate; see ADR-0004's *Result* section for that run and
   for the suite's session-isolation caveat.
+- **A bump also runs the row probe on every other interop-matrix row** (ADR-0004 Amendment
+  2026-10-22, #428): `JUSTRDP_TEST_SERVER=ws2008r2` and `=win11`, then
+  `interop_matrix_row_probe_against_real_vm`. The rows negotiate NLA differently: WS2008 R2
+  selects HYBRID, while WS2019 and Win11 select HYBRID_EX.
 - **0.22 made `TsRequest::buffer_len()` fallible** (`Result<u16>`): a request whose
   encoded length overflows `u16` is now an error rather than a truncated size.
   `write_ts_request` surfaces it as `ConnectFailure::Nla`, the same as an encode

@@ -114,3 +114,27 @@ So: **the sspi bump is proven against the real server**, and the suite's session
 
 1. **A removal obligation cannot live in a closed issue, and "the bot will notice" is not ownership.** Prefer an obligation stated where the thing itself is (the manifest comment, which did survive) *plus* a condition someone re-evaluates, over a tracker entry that can be closed by anyone tidying a backlog.
 2. **Cite evidence, not status.** *"Remove when #689 ships"* is a status claim; it rots silently the moment it comes true. The map's [NLA / CredSSP](../map/territory/nla-credssp.md) and [supply chain](../map/territory/supply-chain-and-gates.md) territories now carry the dated facts instead, indexed by area rather than by event.
+
+## Amendment (2026-10-22) — a bump also connects to every interop-matrix row
+
+**A judgement, the maintainer's (#428), not a derivation.** The version-bump gate is now two
+parts:
+
+1. The main suite passes on WS2019, as before.
+2. `interop_matrix_row_probe_against_real_vm` passes on every other row of the interop matrix
+   (`JUSTRDP_TEST_SERVER=ws2008r2`, `=win11`).
+
+**What it was decided on.** The row run of 2026-10-22, which showed that:
+- `sspi` is the NLA path only, and the rows negotiate it differently. WS2008 R2 selects HYBRID;
+  WS2019 and Win11 select HYBRID_EX. Each sends a different NTLM `Version`.
+- The probe completes X.224 → TLS → CredSSP → activation on a row in 30–40 s.
+- The full suite on the other rows fails for reasons unrelated to `sspi`: a row lacks the
+  feature a test asserts, or the harness cannot drive that desktop (#523, #525).
+
+**What it does not cover.**
+- The rows #428 still leaves open (WS2016, WS2022, Win10, an AD-joined server) join the gate
+  only once they exist.
+- `connect_reaches_session_active_against_real_vm` is not the per-row check. It asserts
+  Channel Join records that Win11 skips (#525). The probe is the check.
+- What a row looks like and why its other tests fail lives in the
+  [verification harness](../map/territory/verification-harness.md#interop-matrix) note.
