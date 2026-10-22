@@ -121,6 +121,9 @@ advisory by the maintainer's call, made when no justrdp stimulus had produced a 
   semantics (CLAUDE.md, "the host owns"). The server's IME Status PDU is skipped on purpose
   (#439; [Session loop & PDU dispatch](session-loop-dispatch.md), Reference behaviour). The
   Unicode path is a different PDU shape, not a table row.
+- **Windows 11 24H2's console ignores Unicode keyboard events** (#529, measured 2026-10-22, with
+  FreeRDP too); its Start search and the new Notepad take them. So text sent as Unicode is not
+  a way to type into every Windows app.
 - Multitouch and pen (epic #15), relative-mouse mode (a GCC early flag exists,
   `RELATIVE_MOUSE_INPUT`) are not implemented.
 - Nothing tests the macOS or Linux tables on their own platform — the CI runner is

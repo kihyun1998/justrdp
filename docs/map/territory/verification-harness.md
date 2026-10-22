@@ -263,11 +263,18 @@ in-session query.
     on the same frame counter (`painted_since`).
   - Measured after the change, 2026-10-22: each of the 18 rerun tests signed out
     (`LogoffByUser`), and nothing cascaded.
-- **Win11 receives typed text altered.** The server copied `aaaserver hhhost: He 한글 😀`
-  where the test typed `server → host: Hé 한글 😀`. Each scripted test also got no verdict.
-  Nothing yet says whether the cause is the input path or the apps.
-- **Win11 sends no audio output.** 0 blocks in 60 s for every format, after the playback was
-  typed.
+- **Win11 24H2's console drops Unicode keyboard events, from any client** (#529, 2026-10-22).
+  Every scripted test types its command line as Unicode, so on Win11 none of them runs.
+  - Into one console, scancodes typed `scan ok ` and landed; the Unicode text typed right after
+    them did not appear. Fast-path and slow-path behaved the same. Text pasted through the
+    clipboard displays, so the font is not the cause.
+  - FreeRDP 3.32.1 from WSL with `/kbd:unicode:on` does the same. Its Unicode reached the Start
+    search and launched PowerShell, and Ctrl+C and Return reached the console, but none of
+    `echo ascii → Hé 한글` did. With `/kbd:unicode:off`, `echo abc` lands.
+  - The new Notepad takes Unicode, but not all of it, and not the same way twice: `→` dropped,
+    `é` as `e`, the emoji broken, the Hangul intact.
+  - So audio output on Win11 is unmeasured. The playback is a typed line too, which explains its
+    0 blocks.
 - A tracing-test `PoisonError` after another test's panic failed both EGFX tests; run alone,
   they pass.
 - **The host's memory is not the suite's.** The 2008 R2 run was reaped four times. A 5 s
