@@ -218,7 +218,7 @@ in-session query.
 |---|---|---|---|---|---|---|
 | WS2019 Standard, .136 | 10.0.17763 | HYBRID_EX | 1280×800, 32 | NSCodec, RemoteFX, Ignore, Image RemoteFX | 10.4 (`0x000A0400`) | 52/53 (2026-10-21) |
 | WS2008 R2 Standard, .167 | 6.1.7601 | HYBRID | 1280×800, 16 | NSCodec | none | 23/55 (2026-10-22) |
-| Win11 Ent eval 24H2, .163 | 10.0.26100 | HYBRID_EX | 1280×800, 32 | NSCodec, RemoteFX, Ignore, Image RemoteFX | 10.4 (`0x000A0400`) | 32/45, 9 not run (2026-10-22) |
+| Win11 Ent eval 24H2, .163 | 10.0.26100 | HYBRID_EX | 1280×800, 32 | NSCodec, RemoteFX, Ignore, Image RemoteFX | 10.4 (`0x000A0400`) | 35/54 (2026-10-22) |
 
 - **WS2019's one failure**, `a_drive_added_and_removed_mid_session_comes_and_goes_on_the_real_vm`,
   is the test's own: the `late seen` clipboard text arrives twice, and the second removal of the
@@ -251,12 +251,25 @@ in-session query.
   - Notepad is the new app, so `keyboard_and_mouse_input_drive_the_real_vm` finds no edit area.
   - `display_control_resize_against_real_vm` fails on both 2008 R2 and Win11. A cliprdr
     Capabilities PDU arrives mid-resize, and the test refuses it as an unexpected event.
-- **Win11 defeats the harness's settle wait.** `powershell` opens in Windows Terminal, and its
-  cursor blinks a frame every ~560 ms. `vm::await_desktop` never sees the desktop settle, so a
-  scripted test types nothing. Teardown then cannot reach Start, and the next test reattaches
-  to the session left behind. 2 of 13 audio and capture tests passed. The other 9
-  PowerShell-driven tests were not run, because they only repeat that cascade. A tracing-test
-  `PoisonError` after another test's panic also failed both EGFX tests; run alone, they pass.
+- **The Win11 VM's default terminal is the Windows Console Host** (#523). This is set for
+  `rdptest` under Settings > System > For developers > Terminal; none of it is in the repo.
+  - Why: out of the box, `powershell` opens in Windows Terminal, and its cursor blinks a frame
+    every ~560 ms forever. `vm::await_desktop` waits for 2 s with no frame, so it never sees
+    the desktop settle. A scripted test then types nothing. Teardown cannot reach Start, and
+    the next test reattaches to the session left behind.
+  - conhost is what WS2019 opens. Its caret stops repainting once idle: the sound tests open
+    it and wait for a settled desktop, and they pass there.
+  - Ignoring small updates would not fix it. A keystroke's acknowledgement is a small repaint
+    on the same frame counter (`painted_since`).
+  - Measured after the change, 2026-10-22: each of the 18 rerun tests signed out
+    (`LogoffByUser`), and nothing cascaded.
+- **Win11 receives typed text altered.** The server copied `aaaserver hhhost: He 한글 😀`
+  where the test typed `server → host: Hé 한글 😀`. Each scripted test also got no verdict.
+  Nothing yet says whether the cause is the input path or the apps.
+- **Win11 sends no audio output.** 0 blocks in 60 s for every format, after the playback was
+  typed.
+- A tracing-test `PoisonError` after another test's panic failed both EGFX tests; run alone,
+  they pass.
 - **The host's memory is not the suite's.** The 2008 R2 run was reaped four times. A 5 s
   sampler showed the test process at 30–62 MB while another workload took the host from
   13.8 GB free to 0.1 GB. Check the host before a long VM run.
