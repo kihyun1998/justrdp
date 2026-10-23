@@ -2948,28 +2948,10 @@ mod tests {
                             vec![key.press(), key.release()]
                         };
                         let type_line = |line: &str| {
-                            let (input_tx, enter, units) = (
-                                input_tx.clone(),
-                                enter.clone(),
-                                line.encode_utf16().collect::<Vec<_>>(),
-                            );
+                            let (input_tx, enter, line) =
+                                (input_tx.clone(), enter.clone(), line.to_string());
                             async move {
-                                for unit in units {
-                                    input_tx
-                                        .send(vec![
-                                            InputEvent::Unicode {
-                                                code_unit: unit,
-                                                release: false,
-                                            },
-                                            InputEvent::Unicode {
-                                                code_unit: unit,
-                                                release: true,
-                                            },
-                                        ])
-                                        .await
-                                        .map_err(|_| "the session closed".to_string())?;
-                                    tokio::time::sleep(Duration::from_millis(15)).await;
-                                }
+                                vm::type_ascii(&input_tx, &vm::console_line(&line)).await?;
                                 input_tx
                                     .send(enter)
                                     .await
@@ -5148,28 +5130,10 @@ mod tests {
                             vec![key.press(), key.release()]
                         };
                         let type_line = |line: &str| {
-                            let (input_tx, enter, units) = (
-                                input_tx.clone(),
-                                enter.clone(),
-                                line.encode_utf16().collect::<Vec<_>>(),
-                            );
+                            let (input_tx, enter, line) =
+                                (input_tx.clone(), enter.clone(), line.to_string());
                             async move {
-                                for unit in units {
-                                    input_tx
-                                        .send(vec![
-                                            InputEvent::Unicode {
-                                                code_unit: unit,
-                                                release: false,
-                                            },
-                                            InputEvent::Unicode {
-                                                code_unit: unit,
-                                                release: true,
-                                            },
-                                        ])
-                                        .await
-                                        .map_err(|_| "the session closed".to_string())?;
-                                    tokio::time::sleep(Duration::from_millis(15)).await;
-                                }
+                                vm::type_ascii(&input_tx, &vm::console_line(&line)).await?;
                                 input_tx
                                     .send(enter)
                                     .await
@@ -5439,28 +5403,10 @@ mod tests {
                             vec![key.press(), key.release()]
                         };
                         let type_line = |line: &str| {
-                            let (input_tx, enter, units) = (
-                                input_tx.clone(),
-                                enter.clone(),
-                                line.encode_utf16().collect::<Vec<_>>(),
-                            );
+                            let (input_tx, enter, line) =
+                                (input_tx.clone(), enter.clone(), line.to_string());
                             async move {
-                                for unit in units {
-                                    input_tx
-                                        .send(vec![
-                                            InputEvent::Unicode {
-                                                code_unit: unit,
-                                                release: false,
-                                            },
-                                            InputEvent::Unicode {
-                                                code_unit: unit,
-                                                release: true,
-                                            },
-                                        ])
-                                        .await
-                                        .map_err(|_| "the session closed".to_string())?;
-                                    tokio::time::sleep(Duration::from_millis(15)).await;
-                                }
+                                vm::type_ascii(&input_tx, &vm::console_line(&line)).await?;
                                 input_tx
                                     .send(enter)
                                     .await
@@ -5833,22 +5779,7 @@ mod tests {
                         };
                         vm::start_menu_run(&input_tx, &frames, desktop, "powershell").await?;
                         vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
-                        for unit in SCRIPT.encode_utf16() {
-                            input_tx
-                                .send(vec![
-                                    InputEvent::Unicode {
-                                        code_unit: unit,
-                                        release: false,
-                                    },
-                                    InputEvent::Unicode {
-                                        code_unit: unit,
-                                        release: true,
-                                    },
-                                ])
-                                .await
-                                .map_err(|_| "the session closed".to_string())?;
-                            tokio::time::sleep(Duration::from_millis(15)).await;
-                        }
+                        vm::type_ascii(&input_tx, &vm::console_line(SCRIPT)).await?;
                         input_tx
                             .send(enter)
                             .await
@@ -6187,28 +6118,10 @@ mod tests {
                             vec![key.press(), key.release()]
                         };
                         let type_line = |line: &str| {
-                            let (input_tx, enter, units) = (
-                                input_tx.clone(),
-                                enter.clone(),
-                                line.encode_utf16().collect::<Vec<_>>(),
-                            );
+                            let (input_tx, enter, line) =
+                                (input_tx.clone(), enter.clone(), line.to_string());
                             async move {
-                                for unit in units {
-                                    input_tx
-                                        .send(vec![
-                                            InputEvent::Unicode {
-                                                code_unit: unit,
-                                                release: false,
-                                            },
-                                            InputEvent::Unicode {
-                                                code_unit: unit,
-                                                release: true,
-                                            },
-                                        ])
-                                        .await
-                                        .map_err(|_| "the session closed".to_string())?;
-                                    tokio::time::sleep(Duration::from_millis(15)).await;
-                                }
+                                vm::type_ascii(&input_tx, &vm::console_line(&line)).await?;
                                 input_tx
                                     .send(enter)
                                     .await
@@ -6829,22 +6742,7 @@ mod tests {
                         };
                         vm::start_menu_run(&input_tx, &frames, desktop, "powershell").await?;
                         vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
-                        for unit in SCRIPT.encode_utf16() {
-                            input_tx
-                                .send(vec![
-                                    InputEvent::Unicode {
-                                        code_unit: unit,
-                                        release: false,
-                                    },
-                                    InputEvent::Unicode {
-                                        code_unit: unit,
-                                        release: true,
-                                    },
-                                ])
-                                .await
-                                .map_err(|_| "the session closed".to_string())?;
-                            tokio::time::sleep(Duration::from_millis(15)).await;
-                        }
+                        vm::type_ascii(&input_tx, &vm::console_line(SCRIPT)).await?;
                         input_tx
                             .send(enter)
                             .await
@@ -7230,22 +7128,7 @@ mod tests {
                         };
                         vm::start_menu_run(&input_tx, &frames, desktop, "powershell").await?;
                         vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
-                        for unit in SCRIPT.encode_utf16() {
-                            input_tx
-                                .send(vec![
-                                    InputEvent::Unicode {
-                                        code_unit: unit,
-                                        release: false,
-                                    },
-                                    InputEvent::Unicode {
-                                        code_unit: unit,
-                                        release: true,
-                                    },
-                                ])
-                                .await
-                                .map_err(|_| "the session closed".to_string())?;
-                            tokio::time::sleep(Duration::from_millis(15)).await;
-                        }
+                        vm::type_ascii(&input_tx, &vm::console_line(SCRIPT)).await?;
                         input_tx
                             .send(enter)
                             .await
@@ -7897,22 +7780,7 @@ mod tests {
                         vm::start_menu_run(&input_tx, &frames, desktop, "powershell").await?;
                         vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
                         const SCRIPT: &str = "[console]::beep(800,300);[console]::Write([char]7);                            [Media.SystemSounds]::Beep.Play();[Media.SystemSounds]::Asterisk.Play()";
-                        for unit in SCRIPT.encode_utf16() {
-                            input_tx
-                                .send(vec![
-                                    InputEvent::Unicode {
-                                        code_unit: unit,
-                                        release: false,
-                                    },
-                                    InputEvent::Unicode {
-                                        code_unit: unit,
-                                        release: true,
-                                    },
-                                ])
-                                .await
-                                .map_err(|_| "the session closed".to_string())?;
-                            tokio::time::sleep(Duration::from_millis(15)).await;
-                        }
+                        vm::type_ascii(&input_tx, &vm::console_line(SCRIPT)).await?;
                         let enter = justrdp::input::scancode_from_windows_vk(0x0D).unwrap();
                         input_tx
                             .send(vec![enter.press(), enter.release()])
@@ -10280,6 +10148,104 @@ mod tests {
             }
         }
 
+        /// The US-layout key that types `ch`: its Windows VK, and whether Shift is held.
+        /// `None` for a character the layout has no key for.
+        pub(super) fn us_key(ch: char) -> Option<(u16, bool)> {
+            const SHIFTED_DIGITS: &str = ")!@#$%^&*(";
+            // (VK, unshifted, shifted) for the OEM keys.
+            const OEM: [(u16, char, char); 11] = [
+                (0xBA, ';', ':'),
+                (0xBB, '=', '+'),
+                (0xBC, ',', '<'),
+                (0xBD, '-', '_'),
+                (0xBE, '.', '>'),
+                (0xBF, '/', '?'),
+                (0xC0, '`', '~'),
+                (0xDB, '[', '{'),
+                (0xDC, '\\', '|'),
+                (0xDD, ']', '}'),
+                (0xDE, '\'', '"'),
+            ];
+            match ch {
+                'a'..='z' => Some((ch.to_ascii_uppercase() as u16, false)),
+                'A'..='Z' => Some((ch as u16, true)),
+                '0'..='9' => Some((ch as u16, false)),
+                ' ' => Some((0x20, false)),
+                _ => SHIFTED_DIGITS
+                    .find(ch)
+                    .map(|digit| (0x30 + digit as u16, true))
+                    .or_else(|| {
+                        OEM.iter().find_map(|&(vk, plain, shifted)| {
+                            (ch == plain)
+                                .then_some((vk, false))
+                                .or((ch == shifted).then_some((vk, true)))
+                        })
+                    }),
+            }
+        }
+
+        /// `line` as a console can take it in scancodes: unchanged when it is ASCII, otherwise
+        /// a PowerShell `-EncodedCommand` that runs it.
+        pub(super) fn console_line(line: &str) -> String {
+            if line.is_ascii() {
+                return line.to_string();
+            }
+            let utf16le: Vec<u8> = line.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            format!("powershell -NoProfile -EncodedCommand {}", base64(&utf16le))
+        }
+
+        /// Standard base64 (RFC 4648, padded).
+        pub(super) fn base64(bytes: &[u8]) -> String {
+            const ALPHABET: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+            for chunk in bytes.chunks(3) {
+                let n = chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+                for i in 0..4 {
+                    out.push(if i <= chunk.len() {
+                        char::from(ALPHABET[(n >> (18 - 6 * i) & 0x3F) as usize])
+                    } else {
+                        '='
+                    });
+                }
+            }
+            out
+        }
+
+        /// Type `line` as US-layout scancodes, one character per batch with Shift around the
+        /// shifted ones. A line with a character the layout has no key for is refused whole,
+        /// before anything is sent.
+        pub(super) async fn type_ascii(
+            tx: &tokio::sync::mpsc::Sender<Vec<InputEvent>>,
+            line: &str,
+        ) -> Result<(), String> {
+            let scancode = |vk| {
+                justrdp::input::scancode_from_windows_vk(vk)
+                    .unwrap_or_else(|| panic!("VK {vk:#04x} maps to a scancode"))
+            };
+            let keys = line
+                .chars()
+                .map(|ch| us_key(ch).ok_or_else(|| format!("no US key for {ch:?}")))
+                .collect::<Result<Vec<_>, _>>()?;
+            let shift = scancode(0x10);
+            for (vk, shifted) in keys {
+                let key = scancode(vk);
+                let events = if shifted {
+                    vec![shift.press(), key.press(), key.release(), shift.release()]
+                } else {
+                    vec![key.press(), key.release()]
+                };
+                tx.send(events)
+                    .await
+                    .map_err(|_| "the session closed".to_string())?;
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            Ok(())
+        }
+
         /// What [`start_menu_run`] observed on its way through: the frame count at each step,
         /// and how many input events it sent.
         ///
@@ -10706,6 +10672,70 @@ mod tests {
             assert_eq!(vk_for('l'), vk_for('L'));
             assert_eq!(vk_for('/'), Some(0xBF));
             assert_eq!(vk_for(' '), Some(0x20));
+        }
+
+        /// Every printable ASCII character has a US-layout key, and that key has a scancode:
+        /// every script the suite types into a console is ASCII (#533).
+        #[test]
+        fn us_key_types_every_printable_ascii_character() {
+            for ch in (0x20u8..=0x7E).map(char::from) {
+                let (vk, _) = us_key(ch).unwrap_or_else(|| panic!("no US key for {ch:?}"));
+                assert!(
+                    justrdp::input::scancode_from_windows_vk(vk).is_some(),
+                    "VK {vk:#04x} for {ch:?} has no set-1 scancode"
+                );
+            }
+            assert_eq!(us_key('$'), Some((0x34, true)));
+            assert_eq!(us_key('\\'), Some((0xDC, false)));
+            assert_eq!(us_key('"'), Some((0xDE, true)));
+            assert_eq!(us_key('a'), Some((0x41, false)));
+            assert_eq!(us_key('A'), Some((0x41, true)));
+            assert_eq!(us_key('é'), None);
+            assert_eq!(us_key('\n'), None);
+        }
+
+        /// An ASCII line is typed as it is; any other line becomes a PowerShell
+        /// `-EncodedCommand` (UTF-16LE, base64), which is all ASCII.
+        #[test]
+        fn console_line_encodes_only_a_line_with_non_ascii() {
+            assert_eq!(
+                console_line("Set-Clipboard -Value later"),
+                "Set-Clipboard -Value later"
+            );
+            // `powershell -EncodedCommand ZABpAHIA` runs `dir` (the documented example).
+            assert_eq!(
+                console_line("dir한"),
+                "powershell -NoProfile -EncodedCommand ZABpAHIAXNU="
+            );
+            assert_eq!(base64(b"dir"), "ZGly");
+            assert_eq!(base64(b"di"), "ZGk=");
+            assert_eq!(base64(b"d"), "ZA==");
+            assert!(console_line("hello 한글 😀").is_ascii());
+        }
+
+        /// A shifted character is typed inside a Shift press and release; an unshifted one
+        /// is not, and a character with no key is refused before anything is sent.
+        #[tokio::test]
+        async fn type_ascii_holds_shift_only_around_a_shifted_character() {
+            let key = |vk| justrdp::input::scancode_from_windows_vk(vk).unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            type_ascii(&tx, "a$").await.expect("ASCII types");
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                vec![key(0x41).press(), key(0x41).release()]
+            );
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                vec![
+                    key(0x10).press(),
+                    key(0x34).press(),
+                    key(0x34).release(),
+                    key(0x10).release()
+                ]
+            );
+            let err = type_ascii(&tx, "é").await.expect_err("no US key for é");
+            assert!(err.contains("'é'"), "{err}");
+            assert!(rx.try_recv().is_err(), "nothing is sent for a refused line");
         }
 
         /// An RGBA8888 black desktop with `white` rectangles `(x, y, w, h)` painted on it.
@@ -14229,28 +14259,10 @@ mod tests {
                             vec![key.press(), key.release()]
                         };
                         let type_line = |line: &str| {
-                            let (input_tx, enter, units) = (
-                                input_tx.clone(),
-                                enter.clone(),
-                                line.encode_utf16().collect::<Vec<_>>(),
-                            );
+                            let (input_tx, enter, line) =
+                                (input_tx.clone(), enter.clone(), line.to_string());
                             async move {
-                                for unit in units {
-                                    input_tx
-                                        .send(vec![
-                                            InputEvent::Unicode {
-                                                code_unit: unit,
-                                                release: false,
-                                            },
-                                            InputEvent::Unicode {
-                                                code_unit: unit,
-                                                release: true,
-                                            },
-                                        ])
-                                        .await
-                                        .map_err(|_| "the session closed".to_string())?;
-                                    tokio::time::sleep(Duration::from_millis(15)).await;
-                                }
+                                vm::type_ascii(&input_tx, &vm::console_line(&line)).await?;
                                 input_tx
                                     .send(enter)
                                     .await

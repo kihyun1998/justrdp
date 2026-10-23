@@ -218,7 +218,7 @@ in-session query.
 |---|---|---|---|---|---|---|
 | WS2019 Standard, .136 | 10.0.17763 | HYBRID_EX | 1280×800, 32 | NSCodec, RemoteFX, Ignore, Image RemoteFX | 10.4 (`0x000A0400`) | 52/53 (2026-10-21) |
 | WS2008 R2 Standard, .167 | 6.1.7601 | HYBRID | 1280×800, 16 | NSCodec | none | 23/55 (2026-10-22) |
-| Win11 Ent eval 24H2, .163 | 10.0.26100 | HYBRID_EX | 1280×800, 32 | NSCodec, RemoteFX, Ignore, Image RemoteFX | 10.4 (`0x000A0400`) | 35/54 (2026-10-22) |
+| Win11 Ent eval 24H2, .163 | 10.0.26100 | HYBRID_EX | 1280×800, 32 | NSCodec, RemoteFX, Ignore, Image RemoteFX | 10.4 (`0x000A0400`) | 47/54 (2026-10-23) |
 
 - **WS2019's one failure**, `a_drive_added_and_removed_mid_session_comes_and_goes_on_the_real_vm`,
   is the test's own: the `late seen` clipboard text arrives twice, and the second removal of the
@@ -264,7 +264,7 @@ in-session query.
   - Measured after the change, 2026-10-22: each of the 18 rerun tests signed out
     (`LogoffByUser`), and nothing cascaded.
 - **Win11 24H2's console drops Unicode keyboard events, from any client** (#529, 2026-10-22).
-  Every scripted test types its command line as Unicode, so on Win11 none of them runs.
+  So the harness types every console line as scancodes (#533, below).
   - Into one console, scancodes typed `scan ok ` and landed; the Unicode text typed right after
     them did not appear. Fast-path and slow-path behaved the same. Text pasted through the
     clipboard displays, so the font is not the cause.
@@ -273,8 +273,28 @@ in-session query.
     `echo ascii → Hé 한글` did. With `/kbd:unicode:off`, `echo abc` lands.
   - The new Notepad takes Unicode, but not all of it, and not the same way twice: `→` dropped,
     `é` as `e`, the emoji broken, the Hangul intact.
-  - So audio output on Win11 is unmeasured. The playback is a typed line too, which explains its
-    0 blocks.
+- **The harness types console lines as US-layout scancodes on every row** (#533, the
+  maintainer's call, 2026-10-23).
+  - `vm::type_ascii` sends each character as its US-layout key, wrapped in Shift where the
+    character needs it. It refuses a whole line with a character the layout lacks, before
+    sending anything: a half-typed line would run another command.
+  - `vm::console_line` turns a line with non-ASCII text into `powershell -NoProfile
+    -EncodedCommand <base64 of its UTF-16LE>`, which is all ASCII. Four tests carry Hangul in
+    their scripts.
+  - What still types Unicode, on purpose: the Run dialog line of the audio-input tests (the Run
+    dialog takes it on Win11), the Notepad text of
+    `text_crosses_the_clipboard_both_ways_on_the_real_vm` (it is the test's data), and the
+    2008 R2 GDI script (that console takes it).
+  - So the VMs must keep the US layout. A scancode is a key position, and the server's layout
+    decides its character.
+  - Measured: WS2019 passes all 15 scripted tests through the new path. On Win11, 13 of 15 pass,
+    and Win11's audio output works for every format.
+- **Two scripted tests still fail on Win11**, unexplained:
+  - `images_cross_the_clipboard_both_ways_on_the_real_vm`: Print Screen puts nothing on the
+    clipboard ("no message was dropped within 30 s"). Win11 may send Print Screen to the
+    Snipping Tool; unverified.
+  - `a_clipboard_without_file_transfer_is_offered_no_files_on_the_real_vm`: the server fails the
+    host's request for the text a `Set-Clipboard` put there. The same line passes on WS2019.
 - A tracing-test `PoisonError` after another test's panic failed both EGFX tests; run alone,
   they pass.
 - **The host's memory is not the suite's.** The 2008 R2 run was reaped four times. A 5 s
