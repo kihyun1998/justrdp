@@ -4834,11 +4834,12 @@ mod tests {
             }
 
             let driver = {
-                let (frames, cancel, clipboard, handshake_done) = (
+                let (frames, cancel, clipboard, handshake_done, dib_requested) = (
                     frames.clone(),
                     cancel.clone(),
                     clipboard.clone(),
                     handshake_done.clone(),
+                    dib_requested.clone(),
                 );
                 let commands_tx = commands_tx.clone();
                 tokio::spawn(async move {
@@ -4947,10 +4948,22 @@ mod tests {
                                 "the server answered the host's Format List with {accepted:?}"
                             ));
                         }
+                        // The paste is done once Paint has fetched the gradient. Windows 11 Paint
+                        // repaints without pause while a pasted selection floats, so the desktop
+                        // does not settle until Esc sets the selection down.
                         send(chord(0x56)).await?;
-                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                        let start = tokio::time::Instant::now();
+                        while dib_requested.load(Ordering::SeqCst) == 0 {
+                            if start.elapsed() > vm::MENU_DEADLINE {
+                                return Err("pasting in Paint never asked for the CF_DIB".into());
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
                         send(chord(0x43)).await?;
                         let (round_trip, _) = next_image(&mut images).await?;
+                        let esc = key(0x1B);
+                        send(vec![esc.press(), esc.release()]).await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
                         Ok((dropped_length, screenshot, round_trip))
                     }
                     .await;
