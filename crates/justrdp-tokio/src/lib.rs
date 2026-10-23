@@ -10110,6 +10110,9 @@ mod tests {
         /// How long a menu or a search result gets to *finish* drawing. Shorter than
         /// [`DESKTOP_DEADLINE`] because something is already known to be painting by then.
         pub(super) const MENU_DEADLINE: Duration = Duration::from_secs(15);
+        /// How long each step of a sign-out typed without acknowledgements waits before the
+        /// next.
+        const BLIND_STEP: Duration = Duration::from_secs(3);
 
         /// Wait until the server has painted *something* and then gone quiet for
         /// [`DESKTOP_QUIET`]; returns the frame count it settled at.
@@ -10575,6 +10578,64 @@ mod tests {
             }
         }
 
+        /// How [`sign_out_drive`] typed the sign-out.
+        #[derive(Debug, PartialEq)]
+        enum SignOutPath {
+            /// Through [`start_menu_run`], each step acknowledged by the frame stream.
+            Acknowledged,
+            /// At [`BLIND_STEP`] intervals, because the desktop painted but never went quiet.
+            Blind,
+        }
+
+        /// Type `command` into the Start search and press Enter, so the session signs out.
+        ///
+        /// A desktop that settles within `deadline` gets [`start_menu_run`]. One that paints
+        /// but never goes quiet, such as an application that repaints without pause, gets the
+        /// same keystrokes at [`BLIND_STEP`] intervals: Esc, a Start click, the command, Enter.
+        /// One that never paints gets nothing.
+        async fn sign_out_drive(
+            tx: &tokio::sync::mpsc::Sender<Vec<InputEvent>>,
+            frames: &AtomicUsize,
+            desktop: (u16, u16),
+            command: &str,
+            deadline: Duration,
+        ) -> Result<SignOutPath, String> {
+            match await_desktop(frames, deadline).await {
+                Ok(_) => start_menu_run(tx, frames, desktop, command)
+                    .await
+                    .map(|_| SignOutPath::Acknowledged),
+                Err(why) if frames.load(Ordering::SeqCst) == 0 => Err(why),
+                Err(why) => {
+                    eprintln!("vm harness: {why}; typing the sign-out without acknowledgements");
+                    let closed = || "the session loop closed the input channel".to_string();
+                    tx.send(tap(0x1B)).await.map_err(|_| closed())?;
+                    tokio::time::sleep(BLIND_STEP).await;
+                    let (x, y) = (24u16, desktop.1.saturating_sub(20));
+                    let click = [
+                        justrdp_pdu::input::PTRFLAGS_MOVE,
+                        justrdp_pdu::input::PTRFLAGS_DOWN | justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                        justrdp_pdu::input::PTRFLAGS_BUTTON1,
+                    ]
+                    .map(|flags| InputEvent::Mouse {
+                        flags,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    });
+                    tx.send(click.to_vec()).await.map_err(|_| closed())?;
+                    tokio::time::sleep(BLIND_STEP).await;
+                    for ch in command.chars() {
+                        let vk = vk_for(ch).ok_or_else(|| format!("no VK mapping for {ch:?}"))?;
+                        tx.send(tap(vk)).await.map_err(|_| closed())?;
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                    tokio::time::sleep(BLIND_STEP).await;
+                    tx.send(tap(0x0D)).await.map_err(|_| closed())?;
+                    Ok(SignOutPath::Blind)
+                }
+            }
+        }
+
         /// Return the VM to a clean desktop by **signing the Windows session out**, forcibly.
         ///
         /// Why a sign-out and not a sweep of the open windows: closing windows from the client
@@ -10617,15 +10678,19 @@ mod tests {
                 // A reattach can wait a long time for its first paint (Windows 11 sent nothing
                 // for 60 s after a session dropped 0.1 s into its logon, #540), so the teardown
                 // waits longer than a test does before `start_menu_run` waits its own way.
-                if let Err(why) = await_desktop(&frames, TEARDOWN_DESKTOP_DEADLINE).await {
-                    eprintln!("vm harness: teardown saw no desktop: {why}");
-                    return;
-                }
-                if let Err(why) = start_menu_run(&tx, &frames, desktop, target.sign_out()).await {
+                let signed = sign_out_drive(
+                    &tx,
+                    &frames,
+                    desktop,
+                    target.sign_out(),
+                    TEARDOWN_DESKTOP_DEADLINE,
+                )
+                .await;
+                if let Err(why) = signed {
                     // Say it here rather than only failing below: this is the sentence that
                     // distinguishes "the sign-out was refused" from "the sign-out was never
                     // typed", and #182's whole cost was not being able to tell those apart.
-                    eprintln!("vm harness: teardown could not reach the Start menu: {why}");
+                    eprintln!("vm harness: teardown could not type the sign-out: {why}");
                     return;
                 }
                 // Hold the input channel open so the session loop keeps its input branch until
@@ -10642,7 +10707,8 @@ mod tests {
             // `TEARDOWN_DESKTOP_DEADLINE` (90 s) + the settled desktop `start_menu_run` sees
             // again (~2 s) + `START_ATTEMPTS` x `STEP_ACK` (30 s) + the typing and its
             // acknowledgement (~8 s) = ~130 s, and Windows' own sign-out measures ~20 s on top
-            // of a measured ~28 s happy path.
+            // of a measured ~28 s happy path. A desktop that never settles takes the blind path
+            // instead: 90 s + ~11 s of typing, then the sign-out.
             let ended = tokio::time::timeout(
                 Duration::from_secs(180),
                 run_session_with_input(
@@ -10690,6 +10756,54 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// A desktop that repaints without pause never settles, and the teardown still has to
+        /// sign it out: the sign-out is typed blind, Esc first and Enter last.
+        #[tokio::test(start_paused = true)]
+        async fn sign_out_drive_types_blind_on_a_desktop_that_never_settles() {
+            let frames = Arc::new(AtomicUsize::new(0));
+            let painting = frames.clone();
+            let animation = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    painting.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            let path = sign_out_drive(&tx, &frames, (1280, 800), SIGN_OUT, Duration::from_secs(10))
+                .await
+                .expect("a painting desktop is signed out blind");
+            animation.abort();
+            drop(tx);
+            let mut sent = Vec::new();
+            while let Some(events) = rx.recv().await {
+                sent.push(events);
+            }
+            assert_eq!(path, SignOutPath::Blind);
+            assert_eq!(sent.first(), Some(&tap(0x1B)), "Esc first");
+            assert!(
+                sent[1]
+                    .iter()
+                    .any(|e| matches!(e, InputEvent::Mouse { .. })),
+                "then the Start click: {:?}",
+                sent[1]
+            );
+            assert_eq!(sent.len(), 2 + SIGN_OUT.chars().count() + 1);
+            assert_eq!(sent.last(), Some(&tap(0x0D)), "Enter last");
+        }
+
+        /// A desktop that never paints gets no keystrokes at all.
+        #[tokio::test(start_paused = true)]
+        async fn sign_out_drive_types_nothing_into_a_desktop_that_never_painted() {
+            let frames = AtomicUsize::new(0);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            let err = sign_out_drive(&tx, &frames, (1280, 800), SIGN_OUT, Duration::from_secs(10))
+                .await
+                .expect_err("nothing painted, so nothing is typed");
+            drop(tx);
+            assert!(err.contains("(0 frames)"), "{err}");
+            assert!(rx.recv().await.is_none(), "no input was sent");
         }
 
         /// The `> 0` half of [`await_desktop`], which is the whole of #198's cold-logon
