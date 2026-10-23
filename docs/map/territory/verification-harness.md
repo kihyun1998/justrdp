@@ -260,8 +260,10 @@ in-session query.
   and the 2008 R2 Capabilities bytes are now in its unit test. What failed was the image
   test's own sum, which left the padding out. It now adds the padding of the Format Data
   Response that was delivered. On 2008 R2 (2026-10-23) the sum holds: 2048064 = 8 + 2048052
-  + 4. The test then stops at the screenshot itself. 2008 R2 sends it as a 16 bpp
-  `BI_BITFIELDS` DIB (RGB565 masks), and the test's DIB reader takes only 24 and 32 bpp.
+  + 4. 2008 R2 sends the screenshot as a 16 bpp `BI_BITFIELDS` DIB (RGB565 masks). Since
+  #543 the test's DIB reader takes every channel through its mask and widens it by repeating
+  its top bits, the rule the comparison at the session's depth uses. With that, the whole
+  test passes on 2008 R2 (2026-10-23).
 - **Win11's own differences, and how the tests take them** (#525, 2026-10-23).
   - The server sets skip-channel-join and is answered with no Channel Join.
     `connect_reaches_session_active_against_real_vm` therefore expects no `rdp_channel_join`

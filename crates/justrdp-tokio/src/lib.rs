@@ -4576,8 +4576,9 @@ mod tests {
     }
 
     /// The pixels of `CF_DIB` data as top-down RGB rows: `(width, height, rgb)`. Reads the
-    /// `BITMAPINFOHEADER` forms a clipboard carries: 24 or 32 bits per pixel, `BI_RGB` or
-    /// `BI_BITFIELDS` with byte-aligned masks, bottom-up or top-down.
+    /// `BITMAPINFOHEADER` forms a clipboard carries: 16, 24 or 32 bits per pixel, `BI_RGB` or
+    /// `BI_BITFIELDS`, bottom-up or top-down. A channel narrower than 8 bits is widened by
+    /// repeating its top bits.
     fn dib_rgb(dib: &[u8]) -> Result<(usize, usize, Vec<[u8; 3]>), String> {
         let u32_at = |at: usize| -> Result<u32, String> {
             dib.get(at..at + 4)
@@ -4590,11 +4591,14 @@ mod tests {
         let bpp = u16::from_le_bytes([dib[14], dib[15]]);
         let compression = u32_at(16)?;
         let colors_used = u32_at(32)? as usize;
-        if width <= 0 || height == 0 || !matches!(bpp, 24 | 32) {
+        if width <= 0 || height == 0 || !matches!(bpp, 16 | 24 | 32) {
             return Err(format!("unsupported DIB: {width}x{height} at {bpp} bpp"));
         }
-        // Blue, green and red byte offsets inside a pixel.
-        let (mut offsets, mut pixels_at) = ([0usize, 1, 2], header_size);
+        // Red, green and blue masks over a little-endian pixel.
+        let (mut masks, mut pixels_at) = match bpp {
+            16 => ([0x7C00u32, 0x03E0, 0x001F], header_size),
+            _ => ([0x00FF_0000u32, 0x0000_FF00, 0x0000_00FF], header_size),
+        };
         match compression {
             0 => {}
             3 => {
@@ -4603,23 +4607,29 @@ mod tests {
                 if header_size == 40 {
                     pixels_at += 12;
                 }
-                let shift = |mask: u32| -> Result<usize, String> {
-                    match mask {
-                        0x0000_00FF => Ok(0),
-                        0x0000_FF00 => Ok(1),
-                        0x00FF_0000 => Ok(2),
-                        0xFF00_0000 => Ok(3),
-                        _ => Err(format!("DIB mask {mask:#010x} is not byte-aligned")),
-                    }
-                };
-                offsets = [
-                    shift(u32_at(masks_at + 8)?)?,
-                    shift(u32_at(masks_at + 4)?)?,
-                    shift(u32_at(masks_at)?)?,
+                masks = [
+                    u32_at(masks_at)?,
+                    u32_at(masks_at + 4)?,
+                    u32_at(masks_at + 8)?,
                 ];
+                if let Some(mask) = masks
+                    .iter()
+                    .find(|m| **m == 0 || (*m >> m.trailing_zeros()).count_ones() > 8)
+                {
+                    return Err(format!("DIB mask {mask:#010x} is not 1 to 8 bits"));
+                }
             }
             other => return Err(format!("DIB compression {other} is not read here")),
         }
+        let channel = |pixel: u32, mask: u32| -> u8 {
+            let (bits, value) = (mask.count_ones(), (pixel & mask) >> mask.trailing_zeros());
+            let (mut wide, mut filled) = (0u32, 0);
+            while filled < 8 {
+                wide = wide << bits | value;
+                filled += bits;
+            }
+            (wide >> (filled - 8)) as u8
+        };
         pixels_at += colors_used * 4;
         let (width, rows) = (width as usize, height.unsigned_abs() as usize);
         let bytes = usize::from(bpp) / 8;
@@ -4632,8 +4642,10 @@ mod tests {
             let stored = if height > 0 { rows - 1 - row } else { row };
             let line = &pixels[stored * stride..];
             for x in 0..width {
-                let px = &line[x * bytes..];
-                rgb.push([px[offsets[2]], px[offsets[1]], px[offsets[0]]]);
+                let mut le = [0u8; 4];
+                le[..bytes].copy_from_slice(&line[x * bytes..x * bytes + bytes]);
+                let pixel = u32::from_le_bytes(le);
+                rgb.push(masks.map(|mask| channel(pixel, mask)));
             }
         }
         Ok((width, rows, rgb))
@@ -4670,6 +4682,36 @@ mod tests {
         }
         dib.extend_from_slice(&[10, 20, 30, 0]);
         assert_eq!(dib_rgb(&dib).unwrap(), (1, 1, vec![[10, 20, 30]]));
+
+        // 3x1, 16 bpp, BI_BITFIELDS RGB565 (WS2008 R2's screenshot), top-down, a row padded to
+        // 8 bytes: red, green, and r=16 g=32 b=1, each widened by repeating its top bits.
+        let mut dib = vec![0u8; 40];
+        dib[0] = 40;
+        dib[4] = 3;
+        dib[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        dib[12] = 1;
+        dib[14] = 16;
+        dib[16] = 3;
+        for mask in [0xF800u32, 0x07E0, 0x001F] {
+            dib.extend_from_slice(&mask.to_le_bytes());
+        }
+        for pixel in [0xF800u16, 0x07E0, 0x8401, 0] {
+            dib.extend_from_slice(&pixel.to_le_bytes());
+        }
+        assert_eq!(
+            dib_rgb(&dib).unwrap(),
+            (3, 1, vec![[255, 0, 0], [0, 255, 0], [132, 130, 8]])
+        );
+
+        // 1x1, 16 bpp, BI_RGB: 5-5-5 with the top bit unused.
+        let mut dib = vec![0u8; 40];
+        dib[0] = 40;
+        dib[4] = 1;
+        dib[8] = 1;
+        dib[12] = 1;
+        dib[14] = 16;
+        dib.extend_from_slice(&[0x00, 0x7C, 0, 0]);
+        assert_eq!(dib_rgb(&dib).unwrap(), (1, 1, vec![[255, 0, 0]]));
     }
 
     /// A 24 bpp `BI_RGB` bottom-up `CF_DIB` of a `size`-square gradient, and its top-down RGB.
