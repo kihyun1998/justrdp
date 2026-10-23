@@ -10018,6 +10018,9 @@ mod tests {
         /// How long a desktop gets to paint and settle before it is declared absent. Measured
         /// at 4–8 s on this VM's cold logon, so this is ~6x headroom rather than a guess.
         pub(super) const DESKTOP_DEADLINE: Duration = Duration::from_secs(45);
+        /// How long the teardown's reattach gets for its first paint: Windows 11 has been
+        /// measured silent for 60 s after a session dropped early in its logon (#540).
+        const TEARDOWN_DESKTOP_DEADLINE: Duration = Duration::from_secs(90);
         /// How long one synthesised step gets to draw something before it is retried.
         const STEP_ACK: Duration = Duration::from_secs(5);
         /// How many times the Start button is re-clicked before the shell is declared absent.
@@ -10529,6 +10532,13 @@ mod tests {
             let frames_in_sink = frames.clone();
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(32);
             let driver = tokio::spawn(async move {
+                // A reattach can wait a long time for its first paint (Windows 11 sent nothing
+                // for 60 s after a session dropped 0.1 s into its logon, #540), so the teardown
+                // waits longer than a test does before `start_menu_run` waits its own way.
+                if let Err(why) = await_desktop(&frames, TEARDOWN_DESKTOP_DEADLINE).await {
+                    eprintln!("vm harness: teardown saw no desktop: {why}");
+                    return;
+                }
                 if let Err(why) = start_menu_run(&tx, &frames, desktop, target.sign_out()).await {
                     // Say it here rather than only failing below: this is the sentence that
                     // distinguishes "the sign-out was refused" from "the sign-out was never
@@ -10547,11 +10557,12 @@ mod tests {
             // while the driver is still waiting and the sentence that says *why* — the one
             // `start_menu_run` returns — is never printed, which is the failure mode this
             // whole change exists to remove. The driver's worst case is
-            // `DESKTOP_DEADLINE` (45 s) + `START_ATTEMPTS` x `STEP_ACK` (30 s) + the typing
-            // and its acknowledgement (~8 s) = ~83 s, and Windows' own sign-out measures ~20 s
-            // on top of a measured ~28 s happy path.
+            // `TEARDOWN_DESKTOP_DEADLINE` (90 s) + the settled desktop `start_menu_run` sees
+            // again (~2 s) + `START_ATTEMPTS` x `STEP_ACK` (30 s) + the typing and its
+            // acknowledgement (~8 s) = ~130 s, and Windows' own sign-out measures ~20 s on top
+            // of a measured ~28 s happy path.
             let ended = tokio::time::timeout(
-                Duration::from_secs(150),
+                Duration::from_secs(180),
                 run_session_with_input(
                     &mut stream,
                     &mut machine,
@@ -10591,7 +10602,7 @@ mod tests {
                     }
                     let _ = std::fs::write(&path, ppm);
                     panic!(
-                        "vm harness: the session did not sign out within 150s — the next test \
+                        "vm harness: the session did not sign out within 180s — the next test \
                          would inherit this desktop; dumped to {}",
                         path.display()
                     );
