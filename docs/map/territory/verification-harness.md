@@ -233,14 +233,24 @@ in-session query.
     Start menu does not slide, so there is no ScrBlt.
   - the scripted tests get no verdict. Their scripts use cmdlets newer than 2008 R2's
     PowerShell 2.0 (unverified).
-  - `frame_markers_bracket_what_a_redraw_paints_on_the_real_vm` differs from the redraw by
-    647013 pixels, every run. The test takes its snapshot before the logon has finished (#524).
+  - `frame_markers_bracket_what_a_redraw_paints_on_the_real_vm` differed from the redraw by
+    647013 pixels, every run. The test took its snapshot before the logon had finished (#524).
     The redraw holds the Initial Configuration Tasks window and the tray icons; the snapshot
-    has neither. Two probes, 2026-10-22, show justrdp paints what the server paints:
+    had neither. Two probes, 2026-10-22, show justrdp paints what the server paints:
     - wait 30 s after the Start click before the snapshot, and the whole test passes;
     - wait 20 s after the redraw and send a second Refresh Rect, and it matches what the
       session painted to 0 px.
-    The test's fix is #525's.
+
+    **The 2008 R2 logon goes quiet mid-way** (#537). Four runs, 2026-10-23, timed every
+    frame update from the end of the connect. The logon paints, then stops for 2.9–5.1 s
+    while the shell starts. The taskbar, tray and ICT window follow, and the last of them lands
+    at 6.3–6.7 s. After that only the clock repaints, once a minute. A 2 s quiet window
+    therefore ended inside the pause (at 2.3–3.5 s). No protocol message marks the shell as
+    up: Save Session Info arrives before it. So the three tests that compare a snapshot with
+    a Refresh Rect redraw now settle the logon on `LOGON_QUIET`, 15 s, about 3x the longest
+    pause. A clock tick can only restart that wait, never end it early. Set back to 2 s, the
+    test reddens with the same 647013 px; at 15 s it passes on 2008 R2, and all three pass on
+    WS2019. Each of the three pays about 13 s more per run.
 - **2008 R2 pads every cliprdr PDU by four bytes; Win11 does not** (#522). Seen three times:
   - a Capabilities PDU with `dataLen` 16 in 28 bytes. Win11 sends the same PDU in 24.
   - a first PDU of 8 + `dataLen` + 4.
