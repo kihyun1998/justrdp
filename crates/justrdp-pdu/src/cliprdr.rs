@@ -968,6 +968,22 @@ mod tests {
             ClipboardPdu::decode(&padded, true).unwrap(),
             ClipboardPdu::MonitorReady
         );
+        // WS2008 R2 pads every message (#522): its Clipboard Capabilities, `dataLen` 16 in 28
+        // bytes, with general flags 0x1E.
+        let ws2008r2_caps: [u8; 28] = [
+            0x07, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x0c, 0x00, 0x02, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            ClipboardPdu::decode(&ws2008r2_caps, true).unwrap(),
+            ClipboardPdu::Capabilities {
+                general: Some(GeneralCapability {
+                    version: CB_CAPS_VERSION_2,
+                    general_flags: 0x1e,
+                })
+            }
+        );
+        assert_eq!(padding(&ws2008r2_caps), 4);
         assert_eq!(padding(&padded), 4);
         assert_eq!(padding(&vm_response), 4);
         assert_eq!(padding(&VM_MONITOR_READY), 0);
