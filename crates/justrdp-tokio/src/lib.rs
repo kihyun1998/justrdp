@@ -8498,16 +8498,31 @@ mod tests {
     }
 
     impl OrderDrive {
+        /// How long the frame stream must stay quiet before the logon counts as finished.
+        const LOGON_QUIET: Duration = Duration::from_secs(15);
+
         /// Read until no byte has arrived for 2 s, or for 45 s at most; with `need_frame`,
         /// not before something has painted.
         async fn settle(&mut self, step: &str, need_frame: bool) {
+            self.settle_quiet(step, need_frame, Duration::from_secs(2))
+                .await
+        }
+
+        /// Read until something has painted and then no byte has arrived for
+        /// [`Self::LOGON_QUIET`].
+        async fn settle_logon(&mut self) {
+            self.settle_quiet("the logon", true, Self::LOGON_QUIET)
+                .await
+        }
+
+        /// Read until no byte has arrived for `quiet`, or for `quiet` + 45 s at most; with
+        /// `need_frame`, not before something has painted.
+        async fn settle_quiet(&mut self, step: &str, need_frame: bool, quiet: Duration) {
             let start = tokio::time::Instant::now();
             let frames_before = self.frames;
             let mut readbuf = [0u8; 16 * 1024];
             loop {
-                match tokio::time::timeout(Duration::from_secs(2), self.stream.read(&mut readbuf))
-                    .await
-                {
+                match tokio::time::timeout(quiet, self.stream.read(&mut readbuf)).await {
                     Ok(Ok(0)) => panic!("the server closed the session: {:?}", self.census.orders),
                     Ok(Ok(n)) => {
                         self.census.feed(&readbuf[..n]);
@@ -8519,11 +8534,12 @@ mod tests {
                     Err(_) if !need_frame || self.frames > frames_before => return,
                     Err(_) => {}
                 }
-                if start.elapsed() > Duration::from_secs(45) {
+                let deadline = quiet + Duration::from_secs(45);
+                if start.elapsed() > deadline {
                     self.census.print("#461");
                     let path = dump_ppm(self.machine.framebuffer(), "justrdp-461-stuck.ppm");
                     panic!(
-                        "after {step}: no quiet 2 s, or no frame, within 45 s ({})",
+                        "after {step}: no quiet {quiet:?}, or no frame, within {deadline:?} ({})",
                         path.display()
                     );
                 }
@@ -8804,7 +8820,7 @@ mod tests {
             drive.census.feed(&outcome.activation.leftover);
             let first = feed_drained(&mut drive.machine, &[]).expect("leftover bytes process");
             drive.handle(first).await;
-            drive.settle("the logon", true).await;
+            drive.settle_logon().await;
             drive.click_start().await;
             drive.settle("the Start click", true).await;
             let painted = drive.machine.framebuffer().pixels().to_vec();
@@ -8911,7 +8927,7 @@ mod tests {
             drive.census.feed(&outcome.activation.leftover);
             let first = feed_drained(&mut drive.machine, &[]).expect("leftover bytes process");
             drive.handle(first).await;
-            drive.settle("the logon", true).await;
+            drive.settle_logon().await;
             let before_click = drive.machine.framebuffer().pixels().to_vec();
             let delivered_before = drive.delivered.len();
             drive.click_start().await;
@@ -9040,7 +9056,7 @@ mod tests {
             drive.census.feed(&outcome.activation.leftover);
             let first = feed_drained(&mut drive.machine, &[]).expect("leftover bytes process");
             drive.handle(first).await;
-            drive.settle("the logon", true).await;
+            drive.settle_logon().await;
 
             let before = drive.census.scrblts.len();
             drive.click_start().await;
