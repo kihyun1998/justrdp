@@ -321,11 +321,22 @@ in-session query.
     decides its character.
   - Measured: WS2019 passes all 15 scripted tests through the new path. On Win11, 13 of 15 pass,
     and Win11's audio output works for every format.
-- **Two scripted tests still fail on Win11**, unexplained:
-  - `images_cross_the_clipboard_both_ways_on_the_real_vm`: Print Screen puts nothing on the
-    clipboard ("no message was dropped within 30 s"), and the server sends no Format List
+- **Two scripted tests still fail on Win11**:
+  - `images_cross_the_clipboard_both_ways_on_the_real_vm`. Print Screen put nothing on the
+    clipboard ("no message was dropped within 30 s"), and the server sent no Format List
     after it. Turning off "Use the Print screen key to open screen capture" for `rdptest`
-    (2026-10-23) did not change it.
+    (2026-10-23) did not change it. **Windows 11 24H2 copies nothing on Print Screen while
+    the desktop itself has the focus, from any client** (#538). FreeRDP's Print Screen, on a
+    fresh session:
+    - 0 of 5 Format Lists from the bare desktop, pressed 30–90 s after the logon;
+    - 2 of 2 with a cmd window in front, each `CF_DIB` + `CF_DIBV5` within 0.7 s.
+
+    WS2019 copies from the bare desktop. A 20 s wait, or press and release 100 ms apart, did
+    not change it on Win11. The test now opens Paint before Print Screen, and both Print
+    Screens reach the host on Win11; WS2019 still passes. The test then stops at the paste.
+    While a pasted selection floats, Win11 Paint repaints without pause, so the desktop never
+    settles (4604 frames in 15 s). Teardown then cannot settle the desktop to sign out either.
+    A FreeRDP session left running is only disconnected, and the next test reattaches to it.
   - `a_clipboard_without_file_transfer_is_offered_no_files_on_the_real_vm`: the server fails the
     host's request for the text a `Set-Clipboard` put there. The same line passes on WS2019.
 - A tracing-test `PoisonError` after another test's panic failed both EGFX tests; run alone,

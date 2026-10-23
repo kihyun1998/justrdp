@@ -4858,6 +4858,11 @@ mod tests {
                         };
                         let print_screen = key(0x2C);
 
+                        // Paint is in the foreground before Print Screen: Windows 11 copies
+                        // nothing while the desktop itself has the focus.
+                        vm::start_menu_run(&input_tx, &frames, desktop, "mspaint").await?;
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+
                         // Under a 1 MiB cap the screenshot is dropped, and the session goes on.
                         set_cap(1 << 20).await?;
                         send(vec![print_screen.press(), print_screen.release()]).await?;
@@ -4900,8 +4905,6 @@ mod tests {
                                 "the server answered the host's Format List with {accepted:?}"
                             ));
                         }
-                        vm::start_menu_run(&input_tx, &frames, desktop, "mspaint").await?;
-                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
                         send(chord(0x56)).await?;
                         vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
                         send(chord(0x43)).await?;
