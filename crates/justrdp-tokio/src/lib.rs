@@ -2649,23 +2649,41 @@ mod tests {
             // record is matched by target only and its branch printed, because which branch a
             // server takes is its state, not ours (`docs/map/territory/licensing.md`).
             logs_assert(|lines: &[&str]| {
-                assert_records_in_order(
-                    lines,
-                    &[
-                        ("rdp_x224", &["step=\"request\""]),
-                        ("rdp_x224", &["step=\"selected\""]),
-                        ("rdp_mcs", &["step=\"connect-response\""]),
-                        ("rdp_mcs", &["step=\"attach-user\""]),
-                        ("rdp_channel_join", &["remaining=0"]),
-                        ("rdp_licensing", &[]),
-                        ("rdp_demand_active", &[]),
-                        ("rdp_finalization", &["leg=\"connect\"", "reply=\"synchronize\""]),
-                        ("rdp_finalization", &["leg=\"connect\"", "reply=\"control\""]),
-                        ("rdp_finalization", &["leg=\"connect\"", "reply=\"control\""]),
-                        ("rdp_finalization", &["leg=\"connect\"", "reply=\"font-map\""]),
-                        ("rdp_session_active", &[]),
-                    ],
-                );
+                // A server that sets skip-channel-join (Windows 11, #525) is answered with no
+                // Channel Join at all, so its sequence has no join record and must not have one.
+                let skips_join = lines
+                    .iter()
+                    .any(|l| l.contains("rdp_mcs:") && l.contains("skip_channel_join=true"));
+                if skips_join {
+                    assert!(
+                        !lines.iter().any(|l| l.contains("rdp_channel_join:")),
+                        "the server skips Channel Join, yet a join was recorded"
+                    );
+                }
+                let join: &[(&str, &[&str])] = if skips_join {
+                    &[]
+                } else {
+                    &[("rdp_channel_join", &["remaining=0"])]
+                };
+                let expected: Vec<(&str, &[&str])> = [
+                    ("rdp_x224", &["step=\"request\""][..]),
+                    ("rdp_x224", &["step=\"selected\""]),
+                    ("rdp_mcs", &["step=\"connect-response\""]),
+                    ("rdp_mcs", &["step=\"attach-user\""]),
+                ]
+                .into_iter()
+                .chain(join.iter().copied())
+                .chain([
+                    ("rdp_licensing", &[][..]),
+                    ("rdp_demand_active", &[]),
+                    ("rdp_finalization", &["leg=\"connect\"", "reply=\"synchronize\""]),
+                    ("rdp_finalization", &["leg=\"connect\"", "reply=\"control\""]),
+                    ("rdp_finalization", &["leg=\"connect\"", "reply=\"control\""]),
+                    ("rdp_finalization", &["leg=\"connect\"", "reply=\"font-map\""]),
+                    ("rdp_session_active", &[]),
+                ])
+                .collect();
+                assert_records_in_order(lines, &expected);
                 for line in lines.iter().filter(|l| {
                     ["rdp_x224:", "rdp_mcs:", "rdp_channel_join:", "rdp_licensing:"]
                         .iter()
@@ -10099,22 +10117,31 @@ mod tests {
             false
         }
 
-        /// Side of the all-white square a point must sit in to count as inside an edit area.
+        /// Side of the one-colour light square a point must sit in to count as inside an edit
+        /// area.
         const EDIT_AREA_PROBE: usize = 120;
+        /// The darkest channel an edit area's colour may have: white on WS2019, (249, 249, 249)
+        /// in Windows 11's Notepad.
+        const EDIT_AREA_LIGHTEST: u8 = 0xF0;
 
         /// A point inside the edit area of the window on screen, read from an RGBA8888
         /// framebuffer: the midpoint of every position where an [`EDIT_AREA_PROBE`]-sided square
-        /// is pure white. `None` when no such square exists or the midpoint is not one of them.
+        /// is one light colour. `None` when no such square exists or the midpoint is not one of
+        /// them.
         pub(super) fn edit_area_point(rgba: &[u8], width: u16, height: u16) -> Option<(u16, u16)> {
             let (w, h) = (usize::from(width), usize::from(height));
             let half = EDIT_AREA_PROBE / 2;
-            let white = |x: usize, y: usize| {
-                rgba.get((y * w + x) * 4..(y * w + x) * 4 + 3) == Some(&[0xFF; 3][..])
-            };
+            let px = |x: usize, y: usize| rgba.get((y * w + x) * 4..(y * w + x) * 4 + 3);
             let clear = |cx: usize, cy: usize| {
-                (cy - half..cy + half)
-                    .step_by(4)
-                    .all(|y| (cx - half..cx + half).step_by(4).all(|x| white(x, y)))
+                let Some(colour) = px(cx - half, cy - half) else {
+                    return false;
+                };
+                colour.iter().all(|&c| c >= EDIT_AREA_LIGHTEST)
+                    && (cy - half..cy + half).step_by(4).all(|y| {
+                        (cx - half..cx + half)
+                            .step_by(4)
+                            .all(|x| px(x, y) == Some(colour))
+                    })
             };
             let (mut lo, mut hi) = ((usize::MAX, usize::MAX), (0, 0));
             for cy in (half..h.saturating_sub(half)).step_by(16) {
@@ -10780,6 +10807,36 @@ mod tests {
                 "({x}, {y})"
             );
             assert_ne!((x, y), (640, 400));
+        }
+
+        /// Windows 11's Notepad paints its edit area (249, 249, 249), not white (#525): a
+        /// uniform light square counts, and the point lands in it.
+        #[test]
+        fn edit_area_point_takes_a_uniform_light_grey_edit_area() {
+            let mut rgba = desktop_with(1280, 800, &[]);
+            for y in 100..500 {
+                for x in 32..980 {
+                    rgba[(y * 1280 + x) * 4..][..4].copy_from_slice(&[249, 249, 249, 0xFF]);
+                }
+            }
+            let (x, y) = edit_area_point(&rgba, 1280, 800).expect("an edit area is on screen");
+            assert!(
+                (32..980).contains(&x) && (100..500).contains(&y),
+                "({x}, {y})"
+            );
+        }
+
+        /// A light square that is not one colour is not an edit area.
+        #[test]
+        fn edit_area_point_refuses_a_light_square_of_two_colours() {
+            let mut rgba = desktop_with(1280, 800, &[]);
+            for y in 100..500 {
+                for x in 32..980 {
+                    let shade = if (x / 8 + y / 8) % 2 == 0 { 249 } else { 255 };
+                    rgba[(y * 1280 + x) * 4..][..4].copy_from_slice(&[shade, shade, shade, 0xFF]);
+                }
+            }
+            assert_eq!(edit_area_point(&rgba, 1280, 800), None);
         }
 
         /// The same window restored somewhere else: the point follows it.
@@ -14435,7 +14492,16 @@ mod tests {
             };
 
             let outcome = vm.connect(config).await;
+            // The cliprdr channel `legacy_graphics_config` asks for: Windows 11 and WS2008 R2
+            // send their Clipboard Capabilities on it during the resize (#525).
+            let cliprdr = outcome
+                .mcs
+                .static_channels
+                .iter()
+                .find(|c| c.name == "cliprdr")
+                .map(|c| c.id);
             let session_config = session_config_from(&outcome, session_capabilities);
+            let connect_input_flags = session_config.server.input_flags;
             assert!(
                 session_config.drdynvc_channel_id.is_some(),
                 "the VM should grant the drdynvc static channel; granted: {:?}",
@@ -14458,6 +14524,7 @@ mod tests {
             let reactivated_with_in_event = reactivated_with.clone();
 
             let ready_in_event = ready_seen.clone();
+            let (mut logged_on, mut resize_sent) = (false, false);
             let on_event = move |event: SessionEvent| {
                 // Strict about everything but the logon notification. This was an `assert_eq!`
                 // against `DisplayControlReady` alone until #304 added `SaveSessionInfo`, which
@@ -14465,8 +14532,18 @@ mod tests {
                 // here on it. The strictness is kept rather than dropped: an event this flow
                 // has no reason to produce is still a failure.
                 match event {
-                    SessionEvent::DisplayControlReady => {}
-                    SessionEvent::SaveSessionInfo(_) => return,
+                    SessionEvent::DisplayControlReady => {
+                        eprintln!(
+                            "milestone: DisplayControlReady (drdynvc caps + create + EDISP caps                              done)"
+                        );
+                        ready_in_event.store(true, Ordering::SeqCst);
+                    }
+                    // Windows 11 takes a Monitor Layout sent before the logon is announced and
+                    // never applies it (#525), so the resize waits for the logon too.
+                    SessionEvent::SaveSessionInfo(_) => logged_on = true,
+                    SessionEvent::ChannelData { channel, .. } if Some(channel) == cliprdr => {
+                        return;
+                    }
                     // A Shift tap sent inside the window: the machine must drop it.
                     SessionEvent::Deactivated => {
                         window_in_event.lock().unwrap().push("deactivated");
@@ -14481,10 +14558,10 @@ mod tests {
                     }
                     other => panic!("unexpected session event during resize: {other:?}"),
                 }
-                eprintln!(
-                    "milestone: DisplayControlReady (drdynvc caps + create + EDISP caps done)"
-                );
-                ready_in_event.store(true, Ordering::SeqCst);
+                if resize_sent || !logged_on || !ready_in_event.load(Ordering::SeqCst) {
+                    return;
+                }
+                resize_sent = true;
                 tx.try_send(SessionCommand::Resize(ResizeRequest::new(
                     target.0, target.1,
                 )))
@@ -14537,12 +14614,13 @@ mod tests {
                 ["deactivated", "reactivated"],
                 "the host hears one Deactivation, opened and closed"
             );
-            // Measured on this VM: the same Input set at connect and after the resize (#443).
+            // The same Input set at connect and after the resize (#443): 0x0375 on WS2019,
+            // 0x03F5 on Windows 11 (#525).
             let server = reactivated_with
                 .lock()
                 .unwrap()
                 .expect("Reactivated carries the announcement");
-            assert_eq!(server.input_flags, 0x0375, "{server:?}");
+            assert_eq!(server.input_flags, connect_input_flags, "{server:?}");
             assert!(
                 logs_contain("input dropped during a Deactivation"),
                 "the Shift tap sent inside the Deactivation went out"

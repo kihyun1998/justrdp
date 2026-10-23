@@ -245,12 +245,23 @@ in-session query.
   - a Capabilities PDU with `dataLen` 16 in 28 bytes.
   - a first PDU of 8 + `dataLen` + 4.
   - image Format Data of 2048064 bytes where WS2019 sends 2048060.
-- **Win11's own differences.**
-  - The server skips Channel Join (`skip_channel_join=true`), so
-    `connect_reaches_session_active_against_real_vm` finds no `rdp_channel_join` record.
-  - Notepad is the new app, so `keyboard_and_mouse_input_drive_the_real_vm` finds no edit area.
-  - `display_control_resize_against_real_vm` fails on both 2008 R2 and Win11. A cliprdr
-    Capabilities PDU arrives mid-resize, and the test refuses it as an unexpected event.
+- **Win11's own differences, and how the tests take them** (#525, 2026-10-23).
+  - The server sets skip-channel-join and is answered with no Channel Join.
+    `connect_reaches_session_active_against_real_vm` therefore expects no `rdp_channel_join`
+    record when the attach-user record says `skip_channel_join=true`, and allows none.
+  - Notepad is the new app, and its edit area is (249, 249, 249). `vm::edit_area_point`
+    takes any one-colour square whose channels are all at least `0xF0`. The uniformity is what
+    keeps a separator line from joining two light blocks.
+  - In `display_control_resize_against_real_vm`:
+    - a Clipboard Capabilities PDU arrives on the granted cliprdr channel mid-resize, and the
+      test lets that one channel through. Every other unexpected event still fails it.
+    - Win11 takes a Monitor Layout sent before the logon is announced and never applies it. The
+      resize therefore waits for both Display Control and a Save Session Info.
+    - Win11's Input set is 0x03F5, where WS2019's is 0x0375, so the reactivated set is compared
+      to the set at connect.
+  - On 2008 R2 the resize test still fails: it has no Display Control.
+  - After `connect_reaches_session_active_against_real_vm` on Win11, the teardown saw 0 frames
+    in 45 s although its framebuffer holds the painted desktop (twice). Unexplained.
 - **The Win11 VM's default terminal is the Windows Console Host** (#523). This is set for
   `rdptest` under Settings > System > For developers > Terminal; none of it is in the repo.
   - Why: out of the box, `powershell` opens in Windows Terminal, and its cursor blinks a frame
@@ -291,8 +302,9 @@ in-session query.
     and Win11's audio output works for every format.
 - **Two scripted tests still fail on Win11**, unexplained:
   - `images_cross_the_clipboard_both_ways_on_the_real_vm`: Print Screen puts nothing on the
-    clipboard ("no message was dropped within 30 s"). Win11 may send Print Screen to the
-    Snipping Tool; unverified.
+    clipboard ("no message was dropped within 30 s"), and the server sends no Format List
+    after it. Turning off "Use the Print screen key to open screen capture" for `rdptest`
+    (2026-10-23) did not change it.
   - `a_clipboard_without_file_transfer_is_offered_no_files_on_the_real_vm`: the server fails the
     host's request for the text a `Set-Clipboard` put there. The same line passes on WS2019.
 - A tracing-test `PoisonError` after another test's panic failed both EGFX tests; run alone,
