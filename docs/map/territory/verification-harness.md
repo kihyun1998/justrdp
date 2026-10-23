@@ -260,8 +260,12 @@ in-session query.
     - Win11's Input set is 0x03F5, where WS2019's is 0x0375, so the reactivated set is compared
       to the set at connect.
   - On 2008 R2 the resize test still fails: it has no Display Control.
-  - After `connect_reaches_session_active_against_real_vm` on Win11, the teardown saw 0 frames
-    in 45 s although its framebuffer holds the painted desktop (twice). Unexplained.
+  - **A reattach can wait 60 s for its first paint** (#540). `connect_reaches_session_active_against_real_vm`
+    drops its connection about 0.1 s into the logon. The teardown connects 0.13 s later, and
+    Win11 then sent nothing at all for 60.0 s, followed by 478 frame updates, every one handed
+    to the host. A 45 s wait gave up with "0 frames", and the frames that came after are what
+    painted the dump. So the teardown waits up to 90 s for its first paint
+    (`TEARDOWN_DESKTOP_DEADLINE`), and its overall budget is 180 s.
 - **The Win11 VM's default terminal is the Windows Console Host** (#523). This is set for
   `rdptest` under Settings > System > For developers > Terminal; none of it is in the repo.
   - Why: out of the box, `powershell` opens in Windows Terminal, and its cursor blinks a frame
