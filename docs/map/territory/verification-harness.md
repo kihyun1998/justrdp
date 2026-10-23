@@ -285,6 +285,22 @@ in-session query.
     to the host. A 45 s wait gave up with "0 frames", and the frames that came after are what
     painted the dump. So the teardown waits up to 90 s for its first paint
     (`TEARDOWN_DESKTOP_DEADLINE`), and its overall budget is 180 s.
+  - **A desktop that paints but never goes quiet is signed out blind** (#547, 2026-10-23).
+    Every step of `start_menu_run` waits for a quiet desktop. An application that repaints
+    without pause therefore left the session signed in: Win11 Paint with a floating paste, at
+    about 300 frames a second. The next tests inherited the session, and its clipboard state
+    broke later runs too (#539). `sign_out_drive` now tells the cases apart:
+    - a desktop that settles gets `start_menu_run`, as before;
+    - one that never paints gets nothing;
+    - one that paints but never settles gets the same keystrokes at `BLIND_STEP` (3 s)
+      intervals: Esc, a Start click, the command, Enter.
+
+    The session ending is still the proof that the sign-out took, so a blind step that misses
+    shows up as the same 180 s failure. Measured on Win11 with the image test's Esc removed:
+    the teardown typed blind and the session signed out, 154 s in all against 229 s before.
+    The next run started clean. Choosing this over Ctrl+Alt+End, whose secure desktop is not
+    painted by applications but whose menu order differs by Windows version, was the
+    maintainer's call.
 - **The Win11 VM's default terminal is the Windows Console Host** (#523). This is set for
   `rdptest` under Settings > System > For developers > Terminal; none of it is in the repo.
   - Why: out of the box, `powershell` opens in Windows Terminal, and its cursor blinks a frame
