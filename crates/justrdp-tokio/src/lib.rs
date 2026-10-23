@@ -4771,6 +4771,9 @@ mod tests {
             let (dib, gradient) = gradient_dib(GRADIENT);
             let dib_requested = Arc::new(AtomicUsize::new(0));
             let (dropped_tx, mut dropped) = tokio::sync::mpsc::unbounded_channel::<usize>();
+            // The padding after `dataLen` of the Format Data Response that was delivered: WS2008
+            // R2 pads every message by four bytes (#522), WS2019 does not.
+            let delivered_padding = Arc::new(AtomicUsize::new(0));
 
             let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
             {
@@ -4941,6 +4944,7 @@ mod tests {
                         };
                         assert_eq!(on, channel, "only cliprdr was requested");
                         eprintln!("cliprdr message: {} bytes", data.len());
+                        let padding = justrdp_pdu::cliprdr::padding(&data);
                         let mut clipboard = clipboard.lock().unwrap();
                         let outputs = clipboard
                             .process(&data)
@@ -4972,6 +4976,7 @@ mod tests {
                                     }
                                 }
                                 ClipboardOutput::FormatData { data, .. } => {
+                                    delivered_padding.store(padding, Ordering::SeqCst);
                                     let frame = latest_frame.lock().unwrap().clone();
                                     let _ = images_tx.send((data, frame));
                                 }
@@ -5001,9 +5006,12 @@ mod tests {
             let (dropped_length, (screenshot, frame), round_trip) =
                 driven.expect("the desktop was driven");
 
-            // The dropped message was the screenshot's Format Data Response: its header and the
-            // DIB the second Print Screen delivered.
-            assert_eq!(dropped_length, 8 + screenshot.len());
+            // The dropped message was the screenshot's Format Data Response: its header, the
+            // DIB the second Print Screen delivered, and the padding the delivered one carried.
+            assert_eq!(
+                dropped_length,
+                8 + screenshot.len() + delivered_padding.load(Ordering::SeqCst)
+            );
 
             // Server to host: the screenshot is the decoded desktop.
             eprintln!(

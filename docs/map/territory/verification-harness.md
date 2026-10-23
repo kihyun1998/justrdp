@@ -241,10 +241,17 @@ in-session query.
     - wait 20 s after the redraw and send a second Refresh Rect, and it matches what the
       session painted to 0 px.
     The test's fix is #525's.
-- **2008 R2 pads its cliprdr PDUs by four bytes.** Seen three times:
-  - a Capabilities PDU with `dataLen` 16 in 28 bytes.
+- **2008 R2 pads every cliprdr PDU by four bytes; Win11 does not** (#522). Seen three times:
+  - a Capabilities PDU with `dataLen` 16 in 28 bytes. Win11 sends the same PDU in 24.
   - a first PDU of 8 + `dataLen` + 4.
   - image Format Data of 2048064 bytes where WS2019 sends 2048060.
+
+  The receive path has taken this since #324: what follows `dataLen` is padding (`padding`),
+  and the 2008 R2 Capabilities bytes are now in its unit test. What failed was the image
+  test's own sum, which left the padding out. It now adds the padding of the Format Data
+  Response that was delivered. On 2008 R2 (2026-10-23) the sum holds: 2048064 = 8 + 2048052
+  + 4. The test then stops at the screenshot itself. 2008 R2 sends it as a 16 bpp
+  `BI_BITFIELDS` DIB (RGB565 masks), and the test's DIB reader takes only 24 and 32 bpp.
 - **Win11's own differences, and how the tests take them** (#525, 2026-10-23).
   - The server sets skip-channel-join and is answered with no Channel Join.
     `connect_reaches_session_active_against_real_vm` therefore expects no `rdp_channel_join`

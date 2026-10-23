@@ -358,7 +358,7 @@ glossary, which is vocabulary rather than a decision.
   better one. **`dataLen` must not run past the message, and what follows it is padding**
   (`padding`, logged under `rdp_cliprdr`), which is FreeRDP's rule. Until #324 it had to equal
   the rest of the message, on the ground that every VM message was exact. #324 falsified that
-  ground: the VM's File Contents Response carries four zero bytes after `dataLen`. A capability set other
+  ground: the VM's File Contents Response carries four zero bytes after `dataLen`. WS2008 R2 pads every message the same way (#522). A capability set other
   than the general one is refused, as FreeRDP refuses it; only that one is defined
   (`[MS-RDPECLIP]` 2.2.2.1.1). A Format List Response must set exactly one of OK and FAIL. A
   long format name without its NUL, and a short list that is not whole 36-byte entries, are
