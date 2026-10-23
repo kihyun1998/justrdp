@@ -339,6 +339,19 @@ in-session query.
     A FreeRDP session left running is only disconnected, and the next test reattaches to it.
   - `a_clipboard_without_file_transfer_is_offered_no_files_on_the_real_vm`: the server fails the
     host's request for the text a `Set-Clipboard` put there. The same line passes on WS2019.
+    **The test is sound; the failure is a Win11 session state that another test leaves
+    behind** (#539, 2026-10-23). Measured with the same code on both sides:
+    - Bad state: it fails 4 of 4 right after the image test ended with Paint open and the
+      session was forced to sign out. Each `Set-Clipboard` is announced by one Format List
+      (`CF_UNICODETEXT`, `CF_LOCALE`, `CF_TEXT`, `CF_OEMTEXT`), and the request for it fails.
+    - Clean state: a few runs later it passes 7 of 7, and also after a FreeRDP session that
+      only connects and signs out. Each `Set-Clipboard` is announced twice.
+    - No effect in the bad state: setting the text from the console's own process rather than
+      an `-EncodedCommand` child, or advertising the file-transfer flags.
+
+    The mechanism inside Windows is not known; the clipboard user service `cbdhsvc` is
+    running. So the trigger is the dirty teardown (#546, #547). Run this test before the image
+    test on Win11, or after a clean sign-out.
 - A tracing-test `PoisonError` after another test's panic failed both EGFX tests; run alone,
   they pass.
 - **The host's memory is not the suite's.** The 2008 R2 run was reaped four times. A 5 s
