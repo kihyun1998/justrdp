@@ -57,6 +57,9 @@ rcgen = "0.14"
 # input space the hand-written differential-oracle vectors do not reach. Dev-dependency only; runs
 # on stable (unlike coverage-guided cargo-fuzz, which is a nightly CI-only lane — issue #99).
 proptest = "1"
+# The per-codec benchmarks over the real-server corpora (#555). Dev-dependency only, absent from
+# `cargo tree -e normal`; without plotters and rayon, which a baseline comparison needs neither of.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 # The ADR-0004 fork-bridge that used to live here is GONE — its exit condition was met. sspi 0.21.0's
 # CredSspServer could not complete a Negotiate-NTLM handshake with its own CredSspClient
