@@ -9367,6 +9367,215 @@ mod tests {
         config
     }
 
+    /// [`legacy_graphics_config`] without Surface Commands or Bitmap Codecs, asking for `bpp` in
+    /// the Bitmap set and `highColorDepth`, or 24 there with `WANT_32BPP_SESSION` for 32: the
+    /// server paints in bitmap updates, interleaved RLE below 32 bpp and RDP6 planar at 32.
+    fn bitmap_updates_at_depth(bpp: u16) -> ConnectConfig {
+        use justrdp_pdu::capability::CapabilitySet;
+        let mut config = legacy_graphics_config();
+        config.capabilities.retain(|set| {
+            !matches!(
+                set,
+                CapabilitySet::SurfaceCommands(_) | CapabilitySet::BitmapCodecs(_)
+            )
+        });
+        for set in &mut config.capabilities {
+            if let CapabilitySet::Bitmap(b) = set {
+                b.preferred_bits_per_pixel = bpp;
+            }
+        }
+        config.core.high_color_depth = match bpp {
+            8 => gcc::HIGH_COLOR_DEPTH_8BPP,
+            15 => gcc::HIGH_COLOR_DEPTH_15BPP,
+            16 => gcc::HIGH_COLOR_DEPTH_16BPP,
+            24 | 32 => gcc::HIGH_COLOR_DEPTH_24BPP,
+            _ => panic!("bitmap_updates_at_depth takes 8, 15, 16, 24 or 32, not {bpp}"),
+        };
+        if bpp == 15 {
+            config.core.supported_color_depths |= gcc::SUPPORTED_COLOR_DEPTH_15BPP;
+        }
+        if bpp == 32 {
+            config.core.early_capability_flags = config.core.early_capability_flags
+                | gcc::ClientEarlyCapabilityFlags::WANT_32_BPP_SESSION;
+        }
+        config
+    }
+
+    /// One desktop session driven for a codec corpus (#554): Notepad is launched from the Start
+    /// menu, the pointer crosses the whole desktop on a grid, so it passes over text, window edges
+    /// and the taskbar, and Notepad is closed again. Returns the frame count and how many distinct
+    /// colours the framebuffer holds.
+    ///
+    /// With `JUSTRDP_SESSION_CAPTURE_FILE` set, the capture's length when this session ends is
+    /// printed, because the harness's sign-out session appends to the same file after it.
+    async fn corpus_session(
+        vm: vm::Vm,
+        config: ConnectConfig,
+        egfx: justrdp::EgfxConfig,
+        tag: &str,
+    ) -> (usize, usize) {
+        let session_capabilities = config.capabilities.clone();
+        let outcome = vm.connect(config).await;
+        let mut session_config = session_config_from(&outcome, session_capabilities);
+        session_config.egfx = egfx;
+        let desktop = session_config.desktop_size;
+        let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        let mut stream = outcome.stream;
+
+        let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+        let driver = {
+            let frames = frames.clone();
+            tokio::spawn(async move {
+                let mv = |x: u16, y: u16| {
+                    vec![InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    }]
+                };
+                vm::start_menu_run(&tx, &frames, desktop, "notepad").await?;
+                vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                for row in 1..16u16 {
+                    for column in 1..20u16 {
+                        let point = (desktop.0 / 20 * column, desktop.1 / 16 * row);
+                        tx.send(mv(point.0, point.1))
+                            .await
+                            .map_err(|_| "the session closed".to_string())?;
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                    }
+                }
+                let key = |vk: u16| {
+                    justrdp::input::scancode_from_windows_vk(vk)
+                        .unwrap_or_else(|| panic!("VK {vk:#04x} maps to a scancode"))
+                };
+                let (alt, f4) = (key(0x12), key(0x73));
+                tx.send(vec![alt.press(), f4.press(), f4.release(), alt.release()])
+                    .await
+                    .map_err(|_| "the session closed".to_string())?;
+                vm::await_desktop(&frames, vm::MENU_DEADLINE).await
+            })
+        };
+
+        let session = run_session_with_input(
+            &mut stream,
+            &mut machine,
+            |_, _| {
+                frames.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            |_| {},
+            &mut rx,
+        );
+        tokio::select! {
+            ended = session => panic!("{tag}: the session ended during the corpus run: {ended:?}"),
+            driven = driver => {
+                driven.expect("the driver task").unwrap_or_else(|why| panic!("{tag}: {why}"));
+            }
+        }
+        let colours = machine
+            .framebuffer()
+            .pixels()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| [px[0], px[1], px[2]])
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let dump = dump_ppm(
+            machine.framebuffer(),
+            &format!("justrdp-{}.ppm", tag.replace(['#', ' '], "")),
+        );
+        eprintln!("{tag}: visual dump for confirmation: {}", dump.display());
+        if let Ok(path) = std::env::var(SESSION_CAPTURE_FILE) {
+            let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+            eprintln!("{tag}: the session capture holds {len} bytes when this session ends");
+        }
+        (frames.load(std::sync::atomic::Ordering::SeqCst), colours)
+    }
+
+    /// Issue #554: asked for `bpp` with no Surface Commands to fall back on, the VM paints the
+    /// desktop in bitmap updates and the session paints it. `JUSTRDP_SESSION_CAPTURE_FILE`
+    /// records the bytes the codec corpus is carved from.
+    async fn bitmap_updates_paint_the_desktop_at(vm: vm::Vm, bpp: u16) {
+        let tag = format!("#554 bitmap updates at {bpp} bpp");
+        let (frames, colours) =
+            corpus_session(vm, bitmap_updates_at_depth(bpp), Default::default(), &tag).await;
+        eprintln!("{tag}: {frames} frames, {colours} distinct colours");
+        assert!(
+            colours > 16,
+            "{tag}: the desktop was not painted ({colours} colours)"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn bitmap_updates_at_32_bpp_paint_the_desktop_on_the_real_vm() {
+        with_vm_session(|vm| bitmap_updates_paint_the_desktop_at(vm, 32)).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn bitmap_updates_at_24_bpp_paint_the_desktop_on_the_real_vm() {
+        with_vm_session(|vm| bitmap_updates_paint_the_desktop_at(vm, 24)).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn bitmap_updates_at_15_bpp_paint_the_desktop_on_the_real_vm() {
+        with_vm_session(|vm| bitmap_updates_paint_the_desktop_at(vm, 15)).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn bitmap_updates_at_8_bpp_paint_the_desktop_on_the_real_vm() {
+        with_vm_session(|vm| bitmap_updates_paint_the_desktop_at(vm, 8)).await
+    }
+
+    /// Issue #554: the same driven session over the Graphics Pipeline, for the zgfx corpus.
+    /// `JUSTRDP_SESSION_CAPTURE_FILE` records the bytes it is carved from.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_driven_egfx_session_paints_the_desktop_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            let tag = "#554 EGFX";
+            let (frames, colours) =
+                corpus_session(vm, test_config(), Default::default(), tag).await;
+            eprintln!("{tag}: {frames} frames, {colours} distinct colours");
+            assert!(
+                colours > 16,
+                "{tag}: the desktop was not painted ({colours} colours)"
+            );
+        })
+        .await
+    }
+
+    /// Issue #554: advertising only 8 and 8.1 with `THINCLIENT`, the VM paints in RemoteFX
+    /// (`CODECID_CAVIDEO`) in place of RemoteFX Progressive. `JUSTRDP_SESSION_CAPTURE_FILE`
+    /// records the bytes the RemoteFX corpus is carved from.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn a_driven_thin_client_egfx_session_paints_the_desktop_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            let tag = "#554 EGFX thin client";
+            let egfx = justrdp::EgfxConfig {
+                versions: Some(vec![
+                    justrdp_pdu::egfx::CAPVERSION_8,
+                    justrdp_pdu::egfx::CAPVERSION_8_1,
+                ]),
+                cache: justrdp::EgfxCacheMode::ThinClient,
+            };
+            let (frames, colours) = corpus_session(vm, test_config(), egfx, tag).await;
+            eprintln!("{tag}: {frames} frames, {colours} distinct colours");
+            assert!(
+                colours > 16,
+                "{tag}: the desktop was not painted ({colours} colours)"
+            );
+        })
+        .await
+    }
+
     /// Real-VM differential test (gate #6 fix note 3): capture live bitmap rectangles from
     /// the server and decode the identical bytes with both our codecs and ironrdp-graphics,
     /// asserting byte-identical pixels. The VM delivers them as fast-path updates — the

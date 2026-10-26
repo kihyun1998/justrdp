@@ -154,6 +154,12 @@ The row's point, codec math with no protocol state, is unchanged.
 capture through `SessionStateMachine`, so its fixture lives in `crates/justrdp/tests/fixtures/session/`
 — the crate whose test replays it, as the row requires.
 
+**Note (2026-10-26, #554): a fixture can be read by a second crate's test without moving.**
+The codec-level corpora in `crates/justrdp-codecs/tests/fixtures/` are replayed by that crate's
+`real_server_corpus.rs`, so they live there. `crates/justrdp/tests/codec_corpus.rs` reads the
+ones carved from `crates/justrdp/tests/fixtures/session/` too, to check them against a fresh carve;
+that is a check of where the bytes came from, not a second replay.
+
 **`fuzz/` is out of the workspace, and that is a gate blind spot, not an oversight.**
 `cargo <cmd> --workspace` does not build it, so a rename or a public-path change can leave
 it broken while every gate stays green. It needs its own
