@@ -46,6 +46,9 @@ tokio = { workspace = true, features = [
 # "no-env-filter" keeps events from the `justrdp` core crate (PDU-milestone targets like
 # rdp_deactivate_all) visible to the slice-8 wire-sequence assertions.
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# Installs that capture as the global subscriber before the test harness starts a thread
+# (#535).
+ctor = "1"
 # The mock TLS server in the adapter tests presents a throwaway self-signed cert.
 rcgen = { workspace = true }
 # **R1 verifier** (ADR-0011's 2026-08-26 table) for the live-capture codec test (gate #6 fix

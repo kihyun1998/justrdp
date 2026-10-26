@@ -1525,10 +1525,34 @@ mod tests {
     use justrdp_pdu::nego::SecurityProtocol;
     use justrdp_pdu::{client_info, gcc};
 
-    /// Asserts that `expected` occurs in `lines` in order: each entry matches a later line than
+    static LOG_CAPTURE_INSTALLED_BEFORE_MAIN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Installs tracing-test's log capture as the global subscriber before the test harness
+    /// starts any test thread, so no callsite can be registered while it is half installed
+    /// (#535). The core's unit tests hold the same installer.
+    #[ctor::ctor(unsafe)]
+    fn install_log_capture() {
+        tracing_test::internal::INITIALIZED.call_once(|| {
+            let writer =
+                tracing_test::internal::MockWriter::new(tracing_test::internal::global_buf());
+            let subscriber = tracing_test::internal::get_subscriber(writer, "trace");
+            if tracing::dispatcher::set_global_default(subscriber).is_ok() {
+                LOG_CAPTURE_INSTALLED_BEFORE_MAIN.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
+
+    #[test]
+    fn the_log_capture_is_installed_before_main() {
+        assert!(LOG_CAPTURE_INSTALLED_BEFORE_MAIN.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Checks that `expected` occurs in `lines` in order: each entry matches a later line than
     /// the one before it, by its target and every one of its fields as written
-    /// (`reply="control"`, never the bare word). The core's unit tests hold the same helper.
-    fn assert_records_in_order(lines: &[&str], expected: &[(&str, &[&str])]) {
+    /// (`reply="control"`, never the bare word). Returns the miss as `Err`, for `logs_assert`.
+    /// The core's unit tests hold the same helper.
+    fn records_in_order(lines: &[&str], expected: &[(&str, &[&str])]) -> Result<(), String> {
         let mut from = 0;
         for (target, fields) in expected {
             let hit = lines[from..].iter().position(|line| {
@@ -1536,12 +1560,15 @@ mod tests {
             });
             match hit {
                 Some(offset) => from += offset + 1,
-                None => panic!(
-                    "no `{target}` record with {fields:?} after record {from}; recorded:\n{}",
-                    lines.join("\n")
-                ),
+                None => {
+                    return Err(format!(
+                        "no `{target}` record with {fields:?} after record {from}; recorded:\n{}",
+                        lines.join("\n")
+                    ));
+                }
             }
         }
+        Ok(())
     }
 
     /// A full connect config for the tests: SSL|HYBRID|HYBRID_EX advertised, a modest GCC core,
@@ -2654,11 +2681,8 @@ mod tests {
                 let skips_join = lines
                     .iter()
                     .any(|l| l.contains("rdp_mcs:") && l.contains("skip_channel_join=true"));
-                if skips_join {
-                    assert!(
-                        !lines.iter().any(|l| l.contains("rdp_channel_join:")),
-                        "the server skips Channel Join, yet a join was recorded"
-                    );
+                if skips_join && lines.iter().any(|l| l.contains("rdp_channel_join:")) {
+                    return Err("the server skips Channel Join, yet a join was recorded".into());
                 }
                 let join: &[(&str, &[&str])] = if skips_join {
                     &[]
@@ -2683,7 +2707,7 @@ mod tests {
                     ("rdp_session_active", &[]),
                 ])
                 .collect();
-                assert_records_in_order(lines, &expected);
+                records_in_order(lines, &expected)?;
                 for line in lines.iter().filter(|l| {
                     ["rdp_x224:", "rdp_mcs:", "rdp_channel_join:", "rdp_licensing:"]
                         .iter()
@@ -14859,7 +14883,7 @@ mod tests {
             // this process emitted first, from satisfying the reactivation entries.
             logs_assert(|lines: &[&str]| {
                 let leg = "leg=\"reactivation\"";
-                assert_records_in_order(
+                records_in_order(
                     lines,
                     &[
                         ("rdp_displaycontrol_resize", &[]),
@@ -14877,8 +14901,7 @@ mod tests {
                         ("rdp_finalization", &[leg, "reply=\"font-map\""]),
                         ("rdp_font_map", &[]),
                     ],
-                );
-                Ok(())
+                )
             });
             eprintln!(
                 "PDU milestones asserted: DYNVC caps → create → EDISP caps → Monitor Layout → \

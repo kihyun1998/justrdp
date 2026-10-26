@@ -375,7 +375,7 @@ in-session query.
     running. So the trigger is the dirty teardown (#546, #547). Run this test before the image
     test on Win11, or after a clean sign-out.
 - A tracing-test `PoisonError` after another test's panic failed both EGFX tests; run alone,
-  they pass.
+  they pass. The cascade is closed since #535; see Known holes, *tracing-test*.
 - **The host's memory is not the suite's.** The 2008 R2 run was reaped four times. A 5 s
   sampler showed the test process at 30–62 MB while another workload took the host from
   13.8 GB free to 0.1 GB. Check the host before a long VM run.
@@ -414,6 +414,31 @@ in-session query.
   mutated build stays in `target/`. It surfaced as a VM run advertising `extraFlags = 0x0405`
   from a source that said `0x040d`. Restore by writing the original content, or `touch` the
   file, before trusting any later result.
+
+- **tracing-test's capture is installed before `main`** (#535). Two defects were behind one
+  intermittent red under `cargo test --workspace`:
+  - **Missing records.** `#[traced_test]` registers its subscriber, then sets it as the global
+    default. A callsite first reached on another test thread in between caches
+    `Interest::never` (`tokio-rs/tracing` 2874, 3611). It drops its records for the whole run,
+    so a log assertion sees only part of the log. Both test binaries that use tracing-test
+    (`justrdp` and `justrdp-tokio`, lib tests) therefore install the same capture from a
+    `#[ctor::ctor]` before the harness starts a thread. The macro's own `call_once` then finds
+    it done. With no second thread there is no race at all. Measured with 12,000 callsites
+    under 24 concurrent loops on 28 cores: 21 of 18,000 runs lost records the macro's way, and
+    0 of 18,000 with the installer.
+  - **The cascade.** `logs_assert` runs its closure with the log buffer locked, so a panic
+    there poisons the buffer for every later traced test. So the record checks return `Err`
+    (`records_in_order`) rather than panic inside the closure.
+
+  The hazards of the installer, and what pins each:
+  - It runs before `main`, where a panic may be UB (`ctor`'s `LIFE_BEFORE_MAIN.md`), so it has
+    no panic path.
+  - A linker can strip a ctor's registration. The test `the_log_capture_is_installed_before_main`
+    in each binary reddens if it never ran.
+  - It reads tracing-test's `#[doc(hidden)]` `internal` items and copies the macro's init with
+    the `no-env-filter` value `"trace"`. A tracing-test bump that changes them fails to
+    compile, or reddens that test.
+  - A new test binary that uses `#[traced_test]` needs its own installer.
 
 - **A VM test must not let go of the session before the desktop has painted and settled
   (#307).** Measured on 2026-09-22: when #307's channel test ended its session within 1–2 s

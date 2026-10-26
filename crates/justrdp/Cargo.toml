@@ -47,6 +47,9 @@ proptest.workspace = true
 # sequences are asserted in order without a VM (#429). "no-env-filter" because the records
 # use `target: "rdp_*"`, which the default crate-name filter drops.
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# Installs that capture as the global subscriber before the test harness starts a thread
+# (`log_capture`, #535).
+ctor = "1"
 
 [features]
 # The fuzz seam (#267). Off by default and never enabled by the workspace build, so the
