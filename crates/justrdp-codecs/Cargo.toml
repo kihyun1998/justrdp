@@ -30,9 +30,9 @@ ironrdp-graphics = "0.9"
 # **R2 generator** only (ADR-0011's 2026-08-26 table): constructs the pointer-attribute inputs the
 # ironrdp-graphics pointer oracle consumes (`tests/differential_pointer_ironrdp.rs:12`, issue #41),
 # and the TS_RFX container in `tests/differential_rfx.rs:21`. **What ends it:** we write those
-# encoders. An owned corpus does not — `differential_rfx.rs:14` records why in its own header, the
-# VM never emits CAVIDEO, so the synthetic streams *are* the corpus and the instrument generating
-# them is the one grading them.
+# encoders. An owned corpus does not: the real-server RemoteFX corpus (#554) spans RLGR1, one
+# quantization table and single-rectangle regions, and every other stream the differential needs
+# is one no server here sends (#558, `differential_rfx.rs:14`).
 ironrdp-pdu = "0.9"
 # Property-based robustness tests for the untrusted-input codec decoders (ADR-0008, issue #97):
 # "decode never panics on arbitrary bytes". The differential oracle only checks correctness on
