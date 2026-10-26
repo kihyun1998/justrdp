@@ -38,3 +38,9 @@ ironrdp-pdu = "0.9"
 # "decode never panics on arbitrary bytes". The differential oracle only checks correctness on
 # hand-written valid streams; proptest stresses the malformed/adversarial input space.
 proptest.workspace = true
+# The per-codec benchmarks in `benches/` (#555), over the real-server corpora in `tests/fixtures/`.
+criterion.workspace = true
+
+[[bench]]
+name = "real_server_corpus"
+harness = false

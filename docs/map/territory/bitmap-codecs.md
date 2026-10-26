@@ -272,8 +272,40 @@ attacker-controlled bytes in the repo.
   consumed exactly; IronRDP drives by the count and discards the window. Tolerance is
   the permitted direction on a receive path (#167).
 
+- **Every owned codec's speed over its real-server corpus** (#555, 2026-10-26), from
+  `benches/real_server_corpus.rs`: one captured session per iteration, input bytes as throughput.
+  Measured on an Intel i7-14700K (Windows 11, 64 GB), pinned to one performance core at high
+  priority, twice in one sitting, with the host otherwise ~40 % busy. **Run 2 against run 1 is
+  the same build, so its column is the noise floor, not a change.** Unpinned, the same pair spread
+  −62 % to +97 %.
+
+  | Group | Run 1 | Run 2 | Throughput (run 1) | Run 2 vs 1 |
+  |---|---|---|---|---|
+  | `nscodec` | 19.3 ms | 17.9 ms | 8.05 MiB/s | −7 % |
+  | `planar` | 8.07 ms | 8.73 ms | 60.7 MiB/s | +8 % |
+  | `rle/ws2019-memblt-16bpp` | 2.17 ms | 3.71 ms | 60.7 MiB/s | +70 % |
+  | `rle/ws2008r2-15bpp` | 23.6 ms | 30.5 ms | 16.1 MiB/s | +30 % |
+  | `rle/ws2008r2-8bpp` | 325 µs | 410 µs | 1.49 GiB/s | +26 % |
+  | `pointer` | 48.3 µs | 65.0 µs | 135 MiB/s | +35 % |
+  | `remotefx` | 184 ms | 187 ms | 2.35 MiB/s | +2 % |
+  | `clearcodec` | 1.11 ms | 1.19 ms | 159 MiB/s | +7 % |
+  | `progressive` | 360 ms | 406 ms | 2.42 MiB/s | +13 % |
+  | `zgfx` | 3.15 ms | 3.04 ms | 39.3 MiB/s | −4 % |
+  | `mppc` | 1.13 ms | 979 µs | 53.8 MiB/s | −14 % |
+  | `ncrush` | 1.25 ms | 1.25 ms | 39.1 MiB/s | 0 % |
+  | `xcrush` | 1.06 ms | 1.39 ms | 50.5 MiB/s | +30 % |
+  | `pcm` | 3.14 µs | 2.91 µs | 29.1 GiB/s | −8 % |
+  | `g711_alaw` | 10.4 µs | 14.3 µs | 2.20 GiB/s | +37 % |
+  | `adpcm_ms` | 143 µs | 181 µs | 82.2 MiB/s | +27 % |
+  | `adpcm_ima` | 66.1 µs | 115 µs | 177 MiB/s | +74 % |
+
+  How a change is compared against this floor is `docs/agents/thegraph.md`
+  § *Proof of a performance claim*.
+
 ## Code
 
+- `justrdp-codecs/benches/real_server_corpus.rs` — one criterion group per owned codec over its
+  real-server corpus (#555)
 - `justrdp-codecs/src/rle.rs` — `decompress`, `RleError`
 - `justrdp-codecs/src/planar.rs` — `decompress`, `PlanarError`
 - `justrdp-codecs/src/nscodec.rs` — `decode`, `parse_header`, `split_planes`,

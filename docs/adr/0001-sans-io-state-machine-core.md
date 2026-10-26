@@ -138,6 +138,7 @@ dependency at all; the four crates depend only downward).
 | `crates/justrdp/src/*.rs` | the sans-IO state machines and the host-facing output types. **No `tokio`, no `rustls`, no `sspi`** | this record; measured: `x509-cert` + `tracing` only |
 | `crates/justrdp-tokio/src/*.rs` | **the only place `tokio`, `rustls`, `sspi` or `ring` may appear.** Policy injection | ADR-0002, measured 0 violators |
 | `crates/*/tests/*.rs` | **differential-oracle and real-corpus tests only** | see the test-layout rule below |
+| `crates/*/benches/*.rs` | **criterion benchmarks only**, their inputs read from that crate's `tests/fixtures/`. `criterion` is a dev-dependency and never in `cargo tree -e normal` | #555 |
 | `crates/*/tests/fixtures/<name>/` | captured real-server bytes plus a `README.md`. Appears **only** in a crate whose tests replay them | which is why `crates/justrdp/tests/` has none — both its tests are differential |
 | `crates/*/proptest-regressions/` | generated. Never authored | — |
 | `fuzz/fuzz_targets/*.rs` | fuzz targets, **out of the workspace** | matches 3/3 peers that run a fuzz lane |

@@ -21,3 +21,29 @@ to the adapter. See `CLAUDE.md`.
 never to prior art. **Concept ≠ mechanism** is a reading rule over the first two, not a
 sixth source — a codec we newly own may be absent from IronRDP while its components exist
 in FreeRDP and in the spec. Read both; "new" never justifies skipping the mechanism.
+
+## Proof of a performance claim
+
+A change that touches `crates/justrdp-codecs/` runs the codec benchmarks against master during
+`check-it`'s `silt` step and puts the comparison in the PR (#555). It is not a CI gate: CI has no
+stable runner.
+
+The benchmarks replay the real-server corpora in `tests/fixtures/`, one captured session per
+iteration, so they time the workload a server actually sends. Run them in one sitting, pinned to
+one performance core (on Windows, `start /wait /b /high /affinity 4 <bench exe> --bench …`, the
+exe being what `cargo bench -p justrdp-codecs --no-run` prints):
+
+1. master, `--save-baseline master`;
+2. master again, `--baseline master` — **this run's change is the noise floor**;
+3. the branch, `--baseline master`.
+
+A codec counts as changed only where step 3's interval lies outside step 2's. #555 measured the
+floor on the maintainer's host at −7 % to +74 % across codecs, with other work running; a
+difference inside the floor is no difference. Three rules from #250 bound the rest:
+
+- **State the noise floor with the number.** #91 read a 0.5 % effect off an instrument that spread
+  9.6 %.
+- **Isolate before you time.** A component's share of its codec's time comes first: at 4.6 % of the
+  work, a 2× win is capped at 2.3 %.
+- **Measure the workload's shape, not only its duration.** #91's verdict came from the run-length
+  distribution of real streams, not from a stopwatch.
