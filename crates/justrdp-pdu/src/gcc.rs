@@ -115,6 +115,8 @@ pub const RDP_VERSION_5_PLUS: u32 = 0x0008_0004;
 /// RDP 10.12 — what current Windows clients report.
 pub const RDP_VERSION_10_12: u32 = 0x0008_0011;
 
+/// `highColorDepth` — 15 bpp, a 555 RGB mask.
+pub const HIGH_COLOR_DEPTH_15BPP: u16 = 0x000F;
 /// `highColorDepth` — 16 bpp.
 pub const HIGH_COLOR_DEPTH_16BPP: u16 = 0x0010;
 /// `highColorDepth`: 8 bits per pixel.

@@ -80,6 +80,10 @@ everywhere else.
   and would have gone stale again with #189's `zgfx.rs`
 - `justrdp-tokio/src/lib.rs` — the `#[ignore]`d VM tests and the loopback CredSSP
   test
+- `justrdp/tests/codec_corpus.rs` — carves the codec-level corpora of
+  `justrdp-codecs/tests/fixtures/` from session captures (#554), and checks the ones carved from
+  `justrdp/tests/fixtures/session/` against a fresh carve; `justrdp-codecs/tests/real_server_corpus.rs`
+  replays them
 - Target list derivation: `ls fuzz/fuzz_targets/` — and since #200 this is not just how
   a reader derives it but how `.github/workflows/fuzz.yml` builds its matrix, so the
   roster has one home
@@ -404,6 +408,21 @@ in-session query.
 - [Adapter drive loop](adapter-drive-loop.md) — hosts the VM and loopback tests.
 
 ## Known holes / open
+
+- **Every owned codec that decodes server bytes has a real-server corpus, with two gaps** (#554). The
+  codec-level corpora sit in `justrdp-codecs/tests/fixtures/<codec>/`, one record container for
+  all of them, and prove acceptance only: nothing in them asserts a pixel or a sample value.
+  - **Interleaved RLE at 24 bpp is the one with none.** Asked for 24, the WS2019 VM answers 32
+    and the WS2008 R2 VM answers 16, to justrdp and to FreeRDP 3.32.1 alike (2026-10-26). WS2019
+    also answers 32 to 15 and 16 to 8, so RLE at 8 and 15 bpp comes from WS2008 R2 alone.
+  - **MPPC-8K** has none either: the server compresses nothing at type 0.
+  - **The biggest corpora are prefixes.** Planar, RLE at 8 bpp and RemoteFX keep the records
+    from a session's first that fit 512 KB, the maintainer's call (2026-10-26) against ~5 MB for
+    whole sessions. Planar holds 1016 of 2639 records, RLE 8 bpp 97 of 497, RemoteFX 41 of 162.
+  - **The corpora carved from a committed capture cannot drift from it**, because
+    `codec_corpus.rs` re-carves them in CI. The ones from uncommitted captures (planar, RLE at 8
+    and 15 bpp, pointer, zgfx, RemoteFX) rest on their README's procedure; regenerating one
+    yields a different session.
 
 - **The xrdp server is not a fixture.** It lives in one WSL install on one machine, set up by
   hand. Nothing in the repo rebuilds it, and the xrdp test is skipped wherever

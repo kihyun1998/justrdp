@@ -103,8 +103,11 @@ attacker-controlled bytes in the repo.
   did not cite each other. It is now `checked_sub` on both sides. Two things this
   leaves that the width refusal does not: it is the family's **first refusal a server
   can reach** (a `0x00` byte is two zero nibbles), and it is **not corroborated by the
-  VM**, which never emits CAVIDEO — the safety of refusing rests on FreeRDP agreeing,
-  so it is recorded as a FreeRDP-derived position rather than an observed one. The
+  VM** — the safety of refusing rests on FreeRDP agreeing, so it is recorded as a
+  FreeRDP-derived position rather than an observed one. The VM sends CAVIDEO only to an
+  EGFX advertisement of 8 and 8.1 with `THINCLIENT` (162 payloads in one #554 session,
+  none under the default advertisement), and the 41 in `justrdp-codecs/tests/fixtures/remotefx/`
+  all decode, so none of them carries a zero exponent. The
   differential oracle disagrees and stays green only because no harness quant table
   carries a zero: `Quant::default()` is the MS server's own table (6..7) and the
   harness's second table is 8..12. **If one ever carries a zero the differential goes

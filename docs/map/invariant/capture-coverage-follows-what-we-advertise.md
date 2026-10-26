@@ -96,6 +96,11 @@ confusion arises here.
   from bitmap updates to NSCodec surface bits, so the bitmap differential test now strips the two
   capability sets to keep its subject. What a server advertises bounds what it may send; what it
   sends also depends on state no capability set reports.
+- **#554** — `bitmap-codecs.md` recorded that the VM never emits RemoteFX (`CODECID_CAVIDEO`).
+  It sends 162 in one session to an EGFX advertisement of 8 and 8.1 with `THINCLIENT`, and none
+  to the default one, which was the only one asked. The same issue found the depth half from
+  the server side: no advertisement gets 24 bpp bitmaps from either VM, because each server's
+  configuration answers 24 with 32 or 16, and FreeRDP was told the same.
 
 ## Where it will recur
 
