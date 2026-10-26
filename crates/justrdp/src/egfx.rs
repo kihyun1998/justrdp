@@ -694,6 +694,7 @@ impl GraphicsProcessor {
                 dest_rect,
                 data,
             } => {
+                tracing::trace!(target: "rdp_egfx", surface_id, codec_id, "WireToSurface1");
                 // A destination rectangle is not merely *where* the bitmap lands, it is the
                 // bitmap's dimensions: `[MS-RDPEGFX]` 2.2.2.1 says destRect specifies "the
                 // dimensions (width and height) of the bitmap data encapsulated in the

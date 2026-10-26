@@ -11,9 +11,11 @@
 //!   TS_RFX streams (container encoded by `ironrdp-pdu`, tile payloads by
 //!   `rfx_encode_component`).
 //!
-//! The real VM never emits CAVIDEO (V8+ servers prefer Progressive), so synthetic streams
-//! are the corpus — and a corpus only tests what it generates, hence the coverage guards:
-//! every test asserts both RLGR1 and RLGR3 were actually exercised.
+//! The synthetic streams are this test's corpus: the real-server one
+//! (`tests/fixtures/remotefx/`, #554) holds only RLGR1, one quantization table and
+//! single-rectangle regions, so RLGR3, other tables and empty regions reach the decoder from
+//! here alone (#558). A corpus only tests what it generates, hence the coverage guards: every
+//! test asserts both RLGR1 and RLGR3 were actually exercised.
 
 use ironrdp_graphics::color_conversion::{self, YCbCrBuffer};
 use ironrdp_graphics::image_processing::PixelFormat;

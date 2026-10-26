@@ -1,6 +1,6 @@
 # 0011 — Zero `ironrdp` is the terminal state: the oracle is scaffolding, not a permanent dependency
 
-- Status: Accepted (conformance items #225) — amended 2026-08-13 (#194), 2026-08-18 (#168), 2026-08-18 (#169), 2026-08-19 (#171), 2026-08-19 (#172), 2026-08-19 (#189) and 2026-08-26 (#225); see the Amendments below
+- Status: Accepted (conformance items #225) — amended 2026-08-13 (#194), 2026-08-18 (#168), 2026-08-18 (#169), 2026-08-19 (#171), 2026-08-19 (#172), 2026-08-19 (#189), 2026-08-26 (#225) and 2026-10-26 (#558); see the Amendments below
 - Date: 2026-08-10
 - Records a decision by the maintainer; supersedes the open-ended dev-dependency premise in [ADR-0003](0003-phased-codecs-differential-oracle.md) phase 3 and [ADR-0007](0007-stage-boundary-codec-verification.md) §Decision
 - Related: #158 (Progressive), #189 (zgfx), #194 (Progressive's verification basis)
@@ -315,3 +315,25 @@ above, the pattern [ADR-0012](0012-consumption-site-totality.md) already runs.
 fall to a better derivation. The tracking shape in (e) is the maintainer's **product judgement**,
 taken 2026-08-26 after being shown all four options with the measurements above — including the
 one that removed (a)'s stated cost — and reversing it is theirs.
+
+## Amendment (2026-10-26, #558): RemoteFX has a real-server corpus, and its oracle stays as breadth
+
+The *"cost accepted"* consequence above names CAVIDEO RemoteFX as the codec with no obtainable
+corpus. That is false since #554: WS2019 sends RemoteFX to an EGFX advertisement of 8 and 8.1 with
+`THINCLIENT`, and `justrdp-codecs/tests/fixtures/remotefx/` holds 41 payloads, all decoding.
+**(a) The corpus does not span what the differential covers.** Measured over those 41: RLGR1 only,
+one quantization table, single-rectangle regions. RLGR3, every other table, the zero-exponent
+refusal and empty regions (#117) reach the decoder from `differential_rfx.rs`'s synthetic streams
+alone. So RemoteFX's **R1** stays as **breadth**, as zgfx's did in #189, and its **R2** stays by the
+role table's own rule: only an encoder of ours ends it.
+**(b) Retiring either role would not drop a dependency.** `ironrdp-graphics` is also held by
+ClearCodec, zgfx, Progressive and pointer tests, and `ironrdp-pdu` by
+`differential_pointer_ironrdp.rs` and `progressive_srl_freerdp.rs`; the canary at
+`differential_rfx.rs:328` retires only with the crate's last R1 holder.
+**(c) What the corpus is for instead.** The composed reference glues this decoder's own region and
+blit logic (ADR-0007, assembly layer), so an expectation for real payloads that does not come from
+that logic is the gap worth closing. It is tracked as its own issue, not as a retirement condition.
+**How this was decided.** (a) and (b) are measurements and fall to better ones. Keeping the oracle
+as breadth and tracking the independent expectation separately is the maintainer's call
+(2026-10-26), made over three options: this, this alone without the follow-up, and the follow-up
+plus a test-only TS_RFX encoder to end R2.

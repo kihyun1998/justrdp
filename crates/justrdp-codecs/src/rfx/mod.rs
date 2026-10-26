@@ -4,7 +4,8 @@
 //! so it never had a feature gate to drop — and since #189 nothing here does, because
 //! `egfx-bootstrap` is gone with its last holder. `ironrdp-graphics` appears only as the
 //! dev-dependency oracle, verified per ADR-0007 (stage-boundary + composed-reference
-//! differentials; the real VM never emits CAVIDEO, so synthetic streams are the corpus).
+//! differentials over synthetic streams, which span what the real-server corpus in
+//! `tests/fixtures/remotefx/` does not: #558).
 //!
 //! The pipeline per tile component is the spec's inverse chain: RLGR entropy decode
 //! ([`rlgr`]) → LL3 delta reconstruction → dequantization ([`quant`]) → three-level inverse

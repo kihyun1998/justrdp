@@ -9552,9 +9552,10 @@ mod tests {
     }
 
     /// Issue #554: advertising only 8 and 8.1 with `THINCLIENT`, the VM paints in RemoteFX
-    /// (`CODECID_CAVIDEO`) in place of RemoteFX Progressive. `JUSTRDP_SESSION_CAPTURE_FILE`
-    /// records the bytes the RemoteFX corpus is carved from.
+    /// (`CODECID_CAVIDEO`) in place of RemoteFX Progressive, and every RemoteFX payload decodes
+    /// (#558). `JUSTRDP_SESSION_CAPTURE_FILE` records the bytes the RemoteFX corpus is carved from.
     #[tokio::test]
+    #[traced_test]
     #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
     async fn a_driven_thin_client_egfx_session_paints_the_desktop_on_the_real_vm() {
         with_vm_session(|vm| async move {
@@ -9571,6 +9572,14 @@ mod tests {
             assert!(
                 colours > 16,
                 "{tag}: the desktop was not painted ({colours} colours)"
+            );
+            assert!(
+                logs_contain("codec_id=3"),
+                "{tag}: no RemoteFX WireToSurface1 arrived"
+            );
+            assert!(
+                !logs_contain("RemoteFX WTS1 decode failed"),
+                "{tag}: a RemoteFX payload was skipped"
             );
         })
         .await
