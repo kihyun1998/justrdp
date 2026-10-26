@@ -4955,7 +4955,7 @@ mod tests {
         }
         logs_assert(|lines: &[&str]| {
             let leg = "leg=\"reactivation\"";
-            crate::connect::tests::assert_records_in_order(
+            crate::connect::tests::records_in_order(
                 lines,
                 &[
                     ("rdp_finalization", &[leg, "reply=\"synchronize\""]),
@@ -4970,8 +4970,7 @@ mod tests {
                     ("rdp_finalization", &[leg, "reply=\"font-map\""]),
                     ("rdp_font_map", &[]),
                 ],
-            );
-            Ok(())
+            )
         });
     }
 

@@ -2798,10 +2798,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// Asserts that `expected` occurs in `lines` in order: each entry matches a later line than
+    /// Checks that `expected` occurs in `lines` in order: each entry matches a later line than
     /// the one before it, by its target and every one of its fields as written
-    /// (`reply="control"`, never the bare word).
-    pub(crate) fn assert_records_in_order(lines: &[&str], expected: &[(&str, &[&str])]) {
+    /// (`reply="control"`, never the bare word). Returns the miss as `Err`, for `logs_assert`.
+    pub(crate) fn records_in_order(
+        lines: &[&str],
+        expected: &[(&str, &[&str])],
+    ) -> Result<(), String> {
         let mut from = 0;
         for (target, fields) in expected {
             let hit = lines[from..].iter().position(|line| {
@@ -2809,12 +2812,27 @@ pub(crate) mod tests {
             });
             match hit {
                 Some(offset) => from += offset + 1,
-                None => panic!(
-                    "no `{target}` record with {fields:?} after record {from}; recorded:\n{}",
-                    lines.join("\n")
-                ),
+                None => {
+                    return Err(format!(
+                        "no `{target}` record with {fields:?} after record {from}; recorded:\n{}",
+                        lines.join("\n")
+                    ));
+                }
             }
         }
+        Ok(())
+    }
+
+    /// A missing record fails the test outside tracing-test's buffer lock, so the buffer is not
+    /// poisoned for every later log-asserting test (#535).
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_missing_record_leaves_the_log_buffer_unpoisoned() {
+        let failed = std::panic::catch_unwind(|| {
+            logs_assert(|lines: &[&str]| records_in_order(lines, &[("rdp_never_emitted", &[])]))
+        });
+        assert!(failed.is_err(), "a missing record fails the check");
+        assert!(!tracing_test::internal::global_buf().is_poisoned());
     }
 
     /// Every connect milestone is recorded, in wire order, from the X.224 request to
@@ -2824,7 +2842,7 @@ pub(crate) mod tests {
     fn the_connect_sequence_records_every_milestone_in_wire_order() {
         let _ = session_active();
         logs_assert(|lines: &[&str]| {
-            assert_records_in_order(
+            records_in_order(
                 lines,
                 &[
                     ("rdp_x224", &["step=\"request\""]),
@@ -2855,8 +2873,7 @@ pub(crate) mod tests {
                     ),
                     ("rdp_session_active", &[]),
                 ],
-            );
-            Ok(())
+            )
         });
     }
 
@@ -2985,15 +3002,14 @@ pub(crate) mod tests {
         ))));
         assert!(actions.is_empty());
         logs_assert(|lines: &[&str]| {
-            assert_records_in_order(
+            records_in_order(
                 lines,
                 &[
                     ("rdp_licensing", &["branch=\"license-request\""]),
                     ("rdp_licensing", &["branch=\"platform-challenge\""]),
                     ("rdp_licensing", &["branch=\"new-license\""]),
                 ],
-            );
-            Ok(())
+            )
         });
 
         let actions = sm.process(Event::Received(&server_io_frame(&server_demand_active(

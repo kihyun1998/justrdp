@@ -91,3 +91,29 @@ pub mod fuzzing {
     pub use crate::dvc::{DvcProcessor, ProcessorOutput};
     pub use crate::egfx::GraphicsProcessor;
 }
+
+/// Installs tracing-test's log capture as the global subscriber before the test harness starts
+/// any test thread, so no callsite can be registered while it is half installed (#535).
+#[cfg(test)]
+mod log_capture {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static INSTALLED_BEFORE_MAIN: AtomicBool = AtomicBool::new(false);
+
+    #[ctor::ctor(unsafe)]
+    fn install() {
+        tracing_test::internal::INITIALIZED.call_once(|| {
+            let writer =
+                tracing_test::internal::MockWriter::new(tracing_test::internal::global_buf());
+            let subscriber = tracing_test::internal::get_subscriber(writer, "trace");
+            if tracing::dispatcher::set_global_default(subscriber).is_ok() {
+                INSTALLED_BEFORE_MAIN.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+
+    #[test]
+    fn the_log_capture_is_installed_before_main() {
+        assert!(INSTALLED_BEFORE_MAIN.load(Ordering::SeqCst));
+    }
+}
