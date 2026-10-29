@@ -60,5 +60,5 @@ rcgen = { workspace = true }
 # the whole job: the *values* half must not come from the oracle, or the fixture bakes the
 # instrument's answer in permanently (`docs/map/invariant/oracle-agreement-is-not-independence.md`,
 # violation shape 3). Left open deliberately by #225.
-ironrdp-graphics = "0.9"
+ironrdp-graphics = "0.10"
 justrdp-codecs.workspace = true
