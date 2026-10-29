@@ -26,7 +26,7 @@ justrdp-pdu.workspace = true
 #     #169 amendment.
 # **What ends it (ADR-0011):** R1 drops per codec on an owned basis, *except* where an amendment
 # keeps it as breadth (zgfx, #189). The entry itself leaves only when the last role does.
-ironrdp-graphics = "0.9"
+ironrdp-graphics = "0.10"
 # **R2 generator** only (ADR-0011's 2026-08-26 table): constructs the pointer-attribute inputs the
 # ironrdp-graphics pointer oracle consumes (`tests/differential_pointer_ironrdp.rs:12`, issue #41),
 # and the TS_RFX container in `tests/differential_rfx.rs:21`. **What ends it:** we write those
