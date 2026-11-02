@@ -133,6 +133,58 @@ pub fn encode_font_list() -> Vec<u8> {
     out
 }
 
+/// `bBitMask`: the first Persistent Key List PDU of a sequence.
+pub const PERSIST_PDU_FIRST: u8 = 0x01;
+/// `bBitMask`: the last Persistent Key List PDU of a sequence.
+pub const PERSIST_PDU_LAST: u8 = 0x02;
+/// The most keys one Persistent Key List PDU carries (`[MS-RDPBCGR]` 2.2.1.17.1: SHOULD).
+pub const PERSISTENT_KEYS_PER_PDU: usize = 169;
+
+/// Encode the Persistent Key List PDU bodies (TS_BITMAPCACHE_PERSISTENT_LIST_PDU) for `keys`,
+/// one slice per Revision 2 cache, at most five, each key in the order of the entry it fills.
+/// The keys run in cache order across the sequence, [`PERSISTENT_KEYS_PER_PDU`] a PDU; no key at
+/// all is one PDU of none.
+pub fn encode_persistent_key_lists(keys: &[&[u64]]) -> Vec<Vec<u8>> {
+    let mut totals = [0u16; 5];
+    for (total, cache) in totals.iter_mut().zip(keys) {
+        *total = u16::try_from(cache.len()).unwrap_or(u16::MAX);
+    }
+    let all: Vec<(usize, u64)> = keys
+        .iter()
+        .take(5)
+        .enumerate()
+        .flat_map(|(cache, list)| list.iter().map(move |&key| (cache, key)))
+        .collect();
+    let chunks: Vec<&[(usize, u64)]> = if all.is_empty() {
+        vec![&[]]
+    } else {
+        all.chunks(PERSISTENT_KEYS_PER_PDU).collect()
+    };
+    let last = chunks.len() - 1;
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let mut entries = [0u16; 5];
+            for &(cache, _) in *chunk {
+                entries[cache] += 1;
+            }
+            let mut out = Vec::with_capacity(24 + 8 * chunk.len());
+            for count in entries.iter().chain(&totals) {
+                out.extend_from_slice(&count.to_le_bytes());
+            }
+            let first = if i == 0 { PERSIST_PDU_FIRST } else { 0 };
+            let end = if i == last { PERSIST_PDU_LAST } else { 0 };
+            out.extend_from_slice(&[first | end, 0, 0, 0]); // bBitMask, Pad2, Pad3
+            for &(_, key) in *chunk {
+                out.extend_from_slice(&(key as u32).to_le_bytes());
+                out.extend_from_slice(&((key >> 32) as u32).to_le_bytes());
+            }
+            out
+        })
+        .collect()
+}
+
 /// A Font Map PDU (TS_FONT_MAP_PDU) — the server's last finalization message, and on its own the
 /// session-active gate (#252 decided that deliberately rather than inheriting it). We keep only
 /// `mapFlags` and **that is our choice, not a spec instruction**: `[MS-RDPBCGR]` 2.2.1.22.1 marks
@@ -161,6 +213,74 @@ mod tests {
     use super::*;
     use crate::cursor::ReadCursor;
     use proptest::prelude::*;
+
+    /// `[MS-RDPBCGR]` 4.1.17's Persistent Key List PDU, decrypted, from the Share Data Header on:
+    /// 25 keys for cache 2 in one PDU.
+    #[test]
+    fn the_spec_example_persistent_key_list_encodes_byte_for_byte() {
+        let expected: Vec<u8> = [
+            "000000001900000000000000000019000000000003000000a31e51164829227861f7899ccda966a8444eb7bdb46d9ef6",
+            "399164afbcc370029faafafd6eba58dc7bafde06563ac2ce68ba54b6bf9ebcd6d122c09863e941fe386c50350edbb3f5",
+            "45cc182d3044fc88e5c35d2363f6cf530aa801b61051a52870816c59192900c9e2b5e7a746044e1b728d4add81bb1416",
+            "536a4e3c487266c96c774b4a32482cc6025456f281c985562c0a3d54869d2b97630f0a36f863793ec970414beca87c7b",
+            "7928b6b4a64324decb9cffa2293c025664df80b00d6ee71a83c75431aa8a90b3",
+        ]
+        .concat()
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+        let keys: Vec<u64> = expected[24..]
+            .chunks(8)
+            .map(|key| u64::from_le_bytes(key.try_into().unwrap()))
+            .collect();
+        assert_eq!(keys.len(), 25);
+        let pdus = encode_persistent_key_lists(&[&[], &[], &keys]);
+        assert_eq!(pdus, [expected]);
+    }
+
+    /// More than 169 keys go in several PDUs: first and last marked, the totals the same in
+    /// each, and the keys in cache order across the sequence.
+    #[test]
+    fn a_long_key_list_is_split_at_169_keys() {
+        let cache0: Vec<u64> = (0..100).collect();
+        let cache2: Vec<u64> = (1000..1250).collect();
+        let pdus = encode_persistent_key_lists(&[&cache0, &[], &cache2]);
+        assert_eq!(pdus.len(), 3, "350 keys");
+        let field = |pdu: &[u8], at: usize| u16::from_le_bytes([pdu[at], pdu[at + 1]]);
+        let mut keys = Vec::new();
+        for (i, pdu) in pdus.iter().enumerate() {
+            let entries: Vec<u16> = (0..5).map(|c| field(pdu, 2 * c)).collect();
+            let totals: Vec<u16> = (0..5).map(|c| field(pdu, 10 + 2 * c)).collect();
+            assert_eq!(totals, [100, 0, 250, 0, 0]);
+            let flags = pdu[20];
+            assert_eq!(flags & PERSIST_PDU_FIRST != 0, i == 0);
+            assert_eq!(flags & PERSIST_PDU_LAST != 0, i == 2);
+            let count: usize = entries.iter().map(|&n| usize::from(n)).sum();
+            assert!(count <= 169);
+            assert_eq!(pdu.len(), 24 + 8 * count);
+            keys.extend(
+                pdu[24..]
+                    .chunks(8)
+                    .map(|key| u64::from_le_bytes(key.try_into().unwrap())),
+            );
+        }
+        assert_eq!(keys, [cache0, cache2].concat());
+        assert_eq!(field(&pdus[0], 0), 100);
+        assert_eq!(field(&pdus[0], 4), 69);
+    }
+
+    /// No key at all is still one PDU, first and last.
+    #[test]
+    fn an_empty_key_list_is_one_pdu() {
+        let pdus = encode_persistent_key_lists(&[]);
+        assert_eq!(pdus.len(), 1);
+        assert_eq!(pdus[0], {
+            let mut pdu = vec![0; 24];
+            pdu[20] = PERSIST_PDU_FIRST | PERSIST_PDU_LAST;
+            pdu
+        });
+    }
 
     // ADR-0008 / issue #237 -- the no-panic robustness properties for the connect sequence's last
     // three server parses. All three are `pub fn`s driven straight off server bytes

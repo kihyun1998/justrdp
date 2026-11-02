@@ -1650,6 +1650,7 @@ mod tests {
                 platform_id: justrdp_pdu::license::PLATFORM_ID_NT_POST_52_MICROSOFT,
                 hardware_id: [0x4A55_5354, 0x5244_5001, 0, 0], // "JUST","RDP\1" — arbitrary
             },
+            persistent_bitmaps: Vec::new(),
         }
     }
 
@@ -8551,6 +8552,154 @@ mod tests {
         .await
     }
 
+    /// One session of [`persistent_key_list_sessions_on_the_real_vm`], read for 10 s.
+    struct KeyedSession {
+        census: OrderCensus,
+        persisted: Vec<justrdp::PersistentBitmap>,
+        announced: usize,
+        bytes: usize,
+        framebuffer: justrdp::Framebuffer,
+    }
+
+    /// Connect to `vm` with persistent Revision 2 cells and, when `bitmaps` is not empty, a key
+    /// list announcing them; read the session for 10 s.
+    async fn keyed_session(vm: &vm::Vm, bitmaps: Vec<justrdp::PersistentBitmap>) -> KeyedSession {
+        use justrdp_pdu::capability::{self, CapabilitySet};
+        let mut config = legacy_orders_config(&[
+            capability::ORDER_NEG_MEMBLT_INDEX,
+            capability::ORDER_NEG_MEM3BLT_INDEX,
+        ]);
+        for set in &mut config.capabilities {
+            if let CapabilitySet::BitmapCacheRev2(c) = set {
+                for cell in &mut c.cells {
+                    cell.persistent = true;
+                }
+                if !bitmaps.is_empty() {
+                    c.cache_flags |= capability::PERSISTENT_KEYS_EXPECTED_FLAG;
+                }
+            }
+        }
+        config.persistent_bitmaps = bitmaps;
+        let session_capabilities = config.capabilities.clone();
+        let outcome = vm.connect(config).await;
+        let announced = outcome.activation.persistent_bitmaps.len();
+        let mut machine = SessionStateMachine::new(
+            session_config_from(&outcome, session_capabilities),
+            outcome.activation.leftover.clone(),
+        )
+        .expect("the announced bitmaps fit the advertised caches");
+        let mut stream = outcome.stream;
+        let mut census = OrderCensus::default();
+        census.feed(&outcome.activation.leftover);
+        let mut bytes = outcome.activation.leftover.len();
+        let mut readbuf = [0u8; 16 * 1024];
+        let mut persisted = Vec::new();
+        let mut pending = feed_drained(&mut machine, &[]).expect("leftover bytes process");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            for output in pending.drain(..) {
+                match output {
+                    justrdp::SessionOutput::PersistentBitmap(bitmap) => persisted.push(bitmap),
+                    justrdp::SessionOutput::WriteBytes(bytes) => {
+                        stream.write_all(&bytes).await.expect("write to the VM");
+                    }
+                    _ => {}
+                }
+            }
+            match tokio::time::timeout_at(deadline, stream.read(&mut readbuf)).await {
+                Ok(Ok(0)) => panic!("the server closed the session: {:?}", census.orders),
+                Ok(Ok(n)) => {
+                    census.feed(&readbuf[..n]);
+                    bytes += n;
+                    pending = feed_drained(&mut machine, &readbuf[..n])
+                        .expect("every drawing order decodes");
+                }
+                Ok(Err(e)) => panic!("read failed: {e}"),
+                Err(_) => break,
+            }
+        }
+        KeyedSession {
+            census,
+            persisted,
+            announced,
+            bytes,
+            framebuffer: machine.framebuffer().clone(),
+        }
+    }
+
+    /// Issue #571: the keyed bitmaps one session cached, announced by the next session's key
+    /// list, fill its caches, and the server sends fewer of them again than to a session that
+    /// announces none. Three sessions on one desktop: A collects, B announces, C is B without
+    /// the key list.
+    #[tokio::test]
+    #[traced_test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn persistent_key_list_sessions_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            let mut first = keyed_session(&vm, Vec::new()).await;
+            // The host's renumbering: the last bitmap each entry held, each cache's entries
+            // 0..n in their old order.
+            let mut kept: std::collections::BTreeMap<(u8, u16), justrdp::PersistentBitmap> =
+                std::collections::BTreeMap::new();
+            for bitmap in std::mem::take(&mut first.persisted) {
+                kept.insert((bitmap.cache_id, bitmap.cache_index), bitmap);
+            }
+            let mut next = [0u16; 5];
+            let bitmaps: Vec<justrdp::PersistentBitmap> = kept
+                .into_values()
+                .map(|mut bitmap| {
+                    bitmap.cache_index = next[usize::from(bitmap.cache_id)];
+                    next[usize::from(bitmap.cache_id)] += 1;
+                    bitmap
+                })
+                .collect();
+            let offered = bitmaps.len();
+            let announced = keyed_session(&vm, bitmaps).await;
+            let control = keyed_session(&vm, Vec::new()).await;
+            let fills = |session: &KeyedSession| session.census.count("CacheBitmapRev2");
+            // Above the taskbar, whose clock may tick between B and C.
+            let width = usize::from(control.framebuffer.width());
+            let above_taskbar = (usize::from(control.framebuffer.height()) - 40) * width;
+            let differing = announced
+                .framebuffer
+                .pixels()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(control.framebuffer.pixels().as_chunks::<4>().0)
+                .take(above_taskbar)
+                .filter(|(a, b)| a != b)
+                .count();
+            eprintln!(
+                "#571: A {} fills, {} bytes; offered {offered}, announced {}; \
+                 B {} fills, {} bytes; C {} fills, {} bytes; B and C differ in {differing} px above the taskbar",
+                fills(&first),
+                first.bytes,
+                announced.announced,
+                fills(&announced),
+                announced.bytes,
+                fills(&control),
+                control.bytes
+            );
+            announced.census.print("#571 B");
+            control.census.print("#571 C");
+            dump_ppm(&announced.framebuffer, "justrdp-571-announced.ppm");
+            dump_ppm(&control.framebuffer, "justrdp-571-control.ppm");
+            assert!(offered > 0, "session A cached no keyed bitmap");
+            assert_eq!(announced.announced, offered, "the server took no key list");
+            assert!(
+                fills(&announced) < fills(&control),
+                "the key list spared no fill"
+            );
+            assert!(!logs_contain("reason=CacheMiss"), "a MemBlt missed the cache");
+            assert_eq!(
+                differing, 0,
+                "B, painted from the announced bitmaps, differs from C above the taskbar"
+            );
+        })
+        .await
+    }
+
     /// Issue #460: advertising MemBlt and Mem3Blt over a Revision 2 bitmap cache at 16 bpp,
     /// with no Surface Commands to fall back on, the VM paints the desktop in drawing orders and
     /// the session paints every pixel from the cache, one frame per painting order, unadvertised
@@ -9953,6 +10102,7 @@ mod tests {
             static_channels: outcome.mcs.static_channels.clone(),
             dynamic_channels: Vec::new(),
             egfx: Default::default(),
+            persistent_bitmaps: outcome.activation.persistent_bitmaps.clone(),
         }
     }
 
@@ -11820,6 +11970,7 @@ mod tests {
                 static_channels: Vec::new(),
                 dynamic_channels: Vec::new(),
                 egfx: Default::default(),
+                persistent_bitmaps: Vec::new(),
             },
             Vec::new(),
         )
@@ -11878,6 +12029,7 @@ mod tests {
             }],
             dynamic_channels: Vec::new(),
             egfx: Default::default(),
+            persistent_bitmaps: Vec::new(),
         };
         let message = vec![0x5A; 8 * 1024 * 1024];
         let expected: usize = SessionStateMachine::new(config.clone(), Vec::new())
@@ -12012,6 +12164,7 @@ mod tests {
                 static_channels: Vec::new(),
                 dynamic_channels: Vec::new(),
                 egfx: Default::default(),
+                persistent_bitmaps: Vec::new(),
             },
             Vec::new(),
         )
@@ -12073,6 +12226,7 @@ mod tests {
                 static_channels: Vec::new(),
                 dynamic_channels: Vec::new(),
                 egfx: Default::default(),
+                persistent_bitmaps: Vec::new(),
             },
             Vec::new(),
         )
@@ -12216,6 +12370,7 @@ mod tests {
                 static_channels: Vec::new(),
                 dynamic_channels: Vec::new(),
                 egfx: Default::default(),
+                persistent_bitmaps: Vec::new(),
             },
             Vec::new(),
         )
@@ -12331,6 +12486,7 @@ mod tests {
                 static_channels: Vec::new(),
                 dynamic_channels: Vec::new(),
                 egfx: Default::default(),
+                persistent_bitmaps: Vec::new(),
             },
             Vec::new(),
         )
@@ -12410,6 +12566,7 @@ mod tests {
                 static_channels: Vec::new(),
                 dynamic_channels: Vec::new(),
                 egfx: Default::default(),
+                persistent_bitmaps: Vec::new(),
             },
             Vec::new(),
         )

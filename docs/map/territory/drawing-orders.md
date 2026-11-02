@@ -596,12 +596,29 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 - **The 8 bpp proof is the login screen**, 9 cache bitmaps; the logged-in desktop, which FreeRDP's
   census saw carry 5,024 MemBlt at 8 bpp, needs a logon justrdp cannot make on TLS-only security
   without a password, and was not compared.
-- **Persistent bitmap keys reach the host; nothing sends them back yet** (#570, 2026-11-02).
-  Persistent Revision 2 cells are accepted, and every Cache Bitmap (Revision 2) that carries a key
-  and names a real entry, not the waiting list, becomes a `PersistentBitmap` output: cache, entry,
-  key and the decoded RGBA. Keeping them is the host's. `PERSISTENT_KEYS_EXPECTED_FLAG` is still
-  refused, since it promises a Persistent Key List PDU the core does not send; that is #571.
+- **Persistent bitmaps go round: the keys reach the host, and the host's list pre-fills the next
+  session** (#570, #571, 2026-11-02).
+  - Persistent Revision 2 cells are accepted, and every Cache Bitmap (Revision 2) that carries a
+    key and names a real entry, not the waiting list, becomes a `PersistentBitmap` output: cache,
+    entry, key and the decoded RGBA. Keeping them is the host's.
+  - A later connect takes them back in `ConnectConfig::persistent_bitmaps`. With
+    `PERSISTENT_KEYS_EXPECTED_FLAG` set and a server that advertised Bitmap Cache Host Support
+    (2.2.1.17's condition; WS2019 does), the finalization sends their keys in Persistent Key List
+    PDUs between Request Control and Font List, 169 a PDU, and `ActivationResult` hands the same
+    list to `SessionConfig`, whose caches start with it.
+  - **A key's place in the list is its entry**, so the host renumbers each cache's entries
+    `0..n`. The spec does not say so; its 4.1.17 example labels the keys "Cache 2, Key 0..24",
+    rdesktop sends the key it stored at entry `i` `i`-th and pre-loads that bitmap there
+    (`pstcache.c`), and FreeRDP 3.32.1 lists keys flat from cache 0 (`activation.c`). Measured
+    rather than read: painted from the announced bitmaps, a session equals the control above the
+    taskbar, 0 px in two runs; pre-loading each at the entry next to its own made 472,206 px
+    differ.
   - **WS2019 keys every bitmap it caches for a persistent cell.** With all three cells
     persistent, two sessions sent 163 and 176 Cache Bitmap (Revision 2) orders, all keyed;
     the 176 keys were distinct. With the flag set as well and no key list sent, 166, all
     keyed, and the session ran as usual.
+  - **The key list halves a reconnect's fills and bytes.** Three sessions on one desktop, ten
+    seconds each (`persistent_key_list_sessions_on_the_real_vm`): one collecting, one announcing
+    what it collected, one reconnecting without a list. Announcing 161 and 163 keys, the second
+    received 10 and 14 fills in 10,282 and 12,297 bytes; the third, 28 and 28 fills in 22,546 and
+    22,351 bytes.

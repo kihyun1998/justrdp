@@ -230,6 +230,20 @@ impl Orders {
         }
     }
 
+    /// Fill the Revision 2 caches with `bitmaps`, each at its entry. Entries no cache has are
+    /// left out; [`crate::advertise::check_persistent_bitmaps`] refuses them first.
+    pub(crate) fn preload(&mut self, bitmaps: Vec<PersistentBitmap>) {
+        for bitmap in bitmaps {
+            if let Ok(slot) = self.slot(u16::from(bitmap.cache_id), bitmap.cache_index) {
+                *slot = Some(CachedBitmap {
+                    width: bitmap.width,
+                    height: bitmap.height,
+                    rgba: bitmap.rgba,
+                });
+            }
+        }
+    }
+
     /// The bitmaps cached with a persistent key since the last call, in arrival order.
     pub(crate) fn take_persisted(&mut self) -> Vec<PersistentBitmap> {
         std::mem::take(&mut self.persisted)

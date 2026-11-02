@@ -31,6 +31,7 @@ fn machine() -> SessionStateMachine {
             static_channels: Vec::new(),
             dynamic_channels: Vec::new(),
             egfx: Default::default(),
+            persistent_bitmaps: Vec::new(),
         },
         Vec::new(),
     )

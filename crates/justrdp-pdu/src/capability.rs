@@ -32,6 +32,8 @@ pub const CAPSET_GLYPH_CACHE: u16 = 0x0010;
 pub const CAPSET_OFFSCREEN_CACHE: u16 = 0x0011;
 /// `capabilitySetType`: Bitmap Cache (revision 2).
 pub const CAPSET_BITMAP_CACHE_REV2: u16 = 0x0013;
+/// `capabilitySetType`: Bitmap Cache Host Support (server, 2.2.7.2.1).
+pub const CAPSET_BITMAP_CACHE_HOST_SUPPORT: u16 = 0x0012;
 /// `capabilitySetType`: Virtual Channel.
 pub const CAPSET_VIRTUAL_CHANNEL: u16 = 0x0014;
 /// `capabilitySetType`: Multifragment Update.

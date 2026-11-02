@@ -39,6 +39,8 @@ pub const PDU_TYPE2_SYNCHRONIZE: u8 = 0x1F;
 pub const PDU_TYPE2_CONTROL: u8 = 0x14;
 /// `pduType2`: Font List PDU (client → server).
 pub const PDU_TYPE2_FONT_LIST: u8 = 0x27;
+/// `pduType2`: Persistent Key List PDU (client → server, 2.2.1.17).
+pub const PDU_TYPE2_BITMAPCACHE_PERSISTENT_LIST: u8 = 0x2B;
 /// `pduType2`: Font Map PDU (server → client) — the session-active gate.
 pub const PDU_TYPE2_FONT_MAP: u8 = 0x28;
 /// `pduType2`: Save Session Info PDU (server → client, logon notifications).

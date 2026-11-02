@@ -107,9 +107,10 @@ pub const HONOURED_ORDER_FLAGS: u16 = capability::ORDER_NEGOTIATE_SUPPORT
 pub const HONOURED_ORDER_EX_FLAGS: u16 = capability::ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT;
 
 /// The Revision 2 Bitmap Cache `CacheFlags` the core honours: the waiting list, which the cache
-/// keeps as one extra entry per cache. Not `PERSISTENT_KEYS_EXPECTED_FLAG`, which promises a
-/// Persistent Key List PDU the core does not send.
-pub const HONOURED_BITMAP_CACHE_REV2_FLAGS: u16 = capability::ALLOW_CACHE_WAITING_LIST_FLAG;
+/// keeps as one extra entry per cache, and the promise of a Persistent Key List PDU, which the
+/// connect sequence sends from [`ConnectConfig::persistent_bitmaps`].
+pub const HONOURED_BITMAP_CACHE_REV2_FLAGS: u16 =
+    capability::ALLOW_CACHE_WAITING_LIST_FLAG | capability::PERSISTENT_KEYS_EXPECTED_FLAG;
 
 /// The largest Multifragment Update `MaxRequestSize` the core honours: the session's fast-path
 /// reassembly cap at its floor, which no desktop size lowers.
@@ -144,6 +145,13 @@ pub enum ConnectConfigError {
     /// A `correlationId` whose first byte is 0x00 or 0xF4, or with a 0x0D byte
     /// (`[MS-RDPBCGR]` 2.2.1.1.2).
     CorrelationId([u8; 16]),
+    /// A [`ConnectConfig::persistent_bitmaps`] entry the advertised caches cannot hold.
+    PersistentBitmap {
+        /// Its position in the list.
+        index: usize,
+        /// Why.
+        reason: &'static str,
+    },
 }
 
 impl core::fmt::Display for ConnectConfigError {
@@ -181,11 +189,53 @@ impl core::fmt::Display for ConnectConfigError {
                 f,
                 "correlationId {id:02x?} starts with 0x00 or 0xF4 or holds a 0x0D byte"
             ),
+            Self::PersistentBitmap { index, reason } => {
+                write!(f, "persistent bitmap {index} cannot be cached: {reason}")
+            }
         }
     }
 }
 
 impl core::error::Error for ConnectConfigError {}
+
+/// Refuse the first of `bitmaps` the Revision 2 caches in `capabilities` cannot hold: a cache
+/// past the advertised ones or not persistent, pixels that are not `width × height` RGBA or
+/// overflow the cache's tile, or, per cache, entries that are not `0..n` in list order within
+/// the advertised count and the 65,535 a `totalEntriesCache` field can state.
+pub fn check_persistent_bitmaps(
+    capabilities: &[CapabilitySet],
+    bitmaps: &[crate::PersistentBitmap],
+) -> Result<(), ConnectConfigError> {
+    let cells = capabilities
+        .iter()
+        .find_map(|set| match set {
+            CapabilitySet::BitmapCacheRev2(c) => Some(c.cells.as_slice()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut filled = [0u32; capability::BITMAP_CACHE_REV2_MAX_CELLS];
+    for (index, bitmap) in bitmaps.iter().enumerate() {
+        let refuse = |reason| Err(ConnectConfigError::PersistentBitmap { index, reason });
+        let cache = usize::from(bitmap.cache_id);
+        let Some(cell) = cells.get(cache).filter(|cell| cell.persistent) else {
+            return refuse("its cache is not an advertised persistent Revision 2 cache");
+        };
+        let (width, height) = (usize::from(bitmap.width), usize::from(bitmap.height));
+        let tile = 16usize << cache;
+        if bitmap.rgba.len() != width * height * 4 || width * height > tile * tile {
+            return refuse("its pixels are not width x height RGBA within the cache's tile");
+        }
+        if u32::from(bitmap.cache_index) != filled[cache]
+            || filled[cache] >= cell.entries.min(u32::from(u16::MAX))
+        {
+            return refuse(
+                "its cache's entries are not 0..n in list order within the advertised count",
+            );
+        }
+        filled[cache] += 1;
+    }
+    Ok(())
+}
 
 /// Refuse the first advertisement in `config` the core cannot honour.
 pub fn check(config: &ConnectConfig) -> Result<(), ConnectConfigError> {
@@ -226,6 +276,17 @@ pub fn check(config: &ConnectConfig) -> Result<(), ConnectConfigError> {
         .capabilities
         .iter()
         .try_for_each(check_capability_set)?;
+    check_persistent_bitmaps(&config.capabilities, &config.persistent_bitmaps)?;
+    let promised = config.capabilities.iter().any(|set| {
+        matches!(set, CapabilitySet::BitmapCacheRev2(c)
+            if c.cache_flags & capability::PERSISTENT_KEYS_EXPECTED_FLAG != 0)
+    });
+    if !config.persistent_bitmaps.is_empty() && !promised {
+        return Err(ConnectConfigError::PersistentBitmap {
+            index: 0,
+            reason: "no Revision 2 set promises the Persistent Key List PDU that would announce it",
+        });
+    }
     let surface_commands = config
         .capabilities
         .iter()
@@ -986,10 +1047,91 @@ mod tests {
         ));
     }
 
-    /// Persistent cells pass, since their keys reach the host (#570); the flag that promises a
-    /// Persistent Key List PDU is still refused.
+    /// Issue #571: persistent bitmaps pass when the Revision 2 set promises a key list and each
+    /// fits a persistent cache at the next entry; anything else is refused.
     #[test]
-    fn persistent_cells_pass_and_the_key_list_promise_is_refused() {
+    fn persistent_bitmaps_pass_only_where_the_caches_can_hold_them() {
+        let bitmap = |cache_id: u8, cache_index: u16, side: u16| crate::PersistentBitmap {
+            cache_id,
+            cache_index,
+            key: u64::from(cache_index),
+            width: side,
+            height: side,
+            rgba: vec![0; usize::from(side) * usize::from(side) * 4],
+        };
+        let with = |flags: u16, persistent: [bool; 3], bitmaps: Vec<crate::PersistentBitmap>| {
+            let mut config = orders_config();
+            for set in &mut config.capabilities {
+                if let CapabilitySet::BitmapCacheRev2(c) = set {
+                    c.cache_flags = flags;
+                    for (cell, persistent) in c.cells.iter_mut().zip(persistent) {
+                        cell.persistent = persistent;
+                    }
+                }
+            }
+            config.persistent_bitmaps = bitmaps;
+            check(&config)
+        };
+        let promise = capability::PERSISTENT_KEYS_EXPECTED_FLAG;
+        let all = [true; 3];
+        let refused = |result: Result<(), ConnectConfigError>, index: usize| matches!(result, Err(ConnectConfigError::PersistentBitmap { index: i, .. }) if i == index);
+        assert_eq!(
+            with(
+                promise,
+                all,
+                vec![bitmap(0, 0, 16), bitmap(2, 0, 64), bitmap(0, 1, 8)]
+            ),
+            Ok(())
+        );
+        assert_eq!(with(promise, all, Vec::new()), Ok(()), "an empty key list");
+        assert!(
+            refused(with(0, all, vec![bitmap(0, 0, 16)]), 0),
+            "no promise"
+        );
+        assert!(refused(
+            with(promise, [false, true, true], vec![bitmap(0, 0, 16)]),
+            0
+        ));
+        assert!(
+            refused(with(promise, all, vec![bitmap(3, 0, 16)]), 0),
+            "no cache 3"
+        );
+        assert!(
+            refused(with(promise, all, vec![bitmap(0, 0, 17)]), 0),
+            "past the tile"
+        );
+        assert!(refused(
+            with(promise, all, vec![bitmap(0, 0, 16), bitmap(0, 2, 16)]),
+            1
+        ));
+        let mut short = bitmap(1, 0, 4);
+        short.rgba.pop();
+        assert!(
+            refused(with(promise, all, vec![short]), 0),
+            "not width x height RGBA"
+        );
+        // `totalEntriesCache2` is 16 bits, so 65,536 keys cannot be announced.
+        let mut config = orders_config();
+        for set in &mut config.capabilities {
+            if let CapabilitySet::BitmapCacheRev2(c) = set {
+                c.cache_flags = promise;
+                c.cells[2] = capability::BitmapCacheCellInfo {
+                    entries: 65_536,
+                    persistent: true,
+                };
+            }
+        }
+        config.persistent_bitmaps = (0..=u16::MAX).map(|index| bitmap(2, index, 1)).collect();
+        assert!(
+            refused(check(&config), usize::from(u16::MAX)),
+            "65,536 keys for one cache"
+        );
+    }
+
+    /// Persistent cells pass, since their keys reach the host (#570); the flag that promises a
+    /// Persistent Key List PDU passes too, since #571 sends one.
+    #[test]
+    fn persistent_cells_and_the_key_list_promise_pass() {
         let with_cache = |persistent: bool, flags: u16| {
             let mut config = orders_config();
             for set in &mut config.capabilities {
@@ -1007,13 +1149,10 @@ mod tests {
             with_cache(true, capability::ALLOW_CACHE_WAITING_LIST_FLAG),
             Ok(())
         );
-        assert!(matches!(
+        assert_eq!(
             with_cache(true, capability::PERSISTENT_KEYS_EXPECTED_FLAG),
-            Err(ConnectConfigError::CapabilitySet {
-                set_type: capability::CAPSET_BITMAP_CACHE_REV2,
-                ..
-            })
-        ));
+            Ok(())
+        );
     }
 
     /// A glyph cache of Revision 1 glyphs passes with GlyphIndex (#476); Revision 2, a fragment
@@ -1064,7 +1203,7 @@ mod tests {
     #[test]
     fn order_advertisements_past_what_the_session_keeps_are_refused() {
         type Edit = fn(&mut CapabilitySet);
-        let cases: [(&str, Edit, u16); 8] = [
+        let cases: [(&str, Edit, u16); 7] = [
             (
                 "Cache Bitmap (Revision 3)",
                 |set| {
@@ -1099,15 +1238,6 @@ mod tests {
                 |set| {
                     if let CapabilitySet::Order(o) = set {
                         o.order_support[capability::ORDER_NEG_MEM3BLT_INDEX] = 0;
-                    }
-                },
-                capability::CAPSET_BITMAP_CACHE_REV2,
-            ),
-            (
-                "persistent keys",
-                |set| {
-                    if let CapabilitySet::BitmapCacheRev2(c) = set {
-                        c.cache_flags |= capability::PERSISTENT_KEYS_EXPECTED_FLAG;
                     }
                 },
                 capability::CAPSET_BITMAP_CACHE_REV2,
