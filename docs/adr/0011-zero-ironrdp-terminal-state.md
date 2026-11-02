@@ -1,6 +1,6 @@
 # 0011 — Zero `ironrdp` is the terminal state: the oracle is scaffolding, not a permanent dependency
 
-- Status: Accepted (conformance items #225) — amended 2026-08-13 (#194), 2026-08-18 (#168), 2026-08-18 (#169), 2026-08-19 (#171), 2026-08-19 (#172), 2026-08-19 (#189), 2026-08-26 (#225) and 2026-10-26 (#558); see the Amendments below
+- Status: Accepted (conformance items #225) — amended 2026-08-13 (#194), 2026-08-18 (#168), 2026-08-18 (#169), 2026-08-19 (#171), 2026-08-19 (#172), 2026-08-19 (#189), 2026-08-26 (#225), 2026-10-26 (#558) and 2026-11-02 (#560); see the Amendments below
 - Date: 2026-08-10
 - Records a decision by the maintainer; supersedes the open-ended dev-dependency premise in [ADR-0003](0003-phased-codecs-differential-oracle.md) phase 3 and [ADR-0007](0007-stage-boundary-codec-verification.md) §Decision
 - Related: #158 (Progressive), #189 (zgfx), #194 (Progressive's verification basis)
@@ -337,3 +337,24 @@ that logic is the gap worth closing. It is tracked as its own issue, not as a re
 as breadth and tracking the independent expectation separately is the maintainer's call
 (2026-10-26), made over three options: this, this alone without the follow-up, and the follow-up
 plus a test-only TS_RFX encoder to end R2.
+
+## Amendment (2026-11-02, #560): RemoteFX's values come from FreeRDP, and R1 stops at the ICT
+
+#558's (c) is closed: `remotefx_freerdp_pixels.rs` checks every tile of the 41 real payloads
+against FreeRDP 3.32.1's generic C decoder, through digests in `fixtures/remotefx/`.
+**(a) The first comparison found a disagreement the oracle could not have.** 62 pixels in 15
+records differed by one in one channel. The cause is the ICT's fixed-point coefficients: FreeRDP
+rounds the spec's constants times 2^16 (`prim_colors.c`, `ycbcr_constants[16]`), and this decoder
+truncated them, as `ironrdp-graphics` does through `yuv` 0.8.14 (`rdp.rs:381-384`). The oracle and
+this decoder agreed because they share the choice, which is the shape
+[oracle agreement is not independence](../map/invariant/oracle-agreement-is-not-independence.md)
+names. With rounded constants all 3720 tiles match.
+**(b) So R1 no longer covers the ICT.** `differential_rfx.rs` compares RLGR, the LL3 delta,
+dequantization and the inverse DWT with the oracle's primitives, and its composed reference uses
+this decoder's ICT. The ICT's expectation is FreeRDP's pixels. Progressive shares the ICT
+(`color::rfx_ycbcr_to_rgba`), so its pixels moved too; its assembly test re-pinned its surface
+hash, and no FreeRDP expectation covers Progressive's pixels yet.
+**How this was decided.** (a) is a measurement. Rounding the constants, rather than keeping the
+truncation and recording the 62 pixels as a known difference, is the maintainer's call
+(2026-11-02), made on that measurement and on ADR-0003's ranking of an owned basis above the
+oracle.

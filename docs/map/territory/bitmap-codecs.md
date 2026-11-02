@@ -340,6 +340,16 @@ and the framebuffer hash pinned in `justrdp/tests/real_server_surface_bits.rs` w
 that render was looked at. The stream there is 64×64 tiles (64×32 on the last row), colour-loss
 level 3, 1409 of 1432 chroma-subsampled, none with an alpha plane.
 
+**The RemoteFX ICT rounds its coefficients as FreeRDP does** (#560, 2026-11-02). FreeRDP rounds the
+constants times 2^16 (`prim_colors.c`, `ycbcr_constants[16]`); `ironrdp-graphics` truncates them
+(`yuv` 0.8.14, `rdp.rs:381-384`), and `rfx_ycbcr_to_rgba` did too, to match it. Over the 41 real
+RemoteFX payloads the truncation differed from FreeRDP 3.32.1's generic C decoder in 62 pixels of 15
+records, by one in one channel, and the rounding matches it in every tile. FreeRDP's own SIMD build,
+primitives autodetected, differs from its C decoder in 92,849 pixels of the same corpus, each
+channel by one, the margin its own `TestPrimitivesYCbCr.c` allows, so "FreeRDP's pixels" means the C
+decoder's. Progressive shares the function, so this moved its pixels too, unmeasured against
+FreeRDP.
+
 Beyond that, no verified external-fact store — despite this being the territory with the *most*
 reference-derived behaviour in the repo (FreeRDP's OOB fixes, IronRDP's decoders). What exists
 instead: the differential tests themselves, and the `clearcodec_corpus` fixtures, which encode

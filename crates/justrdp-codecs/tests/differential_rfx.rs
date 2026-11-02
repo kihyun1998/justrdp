@@ -3,13 +3,17 @@
 //! *primitives* — so correctness is proven two complementary ways instead of one end-to-end
 //! byte-diff (the ClearCodec recipe):
 //!
-//! - **(A) stage-boundary**: each inverse stage of our pipeline (RLGR → LL3 delta →
-//!   dequantize → inverse DWT → ICT) is fed the same intermediate buffer as the matching
-//!   oracle primitive and must produce byte-identical output;
+//! - **(A) stage-boundary**: each inverse stage of our pipeline up to the colour transform
+//!   (RLGR → LL3 delta → dequantize → inverse DWT) is fed the same intermediate buffer as the
+//!   matching oracle primitive and must produce byte-identical output;
 //! - **(B) composed reference**: the oracle's primitives are glued in spec order into a
-//!   reference decoder, and our full-payload RGBA must match it byte for byte on synthetic
-//!   TS_RFX streams (container encoded by `ironrdp-pdu`, tile payloads by
-//!   `rfx_encode_component`).
+//!   reference decoder, with our ICT in place of the oracle's, and our full-payload RGBA must
+//!   match it byte for byte on synthetic TS_RFX streams (container encoded by `ironrdp-pdu`,
+//!   tile payloads by `rfx_encode_component`).
+//!
+//! The ICT is not compared with the oracle's: ours rounds the coefficients as FreeRDP does and
+//! the oracle's truncates them, and the ICT's expectation is FreeRDP's pixels over the
+//! real-server corpus (`remotefx_freerdp_pixels.rs`, #560).
 //!
 //! The synthetic streams are this test's corpus: the real-server one
 //! (`tests/fixtures/remotefx/`, #554) holds only RLGR1, one quantization table and
@@ -17,7 +21,7 @@
 //! here alone (#558). A corpus only tests what it generates, hence the coverage guards: every
 //! test asserts both RLGR1 and RLGR3 were actually exercised.
 
-use ironrdp_graphics::color_conversion::{self, YCbCrBuffer};
+use ironrdp_graphics::color_conversion;
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::{dwt, quantization, rfx_encode_component, rlgr, subband_reconstruction};
 use ironrdp_pdu::codecs::rfx as oracle_rfx;
@@ -415,45 +419,6 @@ fn every_inverse_stage_matches_the_oracle_primitive_at_its_boundary() {
     );
 }
 
-/// Stage 5 (ICT) separately: it consumes all three planes at once, so it does not fit the
-/// per-component walk above. Same inputs → byte-identical RGBA.
-#[test]
-fn the_ict_color_stage_matches_the_oracle_on_reconstructed_planes() {
-    for (mode, mode_name) in MODES {
-        for (pattern_name, rgba) in patterns() {
-            let quant = oracle_rfx::Quant::default();
-            let (y, cb, cr) = to_planes(&rgba);
-            // Round-trip each plane through the oracle pipeline so the ICT sees realistic
-            // (lossy-reconstructed) samples, not the pristine forward output.
-            let reconstruct = |plane: &[i16; TILE_PIXELS]| {
-                let encoded = encode_component(plane, &quant, mode);
-                let mut buf = [0i16; TILE_PIXELS];
-                rlgr::decode(mode, &encoded, &mut buf).expect("oracle rlgr");
-                subband_reconstruction::decode(&mut buf[4032..]);
-                quantization::decode(&mut buf, &quant);
-                let mut temp = [0i16; TILE_PIXELS];
-                dwt::decode(&mut buf, &mut temp);
-                buf
-            };
-            let (ry, rcb, rcr) = (reconstruct(&y), reconstruct(&cb), reconstruct(&cr));
-
-            let mut theirs = vec![0u8; TILE_PIXELS * 4];
-            color_conversion::ycbcr_to_rgba(
-                YCbCrBuffer {
-                    y: &ry,
-                    cb: &rcb,
-                    cr: &rcr,
-                },
-                &mut theirs,
-            )
-            .expect("oracle ICT");
-            let mut mine = vec![0u8; TILE_PIXELS * 4];
-            color::rfx_ycbcr_to_rgba(&ry, &rcb, &rcr, &mut mine);
-            assert_eq!(mine, theirs, "ICT diverged ({mode_name}/{pattern_name})");
-        }
-    }
-}
-
 // ---------------------------------------------------------------- (B) composed reference
 
 /// One synthetic tile: grid position plus the three encoded component streams.
@@ -523,8 +488,8 @@ fn build_stream(
 }
 
 /// The reference decoder: the oracle's primitives glued in spec order — parse with
-/// `ironrdp-pdu`, per tile RLGR → LL3 → dequantize → iDWT → ICT, composited with the same
-/// region-clipped blit semantics our decoder implements.
+/// `ironrdp-pdu`, per tile RLGR → LL3 → dequantize → iDWT, then our ICT, composited with the
+/// same region-clipped blit semantics our decoder implements.
 fn reference_decode(data: &[u8], w: usize, h: usize) -> Vec<u8> {
     use oracle_rfx::{Block, CodecChannel};
     let mut out = vec![0u8; w * h * 4];
@@ -566,15 +531,7 @@ fn reference_decode(data: &[u8], w: usize, h: usize) -> Vec<u8> {
                     let cb = decode_plane(tile.cb_data);
                     let cr = decode_plane(tile.cr_data);
                     let mut rgba = vec![0u8; TILE_PIXELS * 4];
-                    color_conversion::ycbcr_to_rgba(
-                        YCbCrBuffer {
-                            y: &y,
-                            cb: &cb,
-                            cr: &cr,
-                        },
-                        &mut rgba,
-                    )
-                    .expect("oracle ICT");
+                    color::rfx_ycbcr_to_rgba(&y, &cb, &cr, &mut rgba);
                     let (tx, ty) = (usize::from(tile.x) * 64, usize::from(tile.y) * 64);
                     for &(cx, cy, cw, ch) in &region {
                         let left = tx.max(cx).min(w);
