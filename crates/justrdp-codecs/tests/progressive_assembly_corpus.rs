@@ -424,7 +424,7 @@ fn the_assembled_surface_is_deterministic_and_pinned() {
         hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
     }
     assert_eq!(
-        hash, 3_942_531_376_082_079_810,
+        hash, 16_936_718_445_030_295_473,
         "the assembled surface changed — see this test's doc before touching the number"
     );
 }

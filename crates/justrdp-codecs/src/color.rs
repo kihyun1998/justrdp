@@ -231,23 +231,19 @@ pub fn to_rgba(
 /// fixed point, each sample ≈ `(channel − 128) · 32` — so the level shift folds in here
 /// (`+4096 = 128 · 32`) and the final shift drops both the ×32 and the coefficient scale.
 ///
-/// The coefficients are the spec's constants in `f32`, and the per-pixel arithmetic mirrors
-/// the differential oracle's fixed-point form bit for bit (ADR-0007) — a "nicer" rounding
-/// here would be a permanent 1-LSB diff against every interoperable decoder. Accumulation is
-/// `i64` so hostile out-of-range samples saturate at the clamp instead of overflowing.
+/// The coefficients are the spec's constants times 2^16, rounded to the nearest integer: FreeRDP's
+/// `ycbcr_constants[16]` (`prim_colors.c`). Accumulation is `i64` so hostile out-of-range samples
+/// saturate at the clamp instead of overflowing.
 pub fn rfx_ycbcr_to_rgba(y: &[i16], cb: &[i16], cr: &[i16], out: &mut [u8]) {
     const PRECISION: i64 = 1 << 16;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "spec constants scaled to 16-bit fixed point; exact f32 product fits i64"
-    )]
-    const CR_R: i64 = (1.402_525_f32 * PRECISION as f32) as i64;
-    #[expect(clippy::cast_possible_truncation, reason = "as above")]
-    const CB_G: i64 = (0.343_730_f32 * PRECISION as f32) as i64;
-    #[expect(clippy::cast_possible_truncation, reason = "as above")]
-    const CR_G: i64 = (0.714_401_f32 * PRECISION as f32) as i64;
-    #[expect(clippy::cast_possible_truncation, reason = "as above")]
-    const CB_B: i64 = (1.769_905_f32 * PRECISION as f32) as i64;
+    /// 1.402525 · 2^16
+    const CR_R: i64 = 91_916;
+    /// 0.343730 · 2^16
+    const CB_G: i64 = 22_527;
+    /// 0.714401 · 2^16
+    const CR_G: i64 = 46_819;
+    /// 1.769905 · 2^16
+    const CB_B: i64 = 115_992;
 
     debug_assert_eq!(y.len(), cb.len());
     debug_assert_eq!(y.len(), cr.len());
