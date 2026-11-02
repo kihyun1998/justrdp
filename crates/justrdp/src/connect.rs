@@ -48,6 +48,13 @@ pub struct ConnectConfig {
     /// Licensing parameters for the full MS-RDPELE negotiation (most servers short-circuit it
     /// with `STATUS_VALID_CLIENT` and never consume these).
     pub license: LicenseConfig,
+    /// Bitmaps kept from earlier sessions ([`crate::SessionOutput::PersistentBitmap`]), whose
+    /// keys the Persistent Key List PDU announces (`[MS-RDPBCGR]` 2.2.1.17). Per cache, the
+    /// entries are `0..n` in list order: the key a PDU lists `i`-th for a cache names entry `i`.
+    /// Sent only with `PERSISTENT_KEYS_EXPECTED_FLAG` in the Revision 2 set and to a server that
+    /// advertised Bitmap Cache Host Support; [`ActivationResult::persistent_bitmaps`] carries
+    /// the ones announced.
+    pub persistent_bitmaps: Vec<crate::PersistentBitmap>,
 }
 
 /// Caller-supplied licensing parameters (MS-RDPELE). Reaches the wire verbatim.
@@ -230,6 +237,9 @@ pub struct ActivationResult {
     /// [`crate::SessionOutput::SaveSessionInfo`] instead. Both legs, one PDU: read whichever
     /// arrives.
     pub save_session_info: Vec<justrdp_pdu::session_info::SaveSessionInfo>,
+    /// The [`ConnectConfig::persistent_bitmaps`] whose keys the Persistent Key List PDU
+    /// announced, for [`crate::SessionConfig::persistent_bitmaps`]: empty when none was sent.
+    pub persistent_bitmaps: Vec<crate::PersistentBitmap>,
 }
 
 /// An input handed to the machine by the host adapter.
@@ -472,6 +482,11 @@ pub struct ConnectStateMachine {
     server_capabilities: Vec<CapabilitySet>,
     /// Save Session Info PDUs seen before the Font Map, handed over in [`ActivationResult`].
     save_session_info: Vec<justrdp_pdu::session_info::SaveSessionInfo>,
+    /// The persistent bitmaps a Persistent Key List PDU announced, handed over in
+    /// [`ActivationResult`].
+    announced_bitmaps: Vec<crate::PersistentBitmap>,
+    /// A Persistent Key List PDU was sent; a later Demand Active sends none (2.2.1.17).
+    key_list_sent: bool,
 }
 
 impl ConnectStateMachine {
@@ -496,7 +511,28 @@ impl ConnectStateMachine {
             negotiated_size: (0, 0),
             server_capabilities: Vec::new(),
             save_session_info: Vec::new(),
+            announced_bitmaps: Vec::new(),
+            key_list_sent: false,
         })
+    }
+
+    /// The persistent bitmaps whose keys this Demand Active's finalization announces: all of
+    /// [`ConnectConfig::persistent_bitmaps`], once, when the Revision 2 set promises a key list
+    /// and the server advertised Bitmap Cache Host Support (`[MS-RDPBCGR]` 2.2.1.17).
+    fn key_list_to_send(&mut self) -> Option<Vec<crate::PersistentBitmap>> {
+        let promised = self.config.capabilities.iter().any(|set| {
+            matches!(set, CapabilitySet::BitmapCacheRev2(c)
+                if c.cache_flags & capability::PERSISTENT_KEYS_EXPECTED_FLAG != 0)
+        });
+        let host_support = self.server_capabilities.iter().any(|set| {
+            matches!(set, CapabilitySet::Unknown { set_type, .. }
+                if *set_type == capability::CAPSET_BITMAP_CACHE_HOST_SUPPORT)
+        });
+        if !promised || !host_support || self.key_list_sent {
+            return None;
+        }
+        self.key_list_sent = true;
+        Some(std::mem::take(&mut self.config.persistent_bitmaps))
     }
 
     /// The current connect stage label, for diagnostics / progress UI.
@@ -1197,7 +1233,7 @@ impl ConnectStateMachine {
 
                 // Pipeline the whole finalization batch with the confirm (MS-RDPBCGR
                 // 1.3.1.1 allows it; one round trip instead of four).
-                let batch = [
+                let mut batch = vec![
                     (
                         share::PDU_TYPE2_SYNCHRONIZE,
                         finalization::Synchronize {
@@ -1214,8 +1250,24 @@ impl ConnectStateMachine {
                         finalization::Control::new(finalization::CTRLACTION_REQUEST_CONTROL)
                             .encode(),
                     ),
-                    (share::PDU_TYPE2_FONT_LIST, finalization::encode_font_list()),
                 ];
+                if let Some(bitmaps) = self.key_list_to_send() {
+                    let mut keys: Vec<Vec<u64>> = vec![Vec::new(); 5];
+                    for bitmap in &bitmaps {
+                        keys[usize::from(bitmap.cache_id)].push(bitmap.key);
+                    }
+                    let keys: Vec<&[u64]> = keys.iter().map(Vec::as_slice).collect();
+                    for body in finalization::encode_persistent_key_lists(&keys) {
+                        batch.push((share::PDU_TYPE2_BITMAPCACHE_PERSISTENT_LIST, body));
+                    }
+                    tracing::debug!(
+                        target: "rdp_demand_active",
+                        keys = bitmaps.len(),
+                        "persistent key list sent"
+                    );
+                    self.announced_bitmaps = bitmaps;
+                }
+                batch.push((share::PDU_TYPE2_FONT_LIST, finalization::encode_font_list()));
                 let mut actions = vec![self.send_io(&confirm)];
                 for (pdu_type2, body) in batch {
                     actions.push(self.send_io(&share::encode_share_data(
@@ -1305,6 +1357,7 @@ impl ConnectStateMachine {
                                 server_capabilities: std::mem::take(&mut self.server_capabilities),
                                 leftover: std::mem::take(&mut self.inbox),
                                 save_session_info: std::mem::take(&mut self.save_session_info),
+                                persistent_bitmaps: std::mem::take(&mut self.announced_bitmaps),
                             },
                         }])
                     }
@@ -1487,6 +1540,7 @@ pub(crate) mod tests {
                 platform_id: license::PLATFORM_ID_NT_POST_52_MICROSOFT,
                 hardware_id: [1, 2, 3, 4],
             },
+            persistent_bitmaps: Vec::new(),
         }
     }
 
@@ -2638,7 +2692,12 @@ pub(crate) mod tests {
 
     /// A synthetic Demand Active: General + Bitmap (carrying `width`×`height`) + Input.
     fn server_demand_active(width: u16, height: u16) -> Vec<u8> {
-        let sets = vec![
+        server_demand_active_with(width, height, Vec::new())
+    }
+
+    /// [`server_demand_active`] with `extra` sets appended.
+    fn server_demand_active_with(width: u16, height: u16, extra: Vec<CapabilitySet>) -> Vec<u8> {
+        let mut sets = vec![
             CapabilitySet::General(capability::GeneralCapabilitySet {
                 os_major_type: 1,
                 os_minor_type: 3,
@@ -2661,6 +2720,7 @@ pub(crate) mod tests {
                 keyboard_function_key: 12,
             }),
         ];
+        sets.extend(extra);
         let mut caps = Vec::new();
         for set in &sets {
             set.encode(&mut caps);
@@ -2754,7 +2814,85 @@ pub(crate) mod tests {
 
     /// Through the Font Map into session-active; returns the machine and the result.
     fn session_active() -> (ConnectStateMachine, ActivationResult) {
-        let mut sm = finalizing();
+        finish_activation(finalizing())
+    }
+
+    /// Issue #571: with the key list promised and Bitmap Cache Host Support advertised, the
+    /// batch sends the Persistent Key List PDU between Request Control and Font List, and the
+    /// result hands the announced bitmaps on. A server without Host Support gets none, and the
+    /// result hands none on.
+    #[test]
+    fn a_promised_key_list_goes_between_request_control_and_font_list() {
+        let bitmap = crate::PersistentBitmap {
+            cache_id: 0,
+            cache_index: 0,
+            key: 0x1122_3344_5566_7788,
+            width: 1,
+            height: 1,
+            rgba: vec![1, 2, 3, 255],
+        };
+        let data = |pdu_type2: u8, body: &[u8]| {
+            Action::WriteBytes(frame_io(&share::encode_share_data(
+                1007,
+                SHARE_ID,
+                share::STREAM_MED,
+                pdu_type2,
+                body,
+            )))
+        };
+        let request_control = data(
+            share::PDU_TYPE2_CONTROL,
+            &finalization::Control::new(finalization::CTRLACTION_REQUEST_CONTROL).encode(),
+        );
+        let key_list = data(
+            share::PDU_TYPE2_BITMAPCACHE_PERSISTENT_LIST,
+            &finalization::encode_persistent_key_lists(&[&[bitmap.key]])[0],
+        );
+        let font_list = data(
+            share::PDU_TYPE2_FONT_LIST,
+            &finalization::encode_font_list(),
+        );
+        for host_support in [true, false] {
+            let mut sm = capability_waiting();
+            sm.config.capabilities.push(CapabilitySet::BitmapCacheRev2(
+                capability::BitmapCacheRev2CapabilitySet {
+                    cache_flags: capability::PERSISTENT_KEYS_EXPECTED_FLAG,
+                    cells: vec![capability::BitmapCacheCellInfo {
+                        entries: 1,
+                        persistent: true,
+                    }],
+                },
+            ));
+            sm.config.persistent_bitmaps = vec![bitmap.clone()];
+            let extra = if host_support {
+                vec![CapabilitySet::Unknown {
+                    set_type: capability::CAPSET_BITMAP_CACHE_HOST_SUPPORT,
+                    data: vec![1, 0, 0, 0, 0, 0, 0, 0],
+                }]
+            } else {
+                Vec::new()
+            };
+            let actions = sm.process(Event::Received(&server_io_frame(
+                &server_demand_active_with(1920, 1080, extra),
+            )));
+            let expected_tail = if host_support {
+                vec![request_control.clone(), key_list.clone(), font_list.clone()]
+            } else {
+                vec![request_control.clone(), font_list.clone()]
+            };
+            assert_eq!(actions[3..], expected_tail, "host support {host_support}");
+            let (_, result) = finish_activation(sm);
+            let announced = if host_support {
+                vec![bitmap.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(result.persistent_bitmaps, announced);
+        }
+    }
+
+    /// Drive `sm`, finalizing, through the server's replies and the Font Map.
+    fn finish_activation(mut sm: ConnectStateMachine) -> (ConnectStateMachine, ActivationResult) {
         // The server's own finalization replies, in the usual order.
         for (pdu_type2, body) in [
             (

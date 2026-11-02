@@ -109,6 +109,9 @@ pub struct SessionConfig {
     pub dynamic_channels: Vec<String>,
     /// What the graphics channel advertises when the server opens it.
     pub egfx: crate::EgfxConfig,
+    /// The bitmaps the Persistent Key List PDU announced
+    /// ([`crate::ActivationResult::persistent_bitmaps`]): the Revision 2 caches start with them.
+    pub persistent_bitmaps: Vec<crate::PersistentBitmap>,
 }
 
 /// How many desktops' worth of decoded pixels one graphics update may buy (#367, #494).
@@ -540,6 +543,8 @@ pub enum SessionError {
     },
     /// [`SessionConfig::egfx`] cannot be advertised.
     EgfxConfig(crate::EgfxConfigError),
+    /// One of [`SessionConfig::persistent_bitmaps`] does not fit the advertised caches.
+    PersistentBitmap(crate::ConnectConfigError),
     /// [`SessionConfig::dynamic_channels`] names a channel the core terminates.
     DynamicChannelConfig(crate::dvc::CoreOwnedDynamicChannel),
     /// Interleaved-RLE bitmap data failed to decompress.
@@ -564,6 +569,7 @@ impl core::fmt::Display for SessionError {
                 write!(f, "dynamic channel {channel}: {error}")
             }
             SessionError::EgfxConfig(e) => write!(f, "EGFX config: {e}"),
+            SessionError::PersistentBitmap(e) => write!(f, "persistent bitmaps: {e}"),
             SessionError::DynamicChannelConfig(e) => write!(f, "dynamic channel config: {e}"),
             SessionError::Rle(e) => write!(f, "interleaved RLE: {e}"),
             SessionError::Planar(e) => write!(f, "RDP6 planar: {e}"),
@@ -675,7 +681,7 @@ impl SessionStateMachine {
     /// [`crate::framebuffer::MAX_DESKTOP_DIM`] — a server-declared value that reaches an
     /// allocation, so refusing it here is what keeps the allocation total
     /// (ADR-0012 §1; the 32-bit overflow it prevents is reproduced in `framebuffer`'s tests).
-    pub fn new(config: SessionConfig, leftover: Vec<u8>) -> Result<Self, SessionError> {
+    pub fn new(mut config: SessionConfig, leftover: Vec<u8>) -> Result<Self, SessionError> {
         let framebuffer =
             Framebuffer::new(config.desktop_size.0, config.desktop_size.1).map_err(|error| {
                 SessionError::Framebuffer {
@@ -716,7 +722,13 @@ impl SessionStateMachine {
                 if c.codecs.iter().any(|codec| codec.guid == capability::CODEC_GUID_NSCODEC
                     && codec.id == capability::CODEC_ID_NSCODEC))
         });
-        let orders = crate::orders::Orders::new(&config.capabilities);
+        crate::advertise::check_persistent_bitmaps(
+            &config.capabilities,
+            &config.persistent_bitmaps,
+        )
+        .map_err(SessionError::PersistentBitmap)?;
+        let mut orders = crate::orders::Orders::new(&config.capabilities);
+        orders.preload(std::mem::take(&mut config.persistent_bitmaps));
         let channels = config
             .static_channels
             .iter()
@@ -2735,6 +2747,7 @@ mod tests {
             .collect(),
             dynamic_channels: vec![HOST_DVC.to_string()],
             egfx: Default::default(),
+            persistent_bitmaps: Vec::new(),
         }
     }
 
@@ -4040,6 +4053,55 @@ mod tests {
                 rgba: rgba(RED).to_vec(),
             })]
         );
+    }
+
+    /// Issue #571: the announced persistent bitmaps fill the caches before the first update, so
+    /// a MemBlt naming one paints with no Cache Bitmap order.
+    #[test]
+    fn a_preloaded_persistent_bitmap_paints_with_no_cache_order() {
+        use crate::orders::tests::{BLUE, memblt, rgba};
+        let mut config = orders_config();
+        config.persistent_bitmaps = vec![crate::PersistentBitmap {
+            cache_id: 1,
+            cache_index: 0,
+            key: 7,
+            width: 1,
+            height: 1,
+            rgba: rgba(BLUE).to_vec(),
+        }];
+        for set in &mut config.capabilities {
+            if let CapabilitySet::BitmapCacheRev2(c) = set {
+                c.cells[1].persistent = true;
+            }
+        }
+        let mut sm = SessionStateMachine::new(config, Vec::new()).unwrap();
+        let section = orders_body(&[memblt((1, 0), [2, 1, 1, 1], 0xCC, [0, 0])]);
+        sm.process_bytes(&fastpath::encode_pdu(&[(
+            fastpath::FP_UPDATE_ORDERS,
+            fastpath::FP_FRAGMENT_SINGLE,
+            &section[..],
+        )]))
+        .unwrap();
+        let at = (usize::from(sm.framebuffer().width()) + 2) * 4;
+        assert_eq!(sm.framebuffer().pixels()[at..at + 4], rgba(BLUE));
+    }
+
+    /// A persistent bitmap the caches cannot hold refuses the session.
+    #[test]
+    fn a_persistent_bitmap_past_the_caches_refuses_the_session() {
+        let mut config = orders_config();
+        config.persistent_bitmaps = vec![crate::PersistentBitmap {
+            cache_id: 1,
+            cache_index: 0,
+            key: 7,
+            width: 1,
+            height: 1,
+            rgba: vec![0; 4],
+        }];
+        assert!(matches!(
+            SessionStateMachine::new(config, Vec::new()),
+            Err(SessionError::PersistentBitmap(_))
+        ));
     }
 
     fn red_at(x: i16) -> Vec<Vec<u8>> {

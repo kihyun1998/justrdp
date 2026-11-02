@@ -5,7 +5,8 @@
 The negotiation that decides what the session can actually do: the server's Demand
 Active carries its capability sets and the `shareID`; the client answers with
 Confirm Active carrying its own; then the finalization round-trip (Synchronize →
-Control Cooperate → Control Request Control → Font List → Font Map) reaches
+Control Cooperate → Control Request Control → [Persistent Key List] → Font List → Font Map)
+reaches
 `session-active`. The same exchange re-runs **in-session** as
 Deactivation–Reactivation, which is how a resize actually happens.
 
