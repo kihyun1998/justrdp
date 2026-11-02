@@ -1,6 +1,6 @@
 # 0011 — Zero `ironrdp` is the terminal state: the oracle is scaffolding, not a permanent dependency
 
-- Status: Accepted (conformance items #225) — amended 2026-08-13 (#194), 2026-08-18 (#168), 2026-08-18 (#169), 2026-08-19 (#171), 2026-08-19 (#172), 2026-08-19 (#189), 2026-08-26 (#225), 2026-10-26 (#558) and 2026-11-02 (#560); see the Amendments below
+- Status: Accepted (conformance items #225) — amended 2026-08-13 (#194), 2026-08-18 (#168), 2026-08-18 (#169), 2026-08-19 (#171), 2026-08-19 (#172), 2026-08-19 (#189), 2026-08-26 (#225), 2026-10-26 (#558), 2026-11-02 (#560) and 2026-11-02 (#566); see the Amendments below
 - Date: 2026-08-10
 - Records a decision by the maintainer; supersedes the open-ended dev-dependency premise in [ADR-0003](0003-phased-codecs-differential-oracle.md) phase 3 and [ADR-0007](0007-stage-boundary-codec-verification.md) §Decision
 - Related: #158 (Progressive), #189 (zgfx), #194 (Progressive's verification basis)
@@ -358,3 +358,11 @@ hash, and no FreeRDP expectation covers Progressive's pixels yet.
 truncation and recording the 62 pixels as a known difference, is the maintainer's call
 (2026-11-02), made on that measurement and on ADR-0003's ranking of an owned basis above the
 oracle.
+
+## Amendment (2026-11-02, #566): Progressive's pixels match FreeRDP's
+
+#560's amendment left Progressive's pixels unmeasured against FreeRDP. `progressive_freerdp_pixels.rs`
+now replays its 52 real payloads and compares the surface after each with FreeRDP 3.32.1's
+generic C decoder, through digests in `fixtures/progressive/`: every one of the 13,520 tiles
+matches in R, G and B. With #560's truncated coefficients 4248 would not. Alpha is not compared:
+FreeRDP writes 0 and this decoder 255. This is a measurement and falls to a better one.

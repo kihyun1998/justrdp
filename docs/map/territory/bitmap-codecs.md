@@ -347,8 +347,9 @@ RemoteFX payloads the truncation differed from FreeRDP 3.32.1's generic C decode
 records, by one in one channel, and the rounding matches it in every tile. FreeRDP's own SIMD build,
 primitives autodetected, differs from its C decoder in 92,849 pixels of the same corpus, each
 channel by one, the margin its own `TestPrimitivesYCbCr.c` allows, so "FreeRDP's pixels" means the C
-decoder's. Progressive shares the function, so this moved its pixels too, unmeasured against
-FreeRDP.
+decoder's. Progressive shares the function: over its 52 real payloads (#566) its surface matches
+FreeRDP's C decoder in R, G and B after every payload, where the truncation differs in 4248 of
+13,520 tiles. FreeRDP writes alpha 0 there and this decoder 255.
 
 Beyond that, no verified external-fact store — despite this being the territory with the *most*
 reference-derived behaviour in the repo (FreeRDP's OOB fixes, IronRDP's decoders). What exists

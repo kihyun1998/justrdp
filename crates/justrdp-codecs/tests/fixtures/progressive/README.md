@@ -94,3 +94,28 @@ canary in `tests/progressive_corpus.rs`:
 
 The second is not a consequence of the first — skipping the payload that trips the sentinel does
 not save the ones after it.
+
+## Expected pixels (#566)
+
+`replay.freerdp-tiles.bin`: what FreeRDP's Progressive decoder had painted after each payload,
+as digests. `tests/progressive_freerdp_pixels.rs` replays the corpus and compares.
+
+**Format**, little-endian: a `u32` payload count, then per payload, in order, `u16 width, u16
+height` (the surface's) and one `u64` per 64×64 tile of the surface, tiles in raster order. A
+tile's `u64` is FNV-1a 64 (offset basis `0xcbf29ce484222325`, prime `0x100000001b3`) over the R,
+G and B bytes of its pixels, rows top to bottom, each row clipped to the surface. 52 × 260 tiles.
+
+**Alpha is not digested.** FreeRDP's colour primitive writes 0 there (its gdi surfaces are BGRX,
+so alpha means nothing to it); this decoder writes 255. Compared with alpha, each of the
+first three surfaces differed in 944,128 pixels, all of them in alpha alone.
+
+**How it was made.** The FreeRDP build and settings of `../remotefx/README.md` (tag 3.32.1,
+commit `bf217a504e54cc719880c228e82353382cd7d4fa`, `-DWITH_SIMD=OFF`,
+`primitives_set_hints(PRIMITIVES_PURE_SOFT)`), driven the way `libfreerdp/gdi/gfx.c` drives it: one
+`progressive_context_new(FALSE)`, `progressive_create_surface_context(ctx, 0, 1280, 800)`, then
+per payload `progressive_decompress(ctx, payload, len, surface, PIXEL_FORMAT_RGBA32, 1280 * 4, 0,
+0, &region, 0, index)` into one zeroed surface, which a WireToSurface2 command's zero origin
+matches. The C harness computed the digests itself; it is not in the repository.
+
+With `rfx_ycbcr_to_rgba`'s coefficients truncated, as before #560, 4248 of the 13,520 tiles
+differ; rounded, none do.
