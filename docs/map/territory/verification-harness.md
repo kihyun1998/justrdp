@@ -492,9 +492,10 @@ in-session query.
 
 - **Every owned codec that decodes server bytes has a real-server corpus, with two gaps** (#554). The
   codec-level corpora sit in `justrdp-codecs/tests/fixtures/<codec>/`, one record container for
-  all of them, and prove acceptance only, except RemoteFX: its 41 payloads are also checked
-  against FreeRDP's pixels, tile by tile (`remotefx_freerdp_pixels.rs`, #560). Nothing else in
-  them asserts a pixel or a sample value.
+  all of them, and prove acceptance only, except RemoteFX and Progressive: their payloads are
+  also checked against FreeRDP's pixels, tile by tile (`remotefx_freerdp_pixels.rs`, #560;
+  `progressive_freerdp_pixels.rs`, #566). Nothing else in them asserts a pixel or a sample
+  value.
   - **Interleaved RLE at 24 bpp is the one with none.** Asked for 24, the WS2019 VM answers 32
     and the WS2008 R2 VM answers 16, to justrdp and to FreeRDP 3.32.1 alike (2026-10-26). WS2019
     also answers 32 to 15 and 16 to 8, so RLE at 8 and 15 bpp comes from WS2008 R2 alone.
