@@ -894,6 +894,10 @@ pub async fn run_session_with_input(
                 SessionOutput::PlaySound(_) => {
                     // As above: the core already emitted the `rdp_play_sound` record.
                 }
+                SessionOutput::PersistentBitmap(_) => {
+                    // No event sink here: a host that keeps persistent bitmaps receives them
+                    // through run_session_with_commands.
+                }
                 SessionOutput::ChannelData { channel, data } => {
                     // No event sink here either: a host that uses static channels receives
                     // them through run_session_with_commands, which can also send on them.
@@ -1065,6 +1069,9 @@ pub enum SessionEvent {
     /// The server asked for a beep (`[MS-RDPBCGR]` 2.2.9.1.1.5, issue #354). Whether and how it
     /// sounds is the host's.
     PlaySound(justrdp_pdu::sound::PlaySound),
+    /// A bitmap the server cached with a persistent key (issue #570). Keeping it for a later
+    /// session, and where, is the host's.
+    PersistentBitmap(justrdp::PersistentBitmap),
     /// One whole message on a static channel the host requested (issue #307). What it means,
     /// and whether anything answers it, is the host's.
     ChannelData {
@@ -1164,6 +1171,9 @@ pub async fn run_session_with_commands(
                 }
                 SessionOutput::PlaySound(beep) => {
                     on_event(SessionEvent::PlaySound(beep));
+                }
+                SessionOutput::PersistentBitmap(bitmap) => {
+                    on_event(SessionEvent::PersistentBitmap(bitmap));
                 }
                 SessionOutput::ChannelData { channel, data } => {
                     on_event(SessionEvent::ChannelData { channel, data });
@@ -8387,8 +8397,16 @@ mod tests {
                                 format!("Mem3Blt rop {:#04x}", order.blt.rop)
                             }
                             Ok(DrawingOrder::CacheBitmapRev2(order)) => format!(
-                                "CacheBitmapRev2 cache {} compressed {} {} bpp",
-                                order.cache_id, order.compressed, order.bits_per_pixel
+                                "CacheBitmapRev2 cache {} compressed {} {} bpp{}{}",
+                                order.cache_id,
+                                order.compressed,
+                                order.bits_per_pixel,
+                                if order.key.is_some() { " keyed" } else { "" },
+                                if order.cache_index == orders::BITMAPCACHE_WAITING_LIST_INDEX {
+                                    " waiting"
+                                } else {
+                                    ""
+                                },
                             ),
                             Ok(DrawingOrder::FrameMarker { action }) => {
                                 format!("FrameMarker {action}")
@@ -8436,6 +8454,101 @@ mod tests {
         }
         std::fs::write(&path, ppm).expect("write the visual dump");
         path
+    }
+
+    /// Issue #570: with every Revision 2 cell advertised persistent, the VM gives each bitmap
+    /// it caches a key, and each one in a real entry reaches the host with that key.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn persistent_bitmap_keys_reach_the_host_on_the_real_vm() {
+        with_vm_session(|vm| async move {
+            use justrdp_pdu::capability::{self, CapabilitySet};
+            let mut config = legacy_orders_config(&[
+                capability::ORDER_NEG_MEMBLT_INDEX,
+                capability::ORDER_NEG_MEM3BLT_INDEX,
+            ]);
+            for set in &mut config.capabilities {
+                if let CapabilitySet::BitmapCacheRev2(c) = set {
+                    for cell in &mut c.cells {
+                        cell.persistent = true;
+                    }
+                }
+            }
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, session_capabilities),
+                outcome.activation.leftover.clone(),
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+            let mut census = OrderCensus::default();
+            census.feed(&outcome.activation.leftover);
+            let mut readbuf = [0u8; 16 * 1024];
+            let mut persisted = Vec::new();
+            let mut frames = 0usize;
+            let mut pending = feed_drained(&mut machine, &[]).expect("leftover bytes process");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                for output in pending.drain(..) {
+                    match output {
+                        justrdp::SessionOutput::Frame(_) => frames += 1,
+                        justrdp::SessionOutput::PersistentBitmap(bitmap) => persisted.push(bitmap),
+                        justrdp::SessionOutput::WriteBytes(bytes) => {
+                            stream.write_all(&bytes).await.expect("write to the VM");
+                        }
+                        _ => {}
+                    }
+                }
+                match tokio::time::timeout_at(deadline, stream.read(&mut readbuf)).await {
+                    Ok(Ok(0)) => panic!("the server closed the session: {:?}", census.orders),
+                    Ok(Ok(n)) => {
+                        census.feed(&readbuf[..n]);
+                        pending = feed_drained(&mut machine, &readbuf[..n])
+                            .expect("every drawing order decodes");
+                    }
+                    Ok(Err(e)) => panic!("read failed: {e}"),
+                    Err(_) => break,
+                }
+            }
+            census.print("#570");
+            let keys: std::collections::HashSet<u64> = persisted.iter().map(|b| b.key).collect();
+            eprintln!(
+                "#570: {frames} frames, {} keyed bitmaps reached the host, {} distinct keys",
+                persisted.len(),
+                keys.len()
+            );
+            assert!(frames > 0, "the desktop painted nothing");
+            let fills = |keyed: bool, waiting: bool| -> usize {
+                census
+                    .orders
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("CacheBitmapRev2"))
+                    .filter(|(name, _)| name.contains(" keyed") == keyed)
+                    .filter(|(name, _)| name.ends_with(" waiting") == waiting)
+                    .map(|(_, count)| count)
+                    .sum()
+            };
+            assert_eq!(
+                fills(true, false),
+                persisted.len(),
+                "every keyed fill of a real entry reaches the host: {:?}",
+                census.orders
+            );
+            assert_eq!(
+                fills(false, false) + fills(false, true),
+                0,
+                "the VM cached a bitmap with no key: {:?}",
+                census.orders
+            );
+            for bitmap in &persisted {
+                assert_eq!(
+                    bitmap.rgba.len(),
+                    usize::from(bitmap.width) * usize::from(bitmap.height) * 4
+                );
+            }
+        })
+        .await
     }
 
     /// Issue #460: advertising MemBlt and Mem3Blt over a Revision 2 bitmap cache at 16 bpp,

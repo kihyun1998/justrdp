@@ -184,6 +184,9 @@ pub enum SessionOutput {
     Reactivated,
     /// Fresh pixels for the host's frame sink.
     Frame(FrameUpdate),
+    /// A bitmap the server cached with a persistent key (issue #570). Keeping it for a later
+    /// session, and where, is the host's.
+    PersistentBitmap(crate::PersistentBitmap),
     /// A cursor change for the host's cursor sink (issue #41).
     Cursor(CursorEvent),
     /// Bytes the adapter must write to the socket (reactivation / drdynvc traffic).
@@ -1493,6 +1496,12 @@ impl SessionStateMachine {
             &mut frames,
         );
         outputs.extend(frames.into_iter().map(SessionOutput::Frame));
+        outputs.extend(
+            self.orders
+                .take_persisted()
+                .into_iter()
+                .map(SessionOutput::PersistentBitmap),
+        );
         result
     }
 
@@ -1510,6 +1519,12 @@ impl SessionStateMachine {
             &mut frames,
         );
         outputs.extend(frames.into_iter().map(SessionOutput::Frame));
+        outputs.extend(
+            self.orders
+                .take_persisted()
+                .into_iter()
+                .map(SessionOutput::PersistentBitmap),
+        );
         result
     }
 
@@ -3994,6 +4009,37 @@ mod tests {
         let mut body = (orders.len() as u16).to_le_bytes().to_vec();
         body.extend(orders.concat());
         body
+    }
+
+    /// Issue #570: a bitmap the server caches with a persistent key reaches the host, after the
+    /// frames of the same update.
+    #[test]
+    fn a_keyed_cache_fill_reaches_the_host() {
+        use crate::orders::tests::{RED, cache_bitmap, keyed, memblt, rgba};
+        let mut sm = SessionStateMachine::new(orders_config(), Vec::new()).unwrap();
+        let section = orders_body(&[
+            keyed(cache_bitmap(0, 1, &[&[RED]]), 42),
+            memblt((0, 1), [0, 0, 1, 1], 0xCC, [0, 0]),
+        ]);
+        let outputs = sm
+            .process_bytes(&fastpath::encode_pdu(&[(
+                fastpath::FP_UPDATE_ORDERS,
+                fastpath::FP_FRAGMENT_SINGLE,
+                &section[..],
+            )]))
+            .unwrap();
+        assert!(matches!(outputs[0], SessionOutput::Frame(_)));
+        assert_eq!(
+            outputs[1..],
+            [SessionOutput::PersistentBitmap(crate::PersistentBitmap {
+                cache_id: 0,
+                cache_index: 1,
+                key: 42,
+                width: 1,
+                height: 1,
+                rgba: rgba(RED).to_vec(),
+            })]
+        );
     }
 
     fn red_at(x: i16) -> Vec<Vec<u8>> {

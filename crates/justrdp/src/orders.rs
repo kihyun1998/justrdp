@@ -25,6 +25,24 @@ const SRCCOPY: u8 = 0xCC;
 /// ROP3 PATCOPY: the pattern, unchanged.
 const PATCOPY: u8 = 0xF0;
 
+/// A bitmap the server cached with a persistent key (`[MS-RDPEGDI]` 2.2.2.2.1.2.3), for the host
+/// to keep across sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistentBitmap {
+    /// The Revision 2 cache it was stored in.
+    pub cache_id: u8,
+    /// Its entry in that cache.
+    pub cache_index: u16,
+    /// The 64-bit key the server gave it, `key2:key1`.
+    pub key: u64,
+    /// Its width in pixels.
+    pub width: u16,
+    /// Its height in pixels.
+    pub height: u16,
+    /// Its pixels, top-down RGBA8888.
+    pub rgba: Vec<u8>,
+}
+
 /// One cached bitmap, decoded to top-down RGBA.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedBitmap {
@@ -125,6 +143,8 @@ pub(crate) struct Orders {
     frames_ended: u64,
     /// The update a call stopped in at its budget.
     pending: Option<Pending>,
+    /// The keyed bitmaps cached since [`Self::take_persisted`] last ran.
+    persisted: Vec<PersistentBitmap>,
 }
 
 /// An Orders Update a call stopped in: the orders it had not reached.
@@ -206,7 +226,13 @@ impl Orders {
             held: Vec::new(),
             frames_ended: 0,
             pending: None,
+            persisted: Vec::new(),
         }
+    }
+
+    /// The bitmaps cached with a persistent key since the last call, in arrival order.
+    pub(crate) fn take_persisted(&mut self) -> Vec<PersistentBitmap> {
+        std::mem::take(&mut self.persisted)
     }
 
     /// Forget the primary order history and any frame in flight (a Deactivation–Reactivation).
@@ -1001,11 +1027,23 @@ impl Orders {
         };
         let rgba = decode_bitmap(order.compressed, bpp, order.data, width, height, palette)
             .map_err(NotApplied::Failed)?;
+        let persisted = order
+            .key
+            .filter(|_| order.cache_index != BITMAPCACHE_WAITING_LIST_INDEX)
+            .map(|key| PersistentBitmap {
+                cache_id: order.cache_id,
+                cache_index: order.cache_index,
+                key,
+                width: order.width,
+                height: order.height,
+                rgba: rgba.clone(),
+            });
         *slot = Some(CachedBitmap {
             width: order.width,
             height: order.height,
             rgba,
         });
+        self.persisted.extend(persisted);
         Ok(())
     }
 
@@ -1537,6 +1575,18 @@ pub(crate) mod tests {
         order.extend_from_slice(&(cache_id | 0x4 << 3).to_le_bytes());
         order.push(TS_CACHE_BITMAP_UNCOMPRESSED_REV2);
         order.extend_from_slice(&body);
+        order
+    }
+
+    /// `order`, a [`cache_bitmap`], carrying the persistent `key`.
+    pub(crate) fn keyed(mut order: Vec<u8>, key: u64) -> Vec<u8> {
+        // CBR2_PERSISTENT_KEY_PRESENT sits at bit 1 of the flags, bit 8 of extraFlags.
+        order[4] |= ((orders::CBR2_PERSISTENT_KEY_PRESENT << 7) >> 8) as u8;
+        let length = i16::from_le_bytes([order[1], order[2]]) + 8;
+        order[1..3].copy_from_slice(&length.to_le_bytes());
+        let mut key_bytes = (key as u32).to_le_bytes().to_vec();
+        key_bytes.extend_from_slice(&((key >> 32) as u32).to_le_bytes());
+        order.splice(6..6, key_bytes);
         order
     }
 
@@ -3435,6 +3485,44 @@ pub(crate) mod tests {
         );
         assert_eq!(pixel(&fb, 0, 0), rgba(RED));
         assert_eq!(pixel(&fb, 1, 0), rgba(BLUE));
+    }
+
+    /// A bitmap cached with a persistent key is handed out with its key, once; one with no key,
+    /// or in the waiting list, is not.
+    #[test]
+    fn a_keyed_cache_fill_is_handed_out_with_its_key() {
+        let mut orders = Orders::new(&capabilities(4, true));
+        let mut fb = Framebuffer::new(4, 1).unwrap();
+        let mut waiting = keyed(cache_bitmap(1, 0, &[&[BLUE]]), 7);
+        waiting[4] |= ((orders::CBR2_DO_NOT_CACHE << 7) >> 8) as u8;
+        run(
+            &mut orders,
+            &mut fb,
+            &[
+                keyed(cache_bitmap(0, 3, &[&[RED, BLUE]]), 0x0123_4567_89AB_CDEF),
+                cache_bitmap(0, 2, &[&[RED]]),
+                waiting,
+                memblt((0, 3), [0, 0, 2, 1], SRCCOPY, [0, 0]),
+            ],
+        );
+        let [red, blue] = [rgba(RED), rgba(BLUE)];
+        assert_eq!(
+            orders.take_persisted(),
+            [PersistentBitmap {
+                cache_id: 0,
+                cache_index: 3,
+                key: 0x0123_4567_89AB_CDEF,
+                width: 2,
+                height: 1,
+                rgba: [red, blue].concat(),
+            }]
+        );
+        assert_eq!(
+            pixel(&fb, 1, 0),
+            blue,
+            "the keyed entry paints as any other"
+        );
+        assert!(orders.take_persisted().is_empty());
     }
 
     /// An order of an undecoded type ends the update: what came before it stays applied.
