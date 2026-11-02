@@ -1530,9 +1530,13 @@ mod tests {
 
     /// Installs tracing-test's log capture as the global subscriber before the test harness
     /// starts any test thread, so no callsite can be registered while it is half installed
-    /// (#535). The core's unit tests hold the same installer.
+    /// (#535). The core's unit tests hold the same installer. `JUSTRDP_NO_LOG_CAPTURE` skips it,
+    /// for the end-to-end baseline (#556), which times the session with no subscriber listening.
     #[ctor::ctor(unsafe)]
     fn install_log_capture() {
+        if std::env::var_os("JUSTRDP_NO_LOG_CAPTURE").is_some() {
+            return;
+        }
         tracing_test::internal::INITIALIZED.call_once(|| {
             let writer =
                 tracing_test::internal::MockWriter::new(tracing_test::internal::global_buf());
@@ -9495,6 +9499,92 @@ mod tests {
         (frames.load(std::sync::atomic::Ordering::SeqCst), colours)
     }
 
+    /// Issue #556: one logon of the `rdpbench` account on the real VM, which runs the office and
+    /// heavy workloads and signs itself out, timed from inside: when each connect stage began,
+    /// when the first graphics update's bytes arrived, and how long each `FrameUpdate` took from
+    /// the read that completed it. Printed as one `E2E` line for the parser. Run with
+    /// `JUSTRDP_NO_LOG_CAPTURE=1`, so no subscriber is listening.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM, its rdpbench account and JUSTRDP_TEST_* env vars"]
+    async fn end_to_end_baseline_session_on_the_real_vm() {
+        vm::with_self_ending_vm_session(|vm| async move {
+            let start = std::time::Instant::now();
+            let mut stages: Vec<(String, u128)> = Vec::new();
+            let config = test_config();
+            let capabilities = config.capabilities.clone();
+            let outcome = vm
+                .try_connect(config, |stage| {
+                    stages.push((stage.to_string(), start.elapsed().as_millis()));
+                })
+                .await
+                .unwrap_or_else(|e| panic!("connect failed: {e:?}"));
+            let active = start.elapsed().as_millis();
+            let mut machine = SessionStateMachine::new(
+                session_config_from(&outcome, capabilities),
+                outcome.activation.leftover,
+            )
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+            let mut readbuf = [0u8; 16 * 1024];
+            let mut latencies: Vec<u128> = Vec::new();
+            let mut first_graphics = None;
+            let mut pending = feed_drained(&mut machine, &[]).expect("leftover bytes process");
+            let mut arrived = std::time::Instant::now();
+            let ended = loop {
+                for output in pending.drain(..) {
+                    match output {
+                        justrdp::SessionOutput::Frame(_) => {
+                            first_graphics.get_or_insert((arrived - start).as_millis());
+                            latencies.push(arrived.elapsed().as_micros());
+                        }
+                        justrdp::SessionOutput::WriteBytes(bytes) => {
+                            stream.write_all(&bytes).await.expect("write to the VM");
+                        }
+                        _ => {}
+                    }
+                }
+                let read = stream.read(&mut readbuf);
+                match tokio::time::timeout(Duration::from_secs(180), read).await {
+                    Ok(Ok(0)) => break "closed".to_string(),
+                    Ok(Ok(n)) => {
+                        arrived = std::time::Instant::now();
+                        match feed_drained(&mut machine, &readbuf[..n]) {
+                            Ok(outputs) => pending = outputs,
+                            Err(e) => break format!("{e:?}"),
+                        }
+                    }
+                    Ok(Err(e)) => break format!("read: {e}"),
+                    Err(_) => panic!("the session did not sign itself out within 180 s of a read"),
+                }
+            };
+            latencies.sort_unstable();
+            let pct = |p: usize| {
+                latencies
+                    .get(latencies.len() * p / 100)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let stages = stages
+                .iter()
+                .map(|(name, ms)| format!("\"{name}\":{ms}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "E2E {{\"stages\":{{{stages}}},\"active_ms\":{active},\"first_graphics_ms\":{},\
+                 \"frames\":{},\"latency_p50_us\":{},\"latency_p95_us\":{},\"session_ms\":{},\
+                 \"ended\":\"{}\"}}",
+                first_graphics.unwrap_or(0),
+                latencies.len(),
+                pct(50),
+                pct(95),
+                start.elapsed().as_millis(),
+                ended.replace('"', "'"),
+            );
+            assert!(first_graphics.is_some(), "no graphics update arrived");
+        })
+        .await
+    }
+
     /// Issue #554: asked for `bpp` with no Surface Commands to fall back on, the VM paints the
     /// desktop in bitmap updates and the session paints it. `JUSTRDP_SESSION_CAPTURE_FILE`
     /// records the bytes the codec corpus is carved from.
@@ -10818,6 +10908,19 @@ mod tests {
                 (Ok(_), Err(panic)) => std::panic::resume_unwind(panic),
                 (Ok(value), Ok(())) => value,
             }
+        }
+
+        /// [`with_vm_session_on`] without the teardown, for a session the server signs out itself:
+        /// #556's `rdpbench` account runs its workload at logon and then logs off, so a tidying
+        /// connection would only start that workload again.
+        pub(super) async fn with_self_ending_vm_session<F, Fut, T>(body: F) -> T
+        where
+            F: FnOnce(Vm) -> Fut,
+            Fut: Future<Output = T>,
+        {
+            let target = Target::from_env();
+            let _guard = target.lock().lock().await;
+            body(Vm { target }).await
         }
 
         /// How [`sign_out_drive`] typed the sign-out.
