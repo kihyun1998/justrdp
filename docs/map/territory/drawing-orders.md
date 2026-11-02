@@ -215,7 +215,8 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
     glyph run. The spec and FreeRDP read them differently (an ADD stores the bytes before it in
     the spec, the buffer from its start in FreeRDP; a USE is followed by a delta in the spec, not
     in FreeRDP), xrdp never sends one, and so nothing could settle which is right. #476 allowed
-    refusing them.
+    refusing them. The 2008 R2 VM does send them to a client advertising a fragment cache
+    (#569), so a comparison against its repaint could now settle it.
   - xrdp fills glyph caches 7 to 11, slots 0 to 249 (`xrdp_cache.c`), oldest first. Caches 10
     and 11 lie outside 2.2.2.2.1.1.2.13's 0 to 9, and their glyphs are skipped; the login screen
     uses only cache 7.
@@ -550,8 +551,30 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 - **Unbuilt:** LineTo, MultiDstBlt, MultiPatBlt, MultiScrBlt, polygons, ellipses, SaveBitmap,
   FastIndex and FastGlyph, Cache Glyph Revision 2, glyph fragments, Cache Brush, Cache Bitmap
   revisions 1 and 3, and every alternate secondary order but Frame Marker, Switch Surface and
-  Create Offscreen Bitmap. The 2008 R2 VM sends FastGlyph to a client advertising it (#486); no
-  measured server sent the rest.
+  Create Offscreen Bitmap. The 2008 R2 VM sends FastGlyph to a client advertising it (#486), and
+  Cache Bitmap Revision 1, Cache Glyph Revision 2 and glyph fragments are sent too (the census
+  below); no measured server sent the rest.
+- **Which lab server sends the four unbuilt cache forms, when they are advertised** (#569,
+  2026-11-02). Each form was added to the honoured order advertisement (`honoured_orders_config`,
+  16 bpp) and the server's bytes read until 2 s passed with none (20 s at most), by a justrdp
+  probe with the core's refusal lifted locally; FreeRDP 3.32.1 has no switch for Revision 1, Glyph Revision 2 or a Revision 3 cache.
+
+  | Form advertised | WS2019 | WS2008 R2 | xrdp 0.9.24 |
+  |---|---|---|---|
+  | Revision 1 bitmap cache, in place of Revision 2 | none: the desktop came as 10 bitmap updates | **81** Cache Bitmap Revision 1 (secondary `0x02`) | **4** Cache Bitmap Revision 1 |
+  | `CACHE_BITMAP_REV3_SUPPORT` and the default codecs | none: 157 Revision 2 as before | none | none: `xrdp_cache.c` tries Revision 3 and fell back to Revision 2 |
+  | `GLYPH_SUPPORT_ENCODE` | no glyph order at all | **Cache Glyph Revision 2**: the first, `extraFlags` `0x0136` (`GLYPH_ORDER_REV2` set), stopped the decode | **Cache Glyph Revision 2**: it stopped the decode, and `xrdp_caps.c` turns it on for `ENCODE` |
+  | a fragment cache, 256 × 256 | no glyph order at all | **6** of 438 GlyphIndex hold a fragment operation, against 0 without it | none in 9 GlyphIndex |
+
+  A row of "none" is the measured ground for dropping that form; a bold cell is a server that
+  would use it.
+- **Revision 1 and 3 bitmap caches, Cache Glyph Revision 2 and glyph fragments are not built, the
+  maintainer's call** (#569, 2026-11-02), made on the census above. Revision 3: no server sent
+  it. Revision 1: every server measured takes Revision 2, which is built, so only a server that
+  refuses Revision 2 would need it, and none is known. Glyph Revision 2 and fragments: without
+  them advertised the same servers send Revision 1 glyphs and fragment-free runs, which already
+  paint, so what they would buy is bytes, not measured; fragments touched 6 of 438 GlyphIndex.
+  What the call did not cover: the bytes either would save, and a server that needs them.
 - **FastGlyph is not built, the maintainer's call** (#486, 2026-10-20). Without it advertised the
   2008 R2 VM sends its text as GlyphIndex, which already paints. With it, the bytes the server
   sent changed either way (all bytes, two runs each):
