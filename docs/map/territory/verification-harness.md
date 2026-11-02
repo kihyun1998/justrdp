@@ -209,6 +209,87 @@ that carries the session. FreeRDP logs `Network disconnect!`, reconnects through
 its reconnect Client Info carries its `ARC_CS_PRIVATE_PACKET` — the independent verifier #306
 was checked against.
 
+### End-to-end baseline against FreeRDP
+
+Measured once (#556, 2026-10-26), by hand, never a CI gate. **A change to any validity condition
+below expires the numbers; re-measure only for a change that claims an end-to-end effect.** The
+scripts are [`bench/e2e/`](../../../bench/e2e/).
+
+| Milestone, ms from TCP connect (median of 10; min–max) | justrdp | FreeRDP |
+|---|---|---|
+| NLA starts | 7 (6–20) | 16.5 (12–315) |
+| MCS starts | 9 (8–26) | 18.5 (14–320) |
+| finalization starts | 38.5 (35–100) | 51.5 (43–434) |
+| session-active | 39 (35–101) | 70 (60–471) |
+| first graphics update **arrives** | 63.5 (58–164) | 100 (87–523) |
+
+| Per session (median of 10; min–max) | justrdp | FreeRDP |
+|---|---|---|
+| CPU s, whole session (~84 s) | 1.00 (0.74–2.29) | 9.13 (3.96–50.70) |
+| CPU s, before the animation (logon + office) | 0.10 (0.05–0.16) | 0.52 (0.37–3.53) |
+| CPU s, the animation (sampler's 47–80 s) | 0.83 (0.62–2.17) | 8.58 (3.58–46.91) |
+| peak RSS, MB | 39.2 (37.9–41.1) | 117.8 (116.7–120.1) |
+
+justrdp alone: wire arrival → `FrameUpdate`, P50 1.2 ms (1.0–1.3) and P95 3.9 ms (3.2–4.9),
+over ~16,000 `FrameUpdate`s a session (medians over the sessions' own percentiles). FreeRDP has no
+point to compare it with.
+
+**Method.**
+- **Workload.** The VM account `rdpbench` runs `run.ps1` at every logon: 5 s idle, then Notepad
+  typing and 50 page-downs through a 2000-line file (office), then a maximized WinForms form
+  repainting 12 ellipses every 16 ms for 30 s (heavy), then `shutdown /l /f`. The server ends
+  every session, so both clients see the same stream and need no input. The CPU windows are cut
+  where the median per-second series shows the animation start (`parse.py`'s `HEAVY_FROM_S`).
+- **Both clients from the same WSL install**, alternating justrdp and FreeRDP, 10 s apart.
+  `campaign.sh` runs the 20 timing sessions, then the 20 CPU sessions; timing and CPU are
+  separate runs because FreeRDP's TRACE logging costs CPU.
+- **justrdp** is `end_to_end_baseline_session_on_the_real_vm` in `justrdp-tokio`, a `--release`
+  test binary run with `JUSTRDP_NO_LOG_CAPTURE=1`, so no tracing subscriber listens. Milestones
+  are its `try_connect` stage callbacks; first graphics is the arrival of the read that produced
+  the first `FrameUpdate`.
+- **FreeRDP** milestones are its `"%s --> %s"` state transitions (`connection.c`, DEBUG on
+  `com.freerdp.core.rdp`) from `INITIAL --> NEGO`; first graphics is the first
+  `RecvStartFramePdu`, which 3.32.1 logs at **TRACE** on `com.freerdp.channels.rdpgfx.client`.
+- **CPU** is `utime + stime` from `/proc/<pid>/stat` and RSS from `VmRSS`, sampled every second
+  (`bench.sh`).
+
+**The CPU rows do not compare like for like.** FreeRDP decodes into GDI and presents to an X
+window through WSLg; justrdp composes the `FrameUpdate` and presents nothing. The spread is wide
+for both: justrdp's first four CPU sessions took 1.6–2.3 s and the last six 0.7–1.1 s, and one
+FreeRDP session took 50.7 s against a median of 9.1. The host was ~40% busy with other work.
+
+**Validity conditions.**
+- VM: WS2019 Standard 10.0.17763 at `.136`, Korean UI, account `rdpbench` (Remote Desktop Users),
+  `run.ps1` sha256 `621F40E5B637CFA87968EEE9FB537769CFF614CCF5E33DB02D0E0F4247664CB1`.
+- FreeRDP 3.32.1 from apt; WSL 3.0.3.0 (kernel 6.18.54.1-microsoft-standard-WSL2, WSLg 1.0.79),
+  Ubuntu 24.04.2. justrdp at `00e315d` plus #556, Rust 1.99.0.
+- Host: i7-14700K, 28 threads, 64 GB.
+- Advertised: 1280×800 at 32 bpp, connection type LAN, performance flags 0x7 asked for on both
+  (FreeRDP's resulting value was not read off the wire). EGFX: both advertise 8, 8.1, 10, 10.2,
+  10.3 and 10.4, flags 0 on 8.x and `AVC_DISABLED` on 10.x, and the server confirmed 10.4 to
+  both. justrdp opens `cliprdr` and `drdynvc`; FreeRDP opens its defaults with `-sound
+  -microphone +clipboard`, which were not enumerated.
+
+**Traps, each met once.**
+- **FreeRDP's default EGFX advertisement gets a different stream.** It offers up to 10.7 with
+  `SMALL_CACHE`, and the server confirmed 10.6. `/gfx:mask:1928,small-cache:off` drops 10.1 and
+  10.5–10.7: each mask bit filters one entry of `rdpgfx_is_capability_filtered`'s list, which
+  has no AV1 entry in this build. A first campaign without it was discarded.
+- **A shell function run with `&` is a subshell**, so `$!` named a waiting bash (0 s CPU,
+  2 MB) and not the client. `bench.sh` makes the client `exec` in its place.
+- **The `rdpbench` account's first logon creates its profile** and is not a sample. Its
+  setup, as an administrator on the VM, is
+  `New-LocalUser -Name rdpbench -Password (ConvertTo-SecureString '<password>' -AsPlainText -Force) -PasswordNeverExpires -AccountNeverExpires`
+  and `Add-LocalGroupMember -SID S-1-5-32-555 -Member rdpbench`. Then, signed in as
+  `rdpbench`: `run.ps1` goes to `%USERPROFILE%\bench\`, and the Startup folder gets `bench.cmd`
+  holding
+  `@powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%USERPROFILE%\bench\run.ps1"`.
+  From then on every logon runs the workload and signs out, so the account is no use for anything
+  else.
+- **The campaign dies with its WSL session.** Once the VM went off mid-run, and once the WSL
+  session ended and FreeRDP took `SIGHUP`. Read the CPU files' line counts (~85 per session)
+  before parsing.
+
 ## Interop matrix
 
 Which server a claim was measured on (#428). `JUSTRDP_TEST_SERVER` (`ws2019`, the default;
