@@ -596,5 +596,12 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
 - **The 8 bpp proof is the login screen**, 9 cache bitmaps; the logged-in desktop, which FreeRDP's
   census saw carry 5,024 MemBlt at 8 bpp, needs a logon justrdp cannot make on TLS-only security
   without a password, and was not compared.
-- **Persistent bitmap caching** (keys, the Persistent Key List PDU) is refused at the
-  advertisement and stays on #28.
+- **Persistent bitmap keys reach the host; nothing sends them back yet** (#570, 2026-11-02).
+  Persistent Revision 2 cells are accepted, and every Cache Bitmap (Revision 2) that carries a key
+  and names a real entry, not the waiting list, becomes a `PersistentBitmap` output: cache, entry,
+  key and the decoded RGBA. Keeping them is the host's. `PERSISTENT_KEYS_EXPECTED_FLAG` is still
+  refused, since it promises a Persistent Key List PDU the core does not send; that is #571.
+  - **WS2019 keys every bitmap it caches for a persistent cell.** With all three cells
+    persistent, two sessions sent 163 and 176 Cache Bitmap (Revision 2) orders, all keyed;
+    the 176 keys were distinct. With the flag set as well and no key list sent, 166, all
+    keyed, and the session ran as usual.

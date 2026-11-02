@@ -107,7 +107,8 @@ pub const HONOURED_ORDER_FLAGS: u16 = capability::ORDER_NEGOTIATE_SUPPORT
 pub const HONOURED_ORDER_EX_FLAGS: u16 = capability::ORDERFLAGS_EX_ALTSEC_FRAME_MARKER_SUPPORT;
 
 /// The Revision 2 Bitmap Cache `CacheFlags` the core honours: the waiting list, which the cache
-/// keeps as one extra entry per cache. Not persistent keys, which need a key store.
+/// keeps as one extra entry per cache. Not `PERSISTENT_KEYS_EXPECTED_FLAG`, which promises a
+/// Persistent Key List PDU the core does not send.
 pub const HONOURED_BITMAP_CACHE_REV2_FLAGS: u16 = capability::ALLOW_CACHE_WAITING_LIST_FLAG;
 
 /// The largest Multifragment Update `MaxRequestSize` the core honours: the session's fast-path
@@ -353,12 +354,11 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
         {
             refuse(
                 capability::CAPSET_BITMAP_CACHE_REV2,
-                "CacheFlags outside the waiting list: persistent keys are not kept",
+                "CacheFlags outside the waiting list: no Persistent Key List PDU is sent",
             )
         }
         CapabilitySet::BitmapCacheRev2(c)
             if c.cells.len() > capability::BITMAP_CACHE_REV2_MAX_CELLS
-                || c.cells.iter().any(|cell| cell.persistent)
                 || c.cells
                     .iter()
                     .zip(capability::BITMAP_CACHE_REV2_MAX_ENTRIES)
@@ -366,7 +366,7 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
         {
             refuse(
                 capability::CAPSET_BITMAP_CACHE_REV2,
-                "more than five caches, a persistent cache, or more entries than 2.2.7.1.4.2 allows",
+                "more than five caches, or more entries than 2.2.7.1.4.2 allows",
             )
         }
         CapabilitySet::BitmapCache(c) if c.caches.iter().any(|&(entries, _)| entries != 0) => {
@@ -986,6 +986,36 @@ mod tests {
         ));
     }
 
+    /// Persistent cells pass, since their keys reach the host (#570); the flag that promises a
+    /// Persistent Key List PDU is still refused.
+    #[test]
+    fn persistent_cells_pass_and_the_key_list_promise_is_refused() {
+        let with_cache = |persistent: bool, flags: u16| {
+            let mut config = orders_config();
+            for set in &mut config.capabilities {
+                if let CapabilitySet::BitmapCacheRev2(c) = set {
+                    c.cache_flags = flags;
+                    for cell in &mut c.cells {
+                        cell.persistent = persistent;
+                    }
+                }
+            }
+            check(&config)
+        };
+        assert_eq!(with_cache(true, 0), Ok(()));
+        assert_eq!(
+            with_cache(true, capability::ALLOW_CACHE_WAITING_LIST_FLAG),
+            Ok(())
+        );
+        assert!(matches!(
+            with_cache(true, capability::PERSISTENT_KEYS_EXPECTED_FLAG),
+            Err(ConnectConfigError::CapabilitySet {
+                set_type: capability::CAPSET_BITMAP_CACHE_REV2,
+                ..
+            })
+        ));
+    }
+
     /// A glyph cache of Revision 1 glyphs passes with GlyphIndex (#476); Revision 2, a fragment
     /// cache, a cache past 254 entries or a cell past 2048 bytes is refused, and so is GlyphIndex
     /// with no glyph cache.
@@ -1034,7 +1064,7 @@ mod tests {
     #[test]
     fn order_advertisements_past_what_the_session_keeps_are_refused() {
         type Edit = fn(&mut CapabilitySet);
-        let cases: [(&str, Edit, u16); 9] = [
+        let cases: [(&str, Edit, u16); 8] = [
             (
                 "Cache Bitmap (Revision 3)",
                 |set| {
@@ -1078,15 +1108,6 @@ mod tests {
                 |set| {
                     if let CapabilitySet::BitmapCacheRev2(c) = set {
                         c.cache_flags |= capability::PERSISTENT_KEYS_EXPECTED_FLAG;
-                    }
-                },
-                capability::CAPSET_BITMAP_CACHE_REV2,
-            ),
-            (
-                "a persistent cell",
-                |set| {
-                    if let CapabilitySet::BitmapCacheRev2(c) = set {
-                        c.cells[2].persistent = true;
                     }
                 },
                 capability::CAPSET_BITMAP_CACHE_REV2,

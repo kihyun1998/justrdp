@@ -46,6 +46,7 @@ pub use egfx::{EgfxCacheMode, EgfxConfig, EgfxConfigError};
 pub use framebuffer::{FrameUpdate, Framebuffer};
 pub use input::Scancode;
 pub use justrdp_pdu::input::InputEvent;
+pub use orders::PersistentBitmap;
 // `SessionOutput::KeyboardIndicators` carries this (issue #305), as for `SaveSessionInfo` below.
 pub use justrdp_pdu::input::KeyboardIndicators;
 // `SessionOutput::PlaySound` carries this (issue #354).
