@@ -3,10 +3,10 @@
 //! `ironrdp-graphics`' pointer decoder (accelerated target: straight alpha, checkerboard
 //! inversion — the convention our decoder adopts).
 //!
-//! Coverage is 16/24/32 bpp. The two oracle gaps are pinned by hand vectors in the unit tests
-//! instead: 8 bpp (palettized — the oracle rejects it as unsupported) and 1 bpp (the oracle
-//! skips the spec's bottom-up scan-line flip for monochrome shapes; MS-RDPBCGR 2.2.9.1.1.4.4
-//! says "bottom-up" for every xorBpp, so we flip and deliberately diverge).
+//! Coverage is 16/24/32 bpp. Two depths are pinned by hand vectors in the unit tests instead:
+//! 8 bpp (palettized) and 1 bpp (the oracle skips the spec's bottom-up scan-line flip for
+//! monochrome shapes; MS-RDPBCGR 2.2.9.1.1.4.4 says "bottom-up" for every xorBpp, so we flip and
+//! deliberately diverge).
 
 use ironrdp_graphics::pointer::{DecodedPointer, PointerBitmapTarget};
 use ironrdp_pdu::pointer::{ColorPointerAttribute, Point16, PointerAttribute};

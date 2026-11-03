@@ -24,9 +24,7 @@
 //! (`zIdx = yIdx * gridWidth + xIdx`, `progressive.c:471`), so the surface is the only key
 //! under which a tile index means anything. FreeRDP keys the whole store by `surfaceId`
 //! (`:314`) and treats the block stream's `ctxId` as advisory, warning when it is non-zero
-//! (`:1999`) and reading it nowhere else. The bootstrap oracle keys by `codecContextId`
-//! instead, which is why `justrdp::egfx` carries a per-surface eviction workaround (#83) — it
-//! records that the self-owned decoder retires it, and this is that decoder.
+//! (`:1999`) and reading it nowhere else. `ironrdp-graphics` keys by surface too, since 0.10.
 //!
 //! The store's *lifecycle* — what creates a grid, what frees one, and what only looks as if it
 //! should — is [`SurfaceStore`] (#170), which also owns the per-payload block ordering
@@ -49,15 +47,9 @@
 //! than at its edge, so refusing a band below 6 buys no arithmetic safety. Under ADR-0009 the
 //! formula is applied to whatever arrives.
 //!
-//! **The references do differ here, and this issue's account of *how* did not survive
-//! reading them.** #167 recorded that `ironrdp-graphics` "defines a rounding right-shift for
-//! `q < 6`". It does not, and never has: `dequantize_component_ccq` is byte-identical in
-//! 0.8.0, 0.8.1 and 0.9.0 — `factor = q.saturating_sub(1); if factor > 0 { *coeff <<= factor }`
-//! (`progressive.rs:467`) — and no earlier published version ships a Progressive decoder at
-//! all. The rounding right-shift that description matches is `quantize_component_ccq`, the
-//! *encoder* (`progressive.rs:315`). So the oracle simply applies the formula, FreeRDP
-//! rejects the region, and the disagreement is reject-versus-accept rather than the two
-//! different acceptances #167 described. The corpus cannot arbitrate it: no real region
+//! **The references differ here.** FreeRDP rejects the region; `ironrdp-graphics` 0.11's
+//! `dequantize_component_ccq` accepts it and applies a rounding right-shift by `6 - q`; this
+//! decoder accepts it and applies the formula. The corpus cannot arbitrate it: no real region
 //! carries a band below 6.
 //!
 //! # The layout mismatch this slice refuses rather than reproduces
@@ -363,7 +355,7 @@ const ZERO_QUANT: ProgressiveQuant = ProgressiveQuant {
 ///
 /// Not a table lookup — `quality = 0xFF` means *no progressive quantization*, and FreeRDP's
 /// `quantProgValFull` is a `calloc`'d struct it never fills (`progressive.c:2646-2654`).
-/// Indexing a table by the sentinel is the oracle defect the corpus canary pins (#194).
+/// Indexing a table by the sentinel is wrong (#194).
 const FULL_QUALITY: ProgressiveQuant = ZERO_QUANT;
 
 /// Reusable per-call working buffers. Held by the caller so a frame's worth of tiles costs
@@ -2690,9 +2682,8 @@ mod tests {
         );
     }
 
-    /// `QUALITY_FULL` is a sentinel, not an index — the oracle defect the corpus canary pins
-    /// (#194). A region with an empty progressive-quant table must still decode a full-quality
-    /// tile.
+    /// `QUALITY_FULL` is a sentinel, not an index (#194). A region with an empty
+    /// progressive-quant table must still decode a full-quality tile.
     #[test]
     fn the_full_quality_sentinel_is_not_a_table_index() {
         let (mut grid, mut scratch, mut rgba) = grid_and_scratch();

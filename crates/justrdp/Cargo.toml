@@ -35,7 +35,7 @@ rcgen.workspace = true
 #     `:1947`), so their decoder grades our encoder. **What ends it:** a real-server capture of
 #     the client-to-server leg, which no `JUSTRDP_CONNECT_CAPTURE_FILE` run produces today.
 # ADR-0011 supersedes ADR-0003 phase 3 here; this comment cited ADR-0001 until #225.
-ironrdp-pdu = "0.9.0"
+ironrdp-pdu = "0.11.0"
 # Property-based robustness (ADR-0008). This is the **first** proptest dependency in the core
 # crate, and it is here because the census that names what must carry a no-panic property was
 # scoped to `crates/justrdp-pdu/src` and so could not see this crate at all (#241/#238). Two

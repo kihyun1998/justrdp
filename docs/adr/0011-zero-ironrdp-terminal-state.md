@@ -1,6 +1,6 @@
 # 0011 — Zero `ironrdp` is the terminal state: the oracle is scaffolding, not a permanent dependency
 
-- Status: Accepted (conformance items #225) — amended 2026-08-13 (#194), 2026-08-18 (#168), 2026-08-18 (#169), 2026-08-19 (#171), 2026-08-19 (#172), 2026-08-19 (#189), 2026-08-26 (#225), 2026-10-26 (#558), 2026-11-02 (#560) and 2026-11-02 (#566); see the Amendments below
+- Status: Accepted (conformance items #225) — amended 2026-08-13 (#194), 2026-08-18 (#168), 2026-08-18 (#169), 2026-08-19 (#171), 2026-08-19 (#172), 2026-08-19 (#189), 2026-08-26 (#225), 2026-10-26 (#558), 2026-11-02 (#560), 2026-11-02 (#566) and 2026-11-03 (#576); see the Amendments below
 - Date: 2026-08-10
 - Records a decision by the maintainer; supersedes the open-ended dev-dependency premise in [ADR-0003](0003-phased-codecs-differential-oracle.md) phase 3 and [ADR-0007](0007-stage-boundary-codec-verification.md) §Decision
 - Related: #158 (Progressive), #189 (zgfx), #194 (Progressive's verification basis)
@@ -366,3 +366,48 @@ now replays its 52 real payloads and compares the surface after each with FreeRD
 generic C decoder, through digests in `fixtures/progressive/`: every one of the 13,520 tiles
 matches in R, G and B. With #560's truncated coefficients 4248 would not. Alpha is not compared:
 FreeRDP writes 0 and this decoder 255. This is a measurement and falls to a better one.
+
+## Amendment (2026-11-03, #576): the oracle is at 0.11, and no R4 canary is left
+
+`ironrdp-graphics` and `ironrdp-pdu` moved from 0.9 to 0.11 in every crate. All six R4 canaries of
+the 2026-08-26 table went red on the bump, because upstream fixed the defects they pinned
+(RLGR1 `kp`, the `quality = 0xFF` sentinel, the per-context CONTEXT block, SRL magnitude coding,
+SRL streams restarted per band, ClearCodec's three rejections). So did two tests that rested on an
+oracle defect without being listed: `the_oracle_decodes_almost_none_of_the_corpus` (0.11 decodes
+52 of 52 Progressive payloads) and zgfx's single-segment test, whose 150 KB fixture the 0.11
+compressor now splits into a multipart message. Eight tests in all; no test found this project's
+output disagreeing with the oracle's. The changelog reading the bump is gated on is the 0.9 → 0.11
+worked example in [oracle agreement is not independence](../map/invariant/oracle-agreement-is-not-independence.md#where-it-will-recur).
+**(a) Where a canary already computed a comparison, it now asserts agreement.** Each was run
+against 0.9 and fails there on the old defect:
+- `clearcodec_corpus.rs` `self_owned_matches_oracle_on_every_entry` diffs our decoder against the
+  oracle: **R1**.
+- `progressive_srl_freerdp.rs` `oracle_agrees_with_freerdp_on_every_vector` checks the oracle
+  against our hand-derived FreeRDP vectors, and `oracle_threads_one_stream_across_every_band` and
+  `differential_rfx.rs` `oracle_encoder_round_trips_both_modes` check the oracle alone. These three
+  run no code of ours; their subject is still the oracle, so they are R4 with the polarity
+  reversed, and they exit as R4 does, by deletion with the crate's last R1 holder.
+
+The three Progressive corpus canaries and the zgfx single-segment test were deleted. The zgfx
+test was the only one reaching the decoder's segment cap through output already produced;
+`src/zgfx.rs`'s `output_already_produced_counts_against_the_segment_cap` reaches it with
+hand-built bytes, and `a_single_match_longer_than_the_segment_cap_is_an_error` covers one match
+past it.
+**(b) The RLGR1 canary's own instruction was not followed.** It said to drop the harness encoder
+and feed the oracle's `rfx_encode_component`. That would make the oracle the stream factory, the
+R2 role this record's table ends only when we own the encoder; the harness encoder is ours and
+stays proven by the oracle's decoder.
+**(c) ClearCodec's corpus lost a coverage proof.** `oracle_rejections > 0` and the three rejection
+signatures were the evidence that the corpus exercises #56's `shortVBarCacheMiss`, `rlex` and
+`vbarIndex` shapes. The 0.11 oracle rejects nothing, so nothing asserts the corpus still holds
+those shapes. [ADR-0007](0007-stage-boundary-codec-verification.md) cites that guard as its
+example of a coverage assertion, and [ADR-0009](0009-tolerant-negotiation-posture.md) cites the
+oracle's rejections as part of the ground for ClearCodec's RLEX clip; 0.11 clips an over-filled
+RLEX region and decodes the NSCodec subcodec, so that ground is now the corpus alone. Both rules
+stand.
+**How this was decided.** The red tests, the 0.9 reruns and the role each test now plays are
+measurements. Turning the comparing canaries into agreement checks rather than deleting all of
+them, as the role table's R4 row reads, is the maintainer's call (2026-11-03), made after being
+shown both options: deletion drops a cross-check with an oracle that now agrees; keeping them
+keeps the dependency longer. What they were shown called all four R1; that three are R4 was found
+afterwards. The consequence they weighed holds either way, since R4 exits with the last R1 holder.

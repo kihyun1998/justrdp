@@ -3,16 +3,14 @@
 //!
 //! # Why these vectors are hand-computed instead of captured or diffed
 //!
-//! Three things rule out every cheaper option, and each is measured rather than assumed:
+//! Two things rule out every cheaper option:
 //!
-//! 1. **The oracle cannot arbitrate.** `ironrdp-graphics`'s SRL tests round-trip against its
-//!    *own* `encode_srl`, so they are self-consistent by construction and say nothing about the
-//!    wire — the tautological-proof shape ADR-0007's #118 amendment exists to route around.
-//! 2. **The two references disagree with each other**, so "match the reference" is not a single
-//!    instruction. ADR-0003's byte-exactness ranking names the **oracle**,
-//!    *with FreeRDP as the tie-break when the oracle and we disagree*; ADR-0011 disqualifies the
-//!    oracle for this stage, so FreeRDP is what remains and what these vectors encode.
-//! 3. **A real-server corpus cannot settle it either.** `fixtures/progressive/replay.bin` does
+//! 1. **The oracle cannot be the basis.** ADR-0011 disqualifies it for this stage, and
+//!    ADR-0003's tie-break names FreeRDP, so FreeRDP is what these vectors encode.
+//!    `ironrdp-graphics` agrees with every vector below
+//!    ([`oracle_agrees_with_freerdp_on_every_vector`]); that is a cross-check, not an
+//!    independent basis ([`oracle-agreement-is-not-independence`]).
+//! 2. **A real-server corpus cannot settle it either.** `fixtures/progressive/replay.bin` does
 //!    carry genuine SRL bytes, but a captured stream proves a decoder only once you already
 //!    know the pixels it should produce — which is the thing in question. The corpus is the
 //!    gate for *acceptance*; these vectors are the gate for *values*.
@@ -30,7 +28,7 @@
 //! among several.
 //!
 //! **What produced that `0` is not settled, and two hypotheses fit the evidence equally.** `kp`
-//! of 0 is `ironrdp-graphics`'s initial value (`srl.rs:26`), so the basis may have adopted the
+//! of 0 was `ironrdp-graphics` 0.9's start value (`srl.rs:26`), so the basis may have adopted the
 //! state of the implementation it exists to be independent of. But FreeRDP itself declares
 //! `RFX_PROGRESSIVE_UPGRADE_STATE state = WINPR_C_ARRAY_INIT;` before assigning `kp`, so a
 //! reader who stops at the declaration also gets 0. Both predict the identical 8-of-8 fit, and
@@ -72,44 +70,32 @@
 //! return if sign { -mag } else { mag }                    // :1159-1161
 //! ```
 //!
-//! # Four divergences from `ironrdp-graphics`, not three
+//! # Four properties a first reading misses
 //!
-//! #194 and #168 both describe the divergence as three things. Correcting the initial state
-//! adds a fourth, and it is the one that fires earliest:
 //!
-//! - **Initial `kp`: 8 vs 0.** `k = kp / 8` is therefore 1 for the first symbol of every
-//!   component, so FreeRDP reads a run-length bit the oracle never reads, and the two
-//!   desynchronise from the first symbol on — before either of the next two can apply.
+//! - **Initial `kp` is 8.** `k = kp / 8` is therefore 1 for the first symbol of every
+//!   component, so the first symbol reads a run-length bit.
 //! - **The magnitude is truncated unary starting at 1, with no remainder bits** and a hard cap
-//!   at `(1 << numBits) - 1`. `ironrdp-graphics` (`srl.rs:86-101`) instead reads a Golomb-Rice
-//!   quotient plus `numBits - 1` remainder bits. They coincide **only** at `numBits == 1`.
+//!   at `(1 << numBits) - 1`. A Golomb-Rice quotient plus `numBits - 1` remainder bits
+//!   coincides with it **only** at `numBits == 1`.
 //! - **`mode` persists across calls.** After a `1` bit opens a `k`-bit zero run, the call that
 //!   exhausts that run leaves `mode == 1`, so the *next* value skips the zero-encoding phase
-//!   and goes straight to a magnitude. `ironrdp-graphics` keeps no such state.
-//! - **One bit stream per component, threaded across all ten bands.** Measured by
-//!   [`oracle_still_restarts_both_streams_at_every_band`] below.
+//!   and goes straight to a magnitude.
+//! - **One bit stream per component, threaded across all ten bands.** Measured on the oracle by
+//!   [`oracle_threads_one_stream_across_every_band`] below.
 //!
-//! **The divergence is worst on the commonest input.** The corpus's progressive-quant bit
-//! positions are `{0, 1, 2}`, so a real upgrade pass's `numBits = prev_bitpos - curr_bitpos` is
-//! **1 or 2**, and at `numBits == 2` a magnitude of 1 — the smallest possible refinement, and
-//! the one a refinement pass is mostly made of — comes out of FreeRDP as `+1` and out of the
-//! oracle as `+2` (vector E).
+//! **The magnitude rule matters most on the commonest input.** The corpus's progressive-quant
+//! bit positions are `{0, 1, 2}`, so a real upgrade pass's `numBits = prev_bitpos - curr_bitpos`
+//! is **1 or 2**, and at `numBits == 2` a magnitude of 1 — the smallest possible refinement,
+//! and the one a refinement pass is mostly made of — is `+1`, where a Golomb-Rice reading of the
+//! same bits gives `+2` (vector E).
 //!
-//! # How the harness proves itself, now that there are no positive controls
+//! # How the harness proves itself
 //!
-//! The previous revision proved the bit plumbing with vectors on which the two implementations
-//! agreed: *"a disagreement there would mean the harness feeds bits wrongly, not that the
-//! algorithms differ."* At FreeRDP's real initial state that construction is not available —
-//! the two desynchronise on the first symbol of every component, so agreement is coincidental
-//! where it survives at all (vector A agrees while the two read **different bits**: FreeRDP
-//! spends one on the `k`-bit run, the oracle does not, and both happen to land on a `0` sign).
-//! Exactly one of the nine now agrees, and it is not evidence of anything.
-//!
-//! So the harness is proven directly instead, and without reference to either implementation:
-//! `rfx::srl`'s own `bits_read_msb_first_and_zero_fill_past_the_end` and
-//! `reading_zero_bits_consumes_nothing` pin the bit cursor's order and its end-of-stream
-//! behaviour as unit tests. That is a stronger proof than the old controls were, because it
-//! cannot be satisfied by two implementations sharing a mistake.
+//! Without reference to either implementation: `rfx::srl`'s own
+//! `bits_read_msb_first_and_zero_fill_past_the_end` and `reading_zero_bits_consumes_nothing`
+//! pin the bit cursor's order and its end-of-stream behaviour as unit tests, which two
+//! implementations sharing a mistake cannot satisfy.
 //!
 //! [`oracle-agreement-is-not-independence`]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/oracle-agreement-is-not-independence.md
 
@@ -127,9 +113,6 @@ struct Vector {
     /// Hand-computed from `progressive.c:1075-1162` at the initial state its caller sets
     /// (`kp = 8`). See each vector's trace below.
     freerdp: &'static [i16],
-    /// Whether `ironrdp-graphics::srl::decode_srl` happens to land on the same values.
-    /// **Measured, and not a control** — see the harness note in the module docs.
-    oracle_agrees: bool,
 }
 
 /// The vectors. Traces are written against the pseudocode in this file's module doc, and every
@@ -145,21 +128,14 @@ const VECTORS: &[Vector] = &[
         num_values: 1,
         num_bits: 1,
         freerdp: &[1],
-        oracle_agrees: true,
     },
     // As above with the sign bit set. Bits `1 0 1` → 0b1010_0000.
-    //
-    // The oracle reads `1`, then — having no `k`-bit run to consume — takes the **second** bit
-    // as the sign. That bit is `0`, so it yields +1 where FreeRDP yields -1: the same three
-    // bits, read with a one-bit offset. This is the initial-`kp` divergence in its smallest
-    // form.
     Vector {
         name: "numBits=1, single negative",
         data: &[0b1010_0000],
         num_values: 1,
         num_bits: 1,
         freerdp: &[-1],
-        oracle_agrees: false,
     },
     //   call 1: k=1, mode=0 → bit `0` → nz = 1<<1 = 2, kp = 12, nz-- → 1, emit 0
     //   call 2: nz=1 → nz-- → 0, emit 0
@@ -172,77 +148,57 @@ const VECTORS: &[Vector] = &[
         num_values: 3,
         num_bits: 1,
         freerdp: &[0, 0, 1],
-        oracle_agrees: false,
     },
-    // **The `mode` state machine**, isolated at numBits=1 so the magnitude coding cannot be
-    // what separates the two.
+    // **The `mode` state machine**, isolated at numBits=1 so the magnitude coding plays no part.
     //   call 1: k=1, mode=0 → bit `1` → mode=1; nz = read(1) = `1` = 1
     //           nz > 0 → nz-- → 0, emit 0   (mode stays 1)
     //   call 2: nz=0, mode==1 → **skip the zero-encoding phase entirely**
     //           mode=0, sign = `0` → +, kp = 8-6 = 2, numBits==1 → +1
     // Bits `1 1 0` → 0b1100_0000.
-    //
-    // The oracle keeps no `mode`: it reads `1`, no run bits, then takes `1` as the sign → -1,
-    // and its second value re-enters zero-run mode on the `0` → 0. So `[-1, 0]` against
-    // `[0, 1]` — the values, their signs and their order all differ.
     Vector {
         name: "numBits=1, mode persists across the call that drains a k-bit run",
         data: &[0b1100_0000],
         num_values: 2,
         num_bits: 1,
         freerdp: &[0, 1],
-        oracle_agrees: false,
     },
     // **The realistic case.** The corpus's progressive-quant bit positions are {0, 1, 2}, so a
-    // real upgrade pass's numBits is 1 or 2. At numBits=2 the two diverge on the *commonest*
-    // refinement there is, a magnitude of 1:
+    // real upgrade pass's numBits is 1 or 2. At numBits=2 the truncated-unary rule decides the
+    // *commonest* refinement there is, a magnitude of 1:
     //   call 1: k=1 → bit `1` → mode=1; nz = read(1) = `0` = 0 → fall through
     //           sign = `0` → +, kp=2; numBits=2 → max = 3
     //           mag=1: read `1` → break immediately → +1
     // Bits `1 0 0 1` → 0b1001_0000.
-    //
-    // The oracle reads `1`, sign = `0` → +, then a Golomb-Rice quotient: `0` then `1`
-    // terminates it at 1, and extra_bits = numBits-1 = 1 more bit (`0`) is the remainder →
-    // magnitude = (1 << 1) | 0 = **2**. A +1 refinement is reported as +2.
     Vector {
         name: "numBits=2, magnitude 1 — the commonest real refinement",
         data: &[0b1001_0000],
         num_values: 1,
         num_bits: 2,
         freerdp: &[1],
-        oracle_agrees: false,
     },
     // The magnitude cap — the loop exits on `mag == max` without a terminating 1 bit.
     //   call 1: k=1 → bit `1` → mode=1; nz = read(1) = `0` → fall through
     //           sign = `0` → +, kp=2; numBits=2 → max = 3
     //           mag=1: read `0` → mag=2; read `0` → mag=3; `mag < max` false → stop → +3
     // Bits `1 0 0 0 0` → 0b1000_0000.
-    //
-    // The oracle has no cap: it counts 0-bits past the end of the stream (its reader yields
-    // zeros) until its 0x8000 guard, so the magnitude saturates to 32767.
     Vector {
         name: "numBits=2, magnitude truncated at (1<<numBits)-1",
         data: &[0b1000_0000],
         num_values: 1,
         num_bits: 2,
         freerdp: &[3],
-        oracle_agrees: false,
     },
-    // The same truncated-unary shape at a wider numBits, where the divergence is largest.
+    // The same truncated-unary shape at a wider numBits.
     //   call 1: k=1 → bit `1` → mode=1; nz = read(1) = `0` → fall through
     //           sign = `0` → +, kp=2; numBits=3 → max = 7
     //           mag=1: read `0` → 2; read `0` → 3; read `1` → break → +3
     // Bits `1 0 0 0 0 1` → 0b1000_0100.
-    //
-    // The oracle: quotient counts `0 0 0` to the terminating `1` (→ 3), then reads
-    // extra_bits = 2 remainder bits (`0 0`) → magnitude = (3 << 2) | 0 = 12.
     Vector {
         name: "numBits=3, truncated-unary magnitude 3",
         data: &[0b1000_0100],
         num_values: 1,
         num_bits: 3,
         freerdp: &[3],
-        oracle_agrees: false,
     },
     // `k` growing past 1, so the `1` branch reads a **multi-bit** run length. Reaching k=2
     // needs kp ≥ 16, i.e. two zero runs first — which is why no vector in the previous revision
@@ -261,7 +217,6 @@ const VECTORS: &[Vector] = &[
         num_values: 7,
         num_bits: 1,
         freerdp: &[0, 0, 0, 0, 0, 0, 1],
-        oracle_agrees: false,
     },
     // `kp` shrinking, observed on the value *after* the one that shrank it — which none of the
     // vectors above can see, since each ends on the decrementing value itself.
@@ -280,7 +235,6 @@ const VECTORS: &[Vector] = &[
         num_values: 2,
         num_bits: 1,
         freerdp: &[1, -1],
-        oracle_agrees: false,
     },
 ];
 
@@ -381,56 +335,30 @@ fn vectors_are_well_formed() {
     );
 }
 
-/// **Canary** — the SRL divergence, pinned to the hand-derived FreeRDP values.
-///
-/// This asserts a *disagreement*, which is unusual and deliberate: while it holds, #168 cannot
-/// be gated on the oracle, and the vectors above are what it is gated on instead. If an
-/// `ironrdp-graphics` bump makes this go red, the measuring instrument has moved — re-read
-/// ADR-0011 and #194 rather than deleting the vectors, which remain the owned basis either way.
+/// The oracle agrees with every hand-derived FreeRDP vector. A cross-check only: the vectors,
+/// not the oracle, are the basis (ADR-0011).
 #[test]
-fn oracle_still_diverges_from_freerdp_on_srl() {
-    let mut diverged = 0usize;
+fn oracle_agrees_with_freerdp_on_every_vector() {
     for v in VECTORS {
         let got = ironrdp_graphics::srl::decode_srl(v.data, v.num_values, v.num_bits);
-        eprintln!("{}: FreeRDP {:?} vs oracle {got:?}", v.name, v.freerdp);
         assert_eq!(
-            got == v.freerdp,
-            v.oracle_agrees,
-            "{}: the oracle's agreement with FreeRDP has changed",
+            got.as_deref(),
+            Ok(v.freerdp),
+            "{}: the oracle disagrees with FreeRDP",
             v.name
         );
-        if got != v.freerdp {
-            diverged += 1;
-        }
     }
-    assert!(
-        diverged >= 6,
-        "fewer divergent vectors exercised than expected ({diverged})"
-    );
 }
 
-/// **Canary** — the oracle reads each component's SRL and raw streams from offset 0 **once per
-/// band**, where FreeRDP threads one stream, and one adaptive state, across all ten.
+/// The oracle threads one raw stream, and one adaptive state, across all ten bands of a
+/// component, as FreeRDP's `progressive_rfx_upgrade_component` does (`progressive.c:1256-1277`).
 ///
-/// `ironrdp-graphics` calls `srl::decode_srl(srl_data, …)` and `RawBitReader::new(raw_data)`
-/// *inside* its band loop (0.9.0 `progressive.rs:136`, `:140`), so band `n` re-reads the bytes
-/// band 0 already consumed, with `kp`/`nz` reset. FreeRDP attaches both bit streams once in
-/// `progressive_rfx_upgrade_component` (`progressive.c:1256-1277`) and carries
-/// `RFX_PROGRESSIVE_UPGRADE_STATE` — `nz`, `kp`, `mode` — across every
-/// `progressive_rfx_upgrade_block` call for that component.
-///
-/// The claim survives restatement without naming either implementation: *a single
-/// per-component bit stream is consumed from its start once per band, so bands 1..9 decode
-/// bytes that band 0 already spent.* That is a decoder defect on its own terms.
-///
-/// Observing it needs no pixel comparison. With `num_bits = 8` and a raw stream of exactly two
-/// distinctive bytes, a threaded reader yields `0xAA, 0xBB` **once** and zeros thereafter; a
-/// reader recreated per band yields them again at every band offset. The offsets this finds are
-/// also the extrapolate band layout, and the last of them — **4015** — is the `LL3` offset
-/// #194 cites from FreeRDP, arrived at here from the opposite direction. Our own decoder is
-/// held to the other side of this in `rfx::srl`'s `one_raw_stream_is_threaded_across_every_band`.
+/// With `num_bits = 8` and a raw stream of exactly two distinctive bytes, a threaded reader
+/// yields `0xAA, 0xBB` **once**, at offset 0, and zeros thereafter; a reader recreated per band
+/// would yield them again at every band offset. Our own decoder is held to the same in
+/// `rfx::srl`'s `one_raw_stream_is_threaded_across_every_band`.
 #[test]
-fn oracle_still_restarts_both_streams_at_every_band() {
+fn oracle_threads_one_stream_across_every_band() {
     use ironrdp_pdu::codecs::rfx::progressive::ComponentCodecQuant;
 
     // num_bits = prev.for_band(i) - curr.for_band(i) = 8, for every band.
@@ -463,27 +391,20 @@ fn oracle_still_restarts_both_streams_at_every_band() {
         true, // use_reduce_extrapolate — the layout every real region in the corpus declares
         &mut coefficients,
         &mut sign,
-    );
+    )
+    .expect("the oracle decodes a two-byte raw stream");
 
     let restarts: Vec<usize> = (0..coefficients.len() - 1)
         .filter(|&i| coefficients[i] == 0xAA && coefficients[i + 1] == 0xBB)
         .collect();
-
-    eprintln!("raw stream restarts at band offsets: {restarts:?}");
-    assert!(
-        restarts.len() > 1,
-        "the oracle now threads one raw stream across bands (restarts: {restarts:?}). If an \
-         ironrdp-graphics bump fixed this, the instrument has moved — see ADR-0011 and #194."
-    );
-    // Right-reason bar: one restart per band, not an incidental repeat of two byte values.
-    assert_eq!(
-        restarts.len(),
-        10,
-        "expected one restart per extrapolate band, got {restarts:?}"
-    );
     assert_eq!(
         restarts,
-        vec![0, 1023, 2046, 3007, 3279, 3551, 3807, 3879, 3951, 4015],
-        "the restart offsets are the extrapolate band layout"
+        vec![0],
+        "the raw stream is read from its start once, at band 0"
+    );
+    assert_eq!(
+        coefficients.iter().filter(|&&c| c != 0).count(),
+        2,
+        "only the two raw bytes decode to non-zero values"
     );
 }

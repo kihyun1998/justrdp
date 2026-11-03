@@ -65,7 +65,7 @@ attacker-controlled bytes in the repo.
   reads only `progressive_rfx_srl_read` gets a decoder that is correct symbol-by-symbol
   and desynchronised from the first symbol of every component, because `k = kp / 8` is
   1 rather than 0 and the zero-encoding phase reads a run-length bit the other decoder
-  never reads. Both references make the mistake easy: `ironrdp-graphics` starts at 0
+  never reads. Both references made the mistake easy: `ironrdp-graphics` 0.9 started at 0
   (`srl.rs:26`), and FreeRDP declares the state `WINPR_C_ARRAY_INIT` before assigning
   `kp`, so stopping at the declaration also lands on 0. That is how it survived into
   #194's owned basis and out again in #168 (see
@@ -414,8 +414,9 @@ reference behaviour as data rather than as citations.
   **contract tests**, which the ADR-0007 stage differential structurally cannot supply: it
   compares only streams *both* implementations accept, so truncation and end-of-stream behaviour
   are outside it. **Its verification basis is owned as of #194** — a real-server corpus plus
-  FreeRDP-derived SRL expectations, not an oracle diff, because the oracle decodes 2 of 52 real
-  payloads (ADR-0011); the *stage* differential remains valid and discriminating, which is a
+  FreeRDP-derived SRL expectations, not an oracle diff, because the oracle decoded 2 of 52 real
+  payloads when the basis was set (ADR-0011; 0.11 decodes all 52 and agrees with the SRL vectors,
+  #576); the *stage* differential remains valid and discriminating, which is a
   different layer from the whole-payload one. The SRL half of that basis was **re-derived in
   #168**: five of its eight vectors had been computed at the oracle's initial `kp`.
 

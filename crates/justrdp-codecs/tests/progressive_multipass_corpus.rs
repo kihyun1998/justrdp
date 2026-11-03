@@ -3,8 +3,7 @@
 //! passes refining it, across the whole session.
 //!
 //! This is a separate file from `progressive_corpus.rs` because it is a separate claim. That
-//! file gates the *parser* and pins the oracle canaries; this one gates the *decoder* and its
-//! cross-pass state.
+//! file gates the *parser*; this one gates the *decoder* and its cross-pass state.
 //!
 //! # Why this is the gate, and not a differential
 //!

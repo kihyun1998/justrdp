@@ -6,22 +6,19 @@
 //! arbitrary rectangles. A persistent V-bar cache and a glyph cache span PDUs.
 //!
 //! This decoder is re-derived from the MS-RDPEGFX spec and cross-checked against FreeRDP's
-//! `clear.c`; it does **not** depend on `ironrdp-graphics`. Correctness on streams the oracle
-//! also accepts is proven differentially (`tests/clearcodec_*`). Two places diverge from the
-//! bootstrap oracle — one an oracle defect we correct, one a deliberate tolerance choice:
+//! `clear.c`; it does **not** depend on `ironrdp-graphics`, and its output is checked against
+//! that oracle differentially (`tests/clearcodec_*`). Two decisions are easy to get wrong:
 //!
 //! 1. **SHORT_VBAR_CACHE_MISS field layout.** The 14 payload bits are `shortVBarYOn` in bits
 //!    `[7:0]` and `shortVBarYOff` in bits `[13:8]` (FreeRDP `vBarYOn = h & 0xFF`,
-//!    `vBarYOff = (h >> 8) & 0x3F`). The oracle reads them swapped (`yOn = h >> 6`,
-//!    `yOff = h & 0x3F`), so on real streams `yOn` routinely exceeds the 6-bit `yOff` and it
-//!    rejects with `shortVBarYOff < shortVBarYOn`. Fixing the layout also repopulates the full
-//!    V-bar cache correctly, which transitively removes the oracle's `vbarIndex` "cache miss on
-//!    hit" rejection (bands that previously aborted mid-decode now finish and store their
-//!    columns).
+//!    `vBarYOff = (h >> 8) & 0x3F`). Read swapped (`yOn = h >> 6`, `yOff = h & 0x3F`), `yOn`
+//!    routinely exceeds the 6-bit `yOff` on real streams and the band is rejected with
+//!    `shortVBarYOff < shortVBarYOn`; every column that band would have stored then misses the
+//!    full V-bar cache on a later hit (`vbarIndex`).
 //!
 //! 2. **RLEX region over-fill is clipped, not fatal.** A captured real Windows Server 2019
-//!    stream over-fills its RLEX region (replay corpus entry 0). FreeRDP `clear.c` and the
-//!    ironrdp oracle both *reject* an over-region run/suite (`:260`/`:286`/`:321`), but a client
+//!    stream over-fills its RLEX region (replay corpus entry 0). FreeRDP `clear.c` *rejects* an
+//!    over-region run/suite (`:260`/`:286`/`:321`), but a client
 //!    must not drop a live frame over a server's over-encode, so we clip the surplus at the
 //!    region boundary (and short-fill under-runs). This is backed by the capture, **not** by
 //!    FreeRDP — an earlier comment mis-attributed it as "FreeRDP parity" (#120).
@@ -240,7 +237,7 @@ impl Clear {
     ///
     /// When `JUSTRDP_CLEAR_CAPTURE_DIR` is set, the raw payload and its decode status are
     /// dumped there first (see `capture_clear_payload`) — the corpus harness for the #56
-    /// rewrite, which needs the very streams the bootstrap oracle rejects.
+    /// rewrite, which needs streams no differential can arbitrate.
     pub fn decode_to_bgra(
         &mut self,
         data: &[u8],
@@ -266,8 +263,8 @@ impl Clear {
 /// Test-only corpus capture, gated by the `JUSTRDP_CLEAR_CAPTURE_DIR` env var: append one
 /// ClearCodec payload (`clear-NNNN.bin`) plus a manifest row (`idx⇥w⇥h⇥len⇥status`) to that
 /// directory. It exists so a live real-VM session can harvest the fixture corpus for the #56
-/// rewrite — crucially the streams the bootstrap oracle *rejects*, which a differential test
-/// cannot arbitrate. Best-effort: any IO error is swallowed so capture never perturbs decoding.
+/// rewrite — crucially the streams a differential test cannot arbitrate. Best-effort: any IO
+/// error is swallowed so capture never perturbs decoding.
 fn capture_clear_payload(dir: &str, data: &[u8], width: u16, height: u16, status: &str) {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -581,7 +578,7 @@ impl ClearDecoder {
         // CORRECTED field layout (MS-RDPEGFX 2.2.4.1.1.2.1.1.3, per FreeRDP `clear.c`):
         //   shortVBarYOn  = bits [7:0]   (8 bits)
         //   shortVBarYOff = bits [13:8]  (6 bits)
-        // The bootstrap oracle reads these swapped and so rejects genuine streams.
+        // Read swapped, these reject genuine streams.
         let y_on = (header & 0x00FF) as u8;
         let y_off = ((header >> 8) & 0x3F) as u8;
         if y_off < y_on {
@@ -646,8 +643,7 @@ impl ClearDecoder {
                 0x02 => decode_rlex_region(bitmap, output, x_start, y_start, width, height, sw)?,
                 // NSCodec (0x01): a real WS2019 stream sends it (replay corpus entry 30, 48x78).
                 // Decoded via the self-owned NSCodec codec (epic #132) and composited like the raw
-                // subcodec. The ironrdp oracle still *skips* NSCodec, so this sub-region is the one
-                // place our output legitimately exceeds the oracle (see the corpus differential).
+                // subcodec.
                 0x01 => decode_nscodec_region(bitmap, output, x_start, y_start, width, height, sw)?,
                 _ => return Err(invalid("subCodecId", "unknown subcodec ID")),
             }
@@ -811,7 +807,7 @@ fn decode_rlex_region(
 
     // Clip surplus at the region boundary rather than reject. A captured real Windows Server
     // 2019 stream over-fills its RLEX region (replay corpus entry 0, 64x32); FreeRDP `clear.c`
-    // and the ironrdp oracle both reject that (`suite exceeds region pixel count`), but a client
+    // rejects that, but a client
     // must not drop a live frame over a server's over-encode, so we stop emitting at the region
     // boundary and short-fill under-runs. (NB: this is *not* FreeRDP parity — FreeRDP rejects;
     // the basis is the real capture, verified 2026-07-02. See #120.)
@@ -898,8 +894,8 @@ fn decode_rlex(data: &[u8]) -> Result<RlexData, ClearError> {
         let stop_index = packed & stop_mask;
         let suite_depth = (packed >> stop_index_bits) & depth_mask;
         // startIndex = stopIndex - suiteDepth must not underflow. FreeRDP computes it wrapping and
-        // rejects when startIndex >= paletteCount; we reject the underflow directly (#127) — same
-        // outcome, and it keeps these streams inside the differential oracle (both reject).
+        // rejects when startIndex >= paletteCount; we reject the underflow directly (#127) — the
+        // same outcome.
         let start_index = stop_index
             .checked_sub(suite_depth)
             .ok_or_else(|| invalid("rlex", "suiteDepth exceeds stopIndex"))?;
@@ -976,7 +972,7 @@ mod tests {
     }
 
     /// The corrected SHORT_VBAR_CACHE_MISS field layout: `shortVBarYOn` is the low byte and
-    /// `shortVBarYOff` is bits `[13:8]`. A header that the *oracle* would read as
+    /// `shortVBarYOff` is bits `[13:8]`. A header that a swapped reading would see as
     /// `yOff < yOn` (and reject) must decode here.
     #[test]
     fn short_vbar_cache_miss_uses_low_byte_for_y_on() {
@@ -1007,8 +1003,8 @@ mod tests {
     /// #116 — a V-bar cache hit can carry a *taller* band's column into a *shorter* band. The
     /// reconstruction must clamp the assembled column to the current band height (FreeRDP
     /// `clear.c` vBarUpdate clamps every fill to `vBarPixelCount`); it must never be longer.
-    /// Expectation is hand-derived from the FreeRDP semantics — NOT the `ironrdp-graphics`
-    /// oracle, which shares the same un-clamped `reconstruct_full_vbar` (see #118).
+    /// Expectation is hand-derived from the FreeRDP semantics, not from the `ironrdp-graphics`
+    /// oracle (see #118).
     #[test]
     fn reconstruct_full_vbar_clamps_to_band_height() {
         // 40 rows of short pixels, but the current band is only 10 tall, with y_on = 5.
@@ -1120,10 +1116,10 @@ mod tests {
     }
 
     // #120 — RLEX over/under-region is tolerated, not rejected. A captured real WS2019 stream
-    // over-fills its region (corpus entry 0); FreeRDP `clear.c` and the ironrdp oracle both reject
-    // that, but a client must not drop a live frame, so justrdp clips the surplus and short-fills
-    // under-runs. These assertions pin that intentional tolerance (independent of the oracle,
-    // which rejects). palette_count=2 keeps the test off the single-palette 0-bit path (#121).
+    // over-fills its region (corpus entry 0); FreeRDP `clear.c` rejects that, but a client must
+    // not drop a live frame, so justrdp clips the surplus and short-fills under-runs. These
+    // assertions pin that intentional tolerance. palette_count=2 keeps the test off the
+    // single-palette 0-bit path (#121).
 
     /// A one-segment RLEX bitmap: palette of 2 BGR colors, packed byte `0x00`
     /// (stopIndex=0, suiteDepth=0, startIndex=0) → `run_length` run px + 1 suite px of palette[0].

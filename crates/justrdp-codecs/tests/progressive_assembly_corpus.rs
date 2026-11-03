@@ -5,10 +5,7 @@
 //!
 //! # Why this file is the gate and `ironrdp-graphics::progressive` is not
 //!
-//! ADR-0011 retired the oracle for this codec on seven measured divergences, and #194 measured
-//! the blunt one: it decodes **2 of 52** of these payloads. The gate #171 was originally
-//! written with — *"byte-identical against the oracle, 100%"* — is unmeetable, and meeting it
-//! would mean reproducing the oracle's defects. So the properties asserted here are owned:
+//! ADR-0011 retired the oracle for this codec, so the properties asserted here are owned:
 //! totality over real bytes, a **measured** clipping census, and a counterfactual that prices
 //! the one decision this layer makes that a decoder-level test cannot see.
 //!
