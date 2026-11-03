@@ -43,12 +43,12 @@ now has to distinguish.
 
 ### 2. Coverage-guided fuzzing (`cargo-fuzz` / libFuzzer) — CI lane only
 
-A `fuzz/` workspace member with one libFuzzer target per highest-risk untrusted-input decoder, run on **Ubuntu CI under nightly** — not on the maintainer's Windows host. This lane exists because it catches what `proptest` structurally cannot:
+A `fuzz/` crate (its own workspace, outside the main one) with one libFuzzer target per highest-risk untrusted-input decoder, run on **Ubuntu CI under nightly** — not on the maintainer's Windows host. This lane exists because it catches what `proptest` structurally cannot:
 
 - **Hangs.** `proptest` has no per-case timeout; an infinite loop hangs the test run rather than failing it. libFuzzer's timeout turns a hang into a reportable crash.
 - **Deeper paths.** Coverage feedback mutates toward unexplored branches, reaching states random generation rarely hits.
 
-This ADR fixes the decision that fuzzing **belongs in CI, not local dev**, and why the two lanes are not redundant. (Amended #99, landed: the `fuzz/` workspace member now carries one libFuzzer target per highest-risk decoder, run weekly on nightly Ubuntu. Its CI actions are SHA-pinned and least-privilege per [ADR-0006](0006-supply-chain-action-pinning.md), which formalizes the supply-chain requirement this sentence originally only gestured at.)
+This ADR fixes the decision that fuzzing **belongs in CI, not local dev**, and why the two lanes are not redundant. (Amended #99, landed: the `fuzz/` crate now carries one libFuzzer target per highest-risk decoder, run weekly on nightly Ubuntu. Its CI actions are SHA-pinned and least-privilege per [ADR-0006](0006-supply-chain-action-pinning.md), which formalizes the supply-chain requirement this sentence originally only gestured at.)
 
 ### 3. The standing rule
 

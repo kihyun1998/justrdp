@@ -131,7 +131,7 @@ like any other.
   SHA, Dependabot bumps it with a version comment. That pairing is the whole reason
   the earlier "pinning is unmaintainable" objection was resolved.
 - **The compiler is a pinned input too, and the gate only means something because of it**
-  (ADR-0013). `rust-toolchain.toml` pins `channel = "1.98.0"` exactly; the `rust-toolchain`
+  (ADR-0013). `rust-toolchain.toml` pins an exact three-part `channel`; the `rust-toolchain`
   Dependabot ecosystem raises it. Before the pin, `test.yml` installed whatever `stable`
   resolved to that day while the maintainer's host sat three months back, so a green local
   `clippy` said nothing about the PR gate — #235, where a `justrdp-codecs` change went red
