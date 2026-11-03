@@ -48,11 +48,12 @@ const MAX_PALETTE_COUNT: u8 = 127;
 /// Per-axis tile dimension cap, mirroring the bootstrap decoder's OOM guard: rejects
 /// implausible tile shapes (e.g. 63961x771) regardless of total area before allocation.
 const MAX_DECODE_DIM: u16 = 8_192;
-/// Glyph cache stores tiles no larger than this many pixels — a memory bound, not a spec limit
-/// (#127). The cache has [`GLYPH_CACHE_SIZE`] slots, so an unbounded per-entry size is a DoS
-/// surface; we cap it. A GLYPH_HIT for a larger, uncached tile degrades gracefully (cache-miss →
-/// typed error → the egfx layer warn-and-skips), never a panic. FreeRDP's `1024*1024` (`clear.c`)
-/// is a different thing — an anti-overflow sanity ceiling, not a cache-eligibility threshold.
+/// Glyph cache stores tiles no larger than this many pixels: `[MS-RDPEGFX]` 3.3.1.9 caps each
+/// of the [`GLYPH_CACHE_SIZE`] slots at 1,024 square pixels, which also bounds the cache's memory
+/// (#127). A larger tile is decoded and not stored, so a later GLYPH_HIT on its slot is a typed
+/// error (a miss, or an area mismatch with what the slot holds), never a panic. FreeRDP's
+/// `1024*1024` (`clear.c`) is a different thing — an anti-overflow sanity ceiling, not a
+/// cache-eligibility threshold.
 const MAX_GLYPH_PIXELS: usize = 1_024;
 
 /// Why a ClearCodec stream failed to decode. Malformed input is always a typed error, never a
@@ -201,9 +202,7 @@ struct FullVBar {
 
 #[derive(Clone)]
 struct GlyphEntry {
-    width: u16,
-    height: u16,
-    /// BGRA pixel data.
+    /// BGRA pixel data: a linear stream with no dimensions (`[MS-RDPEGFX]` 4.1.1.5).
     pixels: Vec<u8>,
 }
 
@@ -356,15 +355,20 @@ impl ClearDecoder {
             .checked_mul(usize::from(height))
             .ok_or_else(|| invalid("dimensions", "width * height overflow"))?;
 
-        // Glyph hit: return the cached tile verbatim, no payload follows.
+        // Glyph hit: return the cached pixels verbatim, no payload follows. The destination
+        // rectangle supplies the shape, so any rectangle of the cached glyph's area draws it
+        // (`[MS-RDPEGFX]` 4.1.1.5).
         if flags & FLAG_GLYPH_HIT != 0 {
             let idx =
                 glyph_index.ok_or_else(|| invalid("flags", "GLYPH_HIT without GLYPH_INDEX"))?;
             let entry = self
                 .glyph_get(idx)
                 .ok_or_else(|| invalid("glyphIndex", "glyph cache miss on hit"))?;
-            if entry.width != width || entry.height != height {
-                return Err(invalid("glyphIndex", "cached glyph dimensions mismatch"));
+            if entry.pixels.len() / 4 != pixel_count {
+                return Err(invalid(
+                    "glyphIndex",
+                    "cached glyph area does not match destination",
+                ));
             }
             return Ok(entry.pixels.clone());
         }
@@ -392,8 +396,6 @@ impl ClearDecoder {
             self.glyph_store(
                 idx,
                 GlyphEntry {
-                    width,
-                    height,
                     pixels: output.clone(),
                 },
             );
@@ -969,6 +971,65 @@ mod tests {
         let stream = encoder.encode(&bgra, 4, 2);
         let decoded = Clear::new().decode_to_bgra(&stream, 4, 2).unwrap();
         assert_eq!(decoded, bgra);
+    }
+
+    /// A stream that decodes 16 distinct pixels through the residual layer and stores them in glyph
+    /// slot `index`: one BGR run of length 1 per pixel, pixel `i` = `(i, 0x40 + i, 0x80 + i)`.
+    fn glyph_store_stream(index: u16) -> Vec<u8> {
+        let residual: Vec<u8> = (0u8..16).flat_map(|i| [i, 0x40 + i, 0x80 + i, 1]).collect();
+        let mut stream = vec![FLAG_GLYPH_INDEX, 0x00];
+        stream.extend_from_slice(&index.to_le_bytes());
+        stream.extend_from_slice(&u32::try_from(residual.len()).unwrap().to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes()); // bandsByteCount
+        stream.extend_from_slice(&0u32.to_le_bytes()); // subcodecByteCount
+        stream.extend_from_slice(&residual);
+        stream
+    }
+
+    fn glyph_hit_stream(index: u16) -> Vec<u8> {
+        let mut stream = vec![FLAG_GLYPH_INDEX | FLAG_GLYPH_HIT, 0x01];
+        stream.extend_from_slice(&index.to_le_bytes());
+        stream
+    }
+
+    /// `[MS-RDPEGFX]` 4.1.1.5: a glyph is stored as a linear pixel stream with no dimensions,
+    /// and a hit may draw it as any rectangle of the same area — the example caches 2x8 and hits
+    /// it as 4x4 and as 8x2.
+    #[test]
+    fn a_glyph_hit_draws_the_cached_pixels_as_any_rectangle_of_the_same_area() {
+        let mut d = ClearDecoder::new();
+        let stored = d.decode(&glyph_store_stream(4), 2, 8).unwrap();
+        let expected: Vec<u8> = (0u8..16)
+            .flat_map(|i| [i, 0x40 + i, 0x80 + i, 0xFF])
+            .collect();
+        assert_eq!(
+            stored, expected,
+            "the residual layer paints the 16 pixels in order"
+        );
+
+        for (w, h) in [(2u16, 8u16), (4, 4), (8, 2), (16, 1)] {
+            assert_eq!(
+                d.decode(&glyph_hit_stream(4), w, h).unwrap(),
+                expected,
+                "a {w}x{h} hit returns the linear stream unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_glyph_hit_of_a_different_area_is_an_error() {
+        let mut d = ClearDecoder::new();
+        d.decode(&glyph_store_stream(4), 2, 8).unwrap();
+        for (w, h) in [(3u16, 5u16), (4, 5), (1, 1)] {
+            assert_eq!(
+                d.decode(&glyph_hit_stream(4), w, h),
+                Err(invalid(
+                    "glyphIndex",
+                    "cached glyph area does not match destination"
+                )),
+                "a {w}x{h} hit has a different area from the 2x8 glyph"
+            );
+        }
     }
 
     /// The corrected SHORT_VBAR_CACHE_MISS field layout: `shortVBarYOn` is the low byte and

@@ -35,6 +35,14 @@ attacker-controlled bytes in the repo.
   path where FreeRDP rejects — both are required by real Server 2019 streams (#127).
   These are recorded as deliberate divergences against #127 and memory
   `clearcodec_corpus_required_tolerances`.
+- **A ClearCodec glyph hit draws the cached pixels as any rectangle of the same area** (#586).
+  `[MS-RDPEGFX]` 4.1.1.5 stores a glyph as a linear pixel stream with no dimensions and hits a
+  2x8 glyph as 4x4 and as 8x2; the `ironrdp-graphics` 0.11 oracle does the same. A hit of a
+  different area is refused. FreeRDP also accepts any area up to the slot's buffer (`clear.c:991`
+  compares with `glyphEntry->count`, which `:1020-1033` only ever grows, so a hit can read pixels
+  an earlier, larger glyph left behind); that is not followed,
+  the maintainer's call (2026-11-03): no server has been seen sending one, and the decoder has
+  no channel to report the tolerance as ADR-0009 requires.
 - **NSCodec accepts a zero luma, Co or Cg plane count, which `[MS-RDPNSC]` 2.2.2 forbids** (#371,
   the maintainer's call). `decode_plane` fills a zero-length plane with `0xFF`, as FreeRDP does
   for every plane (`nsc.c`, `nsc_rle_decompress_data`); the spec allows that only for alpha.

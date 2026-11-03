@@ -438,5 +438,11 @@ mod tests {
             decode_pointer(2, 2, 12, &[0; 16], &[0; 4], &Palette::default()),
             Err(PointerError::UnsupportedBpp { bpp: 12 })
         );
+        // 4 bpp: `[MS-RDPBCGR]` 2.2.9.1.1.4.5 allows it; refused here (#586). A 2x2 shape at 4 bpp
+        // has a 2-byte XOR stride, so 4 bytes is the exact mask length.
+        assert_eq!(
+            decode_pointer(2, 2, 4, &[0; 4], &[0; 4], &Palette::default()),
+            Err(PointerError::UnsupportedBpp { bpp: 4 })
+        );
     }
 }
