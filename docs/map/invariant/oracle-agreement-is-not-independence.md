@@ -151,9 +151,10 @@ Worked example, 0.9 → 0.11 (#576), both changelogs read entry by entry:
   sizes before allocating; zgfx bounds decompression at 64 MiB per segment; pointers decode at 4
   and 8 bpp with a palette; ClearCodec accepts a glyph hit whose area matches the cached glyph's.
   No test went red on any of them, which says only that no differential feeds them an input on
-  which the two sides now differ. Two of them are places where our behaviour and the 0.11
-  oracle's now differ (glyph area, 4 bpp pointers); they are carried out of #576 rather than
-  adjudicated here.
+  which the two sides now differ. Two of them were places where our behaviour and the 0.11
+  oracle's differed, adjudicated in #586 against the spec and FreeRDP: ClearCodec now accepts a
+  same-area glyph hit ([bitmap codecs](../territory/bitmap-codecs.md)), and 4 bpp pointers stay
+  refused ([pointer & cursor](../territory/pointer-cursor.md)).
 - **Row 3:** the new `rfx` `TileDecoder`/`MessageDecoder` and `alpha` modules, and every
   `ironrdp-pdu` change outside the two codecs (redirection, window orders, heartbeat, bulk
   compression, logon errors). One of these weakens an instrument rather than moving a value:
