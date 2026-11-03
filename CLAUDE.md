@@ -78,8 +78,8 @@ Virtual workspace, edition 2024; members in `Cargo.toml`, plus `fuzz/` outside t
   `rustls`.
 
 The concrete tree rule is the [ADR-0001 Amendment](docs/adr/0001-sans-io-state-machine-core.md).
-`--workspace` never builds `fuzz/`: after a rename or a public-path change, also run
-`cargo check --manifest-path fuzz/Cargo.toml`.
+`--workspace` never builds `fuzz/`; `test.yml` checks it separately with
+`cargo check --manifest-path fuzz/Cargo.toml`, which is also the local command.
 
 Delegated dependencies are leaf, security-critical and non-RDP only (ADR-0002). `sspi` is pinned
 exactly (`=x.y.z`); a bump passes the real-VM suite before it lands (ADR-0004,

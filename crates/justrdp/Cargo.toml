@@ -64,7 +64,6 @@ ctor = "1"
 # that shape does not transfer. Maintainer's call, 2026-09-07, chosen over `pub mod egfx`, a
 # `#[doc(hidden)]` shim, and shipping the proptest alone.
 #
-# **`cargo clippy --workspace --all-targets` does not build this**, which is why `test.yml`'s
-# clippy step carries `--all-features`: a configuration no gate compiles is the same silent
-# class #200 closed for the fuzz matrix.
+# **`cargo clippy --workspace --all-targets` does not build this.** `test.yml` compiles it in
+# its `Fuzz crate builds` step and lints it through the clippy step's `--all-features`.
 fuzzing = []

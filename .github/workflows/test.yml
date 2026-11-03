@@ -68,11 +68,10 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
-      # `--all-features` because `justrdp`'s `fuzzing` feature (#267) gates the module
-      # re-export the graphics-processor fuzz target enters through. Without it that
-      # configuration is compiled by nothing on a PR — the weekly fuzz lane builds it, and a
-      # merge gate that cannot see a configuration is the silent class #200 closed for the
-      # target matrix. There are no other features in the workspace, so this costs nothing.
+      # `--all-features` so clippy lints `justrdp`'s `fuzzing` feature (#267), the module
+      # re-export the graphics-processor fuzz target enters through. The `Fuzz crate builds`
+      # step below compiles that configuration; this one is what lints it. There are no other
+      # features in the workspace, so this costs nothing.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -92,6 +91,11 @@ jobs:
             echo "::error::does not build alone:$failed"
             exit 1
           fi
+
+      # `fuzz/` is its own workspace, outside every `--workspace` step above and below; this is
+      # the only PR build of it and of `justrdp`'s `fuzzing` feature on its own.
+      - name: Fuzz crate builds (fuzz/Cargo.toml)
+        run: cargo check --locked --manifest-path fuzz/Cargo.toml
 
       - name: Test
         run: cargo test --workspace

@@ -27,8 +27,8 @@ like any other.
 ## Design model
 
 - **Four gating workflows and one report.** `test.yml` — two jobs: `test`
-  (fmt → clippy `-D warnings` → each crate's library alone → `cargo test --workspace` →
-  rustdoc `-D warnings`) and `map`
+  (fmt → clippy `-D warnings` → each crate's library alone → `fuzz/` →
+  `cargo test --workspace` → rustdoc `-D warnings`) and `map`
   (`.github/scripts/check_map.py`, toolchain-free so a docs-only PR answers without
   waiting for cargo); `fuzz.yml` (nightly libFuzzer); `supply-chain.yml`
   (`just-shield`); `overflow-32bit.yml` (the 32-bit target, below). `coverage.yml`
@@ -94,9 +94,17 @@ like any other.
   a bullet could name a symbol at a path it had moved out of and pass (#221, fixed in
   #224).
 - **`--workspace` is not "everything".** `fuzz` has its own `[workspace]`, so the top
-  gate does not even *build* it; a public-API change needs
-  `cargo check --manifest-path fuzz/Cargo.toml`. Note what that command still does not
-  reach: it builds the `[[bin]]` targets the manifest declares, so a `fuzz_targets/*.rs`
+  `--workspace` step does not even *build* it. `test.yml`'s `Fuzz crate builds` step runs
+  `cargo check --manifest-path fuzz/Cargo.toml` on the pinned stable toolchain (#578):
+  checking needs no nightly, only `cargo fuzz run` does. Measured when it was added: 10.5 s
+  and 16.5 s cold in two runs on the maintainer's host, including `libfuzzer-sys`'s build
+  script compiling libFuzzer's C++, and removing `GraphicsProcessor` from `justrdp::fuzzing`
+  turned this step red while clippy `--all-features` stayed green. It passes `--locked`,
+  unlike the workspace steps: the root lock is rewritten by every local build, while
+  `fuzz/Cargo.lock` changes when a path crate gains a dependency and nobody builds `fuzz/`
+  locally, so without the flag CI would re-resolve it silently and leave the committed lock
+  stale. Removing one entry from it turned the step red. Note what that command still does
+  not reach: it builds the `[[bin]]` targets the manifest declares, so a `fuzz_targets/*.rs`
   with no `[[bin]]` entry is invisible to it too.
 - **A green workspace gate does not mean each crate builds alone** (#572). Clippy
   `--all-targets` and `cargo test` compile dev targets, and under resolver 2 that is exactly
@@ -110,9 +118,8 @@ like any other.
   features (`resolver.md`, "When building multiple packages in a workspace … you will need to
   build them via separate `cargo` invocations"). It derives the member list from
   `cargo metadata --no-deps`, for the reason the next bullet gives. It checks default features
-  only: a non-default feature built alone is still seen by no PR gate. `justrdp`'s `fuzzing` is
-  built alone only through `fuzz/Cargo.toml`, which the weekly fuzz lane compiles and the bullet
-  below leaves to a manual `cargo check`.
+  only. `justrdp`'s `fuzzing`, the workspace's one non-default feature, is built alone by the
+  `Fuzz crate builds` step through `fuzz/Cargo.toml`.
 - **A workflow may not keep its own copy of a list the repo already answers** (#200).
   `fuzz.yml`'s matrix was a hand-kept transcription of `ls fuzz/fuzz_targets/` and
   drifted twice in silence — `nscodec` (#143) and `progressive` (#192) each shipped a

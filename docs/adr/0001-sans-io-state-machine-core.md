@@ -162,10 +162,10 @@ The codec-level corpora in `crates/justrdp-codecs/tests/fixtures/` are replayed 
 ones carved from `crates/justrdp/tests/fixtures/session/` too, to check them against a fresh carve;
 that is a check of where the bytes came from, not a second replay.
 
-**`fuzz/` is out of the workspace, and that is a gate blind spot, not an oversight.**
-`cargo <cmd> --workspace` does not build it, so a rename or a public-path change can leave
-it broken while every gate stays green. It needs its own
-`cargo check --manifest-path fuzz/Cargo.toml`.
+**`fuzz/` is out of the workspace, by design.** `cargo <cmd> --workspace` does not build it,
+so it has its own gate: `test.yml` runs `cargo check --manifest-path fuzz/Cargo.toml` on every
+PR (#578). Until then this was a blind spot left to a manual run, and a rename or a public-path
+change could leave `fuzz/` broken while every gate stayed green.
 
 ### Two layout rules that were previously declared nowhere
 

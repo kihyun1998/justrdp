@@ -153,8 +153,7 @@ More detail:
   VM.
 
 The merge gate is [`.github/workflows/test.yml`](.github/workflows/test.yml): run its steps
-locally to reproduce it. `fuzz/` is not a workspace member and no PR gate builds it, so after a
-public-path change also run `cargo check --manifest-path fuzz/Cargo.toml`.
+locally to reproduce it.
 
 The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
 
