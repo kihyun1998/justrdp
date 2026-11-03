@@ -69,8 +69,8 @@ pub use dvc::{CoreOwnedDynamicChannel, DynamicChannelError, DynamicChannelHandle
 
 /// The `fuzz/` lane's door into the EGFX graphics processor (#267) — **not host API**.
 ///
-/// Compiled only under the `fuzzing` feature, which the workspace build never enables, so
-/// nothing here widens the published surface. `egfx` and `dvc` stay private modules; this
+/// Compiled only under the `fuzzing` feature, which only `fuzz/` and the lint and doc gates
+/// enable, so nothing here widens the published surface. `egfx` and `dvc` stay private modules; this
 /// re-exports the two items a libFuzzer target needs to drive
 /// [`GraphicsProcessor`](fuzzing::GraphicsProcessor) the way the manager does.
 ///

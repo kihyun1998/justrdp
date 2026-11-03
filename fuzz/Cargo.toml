@@ -1,8 +1,9 @@
 # Coverage-guided cargo-fuzz / libFuzzer targets for the untrusted-input decoders (ADR-0008,
 # issue #99). This is the CI-only counterpart to the in-crate `proptest` no-panic properties:
 # libFuzzer's `-timeout` catches hangs (infinite loops) that proptest cannot, and coverage
-# guidance reaches deeper paths than random bytes. Requires the nightly toolchain and is
-# effectively Linux-only — it never runs on the maintainer's stable Windows MSVC host.
+# guidance reaches deeper paths than random bytes. Fuzzing requires the nightly toolchain and is
+# effectively Linux-only — it never runs on the maintainer's stable Windows MSVC host. Checking
+# the crate (`cargo check --manifest-path fuzz/Cargo.toml`) needs neither, and `test.yml` does it.
 #
 # Standalone workspace (the empty `[workspace]` below): cargo-fuzz convention, detaches this
 # crate from the parent justrdp workspace so its nightly/libFuzzer build never touches the

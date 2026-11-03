@@ -598,9 +598,9 @@ Read this before starting so the graph does not read as abstractions.
 
 ## Step 6/7 — surfaces & gates
 
-- **The `fuzz` crate is the `--workspace` blind spot** — out of the workspace by
-  design (its own `[workspace]`), so `cargo test --workspace` does not build it. A
-  public-API change needs a separate `cargo check --manifest-path fuzz/Cargo.toml`.
+- **The `fuzz` crate is outside `--workspace`** — out of the workspace by
+  design (its own `[workspace]`), so `cargo test --workspace` does not build it.
+  `test.yml` runs `cargo check --manifest-path fuzz/Cargo.toml` as its own step (#578).
 - **A green workspace gate does not mean each crate builds alone (#572).** Clippy
   `--all-targets` and `cargo test` build dev targets, which lets dev-dependency features
   reach the library, so `justrdp-tokio` passed every gate and did not build on its own.
