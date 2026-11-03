@@ -76,6 +76,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # Each workspace member's library on its own: one `cargo check` per member, no dev
+      # targets, every member checked even after one fails. The reason is in
+      # docs/map/territory/supply-chain-and-gates.md.
+      - name: Each crate builds alone
+        run: |
+          cargo metadata --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          crates=$(python3 -c 'import json, sys; print(" ".join(p["name"] for p in json.load(open(sys.argv[1], encoding="utf-8"))["packages"]))' "$RUNNER_TEMP/metadata.json")
+          test -n "$crates"
+          failed=""
+          for crate in $crates; do
+            cargo check -p "$crate" || failed="$failed $crate"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::does not build alone:$failed"
+            exit 1
+          fi
+
       - name: Test
         run: cargo test --workspace
 

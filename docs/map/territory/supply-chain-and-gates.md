@@ -27,7 +27,8 @@ like any other.
 ## Design model
 
 - **Four gating workflows and one report.** `test.yml` — two jobs: `test`
-  (fmt → clippy `-D warnings` → `cargo test --workspace` → rustdoc `-D warnings`) and `map`
+  (fmt → clippy `-D warnings` → each crate's library alone → `cargo test --workspace` →
+  rustdoc `-D warnings`) and `map`
   (`.github/scripts/check_map.py`, toolchain-free so a docs-only PR answers without
   waiting for cargo); `fuzz.yml` (nightly libFuzzer); `supply-chain.yml`
   (`just-shield`); `overflow-32bit.yml` (the 32-bit target, below). `coverage.yml`
@@ -97,6 +98,21 @@ like any other.
   `cargo check --manifest-path fuzz/Cargo.toml`. Note what that command still does not
   reach: it builds the `[[bin]]` targets the manifest declares, so a `fuzz_targets/*.rs`
   with no `[[bin]]` entry is invisible to it too.
+- **A green workspace gate does not mean each crate builds alone** (#572). Clippy
+  `--all-targets` and `cargo test` compile dev targets, and under resolver 2 that is exactly
+  when dev-dependency features reach the library (the Cargo book, `features.md`, "Dev-dependencies
+  do not activate features unless building a Cargo target that needs them"). `justrdp-tokio`'s
+  dev-dependency enables tokio's `rt`, so its runners' `task::yield_now` compiled under every
+  gate while `cargo check -p justrdp-tokio` failed with 16 errors, and so did
+  `cargo check --workspace`. slice-7 hit the same class with `sync`/`macros` and fixed only the
+  features. The `Each crate builds alone` step in `test.yml` now runs `cargo check -p` once per
+  member, as separate invocations because several `-p` flags in one invocation unify their
+  features (`resolver.md`, "When building multiple packages in a workspace … you will need to
+  build them via separate `cargo` invocations"). It derives the member list from
+  `cargo metadata --no-deps`, for the reason the next bullet gives. It checks default features
+  only: a non-default feature built alone is still seen by no PR gate. `justrdp`'s `fuzzing` is
+  built alone only through `fuzz/Cargo.toml`, which the weekly fuzz lane compiles and the bullet
+  below leaves to a manual `cargo check`.
 - **A workflow may not keep its own copy of a list the repo already answers** (#200).
   `fuzz.yml`'s matrix was a hand-kept transcription of `ls fuzz/fuzz_targets/` and
   drifted twice in silence — `nscodec` (#143) and `progressive` (#192) each shipped a

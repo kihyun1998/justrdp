@@ -9,10 +9,9 @@ repository.workspace = true
 [dependencies]
 justrdp.workspace = true
 justrdp-pdu.workspace = true
-# "sync" + "macros" are lib (not just dev) features since slice-7: `run_session` selects over
-# the socket and the host-input mpsc channel. Without them the lib only compiled via
-# dev-dependency feature unification (tests passed, standalone `cargo check` did not).
-tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros"] }
+# The library's own tokio features: "sync" + "macros" for the session runners' `select!` over the
+# socket and the host-input mpsc channel, "rt" for their `task::yield_now` resume branch.
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "sync", "macros"] }
 # Cancel-aware session teardown (slice-8): the host signals stop via CancellationToken.
 tokio-util = { workspace = true }
 tracing = { workspace = true, features = ["std", "attributes"] }
