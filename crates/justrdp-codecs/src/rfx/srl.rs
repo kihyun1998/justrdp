@@ -603,8 +603,8 @@ mod tests {
     /// across all ten bands, so two distinctive bytes appear exactly once — at the start of the
     /// first band — and never again at a later band's offset.
     ///
-    /// This is the mirror of `oracle_still_restarts_both_streams_at_every_band` in
-    /// `tests/progressive_srl_freerdp.rs`, which measures the oracle failing it at ten offsets.
+    /// `oracle_threads_one_stream_across_every_band` in `tests/progressive_srl_freerdp.rs`
+    /// asserts the same property of the oracle.
     #[test]
     fn one_raw_stream_is_threaded_across_every_band() {
         let mut current = [0i16; COMPONENT_LEN];

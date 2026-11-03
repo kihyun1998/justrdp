@@ -10,10 +10,9 @@
 //! Two properties are asserted:
 //!
 //! 1. The self-owned decoder replays the entire capture without error — the live session does
-//!    too (0 rejections), whereas the bootstrap oracle rejects a large fraction.
-//! 2. Where the oracle *succeeds*, the self-owned output is byte-identical (ADR-0003 phase-2
-//!    acceptance); where the oracle *rejects* with one of its three defective validations, the
-//!    self-owned decoder produces pixels instead.
+//!    too (0 rejections).
+//! 2. The `ironrdp-graphics` oracle also accepts every entry, and the self-owned output is
+//!    byte-identical to it (ADR-0003 phase-2 acceptance).
 
 use justrdp_codecs::clearcodec::ClearDecoder;
 
@@ -99,63 +98,27 @@ fn self_owned_replays_full_capture_without_error() {
 }
 
 /// Differential acceptance: feed the ordered sequence to both the self-owned decoder and the
-/// `ironrdp-graphics` oracle, each stateful. Where the oracle succeeds, outputs must be
-/// byte-identical; where it rejects (its three defective validations), the self-owned decoder
-/// must succeed. Asserts the corpus actually exercises the oracle's defects (rejections > 0) and
-/// that all three rejection signatures appear, so the fix is genuinely covered.
+/// `ironrdp-graphics` oracle, each stateful. Both accept every entry, and the outputs are
+/// byte-identical (ADR-0003 phase-2 acceptance).
 #[test]
-fn self_owned_matches_oracle_where_oracle_succeeds() {
+fn self_owned_matches_oracle_on_every_entry() {
     let entries = load_replay();
+    assert!(!entries.is_empty(), "the replay corpus is empty");
 
     let mut mine = ClearDecoder::new();
     let mut oracle = ironrdp_graphics::clearcodec::ClearCodecDecoder::new();
 
-    let mut oracle_rejections = 0usize;
-    let mut saw_short_vbar = false;
-    let mut saw_rlex = false;
-    let mut saw_vbar_index = false;
-
     for (i, e) in entries.iter().enumerate() {
-        let ours = mine.decode(&e.data, e.width, e.height);
-        let theirs = oracle.decode(&e.data, e.width, e.height);
-
-        match theirs {
-            Ok(theirs) => {
-                let ours = ours.unwrap_or_else(|err| {
-                    panic!("entry {i}: self-owned failed where oracle succeeded: {err}")
-                });
-                assert_eq!(
-                    ours, theirs,
-                    "entry {i} ({}x{}): self-owned BGRA differs from the oracle on a stream both accept",
-                    e.width, e.height
-                );
-            }
-            Err(err) => {
-                oracle_rejections += 1;
-                let msg = err.to_string();
-                if msg.contains("shortVBarCacheMiss") {
-                    saw_short_vbar = true;
-                }
-                if msg.contains("rlex") {
-                    saw_rlex = true;
-                }
-                if msg.contains("vbarIndex") {
-                    saw_vbar_index = true;
-                }
-                assert!(
-                    ours.is_ok(),
-                    "entry {i}: oracle rejected ({msg}) and the self-owned decoder did too"
-                );
-            }
-        }
+        let ours = mine
+            .decode(&e.data, e.width, e.height)
+            .unwrap_or_else(|err| panic!("entry {i}: self-owned decoder rejected it: {err}"));
+        let theirs = oracle
+            .decode(&e.data, e.width, e.height)
+            .unwrap_or_else(|err| panic!("entry {i}: oracle rejected it: {err}"));
+        assert_eq!(
+            ours, theirs,
+            "entry {i} ({}x{}): self-owned BGRA differs from the oracle",
+            e.width, e.height
+        );
     }
-
-    assert!(
-        oracle_rejections > 0,
-        "corpus never triggered an oracle rejection — it does not exercise the #56 fix"
-    );
-    assert!(
-        saw_short_vbar && saw_rlex && saw_vbar_index,
-        "corpus is missing a signature (shortVBarCacheMiss={saw_short_vbar}, rlex={saw_rlex}, vbarIndex={saw_vbar_index})"
-    );
 }

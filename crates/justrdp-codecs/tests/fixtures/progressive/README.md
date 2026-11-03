@@ -8,8 +8,8 @@ reached `Progressive::decode` on the wire, with the `codecContextId` and surface
 was decoded against.
 
 This corpus is Progressive's **primary verification gate** (ADR-0011): the `ironrdp-graphics`
-oracle is scaffolding with a retirement condition, and Progressive is the first codec where the
-oracle demonstrably cannot decode real traffic. See `tests/progressive_corpus.rs`.
+oracle is scaffolding with a retirement condition. See `tests/progressive_corpus.rs` and
+[What the oracle does with it](#what-the-oracle-does-with-it).
 
 ## Why a single ordered file (not per-stream fixtures)
 
@@ -81,8 +81,8 @@ Asserted by `corpus_spans_the_axes_the_epic_needs`, so the list cannot rot silen
 
 ## What the oracle does with it
 
-2 of 52 payloads decode. The rest fail for **two independent reasons**, each pinned by its own
-canary in `tests/progressive_corpus.rs`:
+`ironrdp-graphics` 0.11 decodes all 52 payloads (#576). 0.9.0 decoded 2; the rest failed for
+**two independent reasons**, both fixed upstream since:
 
 1. **1 × `quant index 255 exceeds table length 0`** — the `0xFF` sentinel used as a table index
    (0.9.0 `progressive.rs:1231`, `:1268`), which FreeRDP special-cases (`progressive.c:997`,

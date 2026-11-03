@@ -34,8 +34,8 @@
 //!
 //! Every length here is server-chosen, so
 //! [`untrusted-decode-never-panics`]
-//! governs the whole module. Two allocation bounds exist that neither reference has, both
-//! anticipated by the build plan's verification section (*"malformed sequences could
+//! governs the whole module. Two allocation bounds, both anticipated by the build plan's
+//! verification section (*"malformed sequences could
 //! cause OOM; use a max-decompressed-size limit"*):
 //!
 //! - `MAX_SEGMENT_OUTPUT` caps what one **compressed** segment may expand to. The
@@ -55,16 +55,14 @@ const HISTORY_SIZE: usize = 2_500_000;
 
 /// Cap on what one **compressed** segment may expand to. `[MS-RDPEGFX]` 3.1.8.1 puts the
 /// maximum uncompressed bytes in a single segment at 65535; FreeRDP enforces the same number
-/// as a fixed `OutputBuffer[65536]`. `ironrdp-graphics` has no such bound at all, which is what
-/// makes a ~20-byte segment able to demand gigabytes (a match length is `2^(k+1) + v` for a
-/// unary-coded `k` the stream chooses).
+/// as a fixed `OutputBuffer[65536]`. Without it a ~20-byte segment can demand gigabytes (a match
+/// length is `2^(k+1) + v` for a unary-coded `k` the stream chooses).
 const MAX_SEGMENT_OUTPUT: usize = 65_536;
 
 /// Cap on a multipart message's declared `uncompressedSize`. A conforming server's message is
 /// bounded by `justrdp`'s 4 MiB dynamic-channel reassembly cap on the *compressed* side; this
-/// is the bound on the decompressed side, where the size is a `u32` the server chose and both
-/// references will happily allocate all 4 GiB of it (65535 segments x 65536 bytes reaches it
-/// from ~400 KiB of input).
+/// is the bound on the decompressed side, where the size is a `u32` the server chose (65535
+/// segments x 65536 bytes reaches 4 GiB from ~400 KiB of input).
 const MAX_DECOMPRESSED_BYTES: usize = 64 << 20;
 
 /// Cap on the *input* length of one compressed segment. The bit cursor addresses a segment in
@@ -96,8 +94,7 @@ pub enum ZgfxError {
     /// `RDP8_BULK_ENCODED_DATA`'s low nibble was not `PACKET_COMPR_TYPE_RDP8` (4).
     UnknownCompressionType(u8),
     /// The trailing "unused bits in the final byte" count exceeded the segment's own bit
-    /// length. FreeRDP rejects this (`bits < *pbInputEnd`); `ironrdp-graphics` underflows and
-    /// panics on it (#189's probe, case B).
+    /// length. FreeRDP rejects this (`bits < *pbInputEnd`).
     InvalidUnusedBitCount { unused: usize, available: usize },
     /// A bit pattern matching no entry in the token table. Exactly two exist (`10000` and
     /// `101111111`); FreeRDP silently skips them, we refuse.
@@ -807,6 +804,37 @@ mod tests {
         // 10001 00011 (match, distance 3), then seventeen 1 bits, then the terminating 0.
         let msg = [0xE0u8, 0x24, 0x88, 0xFF, 0xFF, 0xE0, 0x04];
         assert_eq!(z.decompress(&msg), Err(ZgfxError::SegmentOutputTooLarge));
+    }
+
+    #[test]
+    fn a_single_match_longer_than_the_segment_cap_is_an_error() {
+        // k = 16 passes the pre-shift guard and names a length of `1 << 17` = 131072, twice
+        // MAX_SEGMENT_OUTPUT.
+        let mut z = Zgfx::new();
+        // 10001 00011 (match, distance 3), sixteen 1 bits, the terminating 0, then 17 zero
+        // extra bits; 4 padding bits.
+        let msg = [0xE0u8, 0x24, 0x88, 0xFF, 0xFF, 0xC0, 0x00, 0x00, 0x04];
+        assert_eq!(z.decompress(&msg), Err(ZgfxError::SegmentOutputTooLarge));
+    }
+
+    #[test]
+    fn output_already_produced_counts_against_the_segment_cap() {
+        // The first match fills the segment to exactly MAX_SEGMENT_OUTPUT; a 3-byte match after
+        // it is refused although 3 alone is far under the cap.
+        let mut z = Zgfx::new();
+        // 10001 00011 (match, distance 3), fifteen 1 bits, the terminating 0, 16 zero extra bits
+        // (length 1 << 16 = 65536); then 10001 00011 0 (match, distance 3, length 3); 3 padding
+        // bits.
+        let msg = [0xE0u8, 0x24, 0x88, 0xFF, 0xFF, 0x80, 0x00, 0x22, 0x30, 0x03];
+        assert_eq!(MAX_SEGMENT_OUTPUT, 1 << 16);
+        assert_eq!(z.decompress(&msg), Err(ZgfxError::SegmentOutputTooLarge));
+
+        // The first match on its own is within the cap.
+        let first_only = [0xE0u8, 0x24, 0x88, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x06];
+        let out = Zgfx::new()
+            .decompress(&first_only)
+            .expect("one match of exactly MAX_SEGMENT_OUTPUT bytes decodes");
+        assert_eq!(out.len(), MAX_SEGMENT_OUTPUT);
     }
 
     #[test]

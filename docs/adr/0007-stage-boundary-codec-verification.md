@@ -1,6 +1,6 @@
 # 0007 — Stage-boundary differential verification for codecs without a high-level oracle
 
-- Status: Accepted (first implemented in PR #81 / issue #58; amended same day — see Consequences); assembly-layer independence added in the Amendment below (#118, 2026-07-02)
+- Status: Accepted (first implemented in PR #81 / issue #58; amended same day — see Consequences); assembly-layer independence added in the Amendment below (#118, 2026-07-02); examples outdated by the 0.11 oracle noted 2026-11-03 (#576)
 - Date: 2026-06-12
 
 ## Context
@@ -80,3 +80,10 @@ The established pattern is the **#116 / #117 regression tests**: they assert aga
 
 - Verification is now explicitly two-tier: **primitives → oracle-diff (independent math); assembly → spec- or FreeRDP-independent conformance (the oracle is same-lineage).**
 - The specific ClearCodec / RemoteFX behavioural divergences from FreeRDP that the shared oracle hides are tracked as their own issues (RLEX over-region clip #120, single-palette RLEX layout #121, and the remaining lenient divergences #127) rather than left implicit in a green differential.
+
+## Amendment (2026-11-03, #576): two examples above name tests that no longer exist
+
+The `oracle_rejections > 0` guard cited under the synthetic-corpus rule and the
+`oracle_rlgr1_encoder_defect_still_present` canary are gone: the 0.11 oracle fixed the defects both
+rested on. The rules they illustrate stand. What became of each test is
+[ADR-0011](0011-zero-ironrdp-terminal-state.md)'s #576 amendment.

@@ -16,10 +16,8 @@
 //! in `caps_advertise()` and `capset()`.
 //!
 //! WireToSurface1 RemoteFX (`CODECID_CAVIDEO`) decodes through the self-owned
-//! `justrdp-codecs::rfx` decoder (issue #58, ADR-0007) — it skipped the bootstrap phase
-//! outright (the bootstrap crate has no assembled TS_RFX decoder, and real V8 servers prefer
-//! Progressive, so the real VM cannot exercise it; the synthetic differential corpus is the
-//! verification ceiling).
+//! `justrdp-codecs::rfx` decoder (issue #58, ADR-0007), which skipped the bootstrap phase
+//! outright.
 
 use crate::dvc::{DvcProcessor, ProcessorOutput};
 use crate::framebuffer::{FrameUpdate, Framebuffer};

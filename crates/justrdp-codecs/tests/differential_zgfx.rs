@@ -11,18 +11,13 @@
 //! space that basis cannot cover — thousands of generated streams, and the history window
 //! carrying across them.
 //!
-//! **The oracle's compressor is not a conforming encoder**, which bounds what can be compared:
-//! `wrap_compressed` puts an entire compressed stream in one segment whatever it decompresses
-//! to, while `[MS-RDPEGFX]` 3.1.8.1 caps a single segment at 65535 uncompressed bytes and
-//! FreeRDP enforces that as a fixed `OutputBuffer[65536]`. Compressed payloads here therefore
-//! stay under that ceiling; the divergence itself is pinned by
-//! `a_single_segment_expanding_past_the_spec_ceiling_is_refused` below rather than left
-//! implicit.
+//! The 65535-byte segment cap of `[MS-RDPEGFX]` 3.1.8.1 is the decoder's own check, held by
+//! `src/zgfx.rs`'s unit tests rather than here.
 //!
 //! [`oracle-agreement-is-not-independence`]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/oracle-agreement-is-not-independence.md
 
 use ironrdp_graphics::zgfx::{CompressionMode, Compressor, Decompressor, compress_and_wrap_egfx};
-use justrdp_codecs::zgfx::{Zgfx, ZgfxError};
+use justrdp_codecs::zgfx::Zgfx;
 
 /// Decode one message with both decoders and assert they agree with each other *and* with the
 /// bytes that were compressed. Threaded through both stateful decoders so the caller's
@@ -143,27 +138,4 @@ fn a_message_boundary_is_not_a_history_boundary() {
         cold, data,
         "the history window is what makes message 2 mean anything"
     );
-}
-
-#[test]
-fn a_single_segment_expanding_past_the_spec_ceiling_is_refused() {
-    // `[MS-RDPEGFX]` 3.1.8.1 caps a segment at 65535 uncompressed bytes and FreeRDP enforces
-    // it; the oracle's compressor does not, so it can wrap a 150 KB payload into one segment.
-    // We refuse it, which is a divergence from the *oracle's encoder*, not from the spec.
-    let data = vec![0xC3; 150_000];
-    let mut compressor = Compressor::new();
-    let wire = compress_and_wrap_egfx(&data, &mut compressor, CompressionMode::Always).unwrap();
-    assert_eq!(wire[0], 0xE0, "the oracle wrapped it as a single segment");
-    assert_eq!(wire[1], 0x24, "...and marked it compressed");
-
-    assert_eq!(
-        Zgfx::new().decompress(&wire),
-        Err(ZgfxError::SegmentOutputTooLarge)
-    );
-    // The oracle decodes it, so this is a real difference in behaviour and not a bad fixture.
-    let mut oracle_out = Vec::new();
-    Decompressor::new()
-        .decompress(&wire, &mut oracle_out)
-        .expect("the oracle has no output bound at all");
-    assert_eq!(oracle_out.len(), 150_000);
 }

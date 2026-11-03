@@ -48,10 +48,8 @@ fn generate_rle_stream(seed: u64, width: usize, height: usize, pixel_size: usize
                 out.push((run & 0x1F) as u8); // code 0 << 5 | run
                 emitted += run;
             }
-            // Foreground run (regular), always paired with a color run: the oracle requires
-            // one pixel's worth of bytes to remain in the stream right after a regular FG run
-            // header (it sizes the read before distinguishing the SET variants), so the
-            // color-run header + pixel that follows keeps ironrdp satisfied.
+            // Foreground run (regular), always followed by a color run, so no generated stream
+            // ends on a regular FG run.
             2 if remaining >= 2 => {
                 let run = 1 + lcg.below((remaining - 1).min(31));
                 out.push(0x20 | (run & 0x1F) as u8); // code 1 << 5

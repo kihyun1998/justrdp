@@ -1,6 +1,6 @@
 # 0009 — Negotiation posture: tolerant of server self-inconsistency in rendering, strict on security integrity
 
-- Status: Accepted — amended 2026-08-25 (#252), 2026-08-31 (#268), 2026-09-04, 2026-09-16 (#286), 2026-09-18 (#297), 2026-10-06 (#376) and 2026-10-16 (#462, closed by #470); see the Amendments below
+- Status: Accepted — amended 2026-08-25 (#252), 2026-08-31 (#268), 2026-09-04, 2026-09-16 (#286), 2026-09-18 (#297), 2026-10-06 (#376), 2026-10-16 (#462, closed by #470) and 2026-11-03 (#576); see the Amendments below
 - Date: 2026-07-03
 - Closes issue #101
 
@@ -391,3 +391,11 @@ open, so a late end still closes them; `has_open_frame` says whether there is on
 `justrdp-tokio` session runners call it once a frame has stayed open for 1 s; that interval is the
 adapter's policy, a derivation recorded in `docs/map/territory/adapter-drive-loop.md`. Neither a
 release nor a late end is a fault, so §2's enumeration is unchanged.
+
+## Amendment (2026-11-03, #576): ClearCodec's leniencies rest on the corpus alone
+
+The Decision's ClearCodec example names the ironrdp oracle among those that reject an over-region
+RLEX run and the NSCodec subcodec. `ironrdp-graphics` 0.11 clips the first and decodes the second,
+so the spec's strict reading is what remains on the other side, with FreeRDP's rejection of the
+RLEX over-fill (`justrdp-codecs/src/clearcodec.rs`). The tolerance is unchanged: its ground was
+always the captured WS2019 corpus.
