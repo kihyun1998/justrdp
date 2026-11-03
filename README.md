@@ -152,11 +152,9 @@ More detail:
 - **Real VM runs.** Connect and session behaviour is verified against a real Windows Server 2019
   VM.
 
-```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo check --manifest-path fuzz/Cargo.toml   # fuzz/ is not a workspace member
-```
+The merge gate is [`.github/workflows/test.yml`](.github/workflows/test.yml): run its steps
+locally to reproduce it. `fuzz/` is not a workspace member and no PR gate builds it, so after a
+public-path change also run `cargo check --manifest-path fuzz/Cargo.toml`.
 
 The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
 

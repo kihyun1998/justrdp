@@ -601,6 +601,11 @@ Read this before starting so the graph does not read as abstractions.
 - **The `fuzz` crate is the `--workspace` blind spot** — out of the workspace by
   design (its own `[workspace]`), so `cargo test --workspace` does not build it. A
   public-API change needs a separate `cargo check --manifest-path fuzz/Cargo.toml`.
+- **A green workspace gate does not mean each crate builds alone (#572).** Clippy
+  `--all-targets` and `cargo test` build dev targets, which lets dev-dependency features
+  reach the library, so `justrdp-tokio` passed every gate and did not build on its own.
+  `test.yml`'s `Each crate builds alone` step is the command; the reasoning is in
+  `docs/map/territory/supply-chain-and-gates.md`.
 - **A gate that keeps a *memory* of its own verification is the same failure one
   level up (#224).** `supply-chain-and-gates.md` recorded that the map gate *"was
   verified to pass on known-good notes, fail on each of five defect kinds, and ignore
