@@ -278,8 +278,8 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   typed error). With no Revision 2 set every blit misses, so an unadvertised MemBlt paints only
   in a config `check` never saw.
 - **The colour depth is the server's.** `ServerAnnouncement::bits_per_pixel` comes from its
-  Demand Active, the client's Bitmap set only when that is 0. `check_orders` refuses orders below
-  8 bpp on the client's side.
+  Demand Active, the client's Bitmap set only when that is 0. `check_capability_set` refuses a client
+  Bitmap set at a depth no decoder takes, with or without orders (#590).
 - **At 8 bpp the colours are the session palette's, as FreeRDP has them** (#477, the
   maintainer's call of 2026-10-16). A cached bitmap's indices resolve through the palette of the
   last Update Palette when it is filled, and an order's colour index through it when it paints.
@@ -291,8 +291,7 @@ caches that Cache Glyph fills (#476). Epic #22 (the bitmap cache half is
   entry 0, equal to the palette in all 256 colours (read blue, green, red, pad), and every blit
   names entry 0. So Cache Color Table is decoded and paints nothing, and the two signs that a
   server means it are logged at `rdp_orders` warn: a table unlike the palette, and a blit naming
-  an entry other than 0. An entry past the six is skipped. Below 8 bpp is still refused,
-  unmeasured. xrdp sends its colour table to a session that advertises no order too, and sends
+  an entry other than 0. An entry past the six is skipped. xrdp sends its colour table to a session that advertises no order too, and sends
   its Update Palette before the table, so the table is compared with the palette it was made
   from. A table that came before any Update Palette would be compared with the default all-black
   palette, and an order painted before one paints from that palette, without a skip; a derivation
@@ -394,7 +393,8 @@ differed in 1,241 pixels, all inside the GlyphIndex text rectangles; with them (
 in none (`xrdp_paints_its_login_screen_in_orders_as_in_bitmaps`). At 8 bpp (#477) the order
 session got the same orders over 9 Cache Bitmap (Revision 2) at 8 bpp, a Palette Update and a
 Cache Color Table, and differs from the 8 bpp bitmap screen (28 colours) in none either
-(`…_at_8_bpp`). The bitmap screen never passes
+(`…_at_8_bpp`). At 15 bpp (#590) its 12 Cache Bitmap (Revision 2) fills name 16 bpp, the case
+`(16, 15) => 15` holds, and the two screens differ in none (`…_at_15_bpp`). The bitmap screen never passes
 through the order decoder, the fills or the glyphs, so for those it is independent; the logo's
 tiles decode through the same bitmap codecs in both sessions, so for them it is not.
 
@@ -615,7 +615,9 @@ mutation); the top-down reading rests on FreeRDP and the unit tests.
   outcome was that 32 bpp order sessions work).
 - **A server whose colour tables differ from its palette would paint wrong at 8 bpp**, and say so
   in the log. None is known; the spec's way is what such a server would need.
-- **Below 8 bpp** is refused, unmeasured.
+- **Below 8 bpp** is refused at the advertisement (#590), unmeasured against a server. A server
+  that announces such a depth anyway reaches `order_color`'s last arm, which reads the colour as
+  red, green, blue.
 - **The 8 bpp proof is the login screen**, 9 cache bitmaps; the logged-in desktop, which FreeRDP's
   census saw carry 5,024 MemBlt at 8 bpp, needs a logon justrdp cannot make on TLS-only security
   without a password, and was not compared.
