@@ -489,6 +489,17 @@ in-session query.
   which are weekly-only or VM-only.
 - [Adapter drive loop](adapter-drive-loop.md) — hosts the VM and loopback tests.
 
+## Standard RDP Security needs a reconfigured server
+
+`a_server_that_accepts_only_standard_security_paints_its_logon_screen` (#599) and
+`a_standard_security_session_logs_on_uses_a_channel_and_outlives_key_updates` (#600) read their server from
+`JUSTRDP_STANDARD_SECURITY_SERVER` (`host:port`). On the WS2019 VM the registry values under
+`HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp` are `SecurityLayer=2`,
+`UserAuthentication=1`, `MinEncryptionLevel=2` normally; the test wants the first two at 0, and every
+other VM test fails until they are restored. `rdptest` is not an administrator there (its
+`Administrators` group holds `Administrator` alone, 2026-11-06), so the console changes them. The VM
+has no VMware Tools, so `vmrun` cannot run anything in the guest.
+
 ## Known holes / open
 
 - **Every owned codec that decodes server bytes has a real-server corpus, with two gaps** (#554). The

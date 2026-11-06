@@ -4,7 +4,7 @@
 # the connect/session state machines and the codec decoders surface as concrete test gaps (feeding
 # the robustness work — ADR-0008 / #98). No threshold, so it never fails a build on coverage alone.
 #
-# Scope is the sans-IO core (justrdp-pdu + justrdp + justrdp-codecs); the I/O adapter (justrdp-tokio)
+# Scope is the sans-IO core (justrdp-pdu + justrdp-security + justrdp + justrdp-codecs); the I/O adapter (justrdp-tokio)
 # is excluded — its integration tests need the real VM and are #[ignore]d in CI, so measuring it here
 # would report misleadingly-low numbers for code that is deliberately not unit-tested.
 #

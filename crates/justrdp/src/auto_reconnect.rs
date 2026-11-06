@@ -2,9 +2,9 @@
 //! client sends in the Client Info PDU, derived from the `ARC_SC_PRIVATE_PACKET` a previous
 //! session's Save Session Info carried (issue #306).
 
-use crate::license_crypto::md5;
 use justrdp_pdu::client_info::ClientAutoReconnect;
 use justrdp_pdu::session_info::ServerAutoReconnect;
+use justrdp_security::license_crypto::md5;
 
 /// The MD5 block size, in bytes.
 const BLOCK: usize = 64;
@@ -29,19 +29,22 @@ fn hmac_md5(key: &[u8], msg: &[u8]) -> [u8; 16] {
     md5(&outer)
 }
 
-/// `SecurityVerifier = HMAC-MD5(ArcRandomBits, ClientRandom)`, with the zero client random
-/// that Enhanced RDP Security implies.
-fn security_verifier(random_bits: &[u8; 16]) -> [u8; 16] {
-    hmac_md5(random_bits, &ZERO_CLIENT_RANDOM)
+/// `SecurityVerifier = HMAC-MD5(ArcRandomBits, ClientRandom)`: the connection's client random
+/// under Standard RDP Security, the zero one Enhanced RDP Security implies otherwise.
+fn security_verifier(random_bits: &[u8; 16], client_random: Option<&[u8; 32]>) -> [u8; 16] {
+    hmac_md5(random_bits, client_random.unwrap_or(&ZERO_CLIENT_RANDOM))
 }
 
 /// The `ARC_CS_PRIVATE_PACKET` answering `server`: its `Version` and `LogonId`, and the
 /// verifier derived from its random.
-pub(crate) fn client_cookie(server: &ServerAutoReconnect) -> ClientAutoReconnect {
+pub(crate) fn client_cookie(
+    server: &ServerAutoReconnect,
+    client_random: Option<&[u8; 32]>,
+) -> ClientAutoReconnect {
     ClientAutoReconnect {
         version: server.version,
         logon_id: server.logon_id,
-        security_verifier: security_verifier(&server.random_bits),
+        security_verifier: security_verifier(&server.random_bits, client_random),
     }
 }
 
@@ -83,11 +86,11 @@ mod tests {
     fn the_security_verifier_is_hmac_md5_over_a_zero_client_random() {
         let key: [u8; 16] = core::array::from_fn(|i| i as u8);
         assert_eq!(
-            security_verifier(&key).to_vec(),
+            security_verifier(&key, None).to_vec(),
             hex("b639c8731638618b707972aa6e96cf90")
         );
         assert_eq!(
-            security_verifier(&[0xA5; 16]).to_vec(),
+            security_verifier(&[0xA5; 16], None).to_vec(),
             hex("949940ad86c00c6a4f4c1e5a673574bb")
         );
     }
@@ -100,12 +103,22 @@ mod tests {
             logon_id: 48,
             random_bits: [0xA5; 16],
         };
-        let client = client_cookie(&server);
+        let client = client_cookie(&server, None);
         assert_eq!(client.version, 7);
         assert_eq!(client.logon_id, 48);
         assert_eq!(
             client.security_verifier.to_vec(),
             hex("949940ad86c00c6a4f4c1e5a673574bb")
         );
+    }
+
+    /// `[MS-RDPBCGR]` 5.5: zero only under Enhanced RDP Security; otherwise the connection's
+    /// client random.
+    #[test]
+    fn under_standard_security_the_verifier_covers_the_client_random() {
+        let verifier = security_verifier(&[0xA5; 16], Some(&[0x44; 32]));
+        let hex: String = verifier.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "b96be1719c0ca0528456eed8a8df2ba6");
+        assert_ne!(verifier, security_verifier(&[0xA5; 16], None));
     }
 }

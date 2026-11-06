@@ -393,7 +393,7 @@ impl ClientCoreData {
 }
 
 /// Client Security Data (TS_UD_CS_SEC, 0xC002). With TLS/NLA transport security both fields are
-/// zero — RDP-level encryption is never negotiated (ADR-0002 forbids RC4 Standard Security).
+/// zero. Standard RDP Security advertises its methods here (ADR-0020).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClientSecurityData {
     /// `encryptionMethods` bitmask (0 with TLS).
@@ -607,31 +607,37 @@ impl ServerNetworkData {
 }
 
 /// Server Security Data (TS_UD_SC_SEC1, 0x0C02). With TLS both fields are zero and no server
-/// random / certificate follows; the legacy RC4 fields are skipped if a server sends them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// random / certificate follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerSecurityData {
     /// `encryptionMethod` the server selected (0 with TLS).
     pub encryption_method: u32,
     /// `encryptionLevel` (0 = none, with TLS).
     pub encryption_level: u32,
+    /// `serverRandom`, as long as the server sent it; empty with TLS.
+    pub server_random: Vec<u8>,
+    /// `serverCertificate`, undecoded (`license::ServerCertificate::decode`); empty with TLS.
+    pub server_certificate: Vec<u8>,
 }
 
 impl ServerSecurityData {
-    /// Decode a block body, skipping the legacy serverRandom / serverCertificate if present.
+    /// Decode a block body.
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
         let mut cur = ReadCursor::new(body, "server security data");
         let encryption_method = cur.read_u32_le()?;
         let encryption_level = cur.read_u32_le()?;
+        let (mut server_random, mut server_certificate) = (Vec::new(), Vec::new());
         if encryption_method != 0 || encryption_level != 0 {
-            // Legacy RDP security material we never use (ADR-0002): skip random + certificate.
             let random_len = cur.read_u32_le()? as usize;
             let cert_len = cur.read_u32_le()? as usize;
-            cur.read_slice(random_len)?;
-            cur.read_slice(cert_len)?;
+            server_random = cur.read_slice(random_len)?.to_vec();
+            server_certificate = cur.read_slice(cert_len)?.to_vec();
         }
         Ok(Self {
             encryption_method,
             encryption_level,
+            server_random,
+            server_certificate,
         })
     }
 }
@@ -945,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn server_security_data_skips_legacy_crypto_material() {
+    fn server_security_data_keeps_the_random_and_certificate() {
         // encryptionMethod=2 (128-bit), level=1, a 4-byte "random" and 2-byte "certificate".
         let body = [
             0x02, 0x00, 0x00, 0x00, // method
@@ -958,6 +964,76 @@ mod tests {
         let decoded = ServerSecurityData::decode(&body).unwrap();
         assert_eq!(decoded.encryption_method, 2);
         assert_eq!(decoded.encryption_level, 1);
+        assert_eq!(decoded.server_random, [0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(decoded.server_certificate, [0xEE, 0xFF]);
+    }
+
+    /// With a method or a level, the two lengths follow; with neither, nothing does.
+    #[test]
+    fn server_security_data_reads_lengths_when_either_field_is_set() {
+        let lengths = [1, 0, 0, 0, 0, 0, 0, 0, 0xAA];
+        for (method, level) in [(2u32, 0u32), (0, 2)] {
+            let mut body = method.to_le_bytes().to_vec();
+            body.extend_from_slice(&level.to_le_bytes());
+            body.extend_from_slice(&lengths);
+            assert_eq!(
+                ServerSecurityData::decode(&body).unwrap().server_random,
+                [0xAA]
+            );
+        }
+        let mut none = [0u8; 8].to_vec();
+        none.extend_from_slice(&lengths);
+        assert!(
+            ServerSecurityData::decode(&none)
+                .unwrap()
+                .server_random
+                .is_empty()
+        );
+    }
+
+    /// The Server Security Data of `[MS-RDPBCGR]` 4.1.4's annotated Connect Response.
+    #[test]
+    fn server_security_data_decodes_the_spec_dump() {
+        let mut body = vec![2, 0, 0, 0, 2, 0, 0, 0, 0x20, 0, 0, 0, 0xb8, 0, 0, 0];
+        let random = [
+            0x10, 0x11, 0x77, 0x20, 0x30, 0x61, 0x0a, 0x12, 0xe4, 0x34, 0xa1, 0x1e, 0xf2, 0xc3,
+            0x9f, 0x31, 0x7d, 0xa4, 0x5f, 0x01, 0x89, 0x34, 0x96, 0xe0, 0xff, 0x11, 0x08, 0x69,
+            0x7f, 0x1a, 0xc3, 0xd2,
+        ];
+        body.extend_from_slice(&random);
+        let certificate: [u8; 184] = [
+            0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00,
+            0x5c, 0x00, 0x52, 0x53, 0x41, 0x31, 0x48, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x3f, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0xcb, 0x81, 0xfe, 0xba, 0x6d, 0x61,
+            0xc3, 0x55, 0x05, 0xd5, 0x5f, 0x2e, 0x87, 0xf8, 0x71, 0x94, 0xd6, 0xf1, 0xa5, 0xcb,
+            0xf1, 0x5f, 0x0c, 0x3d, 0xf8, 0x70, 0x02, 0x96, 0xc4, 0xfb, 0x9b, 0xc8, 0x3c, 0x2d,
+            0x55, 0xae, 0xe8, 0xff, 0x32, 0x75, 0xea, 0x68, 0x79, 0xe5, 0xa2, 0x01, 0xfd, 0x31,
+            0xa0, 0xb1, 0x1f, 0x55, 0xa6, 0x1f, 0xc1, 0xf6, 0xd1, 0x83, 0x88, 0x63, 0x26, 0x56,
+            0x12, 0xbc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x48, 0x00,
+            0xe9, 0xe1, 0xd6, 0x28, 0x46, 0x8b, 0x4e, 0xf5, 0x0a, 0xdf, 0xfd, 0xee, 0x21, 0x99,
+            0xac, 0xb4, 0xe1, 0x8f, 0x5f, 0x81, 0x57, 0x82, 0xef, 0x9d, 0x96, 0x52, 0x63, 0x27,
+            0x18, 0x29, 0xdb, 0xb3, 0x4a, 0xfd, 0x9a, 0xda, 0x42, 0xad, 0xb5, 0x69, 0x21, 0x89,
+            0x0e, 0x1d, 0xc0, 0x4c, 0x1a, 0xa8, 0xaa, 0x71, 0x3e, 0x0f, 0x54, 0xb9, 0x9a, 0xe4,
+            0x99, 0x68, 0x3f, 0x6c, 0xd6, 0x76, 0x84, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        body.extend_from_slice(&certificate);
+
+        let decoded = ServerSecurityData::decode(&body).unwrap();
+        assert_eq!(decoded.encryption_method, 2);
+        assert_eq!(decoded.encryption_level, 2);
+        assert_eq!(decoded.server_random, random);
+        assert_eq!(decoded.server_certificate, certificate);
+
+        let crate::license::ServerCertificate::Proprietary(key) =
+            crate::license::ServerCertificate::decode(&decoded.server_certificate).unwrap()
+        else {
+            panic!("the dump holds a proprietary certificate");
+        };
+        assert_eq!(key.exponent, 65537);
+        assert_eq!(key.modulus.len(), 64);
+        assert_eq!(key.modulus[63], 0xcb);
+        assert_eq!(key.modulus[0], 0xbc);
     }
 
     // ADR-0008 / issue #97 - the no-panic robustness properties for this module, added with its
@@ -1016,6 +1092,25 @@ mod tests {
             body in proptest::collection::vec(any::<u8>(), 0..=512),
         ) {
             let _ = ServerSecurityData::decode(&body);
+        }
+
+        #[test]
+        fn server_security_data_keeps_what_its_lengths_declare(
+            method in 1u32..,
+            random in proptest::collection::vec(any::<u8>(), 0..=64),
+            certificate in proptest::collection::vec(any::<u8>(), 0..=256),
+            trailing in proptest::collection::vec(any::<u8>(), 0..=8),
+        ) {
+            let mut body = method.to_le_bytes().to_vec();
+            body.extend_from_slice(&1u32.to_le_bytes());
+            body.extend_from_slice(&(random.len() as u32).to_le_bytes());
+            body.extend_from_slice(&(certificate.len() as u32).to_le_bytes());
+            body.extend_from_slice(&random);
+            body.extend_from_slice(&certificate);
+            body.extend_from_slice(&trailing);
+            let decoded = ServerSecurityData::decode(&body).unwrap();
+            prop_assert_eq!(decoded.server_random, random);
+            prop_assert_eq!(decoded.server_certificate, certificate);
         }
 
         #[test]

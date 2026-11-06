@@ -1,0 +1,57 @@
+method=1 mac=d1269e2193325591 client_encrypt=d1269eb5ed9c3b93 client_decrypt=d1269e95a61d89c9
+c2s i=0 sig=20a0138722816e28 ct=4e
+c2s i=1 sig=539d76d2e0fe9b4e ct=1ec5
+c2s i=2 sig=4d670a8201b9a450 ct=2c41ec
+c2s i=4095 sig=93b7f3b57c8f06ad ct=d4de0776
+c2s i=4096 sig=6d329f5624f749f5 ct=48eb727464
+c2s i=4097 sig=bb0f227de39297e1 ct=7bbcf6fbce5e
+c2s i=4098 sig=f89375b555f7b164 ct=4e67970e22757f
+c2s i=8192 sig=1897f6bf513bb948 ct=de715b286a72ab4cc5
+c2s md5_all=7882a55abb14db8c175f811a4a0f31d2
+s2c i=0 sig=20a0138722816e28 ct=42
+s2c i=1 sig=539d76d2e0fe9b4e ct=2e44
+s2c i=2 sig=4d670a8201b9a450 ct=19a18a
+s2c i=4095 sig=93b7f3b57c8f06ad ct=e5ed7e69
+s2c i=4096 sig=6d329f5624f749f5 ct=7317a69d53
+s2c i=4097 sig=bb0f227de39297e1 ct=9f5b2317475a
+s2c i=4098 sig=f89375b555f7b164 ct=b788a61b9fe341
+s2c i=8192 sig=1897f6bf513bb948 ct=7a2c3e8df873ff6c9b
+s2c md5_all=fae3ff1108e481341b8df1789a4d8c58
+method=8 mac=d1efc32193325591 client_encrypt=d1c4b6b5ed9c3b93 client_decrypt=d1241e95a61d89c9
+c2s i=0 sig=e4a79eb730aff40e ct=0d
+c2s i=1 sig=21ec89cc7af747eb ct=c97a
+c2s i=2 sig=9fc3cd2ef69e9990 ct=542cb7
+c2s i=4095 sig=f895f1046cc7baac ct=77d810d7
+c2s i=4096 sig=8a9c071a9872192c ct=396018b7f0
+c2s i=4097 sig=3962ba0653656043 ct=6cc998065f27
+c2s i=4098 sig=449649ae43e7d363 ct=2ceae3802327c9
+c2s i=8192 sig=115529e916e91195 ct=f6dd0c4a4baaa959bb
+c2s md5_all=453d97fb0790ebde1d125d04c127744b
+s2c i=0 sig=e4a79eb730aff40e ct=f3
+s2c i=1 sig=21ec89cc7af747eb ct=c0dc
+s2c i=2 sig=9fc3cd2ef69e9990 ct=0d24aa
+s2c i=4095 sig=f895f1046cc7baac ct=4c83d488
+s2c i=4096 sig=8a9c071a9872192c ct=e8d8cbdc5f
+s2c i=4097 sig=3962ba0653656043 ct=0d5586f509bf
+s2c i=4098 sig=449649ae43e7d363 ct=724998cfdcc321
+s2c i=8192 sig=115529e916e91195 ct=6c9c80868193aaa92a
+s2c md5_all=728df49f6d134ef76066d9ec88ad31c5
+method=2 mac=39efc32193325591daa40ef611bec1ee client_encrypt=fec4b6b5ed9c3b93b27439bc82543b85 client_decrypt=c9241e95a61d89c9a8ad30ab89cec92a
+c2s i=0 sig=9b79f4deae3b5eab ct=e5
+c2s i=1 sig=83d2421db1dd08a9 ct=6181
+c2s i=2 sig=68ab0538a8084ebf ct=a8265e
+c2s i=4095 sig=675cc059810773c6 ct=ddb670a9
+c2s i=4096 sig=9de1074bfcef4cde ct=bfdcaa25a4
+c2s i=4097 sig=78eaa6da926edd3d ct=82ba799ef895
+c2s i=4098 sig=f8f2125211980e2e ct=d69e6ed9f4deb5
+c2s i=8192 sig=4305085a59867a59 ct=9840a301ef2bc21eea
+c2s md5_all=93f49c9b5c9b820d7812c57d183aa26b
+s2c i=0 sig=9b79f4deae3b5eab ct=06
+s2c i=1 sig=83d2421db1dd08a9 ct=b034
+s2c i=2 sig=68ab0538a8084ebf ct=4dd0c8
+s2c i=4095 sig=675cc059810773c6 ct=e60b5365
+s2c i=4096 sig=9de1074bfcef4cde ct=a61c978ebf
+s2c i=4097 sig=78eaa6da926edd3d ct=bd108390de4b
+s2c i=4098 sig=f8f2125211980e2e ct=72899be3e00c3e
+s2c i=8192 sig=4305085a59867a59 ct=141c0d82dfa9feadbb
+s2c md5_all=db1da8adb1bca4ee83f998e09318069d

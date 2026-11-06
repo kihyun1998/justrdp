@@ -144,6 +144,8 @@ pub const HONOURED_MAX_REQUEST_SIZE: u32 = (1 << 20) + (64 << 10);
 /// Why a [`ConnectConfig`] cannot be advertised.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectConfigError {
+    /// The Standard RDP Security opt-in does not fit the rest of the config (ADR-0020).
+    StandardSecurity(&'static str),
     /// `earlyCapabilityFlags` outside [`HONOURED_EARLY_CAPABILITY_FLAGS`]: the refused bits.
     EarlyCapabilityFlags(ClientEarlyCapabilityFlags),
     /// Client Info `flags` outside [`HONOURED_CLIENT_INFO_FLAGS`]: the refused bits.
@@ -190,6 +192,7 @@ pub enum ConnectConfigError {
 impl core::fmt::Display for ConnectConfigError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::StandardSecurity(reason) => write!(f, "Standard RDP Security: {reason}"),
             Self::EarlyCapabilityFlags(bits) => write!(
                 f,
                 "earlyCapabilityFlags {:#06x} cannot be honoured",
@@ -234,6 +237,35 @@ impl core::fmt::Display for ConnectConfigError {
 
 impl core::error::Error for ConnectConfigError {}
 
+/// Refuse a Standard RDP Security opt-in that does not fit the rest of the config, and any of its
+/// fields set without the opt-in (ADR-0020).
+pub fn check_standard_security(config: &ConnectConfig) -> Result<(), ConnectConfigError> {
+    let refuse = |reason| Err(ConnectConfigError::StandardSecurity(reason));
+    let methods = config.security.encryption_methods;
+    if config.standard_security.is_some() {
+        if config.requested.bits() != 0 {
+            return refuse("it is requested alone: `requested` must be empty");
+        }
+        if methods == 0 || methods & !HONOURED_ENCRYPTION_METHODS != 0 {
+            return refuse("`encryption_methods` must name 40, 56 or 128 bits and nothing else");
+        }
+    } else {
+        if config.requested.bits() == 0 {
+            return refuse("an empty `requested` asks for it without `standard_security`");
+        }
+        if methods != 0 {
+            return refuse("`encryption_methods` is set without `standard_security`");
+        }
+    }
+    if config.security.ext_encryption_methods != 0 {
+        return refuse("`ext_encryption_methods` is only for a French-locale legacy client");
+    }
+    Ok(())
+}
+
+/// `ENCRYPTION_METHOD_40BIT | 128BIT | 56BIT`: what `justrdp_security::standard` implements.
+pub const HONOURED_ENCRYPTION_METHODS: u32 = 0x01 | 0x02 | 0x08;
+
 /// Refuse the first of `bitmaps` the Revision 2 caches in `capabilities` cannot hold: a cache
 /// past the advertised ones or not persistent, pixels that are not `width × height` RGBA or
 /// overflow the cache's tile, or, per cache, entries that are not `0..n` in list order within
@@ -275,6 +307,7 @@ pub fn check_persistent_bitmaps(
 
 /// Refuse the first advertisement in `config` the core cannot honour.
 pub fn check(config: &ConnectConfig) -> Result<(), ConnectConfigError> {
+    check_standard_security(config)?;
     if let Some(id) = config.correlation_id
         && (matches!(id[0], 0x00 | 0xF4) || id.contains(&0x0D))
     {
@@ -1545,5 +1578,45 @@ mod tests {
             refused_type(check(&config)),
             Some(capability::CAPSET_SURFACE_COMMANDS)
         );
+    }
+
+    #[test]
+    fn the_standard_security_opt_in_must_fit_the_rest_of_the_config() {
+        use justrdp_pdu::nego::SecurityProtocol;
+        use justrdp_security::standard::ClientRandom;
+        let opted_in = || {
+            let mut c = crate::connect::tests::config();
+            c.requested = SecurityProtocol::from_bits(0);
+            c.security.encryption_methods = 0x02;
+            c.standard_security = Some(ClientRandom::new([1; 32]));
+            c
+        };
+        assert_eq!(check(&opted_in()), Ok(()));
+        let refused = |c: &ConnectConfig| {
+            assert!(
+                matches!(check(c), Err(ConnectConfigError::StandardSecurity(_))),
+                "{c:?}"
+            );
+        };
+
+        let mut with_tls = opted_in();
+        with_tls.requested = SecurityProtocol::SSL;
+        refused(&with_tls);
+        let mut no_method = opted_in();
+        no_method.security.encryption_methods = 0;
+        refused(&no_method);
+        let mut fips = opted_in();
+        fips.security.encryption_methods = 0x10;
+        refused(&fips);
+        let mut french = opted_in();
+        french.security.ext_encryption_methods = 1;
+        refused(&french);
+        let mut not_opted = opted_in();
+        not_opted.standard_security = None;
+        not_opted.security.encryption_methods = 0;
+        refused(&not_opted);
+        let mut methods_alone = crate::connect::tests::config();
+        methods_alone.security.encryption_methods = 0x02;
+        refused(&methods_alone);
     }
 }

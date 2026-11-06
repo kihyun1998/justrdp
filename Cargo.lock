@@ -1403,6 +1403,7 @@ dependencies = [
  "ironrdp-pdu",
  "justrdp-codecs",
  "justrdp-pdu",
+ "justrdp-security",
  "proptest",
  "rcgen",
  "tracing",
@@ -1430,6 +1431,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "justrdp-security"
+version = "0.1.0"
+dependencies = [
+ "ironrdp-pdu",
+ "justrdp-pdu",
+ "proptest",
+]
+
+[[package]]
 name = "justrdp-tokio"
 version = "0.1.0"
 dependencies = [
@@ -1438,6 +1448,7 @@ dependencies = [
  "justrdp",
  "justrdp-codecs",
  "justrdp-pdu",
+ "justrdp-security",
  "rcgen",
  "ring",
  "rustls",

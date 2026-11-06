@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 justrdp.workspace = true
+justrdp-security.workspace = true
 justrdp-pdu.workspace = true
 # The library's own tokio features: "sync" + "macros" for the session runners' `select!` over the
 # socket and the host-input mpsc channel, "rt" for their `task::yield_now` resume branch.

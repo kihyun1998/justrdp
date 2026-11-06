@@ -3,7 +3,7 @@
 # hardens).
 [workspace]
 resolver = "2"
-members = ["crates/justrdp-pdu", "crates/justrdp", "crates/justrdp-codecs", "crates/justrdp-tokio"]
+members = ["crates/justrdp-pdu", "crates/justrdp-security", "crates/justrdp", "crates/justrdp-codecs", "crates/justrdp-tokio"]
 
 [workspace.package]
 edition = "2024"
@@ -13,6 +13,7 @@ repository = "https://github.com/kihyun1998/justrdp"
 
 [workspace.dependencies]
 justrdp-pdu = { path = "crates/justrdp-pdu" }
+justrdp-security = { path = "crates/justrdp-security" }
 justrdp = { path = "crates/justrdp" }
 justrdp-codecs = { path = "crates/justrdp-codecs" }
 # The only external dependency slice-1 introduces: the async runtime the I/O adapter drives the

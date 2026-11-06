@@ -30,6 +30,11 @@ read as the adapter growing a third of its size.
 
 ## Design model
 
+- **A session may run over the plain socket** (#599): under Standard RDP Security `connect` returns
+  `SessionStream::Tcp`, and the session runners take any `AsyncRead + AsyncWrite`. `TrustPolicy`
+  applies to the certificate the server sent: `Chain` refuses it, `Tofu` pins its bytes under a key of
+  its own, `DangerAcceptAny` passes.
+
 - **Policy is injected, never decided here either** — the host supplies credentials,
   the trust policy, the frame sink and the cursor sink; the adapter wires them.
 - **One timeout seam.** Every stage's I/O goes through `with_stage_timeout`, so the
