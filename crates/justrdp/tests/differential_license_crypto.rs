@@ -98,7 +98,7 @@ fn key_derivation_matches_ironrdp() {
 
 #[test]
 fn rsa_premaster_encryption_matches_independent_known_answers() {
-    // ironrdp 0.8 cannot oracle this one: it treats the proprietary certificate's modulus and
+    // ironrdp 0.11 cannot oracle this one: it treats the proprietary certificate's modulus and
     // exponent — little-endian on the wire (MS-RDPBCGR 2.2.1.4.3.1.1.1) — as big-endian, so
     // its full-path licensing RSA is spec-incorrect (FreeRDP reverses; we reverse). The
     // oracle here is an independent computation instead:

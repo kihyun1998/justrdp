@@ -1,4 +1,4 @@
-//! zgfx — RDP 8.0 bulk data decompression (`[MS-RDPEGFX]` 2.2.5.1, 2.2.5.2, 3.1.8.1).
+//! zgfx — RDP 8.0 bulk data decompression (`[MS-RDPEGFX]` 2.2.5.1, 2.2.5.2, 3.1.9.1).
 //!
 //! Self-owned, ungated (#189): the last phase-1 `egfx-bootstrap` wrapper, and with it the
 //! **runtime** `ironrdp-graphics` dependency, retired here — ADR-0003 phase 3 reached for the
@@ -48,15 +48,16 @@
 //! [ADR-0011]: https://github.com/kihyun1998/justrdp/blob/master/docs/adr/0011-zero-ironrdp-terminal-state.md
 //! [`untrusted-decode-never-panics`]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/untrusted-decode-never-panics.md
 
-/// The LZ77 sliding window, in bytes (`[MS-RDPEGFX]` 3.1.8.1 — "maximum match distance /
+/// The LZ77 sliding window, in bytes (`[MS-RDPEGFX]` 3.1.9.1.2 — "maximum match distance /
 /// minimum history size"). Both references use exactly this value; a decompressor with a
 /// smaller window silently mis-decodes a long-distance match rather than failing.
 const HISTORY_SIZE: usize = 2_500_000;
 
-/// Cap on what one **compressed** segment may expand to. `[MS-RDPEGFX]` 3.1.8.1 puts the
-/// maximum uncompressed bytes in a single segment at 65535; FreeRDP enforces the same number
-/// as a fixed `OutputBuffer[65536]`. Without it a ~20-byte segment can demand gigabytes (a match
-/// length is `2^(k+1) + v` for a unary-coded `k` the stream chooses).
+/// Cap on what one **compressed** segment may expand to: the capacity of FreeRDP's
+/// `OutputBuffer[65536]` and of the `m_outputBuffer[65536]` in `[MS-RDPEGFX]` 4.2.1.2's sample,
+/// one byte above the 65,535 that 3.1.9.1.2.4 forbids one compressed segment to exceed. Without it a
+/// ~20-byte segment can demand gigabytes (a match length is `2^(k+1) + v` for a unary-coded `k`
+/// the stream chooses).
 const MAX_SEGMENT_OUTPUT: usize = 65_536;
 
 /// Cap on a multipart message's declared `uncompressedSize`. A conforming server's message is
@@ -147,7 +148,7 @@ impl core::fmt::Display for ZgfxError {
 
 impl core::error::Error for ZgfxError {}
 
-/// One entry of the `[MS-RDPEGFX]` 3.1.8.1 token table. Literals and matches share a shape:
+/// One entry of the `[MS-RDPEGFX]` 3.1.9.1.2.4 token table. Literals and matches share a shape:
 /// a literal's value is `value_base + <value_bits>`, a match's distance is the same sum. The
 /// single-bit `0` prefix is the "null literal" — `value_base = 0`, `value_bits = 8` — so it
 /// needs no special case here.
@@ -179,7 +180,7 @@ const fn mat(prefix_len: u32, prefix_code: u32, value_bits: u32, value_base: u32
     }
 }
 
-/// The token table of `[MS-RDPEGFX]` 3.1.8.1, **sorted by prefix length ascending** — the
+/// The token table of `[MS-RDPEGFX]` 3.1.9.1.2.4, **sorted by prefix length ascending** — the
 /// decode loop below depends on that order, because it grows one candidate prefix and compares
 /// it against each entry in turn.
 ///
@@ -513,7 +514,7 @@ impl Zgfx {
         self.compressed_segment(body, output)
     }
 
-    /// The RDP8 token stream of one `PACKET_COMPRESSED` segment (`[MS-RDPEGFX]` 3.1.8.1).
+    /// The RDP8 token stream of one `PACKET_COMPRESSED` segment (`[MS-RDPEGFX]` 3.1.9.1.2.3, 3.1.9.1.2.4).
     fn compressed_segment(&mut self, body: &[u8], output: &mut Vec<u8>) -> Result<(), ZgfxError> {
         // "NumberOfBitsToDecode = ((NumberOfBytesToDecode - 1) * 8) - ValueOfLastByte". The
         // final byte is the unused-bit count and is never itself decoded, so it is also
@@ -835,6 +836,67 @@ mod tests {
             .decompress(&first_only)
             .expect("one match of exactly MAX_SEGMENT_OUTPUT bytes decodes");
         assert_eq!(out.len(), MAX_SEGMENT_OUTPUT);
+    }
+
+    #[test]
+    fn a_segment_of_exactly_the_cap_decodes_across_two_tokens() {
+        // 10001 00011 (match, distance 3), fourteen 1 bits, the terminating 0, fifteen 1 extra bits
+        // (length 32768 + 32767 = 65535); then 0 00000000 (literal 0x00); 7 padding bits.
+        let msg = [0xE0u8, 0x24, 0x88, 0xFF, 0xFF, 0x7F, 0xFF, 0x00, 0x00, 0x07];
+        let out = Zgfx::new()
+            .decompress(&msg)
+            .expect("65535 matched bytes and one literal fill the segment exactly");
+        assert_eq!(out.len(), 65_536);
+        assert_eq!(out.last(), Some(&0x00));
+    }
+
+    #[test]
+    fn an_unencoded_run_that_ends_exactly_at_the_cap_decodes() {
+        // The same 65535-byte match; then 10001 00000 (distance 0, an unencoded run), a 15-bit
+        // count of 1, 7 alignment bits and the run's byte, the 65536th; no padding.
+        let msg = [
+            0xE0u8, 0x24, 0x88, 0xFF, 0xFF, 0x7F, 0xFF, 0x88, 0x00, 0x00, 0x80, 0xAA, 0x00,
+        ];
+        let out = Zgfx::new()
+            .decompress(&msg)
+            .expect("65535 matched bytes and a one-byte run fill the segment exactly");
+        assert_eq!(out.len(), 65_536);
+        assert_eq!(out.last(), Some(&0xAA));
+    }
+
+    #[test]
+    fn a_single_match_one_byte_past_the_cap_is_an_error() {
+        // 10001 00011 (match, distance 3), fifteen 1 bits, the terminating 0, 16 extra bits of
+        // value 1 (length 65537); 6 padding bits.
+        let msg = [0xE0u8, 0x24, 0x88, 0xFF, 0xFF, 0x80, 0x00, 0x40, 0x06];
+        assert_eq!(
+            Zgfx::new().decompress(&msg),
+            Err(ZgfxError::SegmentOutputTooLarge)
+        );
+    }
+
+    #[test]
+    fn one_literal_past_the_cap_is_an_error() {
+        // 10001 00011 (match, distance 3), fifteen 1 bits, the terminating 0, 16 zero extra bits
+        // (length 65536); then 0 00000000 (literal 0x00), the 65537th byte; 5 padding bits.
+        let msg = [0xE0u8, 0x24, 0x88, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x05];
+        assert_eq!(
+            Zgfx::new().decompress(&msg),
+            Err(ZgfxError::SegmentOutputTooLarge)
+        );
+    }
+
+    #[test]
+    fn a_one_byte_unencoded_run_past_the_cap_is_an_error() {
+        // The same 65536-byte match; then 10001 00000 (distance 0, an unencoded run), a 15-bit
+        // count of 1, 5 alignment bits and the run's byte, the 65537th; no padding.
+        let msg = [
+            0xE0u8, 0x24, 0x88, 0xFF, 0xFF, 0x80, 0x00, 0x22, 0x00, 0x00, 0x20, 0xAA, 0x00,
+        ];
+        assert_eq!(
+            Zgfx::new().decompress(&msg),
+            Err(ZgfxError::SegmentOutputTooLarge)
+        );
     }
 
     #[test]

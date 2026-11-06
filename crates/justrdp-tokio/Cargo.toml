@@ -52,7 +52,8 @@ ctor = "1"
 rcgen = { workspace = true }
 # **R1 verifier** (ADR-0011's 2026-08-26 table) for the live-capture codec test (gate #6 fix
 # note 3): bitmap rectangles captured from the real VM are decoded by both our codecs and
-# ironrdp's and asserted byte-identical (`src/lib.rs:2315` planar, `:2330` rle).
+# ironrdp's and asserted byte-identical (`captured_bitmap_rectangles_decode_identically_in_ironrdp`
+# in `src/lib.rs`, planar and rle).
 # **What ends it (ADR-0011):** an owned basis for planar and rle. Note the shape this crate is in
 # — the test captures real server bytes on every VM run and **writes none of them to disk**, so
 # the *acceptance* half of that basis is produced and discarded each time. Persisting it is not

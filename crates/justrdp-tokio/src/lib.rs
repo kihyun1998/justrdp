@@ -14063,10 +14063,8 @@ mod tests {
     /// `clear-NNNN.bin` each) plus a `manifest.tsv` recording each stream's dimensions and
     /// decode status (`ok` / `err:<msg>`).
     ///
-    /// The payloads whose status carries the `rlex: suite exceeds region pixel count` or
-    /// `shortVBarCacheMiss` signatures are exactly the oracle-rejected corpus #56 needs: the
-    /// bootstrap oracle cannot arbitrate them, so they must be harvested from a real server, not
-    /// synthesised. This test only *proves capture works* and summarises what the VM emitted —
+    /// A row's `err:` status names a stream the self-owned decoder rejected. This test only
+    /// *proves capture works* and summarises what the VM emitted —
     /// it does not assert a particular signature appears, because which regions a server
     /// Clear-codes is non-deterministic. Curate the committed fixtures from the dump afterwards
     /// (the manifest's `err:` rows point at the streams worth keeping).
@@ -14298,15 +14296,9 @@ mod tests {
             parse_errors.is_empty(),
             "the self-owned parser rejected a stream the real server sent: {parse_errors:?}"
         );
-        // `decoded_ok` is deliberately reported and **not** asserted. The bootstrap oracle still
-        // rejects this server's first-pass tiles — it indexes the progressive-quant table by
-        // `quality` without honouring the 0xFF full-quality sentinel that FreeRDP special-cases
-        // — so gating on it here would make this fix hostage to a defect it cannot reach.
-        // That is #194's subject, and #172 is what removes the oracle from this path.
+        // `decoded_ok` is reported and **not** asserted: this test's claim is about the parser.
         if decoded_ok == 0 {
-            eprintln!(
-                "  note: the bootstrap oracle decoded none of them — expected while #194 is open"
-            );
+            eprintln!("  note: the decoder decoded none of them");
         }
         })
         .await

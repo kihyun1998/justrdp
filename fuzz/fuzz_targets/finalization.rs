@@ -51,7 +51,7 @@
 //! undirected input and the `targetUser` read — and climbing a comparison from coverage feedback
 //! is precisely what libFuzzer's auto-dictionary does and what `vec(any::<u8>(), 0..=512)`
 //! structurally cannot: the proptest needs a hand-weighted arm (it has one) while the lane gets
-//! there on its own. For this one parser the nightly lane is now the *stronger* instrument, which
+//! there on its own. For this one parser the weekly lane is now the *stronger* instrument, which
 //! is the reverse of what this header spent three paragraphs establishing.
 //!
 //! What the target is actually for: **roster uniformity and regression insurance.** `fuzz.yml`

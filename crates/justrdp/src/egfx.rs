@@ -511,12 +511,9 @@ impl GraphicsProcessor {
                     })?;
                 Ok(Some(rgba))
             }
-            // Tile-codec failures below are warn-and-skip, not fatal: during the ADR-0003
-            // bootstrap the decoder may simply be incomplete (proven on the real VM: the
-            // oracle's ClearCodec rejects some genuine server streams). The region keeps its
-            // previous content and the next repaint usually heals it; killing the session
-            // over a decoder limitation would be worse than a transient hole. Protocol-level
-            // failures (zgfx, PDU framing, allocation bounds) stay fatal.
+            // Tile-codec failures below are warn-and-skip, not fatal: the region keeps its
+            // previous content. Protocol-level failures (zgfx, PDU framing, the surface
+            // allocation bounds) stay fatal.
             egfx::CODECID_PLANAR => {
                 let Ok(bgr) = planar::decompress(data, uw, uh).map_err(|e| {
                     tracing::warn!(target: "rdp_egfx", error = %e, "planar WTS1 decode failed — region skipped");
@@ -648,9 +645,9 @@ impl GraphicsProcessor {
             }
             EgfxPdu::DeleteSurface { surface_id } => {
                 tracing::debug!(target: "rdp_egfx", surface_id, "DeleteSurface");
-                // Free the surface's Progressive context with it (issue #83): the oracle keys
-                // contexts by id, so without this the context outlives the surface and leaks
-                // across the delete/recreate cycles servers do on resize/reconnect.
+                // Free the surface's Progressive store with it: without this the store outlives
+                // the surface and leaks across the delete/recreate cycles servers do on
+                // resize/reconnect.
                 self.remove_surface(surface_id);
             }
             EgfxPdu::MapSurfaceToOutput {
@@ -820,8 +817,7 @@ impl GraphicsProcessor {
                 };
                 let (sw, sh) = (surface.width, surface.height);
                 // No context bookkeeping: the store is keyed by surface (#170), so a stream
-                // moving to a new `codecContextId` is not an event at all. The eviction this
-                // arm used to perform existed only to cap the id-keyed oracle (#83).
+                // moving to a new `codecContextId` is not an event at all.
                 // Each painted rectangle is charged its clipped bytes (#377), as #268 charges the
                 // list-bearing commands: `paint_tile` meets every tile with every region rect.
                 let budget = MAX_TOTAL_SURFACE_BYTES.saturating_sub(self.frame_paint);

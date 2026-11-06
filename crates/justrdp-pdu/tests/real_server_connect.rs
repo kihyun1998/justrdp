@@ -4,9 +4,9 @@
 //! `capture_connect_response_against_real_vm` and are the seed corpus for the `gcc` and `mcs`
 //! fuzz targets; the third, `finalization-replies.bin`, has no generator (#252 carved it by
 //! hand). `fixtures/connect/README.md` says which is which and how each is regenerated. They are
-//! read here as well, and not only by the nightly lane, for two reasons:
+//! read here as well, and not only by the weekly lane, for two reasons:
 //!
-//! - **A fixture only the fuzz lane reads is a fixture nothing checks.** The lane is nightly and
+//! - **A fixture only the fuzz lane reads is a fixture nothing checks.** The lane is weekly and
 //!   its seeder would report a stale file as a corpus that merely decodes badly, which is
 //!   indistinguishable from a corpus that is doing its job.
 //! - **A capture proves *acceptance*** — that nothing this server sends is rejected — which is

@@ -154,7 +154,7 @@ fn server_license_request_parses_to_the_same_rsa_key_in_both_stacks() {
     assert_eq!(our_key.modulus, modulus_be);
     assert_eq!(our_key.exponent, 65537);
 
-    // Theirs: get_public_key() yields a PKCS#1 RSAPublicKey DER. Oracle caveat: ironrdp 0.8
+    // Theirs: get_public_key() yields a PKCS#1 RSAPublicKey DER. Oracle caveat: ironrdp 0.11
     // copies the proprietary blob's integers into the DER **verbatim** — but the wire stores
     // them little-endian (MS-RDPBCGR 2.2.1.4.3.1.1.1), so their DER holds byte-reversed
     // values (a known ironrdp endianness defect; FreeRDP reverses, we reverse). The
@@ -395,7 +395,7 @@ fn our_confirm_active_with_default_capabilities_decodes_in_ironrdp() {
                 assert_eq!(input.keyboard_layout, 0x0412);
                 assert_eq!(input.keyboard_function_key, 12);
             }
-            // Order's fields are private in ironrdp 0.8; its successful strict parse (84-byte
+            // Order's fields are private in ironrdp 0.11; its successful strict parse (84-byte
             // fixed layout) is the differential signal, and our own unit tests pin the bytes.
             iron_caps::CapabilitySet::Order(_) => {}
             _ => {}
