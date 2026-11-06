@@ -1,4 +1,5 @@
-# Build / format / lint / test gate for the workspace.
+# Build / format / lint / test gate for the workspace (job `test`), the gate for docs/map/ (`map`)
+# and the gate for the fuzz roster (`fuzz-roster`).
 #
 # Previously dropped (commit 2ca6c87) over a concern that SHA-pinning the workflow's actions would
 # be unmanageable to maintain. That concern is resolved: actions are pinned by `just-shield fix`
@@ -139,3 +140,19 @@ jobs:
 
       - name: Map gate (links, anchors, symbols, sections, reciprocity)
         run: python3 .github/scripts/check_map.py
+
+  # Gate for the fuzz roster: every `fuzz/fuzz_targets/*.rs` has a `[[bin]]` in `fuzz/Cargo.toml`
+  # and every `[[bin]]` has its file. Toolchain-free, the same script `fuzz.yml`'s `targets` job
+  # derives its matrix with. The reason is in docs/map/territory/supply-chain-and-gates.md.
+  fuzz-roster:
+    runs-on: ubuntu-latest
+    # Stdlib Python over one directory and one manifest. Bounded as the `map` job is.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Fuzz roster self-test (does it still fail on each defect kind?)
+        run: python3 .github/scripts/check_fuzz_roster.py --selftest
+
+      - name: Fuzz roster (directory and manifest agree)
+        run: python3 .github/scripts/check_fuzz_roster.py

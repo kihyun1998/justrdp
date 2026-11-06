@@ -26,11 +26,12 @@ like any other.
 
 ## Design model
 
-- **Four gating workflows and one report.** `test.yml` — two jobs: `test`
+- **Four gating workflows and one report.** `test.yml` — three jobs: `test`
   (fmt → clippy `-D warnings` → each crate's library alone → `fuzz/` →
   `cargo test --workspace` → rustdoc `-D warnings`) and `map`
   (`.github/scripts/check_map.py`, toolchain-free so a docs-only PR answers without
-  waiting for cargo); `fuzz.yml` (nightly libFuzzer); `supply-chain.yml`
+  waiting for cargo) and `fuzz-roster` (`.github/scripts/check_fuzz_roster.py`, toolchain-free
+  too); `fuzz.yml` (nightly libFuzzer); `supply-chain.yml`
   (`just-shield`); `overflow-32bit.yml` (the 32-bit target, below). `coverage.yml`
   reports with no threshold and does not fail a build.
 - **One gate exists because the others structurally cannot fail.** On x86-64 a wrapping
@@ -68,9 +69,10 @@ like any other.
   and is indistinguishable from a slow queue. Measured on 2026-08-31 (#262), when a hanging
   `justrdp-codecs` property ran to the kill: **10 cancelled jobs, ~56.4 runner-hours in one
   day** — `test` 6 jobs (140/360/360/360/360/361 min) and `coverage` 4 jobs at 360 each. Every
-  job in all five workflows now carries a bound (test 20, map 10, coverage 30, overflow-32bit
-  30, just-shield 10, fuzz `targets` 10, fuzz `fuzz` 30), each sized against its own measured
-  healthy maximum, and **`test.yml`'s block is the one that carries the incident numbers** —
+  job in all five workflows now carries a bound (test 20, map 10, fuzz-roster 10, coverage 30,
+  overflow-32bit 30, just-shield 10, fuzz `targets` 10, fuzz `fuzz` 30), each sized against its
+  own measured healthy maximum except `fuzz-roster`, which takes `map`'s for a job of the same
+  shape, and **`test.yml`'s block is the one that carries the incident numbers** —
   the others point at it rather than copying them, for the same reason the fuzz matrix is
   derived rather than transcribed. Two scoping notes: `coverage.yml` is in that table because
   it runs `cargo llvm-cov --workspace --exclude justrdp-tokio`, i.e. the *same* property, so
@@ -103,9 +105,9 @@ like any other.
   unlike the workspace steps: the root lock is rewritten by every local build, while
   `fuzz/Cargo.lock` changes when a path crate gains a dependency and nobody builds `fuzz/`
   locally, so without the flag CI would re-resolve it silently and leave the committed lock
-  stale. Removing one entry from it turned the step red. Note what that command still does
-  not reach: it builds the `[[bin]]` targets the manifest declares, so a `fuzz_targets/*.rs`
-  with no `[[bin]]` entry is invisible to it too.
+  stale. Removing one entry from it turned the step red. It builds the `[[bin]]` targets the
+  manifest declares, so a `fuzz_targets/*.rs` with no `[[bin]]` entry is the `fuzz-roster` job's
+  to catch, not this step's.
 - **A green workspace gate does not mean each crate builds alone** (#572). Clippy
   `--all-targets` and `cargo test` compile dev targets, and under resolver 2 that is exactly
   when dev-dependency features reach the library (the Cargo book, `features.md`, "Dev-dependencies
@@ -126,7 +128,17 @@ like any other.
   compiling target that CI never ran. It now derives the matrix in a `targets` job and
   fails when `fuzz/Cargo.toml` disagrees with the directory. **Derived from the
   directory, not the manifest**, because the manifest is the copy that can be wrong
-  quietly: a missing `[[bin]]` compiles nothing and reports nothing.
+  quietly: a missing `[[bin]]` compiles nothing and reports nothing, where a `[[bin]]` with no
+  file fails the build. The check is `check_fuzz_roster.py`, run on every PR by `test.yml`'s
+  `fuzz-roster` job (#581) and by `fuzz.yml`'s `targets` job, which takes its matrix from it. A
+  PR that adds a target without its entry goes red on that PR rather than at the next weekly run.
+  `--selftest` runs in the job, so its failure directions are a command rather than a memory,
+  as for the map gate. It reads the manifest with `tomllib` (Python 3.11+; the runner's is 3.12)
+  rather than matching `path` lines, because a line match accepted a non-compiling target listed
+  under `[[example]]`, `[[test]]` or `[package.metadata.*]`, which `cargo check` skips too. It
+  requires each `[[bin]]`'s `path` to be `fuzz_targets/<name>.rs`, because the lane runs a target
+  by the file's stem. It reads the directory's top level only, so a non-compiling file in a
+  subdirectory of `fuzz_targets/` passes it and `cargo check` both.
 - **Pinning is cheap only because it is automated** — `just-shield fix` writes the
   SHA, Dependabot bumps it with a version comment. That pairing is the whole reason
   the earlier "pinning is unmaintainable" objection was resolved.
@@ -155,11 +167,13 @@ like any other.
 
 ## Code
 
-- `.github/workflows/` — `test.yml` (jobs `test` + `map`), `fuzz.yml`,
+- `.github/workflows/` — `test.yml` (jobs `test` + `map` + `fuzz-roster`), `fuzz.yml`,
   `supply-chain.yml`, `overflow-32bit.yml`, `coverage.yml`
 - `.github/scripts/check_map.py` — the map gate (`selftest`, `scope_text`,
   `check_code`, `check_links`, `check_reciprocity`); its scope is declared in its own
   docstring rather than inferred
+- `.github/scripts/check_fuzz_roster.py` — the fuzz roster gate (`check`, `selftest`), and the
+  source of the fuzz lane's matrix
 - `.github/dependabot.yml` — weekly cargo, rust-toolchain and github-actions ecosystems
 - `rust-toolchain.toml` — the exact compiler pin (ADR-0013); read by every `cargo`
   invocation in the tree, `fuzz/` included, since rustup discovers it by walking up
