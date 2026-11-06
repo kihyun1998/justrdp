@@ -4,7 +4,7 @@
 
 How this project knows it is right: a differential oracle against
 `ironrdp-graphics` / `ironrdp` for codecs and crypto, a corpus of real Server 2019
-captures for ClearCodec, property tests that assert decoders never panic, a nightly
+captures for ClearCodec, property tests that assert decoders never panic, a weekly
 libFuzzer lane, a coverage discovery job, and a real Windows Server 2019 VM for the
 things only a server can prove. Verification is a territory because it is something
 the system does — and because a claim about correctness here is load-bearing
@@ -18,7 +18,7 @@ everywhere else.
   verification where no assembled oracle exists; the #118 amendment adds
   assembly-layer independence.
 - [ADR-0008](../../adr/0008-robustness-testing-fuzz-and-property.md) — proptest on
-  stable in the PR gate, coverage-guided fuzzing on a nightly CI lane.
+  stable in the PR gate, coverage-guided fuzzing on a weekly CI lane.
 - [ADR-0011](../../adr/0011-zero-ironrdp-terminal-state.md) — the oracle is scaffolding
   with a **retirement** condition, keyed on **role** since its 2026-08-26 amendment. It
   narrows ADR-0003 (phase 3's exit criterion is no longer sufficient on its own) and
@@ -486,7 +486,7 @@ in-session query.
   criterion is an oracle pass.
 - [Licensing](licensing.md) — the differential crypto test is its only proof.
 - [Supply chain & gates](supply-chain-and-gates.md) — which of these run in CI, and
-  which are nightly-only or VM-only.
+  which are weekly-only or VM-only.
 - [Adapter drive loop](adapter-drive-loop.md) — hosts the VM and loopback tests.
 
 ## Known holes / open
@@ -610,7 +610,7 @@ in-session query.
   not copied here.
 - **A capture is a seed only if something else reads it.** #203's Connect-Response fixture is
   the `gcc`/`mcs` seed corpus *and* is asserted by `justrdp-pdu/tests/real_server_connect.rs` in
-  the stable gate, because the lane that consumes it is nightly and would report a stale fixture
+  the stable gate, because the lane that consumes it is weekly and would report a stale fixture
   as a corpus that merely decodes badly — indistinguishable from one doing its job. It is also
   the first server-to-client connect bytes in the repo that no encoder of ours produced, which
   is what makes it an acceptance proof rather than a round-trip.

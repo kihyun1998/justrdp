@@ -146,7 +146,7 @@ More detail:
 - **Differential and corpus tests.** Codecs are checked against byte streams captured from a real
   Windows Server and against expected output derived independently of the decoder.
 - **Property tests and fuzzing.** Every decoder of untrusted input has `proptest` properties
-  ("never panics") and a `cargo-fuzz` target run in a nightly CI lane (`fuzz/`, outside the
+  ("never panics") and a `cargo-fuzz` target run in a weekly CI lane (`fuzz/`, outside the
   workspace).
 - **A 32-bit overflow lane.** Dimension overflow guards are proven on a 32-bit target.
 - **Real VM runs.** Connect and session behaviour is verified against a real Windows Server 2019

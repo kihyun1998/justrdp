@@ -60,7 +60,7 @@ property of the whole untrusted surface.
   targets. Edge and artifacts added by #460.
   Edge added by #237; the code has carried both artifacts since #200.
 - [Verification harness](../territory/verification-harness.md) — the only territory
-  that *enforces* rather than obeys it: proptest in the PR gate, cargo-fuzz nightly.
+  that *enforces* rather than obeys it: proptest in the PR gate, cargo-fuzz weekly.
 
 ## What a violation looks like
 
@@ -81,7 +81,7 @@ that trusts its server too much) rather than as memory safety.
 - **#98** — proptest "decode never panics on arbitrary bytes" + round-trip
   properties, implemented first for the RLE decoder, running on stable in the PR
   gate.
-- **#99** — coverage-guided `cargo-fuzz` on a nightly CI lane, because proptest's
+- **#99** — coverage-guided `cargo-fuzz` on a weekly CI lane, because proptest's
   random sampling does not reach depth. Two automations for one property: that
   duplication *is* the discovery history.
 - **#219** — the lane's **first crash**, which turned the line above from an argument

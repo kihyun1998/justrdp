@@ -19,7 +19,7 @@ like any other.
 - [ADR-0004](../../adr/0004-sspi-contribute-and-bridge.md) — the fork-bridge rule and
   its removal obligation.
 - [ADR-0008](../../adr/0008-robustness-testing-fuzz-and-property.md) — why fuzzing is
-  a nightly lane rather than a PR gate.
+  a weekly lane rather than a PR gate.
 - [ADR-0013](../../adr/0013-pinned-build-inputs.md) — a build input is pinned to an exact
   version and every pin names its bumper; the compiler is the third participant, after
   actions (0006) and `sspi` (0004).
@@ -31,7 +31,7 @@ like any other.
   `cargo test --workspace` → rustdoc `-D warnings`) and `map`
   (`.github/scripts/check_map.py`, toolchain-free so a docs-only PR answers without
   waiting for cargo) and `fuzz-roster` (`.github/scripts/check_fuzz_roster.py`, toolchain-free
-  too); `fuzz.yml` (nightly libFuzzer); `supply-chain.yml`
+  too); `fuzz.yml` (weekly libFuzzer); `supply-chain.yml`
   (`just-shield`); `overflow-32bit.yml` (the 32-bit target, below). `coverage.yml`
   reports with no threshold and does not fail a build.
 - **One gate exists because the others structurally cannot fail.** On x86-64 a wrapping
@@ -209,7 +209,7 @@ and never re-read. Verify at the source before a decision rests on it.
   territory's dependency.
 - [TLS transport security & trust](tls-transport-security.md) — the `ring` provider
   choice is a build-time constraint on Windows.
-- [Bitmap codecs](bitmap-codecs.md) — the nightly-only fuzz lane is the gap between
+- [Bitmap codecs](bitmap-codecs.md) — the weekly fuzz lane is the gap between
   a new decoder landing and being fuzzed.
 
 ## Known holes / open

@@ -214,7 +214,7 @@ pub fn mac_data(mac_salt: &[u8; 16], data: &[u8]) -> [u8; 16] {
 /// the result little-endian with 8 trailing zero bytes (the proprietary blob convention,
 /// matching FreeRDP). `modulus_be` is **big-endian** — [`crate::connect`] reverses the wire's
 /// little-endian modulus when parsing the certificate, per MS-RDPBCGR 2.2.1.4.3.1.1.1. (Do not
-/// oracle this against ironrdp 0.8: it skips that reversal, so its full-path licensing RSA is
+/// oracle this against ironrdp 0.11: it skips that reversal, so its full-path licensing RSA is
 /// spec-incorrect — see the differential test notes.)
 pub fn encrypt_premaster_secret(
     premaster_secret: &[u8],

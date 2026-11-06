@@ -55,7 +55,7 @@ rcgen = "0.14"
 # Robustness testing of the hand-rolled, untrusted-input parsers (ADR-0008, issue #97): property
 # tests assert "decode never panics on arbitrary bytes" and round-trip invariants across a wide
 # input space the hand-written differential-oracle vectors do not reach. Dev-dependency only; runs
-# on stable (unlike coverage-guided cargo-fuzz, which is a nightly CI-only lane — issue #99).
+# on stable (unlike coverage-guided cargo-fuzz, which needs nightly and runs only in CI — issue #99).
 proptest = "1"
 # The per-codec benchmarks over the real-server corpora (#555). Dev-dependency only, absent from
 # `cargo tree -e normal`; without plotters and rayon, which a baseline comparison needs neither of.

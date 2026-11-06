@@ -2948,7 +2948,7 @@ mod tests {
         // and broadcast it, which made every band's `shift` and `num_bits` equal — and a band
         // whose width differs from its neighbours' is precisely what desynchronises the SRL
         // cursor shared across the ten of them (`super::srl`). The fuzz target has always
-        // generated per band; this is the PR-gate half, and the fuzz lane is nightly.
+        // generated per band; this is the PR-gate half, and the fuzz lane is weekly.
         #![proptest_config(ProptestConfig::with_cases(512))]
         #[test]
         fn the_multi_pass_path_never_panics_on_arbitrary_input(

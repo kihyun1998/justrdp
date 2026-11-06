@@ -88,8 +88,8 @@ carrying a spec-valid `RDP_NEG_CORRELATION_INFO` reaches session-active and pain
 ones, each tried once by mutating the encoder: a length of 0x23, the flag with no structure after
 it, and an id starting with 0x0D. That test therefore proves the server tolerates the field, not
 that the encoding is right; the bytes rest on 2.2.1.1.2 and agree with IronRDP's `CorrelationInfo`
-(master). The pinned `ironrdp-pdu` 0.9.0 oracle cannot check them: its `ConnectionRequest`
-decoder refuses any request with `CORRELATION_INFO_PRESENT` (a `TODO(#111)` in its `nego.rs`). The refusal of 0x00 / 0xF4 / 0x0D
+(master). `ironrdp-pdu` 0.11 decodes the field (`CorrelationInfo::read` in its `nego.rs`), and no
+differential test feeds it these bytes. The refusal of 0x00 / 0xF4 / 0x0D
 rests on FreeRDP's server (`nego_process_correlation_info`, `libfreerdp/core/nego.c` at
 `18513805`), which fails the request on each, not on anything this VM does. Whether the VM
 records the id is not observed: nothing here reads its event log.

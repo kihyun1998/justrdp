@@ -512,6 +512,19 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   self-owned lifecycle reproduces it and then some — `order_payload` never gates a region on
   a context block at all, which is FreeRDP's rule and the one the real server needs (51 of
   its 52 payloads carry no `CONTEXT`).
+- **A tile-codec failure skips the region rather than ending the session.** The region keeps
+  its previous content and the next repaint usually heals it, where ending the session over one
+  undecodable tile loses everything. zgfx, PDU framing and the surface allocation bounds stay
+  fatal.
+- **A compressed zgfx segment may expand to 65536 bytes, one past `[MS-RDPEGFX]`
+  3.1.9.1.2.4's 65,535** (maintainer's call, #588). 3.1.9.1.2 lists that number under
+  "compressor limits". FreeRDP (`zgfx.c`, `count > sizeof(zgfx->OutputBuffer) -
+  zgfx->OutputCount`, read at `9e9f2148`) and the spec's 4.2.1.2 sample both hold 65536 bytes, and
+  `MAX_SEGMENT_OUTPUT` matches them: a zgfx failure ends the session, and one more byte amplifies
+  nothing. So a single match of 65536 decodes, past the token table's last length row of 65535;
+  FreeRDP's length loop accepts it too. No real server has shown either value: the largest
+  segment output in `fixtures/zgfx/ws2019.bin` is 46,728 bytes over its 65 single-segment
+  messages.
 - **The VM has never sent a multipart zgfx message.** Measured over one session: 25
   messages, every one `ZGFX_SEGMENTED_SINGLE` and `PACKET_COMPRESSED`; the `0xE1`
   descriptor's decode path is proved by the `[MS-RDPEGFX]` sample and the oracle
@@ -519,6 +532,10 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   [capture coverage follows what we advertise](../invariant/capture-coverage-follows-what-we-advertise.md),
   with no advertised flag to change — a server sends multipart only when a message exceeds
   65535 bytes, and this one's largest was 10 680.
+- **zgfx's three tolerated segment shapes are not observable, which ADR-0009 §3(b) requires**
+  (maintainer's call to record it, #588): a compressed segment of exactly 65536 bytes, an empty
+  compressed body, and an uncompressed segment past 65536 bytes all decode with no record, and
+  `justrdp-codecs` has no `tracing` dependency to write one. None has been seen from a server.
 - **The off-surface `destRect` tolerance is not observable, which ADR-0009 §3(b) requires**
   (found sweeping #263). `Surface::blit` clips a rectangle that runs past the surface
   silently — no `tracing` record on the clip path — and #263's bound is argued *on the

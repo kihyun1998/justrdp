@@ -1,4 +1,4 @@
-//! Differential tests (ADR-0001): our input PDU **encoders** against ironrdp-pdu 0.8's as the
+//! Differential tests (ADR-0001): our input PDU **encoders** against ironrdp-pdu 0.11's as the
 //! reference oracle. Input is encode-only for a client, so the differential is byte equality
 //! of complete PDUs — any divergence in header packing, lengths, flags folding, or padding
 //! shows up as a byte diff.
