@@ -243,7 +243,7 @@ pub fn mac_data(mac_salt: &[u8; 16], data: &[u8]) -> [u8; 16] {
 /// oracle this against ironrdp 0.11: it skips that reversal, so its full-path licensing RSA is
 /// spec-incorrect — see the differential test notes.)
 ///
-/// The result is `modulus_be.len() + 8` bytes. `None` for a modulus [`usable_modulus`] refuses.
+/// The result is `modulus_be.len() + 8` bytes. `None` for a zero modulus or one past 512 bytes.
 pub fn encrypt_premaster_secret(
     premaster_secret: &[u8],
     modulus_be: &[u8],
