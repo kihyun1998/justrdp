@@ -42,7 +42,7 @@ and NLA to [`sspi`](https://github.com/Devolutions/sspi-rs).
 | Crate | Role | Depends on |
 |---|---|---|
 | [`justrdp-pdu`](crates/justrdp-pdu) | RDP wire-format PDUs: encode and decode | nothing |
-| [`justrdp-security`](crates/justrdp-security) | The legacy RDP cryptography, usable without the rest of justrdp | nothing |
+| [`justrdp-security`](crates/justrdp-security) | The legacy RDP cryptography, usable without the rest of justrdp | `justrdp-pdu` |
 | [`justrdp-codecs`](crates/justrdp-codecs) | Bitmap and surface codecs, decoding to RGBA8888 | `justrdp-pdu` |
 | [`justrdp`](crates/justrdp) | The sans-IO core: connect and session state machines, virtual channels, framebuffer | `justrdp-pdu`, `justrdp-security`, `justrdp-codecs` |
 | [`justrdp-tokio`](crates/justrdp-tokio) | The Tokio adapter: socket, TLS handshake and trust, CredSSP, per-stage timeouts, session runner | `justrdp`, `tokio`, `rustls`, `sspi` |

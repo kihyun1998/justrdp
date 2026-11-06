@@ -1,6 +1,6 @@
 # 0009 — Negotiation posture: tolerant of server self-inconsistency in rendering, strict on security integrity
 
-- Status: Accepted — amended 2026-08-25 (#252), 2026-08-31 (#268), 2026-09-04, 2026-09-16 (#286), 2026-09-18 (#297), 2026-10-06 (#376), 2026-10-16 (#462, closed by #470) and 2026-11-03 (#576); see the Amendments below
+- Status: Accepted — amended 2026-08-25 (#252), 2026-08-31 (#268), 2026-09-04, 2026-09-16 (#286), 2026-09-18 (#297), 2026-10-06 (#376), 2026-10-16 (#462, closed by #470), 2026-11-03 (#576) and 2026-11-06 (#598); see the Amendments below
 - Date: 2026-07-03
 - Closes issue #101
 
@@ -399,3 +399,9 @@ RLEX run and the NSCodec subcodec. `ironrdp-graphics` 0.11 clips the first and d
 so the spec's strict reading is what remains on the other side, with FreeRDP's rejection of the
 RLEX over-fill (`justrdp-codecs/src/clearcodec.rs`). The tolerance is unchanged: its ground was
 always the captured WS2019 corpus.
+
+## Amendment (2026-11-06, #598): rejecting Standard RDP Security means rejecting a downgrade
+
+The Context lists "rejects Standard RDP Security" among the strict cases. A host may now opt in to it
+([ADR-0020](0020-standard-rdp-security-when-the-host-opts-in.md)), so what §1 keeps is the downgrade:
+a server that selects this protection for a host that did not ask is refused, unchanged.

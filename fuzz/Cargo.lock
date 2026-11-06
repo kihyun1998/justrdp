@@ -135,6 +135,7 @@ dependencies = [
  "justrdp",
  "justrdp-codecs",
  "justrdp-pdu",
+ "justrdp-security",
  "libfuzzer-sys",
 ]
 
@@ -145,6 +146,9 @@ version = "0.1.0"
 [[package]]
 name = "justrdp-security"
 version = "0.1.0"
+dependencies = [
+ "justrdp-pdu",
+]
 
 [[package]]
 name = "libc"

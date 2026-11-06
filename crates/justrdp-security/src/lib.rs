@@ -1,4 +1,4 @@
-//! `justrdp-security` — the legacy RDP cryptography, with no dependency on the rest of justrdp.
+//! `justrdp-security` — the legacy RDP cryptography, depending on nothing but `justrdp-pdu`.
 //! It holds no socket and no runtime.
 
 #![doc(
@@ -7,3 +7,4 @@
 )]
 
 pub mod license_crypto;
+pub mod standard;

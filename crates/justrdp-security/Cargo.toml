@@ -7,10 +7,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The security header and the Security Exchange PDU, as wire types.
+justrdp-pdu.workspace = true
 
 [dev-dependencies]
-# Builds the licensing messages `tests/differential_license_crypto.rs` feeds to both stacks.
-justrdp-pdu.workspace = true
+proptest.workspace = true
 # The differential oracle in `tests/differential_license_crypto.rs`, role R1 verifier in ADR-0011's
 # role table.
 ironrdp-pdu = "0.11.0"

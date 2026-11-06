@@ -43,6 +43,11 @@ decision of its own. That inference has never been written down as a record.
 - `justrdp-security/src/license_crypto.rs` — `derive_license_keys`,
   `encrypt_premaster_secret`, `salted_hash`, `mac_data`, `rc4`, `md5`, `sha1`,
   `BigUint`, `LicenseKeys`
+- `justrdp-security/src/license_crypto.rs` — `Rc4`, `rsa_public_le`, which
+  `justrdp-security/src/standard.rs` builds Standard RDP Security on: `StandardSecurity`,
+  `ClientRandom`, `EncryptionMethod`, `EncryptionLevel`, `encrypt_client_random`,
+  `StandardSecurityError`
+- `justrdp-pdu/src/client_info.rs` — `encode_security_exchange`
 - `justrdp/src/connect.rs` — `LicenseConfig`, `LicenseEntropy`
 - `justrdp-tokio/src/lib.rs` — `generate_license_entropy`
 - Spec sections cited inline: `[MS-RDPELE]` 2.2.2.5.1, 2.2.2.7, 3.2.5, 5.1.2, 5.1.6
@@ -59,6 +64,14 @@ fired and prints its branch rather than pinning one. One WS2019 box in Remote De
 Administration mode; the RD Session Host role made it send a License Request instead
 ([verification harness](verification-harness.md), #400). No FreeRDP / IronRDP behaviour is
 recorded here.
+
+**Standard RDP Security's arithmetic against FreeRDP** (#598, 2026-11-06, commit `9e9f2148`):
+`libfreerdp/core/security.c` compiled unchanged and driven for 8200 packets each way at 40, 56 and
+128 bits, past two key updates, with every third MAC salted. `justrdp_security::standard` produces
+the same signatures and ciphertexts (`crates/justrdp-security/tests/fixtures/freerdp_vectors/`). The
+spec has no such vector: section 4.1's dump does not state its client random, and 4.8's key is not
+that server's. The RSA value rests on 4.8's key and random, computed outside this code and recovered
+with 4.8's private exponent. 26 mutations of the layer each turned a named test red, or hung it where the guard they removed is the only bound.
 
 ## Cross-cutting invariants
 
@@ -87,6 +100,14 @@ recorded here.
 
 ## Known holes / open
 
+- **A zero modulus hangs `encrypt_premaster_secret`.** A server's certificate supplies the modulus
+  and the exponent. With a modulus of zero `BigUint::rem` reduces nothing, so `modpow` squares without
+  bound. The same arithmetic behind `encrypt_client_random`, its guard removed, ran past 280 s against
+  `u32::MAX` as the exponent before the run was killed. `encrypt_client_random` refuses that key;
+  licensing does not, and no test has driven it there (#598).
+- **`encrypt_premaster_secret` can return too few bytes.** `to_bytes_le` trims high zero bytes, so a
+  ciphertext with a zero top byte comes out shorter than its modulus. `rsa_public_le` does not trim.
+  What a server does with a short licensing blob is unmeasured (#598).
 - **The grant path is effectively unexercised.** The test VM has no licensing server,
   so only the "error = proceed" branch is proven end-to-end; New License and Platform
   Challenge rest on the differential test alone. **An RD Session Host takes the request

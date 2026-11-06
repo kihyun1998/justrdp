@@ -7,8 +7,8 @@
 //!
 //! **Not general-purpose cryptography.** MD5/SHA-1/RC4/unpadded RSA are broken primitives by
 //! modern standards; they exist here solely because the licensing wire format requires them.
-//! Nothing outside the licensing exchange and auto-reconnect (`[MS-RDPBCGR]` 5.5, whose
-//! verifier is HMAC-MD5 by the same frozen spec) may use this module.
+//! Nothing outside the licensing exchange, auto-reconnect (`[MS-RDPBCGR]` 5.5, whose verifier is
+//! HMAC-MD5 by the same frozen spec) and [`crate::standard`] may use this module.
 
 /// One MD5 digest (RFC 1321). Used by the licensing key derivation and MAC.
 pub fn md5(data: &[u8]) -> [u8; 16] {
@@ -139,25 +139,51 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
 /// RC4-encrypt (or decrypt — the cipher is symmetric) `data` with `key`. Each licensing
 /// message uses a fresh keystream (MS-RDPELE resets the cipher per message).
 pub fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut s: [u8; 256] = core::array::from_fn(|i| i as u8);
-    let mut j = 0usize;
-    for i in 0..256 {
-        j = (j + s[i] as usize + key[i % key.len()] as usize) % 256;
-        s.swap(i, j);
-    }
-    let (mut i, mut j) = (0usize, 0usize);
-    data.iter()
-        .map(|&byte| {
-            i = (i + 1) % 256;
-            j = (j + s[i] as usize) % 256;
+    let mut cipher = Rc4::new(key);
+    let mut out = data.to_vec();
+    cipher.apply(&mut out);
+    out
+}
+
+/// An RC4 keystream that continues across calls. `key` must not be empty.
+#[derive(Clone)]
+pub struct Rc4 {
+    s: [u8; 256],
+    i: usize,
+    j: usize,
+}
+
+impl Rc4 {
+    /// Run the key schedule.
+    pub fn new(key: &[u8]) -> Self {
+        let mut s: [u8; 256] = core::array::from_fn(|i| i as u8);
+        let mut j = 0usize;
+        for i in 0..256 {
+            j = (j + s[i] as usize + key[i % key.len()] as usize) % 256;
             s.swap(i, j);
-            byte ^ s[(s[i] as usize + s[j] as usize) % 256]
-        })
-        .collect()
+        }
+        Self { s, i: 0, j: 0 }
+    }
+
+    /// XOR the next `data.len()` keystream bytes into `data`.
+    pub fn apply(&mut self, data: &mut [u8]) {
+        for byte in data {
+            self.i = (self.i + 1) % 256;
+            self.j = (self.j + self.s[self.i] as usize) % 256;
+            self.s.swap(self.i, self.j);
+            *byte ^= self.s[(self.s[self.i] as usize + self.s[self.j] as usize) % 256];
+        }
+    }
+}
+
+impl core::fmt::Debug for Rc4 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Rc4(..)")
+    }
 }
 
 /// `SaltedHash` (MS-RDPELE 5.1.3): `MD5(salt ‖ SHA1(input ‖ salt ‖ salt1 ‖ salt2))`.
-fn salted_hash(salt: &[u8], salt1: &[u8], salt2: &[u8], input: &[u8]) -> [u8; 16] {
+pub(crate) fn salted_hash(salt: &[u8], salt1: &[u8], salt2: &[u8], input: &[u8]) -> [u8; 16] {
     let sha = sha1(&[input, salt, salt1, salt2].concat());
     md5(&[salt, &sha].concat())
 }
@@ -226,6 +252,16 @@ pub fn encrypt_premaster_secret(
     let c = m.modpow(exponent, &n);
     let mut out = c.to_bytes_le();
     out.resize(out.len() + 8, 0);
+    out
+}
+
+/// `data^exponent mod modulus`, with `data` and the result little-endian and the result exactly
+/// `modulus_be.len()` bytes. `modulus_be` must not be zero.
+pub(crate) fn rsa_public_le(data: &[u8], modulus_be: &[u8], exponent: u32) -> Vec<u8> {
+    let m = BigUint::from_bytes_le(data);
+    let n = BigUint::from_bytes_be(modulus_be);
+    let mut out = m.modpow(exponent, &n).to_bytes_le();
+    out.resize(modulus_be.len(), 0);
     out
 }
 

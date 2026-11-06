@@ -196,8 +196,7 @@ fn read_der_length(cur: &mut ReadCursor<'_>) -> Result<usize, DecodeError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerCertificate {
     /// `CERT_CHAIN_VERSION_1` — the proprietary format, already parsed down to its RSA key
-    /// (the signature is not verified: licensing rides inside the already-authenticated TLS
-    /// session, and the proprietary signing key is public knowledge anyway).
+    /// (the signature is not verified: the proprietary signing key is public knowledge, ADR-0020).
     Proprietary(RsaPublicKey),
     /// `CERT_CHAIN_VERSION_2` — an X.509 chain, leaf last. Parsing X.509 needs an ASN.1
     /// walker, which this dependency-free crate does not carry; the `justrdp` core extracts
