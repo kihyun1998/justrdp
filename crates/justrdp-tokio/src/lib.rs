@@ -12934,9 +12934,13 @@ mod tests {
         let at_depth = |config: &mut ConnectConfig| {
             config.core.high_color_depth = match bpp {
                 8 => gcc::HIGH_COLOR_DEPTH_8BPP,
+                15 => gcc::HIGH_COLOR_DEPTH_15BPP,
                 16 => gcc::HIGH_COLOR_DEPTH_16BPP,
-                _ => panic!("the xrdp comparison runs at 8 or 16 bpp, not {bpp}"),
+                _ => panic!("the xrdp comparison runs at 8, 15 or 16 bpp, not {bpp}"),
             };
+            if bpp == 15 {
+                config.core.supported_color_depths |= gcc::SUPPORTED_COLOR_DEPTH_15BPP;
+            }
             for set in &mut config.capabilities {
                 if let CapabilitySet::Bitmap(b) = set {
                     b.preferred_bits_per_pixel = bpp;
@@ -12975,9 +12979,10 @@ mod tests {
             "the oracle is painted in bitmaps, not orders: {:?}",
             oracle.census.orders
         );
+        let fill_bpp = if bpp == 15 { 16 } else { bpp };
         assert!(
             ordered.census.count(&format!(
-                "CacheBitmapRev2 cache 2 compressed true {bpp} bpp"
+                "CacheBitmapRev2 cache 2 compressed true {fill_bpp} bpp"
             )) > 0,
             "no {bpp} bpp cache fill: the server answered another depth: {:?}",
             ordered.census.orders
@@ -13006,6 +13011,13 @@ mod tests {
     #[ignore = "requires the xrdp census server and JUSTRDP_XRDP_ADDR"]
     async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps() {
         xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_at(16).await;
+    }
+
+    /// Issue #590, at 15 bpp: xrdp's cache fills name 16 bpp and hold 15 bpp pixels.
+    #[tokio::test]
+    #[ignore = "requires the xrdp census server and JUSTRDP_XRDP_ADDR"]
+    async fn xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_at_15_bpp() {
+        xrdp_paints_its_login_screen_in_orders_as_in_bitmaps_at(15).await;
     }
 
     /// Issue #477, at 8 bpp: the colours come from the session palette, which xrdp also sends as

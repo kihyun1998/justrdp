@@ -132,6 +132,12 @@ pub const SUPPORTED_COLOR_DEPTH_32BPP: u16 = 0x0008;
 /// `colorDepth` is ignored by servers when the post-beta2 field is present, but must hold a
 /// valid enum value.
 pub const COLOR_DEPTH_8BPP: u16 = 0xCA01;
+/// `postBeta2ColorDepth` — 15 bpp, a 555 RGB mask (`RNS_UD_COLOR_16BPP_555`).
+pub const COLOR_DEPTH_15BPP: u16 = 0xCA02;
+/// `postBeta2ColorDepth` — 16 bpp, a 565 RGB mask (`RNS_UD_COLOR_16BPP_565`).
+pub const COLOR_DEPTH_16BPP: u16 = 0xCA03;
+/// `postBeta2ColorDepth` — 24 bpp (`RNS_UD_COLOR_24BPP`).
+pub const COLOR_DEPTH_24BPP: u16 = 0xCA04;
 /// `keyboardType` — IBM enhanced (101/102-key), the common PC keyboard.
 pub const KEYBOARD_TYPE_IBM_ENHANCED: u32 = 4;
 /// `connectionType` — LAN.
@@ -212,7 +218,7 @@ pub struct ClientCoreData {
     /// IME file name (usually empty).
     pub ime_file_name: String,
     /// `postBeta2ColorDepth` (e.g. [`COLOR_DEPTH_8BPP`]); servers ignore it when
-    /// `highColorDepth` is present, but it must hold a valid enum value.
+    /// `highColorDepth` is present. `justrdp::advertise` holds the values the core honours.
     pub post_beta2_color_depth: u16,
     /// `clientProductId` (informational, typically 1).
     pub client_product_id: u16,
