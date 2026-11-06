@@ -1265,7 +1265,13 @@ impl ConnectStateMachine {
                     &entropy.premaster_secret,
                     &key.modulus,
                     key.exponent,
-                );
+                )
+                .ok_or(ConnectError::Decode(
+                    justrdp_pdu::DecodeError::InvalidField {
+                        field: "ServerCertificate.modulus",
+                        reason: "zero, or longer than 512 bytes",
+                    },
+                ))?;
                 let msg = license::encode_new_license_request(
                     self.config.license.platform_id,
                     &entropy.client_random,
@@ -3302,7 +3308,7 @@ pub(crate) mod tests {
         //    from the caller's entropy and the certificate's RSA key — byte-exact.
         let actions = sm.process(Event::Received(&server_io_frame(&server_license_request())));
         let encrypted_premaster =
-            license_crypto::encrypt_premaster_secret(&[0x22; 48], &TEST_MODULUS, 65537);
+            license_crypto::encrypt_premaster_secret(&[0x22; 48], &TEST_MODULUS, 65537).unwrap();
         let expected = license::encode_new_license_request(
             license::PLATFORM_ID_NT_POST_52_MICROSOFT,
             &[0x11; 32],

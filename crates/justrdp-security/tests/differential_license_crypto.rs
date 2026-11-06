@@ -124,7 +124,7 @@ fn rsa_premaster_encryption_matches_independent_known_answers() {
         ),
     ];
     for (modulus_be, expected_hex) in cases {
-        let ours = license_crypto::encrypt_premaster_secret(&PREMASTER, modulus_be, 65537);
+        let ours = license_crypto::encrypt_premaster_secret(&PREMASTER, modulus_be, 65537).unwrap();
         let ours_hex: String = ours.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(ours_hex, expected_hex.replace(char::is_whitespace, ""));
     }

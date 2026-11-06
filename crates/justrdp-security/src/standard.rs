@@ -4,7 +4,7 @@
 //! [`StandardSecurity`] is a value with no socket: bytes in, bytes out. The cipher state advances
 //! on every call, so PDUs must reach the wire in the order they were protected.
 
-use crate::license_crypto::{Rc4, md5, rsa_public_le, salted_hash, sha1};
+use crate::license_crypto::{Rc4, md5, rsa_public_le, salted_hash, sha1, usable_modulus};
 use justrdp_pdu::client_info::{
     MAC_SIGNATURE_SIZE, SEC_AUTODETECT_REQ, SEC_ENCRYPT, SEC_HEARTBEAT, SEC_LICENSE_PKT,
     SEC_REDIRECTION_PKT, SEC_SECURE_CHECKSUM, SEC_TRANSPORT_REQ, encode_basic_security_header,
@@ -17,8 +17,6 @@ use justrdp_pdu::license::RsaPublicKey;
 pub const RANDOM_SIZE: usize = 32;
 /// Packets one key encrypts before it is updated (5.3.7.1).
 const PACKETS_PER_KEY: u32 = 4096;
-/// The longest modulus accepted, in bytes.
-const MAX_MODULUS_SIZE: usize = 512;
 /// `FASTPATH_*_SECURE_CHECKSUM`, as a fast-path header's two flag bits hold it.
 pub const FASTPATH_SECURE_CHECKSUM: u8 = 0x1;
 /// `FASTPATH_*_ENCRYPTED`, as a fast-path header's two flag bits hold it.
@@ -168,7 +166,7 @@ pub fn encrypt_client_random(
     client_random: &ClientRandom,
     key: &RsaPublicKey,
 ) -> Result<Vec<u8>, StandardSecurityError> {
-    if key.modulus.len() > MAX_MODULUS_SIZE || key.modulus.iter().all(|&b| b == 0) {
+    if !usable_modulus(&key.modulus) {
         return Err(StandardSecurityError::InvalidPublicKey);
     }
     let mut out = rsa_public_le(client_random.as_bytes(), &key.modulus, key.exponent);
@@ -624,7 +622,7 @@ mod tests {
     #[test]
     fn an_unusable_public_key_is_refused() {
         let random = ClientRandom::new([1; 32]);
-        for modulus in [vec![], vec![0; 64], vec![0xFF; MAX_MODULUS_SIZE + 1]] {
+        for modulus in [vec![], vec![0; 64], vec![0xFF; 513]] {
             let key = RsaPublicKey {
                 modulus,
                 exponent: u32::MAX,

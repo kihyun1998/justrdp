@@ -27,6 +27,10 @@ decision of its own. That inference has never been written down as a record.
 - The premaster secret and the derived license keys follow `[MS-RDPELE]` 5.1.x
   verbatim; the entropy is host-supplied (`LicenseEntropy`) so the core stays
   deterministic and testable.
+- **A server's modulus is checked before the exponentiation** (`usable_modulus`, #601): with a zero
+  one `BigUint::rem` reduces nothing and `modpow` squares without bound. The same arithmetic with the
+  guard removed ran past 280 s against `u32::MAX` as the exponent. The server supplies both, on the
+  default TLS path too.
 - `BigUint` exists only to do one modular exponentiation — a deliberate refusal to
   pull an RSA crate in for a single operation.
 - **The crypto is a crate of its own** (#597), `justrdp-security`, because a host that relays RDP
@@ -41,7 +45,7 @@ decision of its own. That inference has never been written down as a record.
   `ServerCertificate`, `RsaPublicKey`, `PlatformChallenge`, `NewLicense`,
   `encode_new_license_request`, `encode_platform_challenge_response`, `LicenseError`
 - `justrdp-security/src/license_crypto.rs` — `derive_license_keys`,
-  `encrypt_premaster_secret`, `salted_hash`, `mac_data`, `rc4`, `md5`, `sha1`,
+  `encrypt_premaster_secret`, `usable_modulus`, `salted_hash`, `mac_data`, `rc4`, `md5`, `sha1`,
   `BigUint`, `LicenseKeys`
 - `justrdp-security/src/license_crypto.rs` — `Rc4`, `rsa_public_le`, which
   `justrdp-security/src/standard.rs` builds Standard RDP Security on: `StandardSecurity`,
@@ -103,14 +107,6 @@ with 4.8's private exponent. 26 mutations of the layer each turned a named test 
 - **Under Standard RDP Security licensing goes out unencrypted**, which 5.3.6 allows, and the Security
   Exchange still offers `SEC_LICENSE_ENCRYPT_SC`, so an encrypted server message is read. Only the
   `valid-client` branch was seen (#599).
-- **A zero modulus hangs `encrypt_premaster_secret`.** A server's certificate supplies the modulus
-  and the exponent. With a modulus of zero `BigUint::rem` reduces nothing, so `modpow` squares without
-  bound. The same arithmetic behind `encrypt_client_random`, its guard removed, ran past 280 s against
-  `u32::MAX` as the exponent before the run was killed. `encrypt_client_random` refuses that key;
-  licensing does not, and no test has driven it there (#598).
-- **`encrypt_premaster_secret` can return too few bytes.** `to_bytes_le` trims high zero bytes, so a
-  ciphertext with a zero top byte comes out shorter than its modulus. `rsa_public_le` does not trim.
-  What a server does with a short licensing blob is unmeasured (#598).
 - **The grant path is effectively unexercised.** The test VM has no licensing server,
   so only the "error = proceed" branch is proven end-to-end; New License and Platform
   Challenge rest on the differential test alone. **An RD Session Host takes the request

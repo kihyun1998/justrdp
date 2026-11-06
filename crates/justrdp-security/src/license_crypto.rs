@@ -242,17 +242,28 @@ pub fn mac_data(mac_salt: &[u8; 16], data: &[u8]) -> [u8; 16] {
 /// little-endian modulus when parsing the certificate, per MS-RDPBCGR 2.2.1.4.3.1.1.1. (Do not
 /// oracle this against ironrdp 0.11: it skips that reversal, so its full-path licensing RSA is
 /// spec-incorrect — see the differential test notes.)
+///
+/// The result is `modulus_be.len() + 8` bytes. `None` for a modulus [`usable_modulus`] refuses.
 pub fn encrypt_premaster_secret(
     premaster_secret: &[u8],
     modulus_be: &[u8],
     exponent: u32,
-) -> Vec<u8> {
-    let m = BigUint::from_bytes_le(premaster_secret);
-    let n = BigUint::from_bytes_be(modulus_be);
-    let c = m.modpow(exponent, &n);
-    let mut out = c.to_bytes_le();
+) -> Option<Vec<u8>> {
+    if !usable_modulus(modulus_be) {
+        return None;
+    }
+    let mut out = rsa_public_le(premaster_secret, modulus_be, exponent);
     out.resize(out.len() + 8, 0);
-    out
+    Some(out)
+}
+
+/// The longest modulus accepted, in bytes.
+const MAX_MODULUS_SIZE: usize = 512;
+
+/// Whether a server's modulus can be used: not zero, whose exponentiation would never reduce, and
+/// not past [`MAX_MODULUS_SIZE`].
+pub(crate) fn usable_modulus(modulus_be: &[u8]) -> bool {
+    modulus_be.len() <= MAX_MODULUS_SIZE && modulus_be.iter().any(|&b| b != 0)
 }
 
 /// `data^exponent mod modulus`, with `data` and the result little-endian and the result exactly
@@ -505,7 +516,7 @@ mod tests {
 
     #[test]
     fn encrypted_premaster_carries_proprietary_padding() {
-        let out = encrypt_premaster_secret(&[0x42; 48], &[0xC3; 64], 65537);
+        let out = encrypt_premaster_secret(&[0x42; 48], &[0xC3; 64], 65537).unwrap();
         // Result is at most modulus-sized, plus exactly 8 trailing zero bytes.
         assert!(out.len() <= 64 + 8);
         assert_eq!(&out[out.len() - 8..], &[0; 8]);
@@ -527,5 +538,24 @@ mod tests {
         let mac = mac_data(&salt, b"hello");
         assert_ne!(mac, mac_data(&salt, b"hellp"));
         assert_ne!(mac, mac_data(&[8u8; 16], b"hello"));
+    }
+
+    /// 1^e mod n is 1, whose little-endian form ends in zeros a trimming encoder would drop.
+    #[test]
+    fn the_encrypted_premaster_fills_its_buffer_whatever_its_value() {
+        let modulus = [0xC3; 64];
+        let mut secret = [0u8; 48];
+        secret[0] = 1;
+        let encrypted = encrypt_premaster_secret(&secret, &modulus, 65537).unwrap();
+        assert_eq!(encrypted.len(), 72);
+        assert_eq!(encrypted[0], 1);
+        assert!(encrypted[1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn an_unusable_modulus_is_refused_before_the_exponentiation() {
+        for modulus in [vec![], vec![0; 64], vec![0xFF; MAX_MODULUS_SIZE + 1]] {
+            assert_eq!(encrypt_premaster_secret(&[1; 48], &modulus, u32::MAX), None);
+        }
     }
 }
