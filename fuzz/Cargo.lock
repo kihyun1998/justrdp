@@ -116,6 +116,7 @@ version = "0.1.0"
 dependencies = [
  "justrdp-codecs",
  "justrdp-pdu",
+ "justrdp-security",
  "tracing",
  "x509-cert",
 ]
@@ -139,6 +140,10 @@ dependencies = [
 
 [[package]]
 name = "justrdp-pdu"
+version = "0.1.0"
+
+[[package]]
+name = "justrdp-security"
 version = "0.1.0"
 
 [[package]]

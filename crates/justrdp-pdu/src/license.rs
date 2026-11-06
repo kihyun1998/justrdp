@@ -1,6 +1,6 @@
 //! RDP licensing PDUs (MS-RDPELE) — the gatekeeping exchange between the Client Info PDU and
 //! capability negotiation. Pure (de)serialization: the key derivation / RC4 / RSA arithmetic the
-//! full negotiation needs lives in the `justrdp` core (`license_crypto`), not here.
+//! full negotiation needs lives in `justrdp-security` (`license_crypto`), not here.
 //!
 //! Every licensing message rides in a basic security header carrying `SEC_LICENSE_PKT`
 //! (`client_info::SEC_LICENSE_PKT`), then a 4-byte preamble, then the message body. In the

@@ -212,7 +212,7 @@ pub fn mac_data(mac_salt: &[u8; 16], data: &[u8]) -> [u8; 16] {
 /// Textbook RSA for the premaster secret (MS-RDPELE 5.1.2.1): interpret the secret as a
 /// little-endian integer, raise to the certificate's public exponent mod its modulus, and emit
 /// the result little-endian with 8 trailing zero bytes (the proprietary blob convention,
-/// matching FreeRDP). `modulus_be` is **big-endian** — [`crate::connect`] reverses the wire's
+/// matching FreeRDP). `modulus_be` is **big-endian** — the connect machine in `justrdp` reverses the wire's
 /// little-endian modulus when parsing the certificate, per MS-RDPBCGR 2.2.1.4.3.1.1.1. (Do not
 /// oracle this against ironrdp 0.11: it skips that reversal, so its full-path licensing RSA is
 /// spec-incorrect — see the differential test notes.)

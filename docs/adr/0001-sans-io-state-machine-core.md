@@ -133,6 +133,7 @@ dependency at all; the four crates depend only downward).
 |---|---|---|
 | `crates/justrdp-pdu/src/*.rs` | one file per `[MS-*]` protocol area — bytes↔types only. **Zero external dependencies** | this record + ADR-0002, measured 0 violators |
 | `crates/justrdp-pdu/src/<area>/` | a protocol area that outgrew one file. Module root is **`<area>.rs` beside it**, never `mod.rs` | spelling rule |
+| `crates/justrdp-security/src/*.rs` | the legacy RDP cryptography, for a host that needs it without the session or the codecs. **Zero external dependencies**, no socket and no runtime | a consumer that needs the part alone, the crate-count rule below (#597) |
 | `crates/justrdp-codecs/src/*.rs` | one codec per file — **pixel and sample math only**. Depends on `justrdp-pdu` and nothing else | ADR-0003 / ADR-0007, measured |
 | `crates/justrdp-codecs/src/<codec>/` | a codec that outgrew one file | spelling rule |
 | `crates/justrdp/src/*.rs` | the sans-IO state machines and the host-facing output types. **No `tokio`, no `rustls`, no `sspi`** | this record; measured: `x509-cert` + `tracing` only |

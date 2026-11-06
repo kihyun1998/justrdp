@@ -6,13 +6,13 @@
 //! (Synchronize / Control / Font List ↔ Font Map) → `session-active`.
 
 use crate::advertise::ConnectConfigError;
-use crate::license_crypto;
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::client_info;
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::gcc::{ClientGccBlocks, ClientNetworkData, ServerEarlyCapabilityFlags};
 use justrdp_pdu::nego::{NegFailureCode, NegRequest, NegResponse, SecurityProtocol};
 use justrdp_pdu::{finalization, gcc, license, mcs, share, tpkt, x224};
+use justrdp_security::license_crypto;
 
 /// Everything the connect sequence needs from the caller, fixed at construction. The GCC fields
 /// — most critically `core.early_capability_flags`, the EGFX gate (ADR-0017) — reach the wire

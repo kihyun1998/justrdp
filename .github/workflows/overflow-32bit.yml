@@ -35,6 +35,7 @@ on:
   pull_request:
     paths:
       - "crates/justrdp-codecs/**"
+      - "crates/justrdp-security/**"
       - "crates/justrdp/**"
       - "crates/justrdp-pdu/**"
       - "rust-toolchain.toml"
@@ -43,6 +44,7 @@ on:
     branches: [master]
     paths:
       - "crates/justrdp-codecs/**"
+      - "crates/justrdp-security/**"
       - "crates/justrdp/**"
       - "crates/justrdp-pdu/**"
       - "rust-toolchain.toml"
@@ -80,4 +82,4 @@ jobs:
       # Not `--workspace`: that would pull in justrdp-tokio, whose tests need the VM. Not
       # `-p justrdp-codecs` alone either — see the scope note in the header.
       - name: Test on 32-bit
-        run: cargo test -p justrdp-codecs -p justrdp --target i686-pc-windows-msvc
+        run: cargo test -p justrdp-codecs -p justrdp-security -p justrdp --target i686-pc-windows-msvc

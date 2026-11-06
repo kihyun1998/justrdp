@@ -1,12 +1,12 @@
 //! Differential oracle for the hand-rolled licensing crypto (ADR-0001): the same inputs run
-//! through `justrdp::license_crypto` and through ironrdp's
+//! through `justrdp_security::license_crypto` and through ironrdp's
 //! `ClientNewLicenseRequest::from_server_license_request` (which performs the identical
 //! MS-RDPELE 5.1.3 derivation and 5.1.2 RSA encryption internally) must produce identical
 //! session keys and identical encrypted premaster bytes.
 
-use justrdp::license_crypto;
 use justrdp_pdu::client_info;
 use justrdp_pdu::license;
+use justrdp_security::license_crypto;
 
 use ironrdp_pdu::decode as ironrdp_decode;
 use ironrdp_pdu::rdp::server_license as iron_license;

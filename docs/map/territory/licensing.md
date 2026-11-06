@@ -28,14 +28,19 @@ decision of its own. That inference has never been written down as a record.
   verbatim; the entropy is host-supplied (`LicenseEntropy`) so the core stays
   deterministic and testable.
 - `BigUint` exists only to do one modular exponentiation — a deliberate refusal to
-  pull an RSA crate into the core for a single operation.
+  pull an RSA crate in for a single operation.
+- **The crypto is a crate of its own** (#597), `justrdp-security`, because a host that relays RDP
+  needs it without the session or the codecs, and `justrdp` depends on `justrdp-codecs`
+  unconditionally. That is the ADR-0001 crate-count rule's "a consumer that needs the part alone".
+  An outside crate depending on it by path has only `justrdp-security` in its `cargo tree`
+  (measured 2026-11-06).
 
 ## Code
 
 - `justrdp-pdu/src/license.rs` — `LicensePreamble`, `ServerLicenseRequest`,
   `ServerCertificate`, `RsaPublicKey`, `PlatformChallenge`, `NewLicense`,
   `encode_new_license_request`, `encode_platform_challenge_response`, `LicenseError`
-- `justrdp/src/license_crypto.rs` — `derive_license_keys`,
+- `justrdp-security/src/license_crypto.rs` — `derive_license_keys`,
   `encrypt_premaster_secret`, `salted_hash`, `mac_data`, `rc4`, `md5`, `sha1`,
   `BigUint`, `LicenseKeys`
 - `justrdp/src/connect.rs` — `LicenseConfig`, `LicenseEntropy`

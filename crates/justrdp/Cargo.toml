@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 justrdp-pdu.workspace = true
+# The legacy cryptography licensing and auto-reconnect need.
+justrdp-security.workspace = true
 # The legacy graphics codecs (slice-6): the session machine decodes bitmap rectangles
 # through this crate's pure decode API (ADR-0003).
 justrdp-codecs.workspace = true

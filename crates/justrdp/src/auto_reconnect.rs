@@ -2,9 +2,9 @@
 //! client sends in the Client Info PDU, derived from the `ARC_SC_PRIVATE_PACKET` a previous
 //! session's Save Session Info carried (issue #306).
 
-use crate::license_crypto::md5;
 use justrdp_pdu::client_info::ClientAutoReconnect;
 use justrdp_pdu::session_info::ServerAutoReconnect;
+use justrdp_security::license_crypto::md5;
 
 /// The MD5 block size, in bytes.
 const BLOCK: usize = 64;
