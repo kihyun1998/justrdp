@@ -674,9 +674,9 @@ pub struct SessionStateMachine {
     drdynvc: Drdynvc,
     /// Chunk reassembly for each host static channel, keyed by MCS channel ID.
     channels: Vec<(u16, crate::svc::Reassembler)>,
-    /// Outbound virtual channel frames held while the server has suspended virtual channel
+    /// Outbound virtual channel chunks and their channels, unprotected, held while the server has suspended virtual channel
     /// traffic (`CHANNEL_FLAG_SUSPEND`); `None` while it flows.
-    suspended: Option<Vec<Vec<u8>>>,
+    suspended: Option<Vec<(u16, Vec<u8>)>>,
     /// Bytes of host messages among the held frames.
     held_bytes: usize,
     /// The Surface Commands `cmdFlags` the Confirm Active advertised.
@@ -805,13 +805,31 @@ impl SessionStateMachine {
         &self.framebuffer
     }
 
-    /// Feed raw socket bytes (any chunking); returns the outputs they produced, in order.
-    /// The stream interleaves TPKT frames (slow-path) and fast-path PDUs; the first byte
-    /// disambiguates (TPKT's version byte is `0x03`, a fast-path header has `action == 0`).
+    /// The security layer's counts ([`StandardSecurity::packet_counts`]), under Standard RDP
+    /// Security.
     ///
-    /// A call starts no further PDU, fast-path section or drawing order once it has bought one
-    /// update's paint budget, and keeps the rest; [`Self::has_pending_input`] then says so, and
-    /// a call with no bytes continues.
+    /// [`StandardSecurity::packet_counts`]: justrdp_security::standard::StandardSecurity::packet_counts
+    pub fn standard_security_packet_counts(&self) -> Option<(u32, u32)> {
+        self.security.as_ref().map(|s| s.packet_counts())
+    }
+
+    /// A fast-path input PDU under the security layer: its flags in the header, `dataSignature`
+    /// after the length fields, and what followed them encrypted (`[MS-RDPBCGR]` 2.2.8.1.2).
+    fn protect_fastpath_input(&mut self, frame: Vec<u8>) -> Vec<u8> {
+        let Some(security) = self.security.as_mut() else {
+            return frame;
+        };
+        let body_at = if frame[1] & 0x80 != 0 { 3 } else { 2 };
+        let protected = security.protect_fast_path(&frame[body_at..]);
+        let total = 3 + protected.body.len();
+        let mut out = Vec::with_capacity(total);
+        out.push(frame[0] | protected.header_flags << 6);
+        out.push(0x80 | (total >> 8) as u8);
+        out.push(total as u8);
+        out.extend_from_slice(&protected.body);
+        out
+    }
+
     /// Continue Standard RDP Security from the connect machine
     /// ([`ConnectStateMachine::take_standard_security`](crate::ConnectStateMachine::take_standard_security)).
     /// Every frame this machine returns then advances the cipher, so frames must reach the socket
@@ -824,6 +842,13 @@ impl SessionStateMachine {
         self
     }
 
+    /// Feed raw socket bytes (any chunking); returns the outputs they produced, in order.
+    /// The stream interleaves TPKT frames (slow-path) and fast-path PDUs; the first byte
+    /// disambiguates (TPKT's version byte is `0x03`, a fast-path header has `action == 0`).
+    ///
+    /// A call starts no further PDU, fast-path section or drawing order once it has bought one
+    /// update's paint budget, and keeps the rest; [`Self::has_pending_input`] then says so, and
+    /// a call with no bytes continues.
     pub fn process_bytes(&mut self, bytes: &[u8]) -> Result<Vec<SessionOutput>, SessionError> {
         self.inbox.extend_from_slice(bytes);
         self.call_spent = 0;
@@ -1864,12 +1889,12 @@ impl SessionStateMachine {
         let fastpath_input = self.config.server.input_flags
             & (capability::INPUT_FLAG_FASTPATH_INPUT | capability::INPUT_FLAG_FASTPATH_INPUT2)
             != 0;
-        if fastpath_input && self.security.is_none() {
+        if fastpath_input {
             // 255 events is the numEvents field bound; at ≤7 wire bytes per event a full
             // chunk stays far below the 0x7FFF length-field ceiling.
             events
                 .chunks(255)
-                .map(input::encode_fastpath_input)
+                .map(|chunk| self.protect_fastpath_input(input::encode_fastpath_input(chunk)))
                 .collect()
         } else {
             events
@@ -1957,20 +1982,31 @@ impl SessionStateMachine {
             && let Some(held) = self.suspended.take()
         {
             tracing::debug!(target: "rdp_svc", frames = held.len(), "virtual channel traffic resumed");
-            outputs.extend(held.into_iter().map(SessionOutput::WriteBytes));
+            for (channel, chunk) in held {
+                outputs.push(SessionOutput::WriteBytes(
+                    self.wrap_channel(channel, &chunk),
+                ));
+            }
             self.held_bytes = 0;
         }
     }
 
-    /// `frames` to write now, or none while suspended (they are held for the resume).
-    fn unless_suspended(&mut self, frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-        match &mut self.suspended {
-            Some(held) => {
-                held.extend(frames);
-                Vec::new()
-            }
-            None => frames,
+    /// The frames carrying `chunks` on `channel` to write now, or none while suspended. Held
+    /// chunks are protected at their release: the cipher advances in the order frames reach the
+    /// socket, and other traffic flows meanwhile.
+    fn unless_suspended(
+        &mut self,
+        channel: u16,
+        chunks: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Vec<Vec<u8>> {
+        if let Some(held) = &mut self.suspended {
+            held.extend(chunks.into_iter().map(|chunk| (channel, chunk)));
+            return Vec::new();
         }
+        chunks
+            .into_iter()
+            .map(|chunk| self.wrap_channel(channel, &chunk))
+            .collect()
     }
 
     /// Consume one MCS-delivered payload on the drdynvc static channel: SVC reassembly →
@@ -2012,12 +2048,8 @@ impl SessionStateMachine {
         for event in events {
             match event {
                 DvcEvent::Send(pdu) => {
-                    let frames: Vec<Vec<u8>> = svc::encode_chunks(&pdu)
-                        .iter()
-                        .map(|chunk| self.wrap_channel(mcs_channel_id, chunk))
-                        .collect();
                     outputs.extend(
-                        self.unless_suspended(frames)
+                        self.unless_suspended(mcs_channel_id, svc::encode_chunks(&pdu))
                             .into_iter()
                             .map(SessionOutput::WriteBytes),
                     );
@@ -2313,13 +2345,11 @@ impl SessionStateMachine {
             orientation: request.orientation.degrees(),
             ..displaycontrol::Monitor::primary(width, height)
         }]);
-        let mut frames = Vec::new();
-        for pdu in dvc::encode_data(channel_id, &layout) {
-            for chunk in svc::encode_chunks(&pdu) {
-                frames.push(self.wrap_channel(drdynvc_id, &chunk));
-            }
-        }
-        Ok(self.unless_suspended(frames))
+        let chunks = dvc::encode_data(channel_id, &layout)
+            .iter()
+            .flat_map(|pdu| svc::encode_chunks(pdu))
+            .collect::<Vec<_>>();
+        Ok(self.unless_suspended(drdynvc_id, chunks))
     }
 
     /// Encode `message` for the host static channel `channel`: split into chunks
@@ -2352,11 +2382,7 @@ impl SessionStateMachine {
         } else {
             svc::encode_chunks(message)
         };
-        let frames = chunks
-            .iter()
-            .map(|chunk| self.wrap_channel(channel, chunk))
-            .collect();
-        Ok(self.unless_suspended(frames))
+        Ok(self.unless_suspended(channel, chunks))
     }
 
     /// Encode `message` for the host dynamic channel `channel` (ADR-0018): drdynvc data
@@ -2397,12 +2423,11 @@ impl SessionStateMachine {
         let Some(drdynvc_id) = self.config.drdynvc_channel_id else {
             return Vec::new();
         };
-        let frames = pdus
+        let chunks = pdus
             .iter()
             .flat_map(|pdu| svc::encode_chunks(pdu))
-            .map(|chunk| self.wrap_channel(drdynvc_id, &chunk))
-            .collect();
-        self.unless_suspended(frames)
+            .collect::<Vec<_>>();
+        self.unless_suspended(drdynvc_id, chunks)
     }
 
     /// Wrap a channel payload into a complete outbound frame on `channel_id`.
@@ -7541,5 +7566,119 @@ mod tests {
             .unwrap()
             .request_shutdown();
         assert_eq!(pdu.payload, client_user_data(&plain[0]));
+    }
+
+    /// `[MS-RDPBCGR]` 2.2.8.1.2: the same events, encrypted after a `dataSignature`, with the flags
+    /// in the header and the header's `numEvents` kept.
+    #[test]
+    fn fast_path_input_is_protected() {
+        let mut cfg = config();
+        cfg.server.input_flags = capability::INPUT_FLAG_FASTPATH_INPUT;
+        let (client, mut server) = standard_pair();
+        let mut sm = SessionStateMachine::new(cfg.clone(), Vec::new())
+            .unwrap()
+            .with_standard_security(Some(client));
+        let mut plain_sm = SessionStateMachine::new(cfg, Vec::new()).unwrap();
+        for events in [key_press(), key_press().repeat(20), key_press().repeat(100)] {
+            let frames = sm.encode_input(&events);
+            assert_eq!(frames.len(), 1);
+            let plain = &plain_sm.encode_input(&events)[0];
+            let (flags, body) = fastpath::split_protected(&frames[0]).unwrap();
+            assert_eq!(flags, 2, "FASTPATH_INPUT_ENCRYPTED");
+            assert_eq!(
+                frames[0][0] & 0x3F,
+                plain[0],
+                "the action and numEvents are kept"
+            );
+            assert_eq!(
+                fastpath::frame_len_under_standard_security(&frames[0]),
+                Ok(frames[0].len())
+            );
+            let (_, plain_body) = fastpath::split_protected(plain).unwrap();
+            assert_eq!(server.unprotect_fast_path(flags, body).unwrap(), plain_body);
+        }
+        assert_eq!(sm.standard_security_packet_counts(), Some((3, 0)));
+    }
+
+    #[test]
+    fn slow_path_input_is_protected() {
+        let mut cfg = config();
+        cfg.server.input_flags = 0;
+        let (client, mut server) = standard_pair();
+        let mut sm = SessionStateMachine::new(cfg.clone(), Vec::new())
+            .unwrap()
+            .with_standard_security(Some(client));
+        let frames = sm.encode_input(&key_press());
+        assert_eq!(frames.len(), 1);
+        let pdu = server
+            .unprotect_slow_path(&client_user_data(&frames[0]))
+            .unwrap();
+        let plain = SessionStateMachine::new(cfg, Vec::new())
+            .unwrap()
+            .encode_input(&key_press());
+        assert_eq!(pdu.payload, client_user_data(&plain[0]));
+    }
+
+    /// Static channel data decrypts before the channel sees it, and a host's message goes out
+    /// protected.
+    #[test]
+    fn a_static_channel_carries_protected_data_both_ways() {
+        let mut cfg = config();
+        cfg.static_channels = vec![crate::StaticChannel {
+            name: "cliprdr".to_string(),
+            id: 1009,
+            options: 0,
+        }];
+        let (client, mut server) = standard_pair();
+        let mut sm = SessionStateMachine::new(cfg.clone(), Vec::new())
+            .unwrap()
+            .with_standard_security(Some(client));
+        let chunk = svc::encode_chunks(b"to the host");
+        let frame = server_channel_frame(1009, &server.protect_slow_path(0, &chunk[0]));
+        let outputs = sm.process_bytes(&frame).unwrap();
+        assert!(
+            matches!(
+                outputs.as_slice(),
+                [SessionOutput::ChannelData { channel: 1009, data }] if data == b"to the host"
+            ),
+            "{outputs:?}"
+        );
+
+        let frames = sm.send_channel(1009, b"to the server").unwrap();
+        assert_eq!(frames.len(), 1);
+        let pdu = server
+            .unprotect_slow_path(&client_user_data(&frames[0]))
+            .unwrap();
+        assert_eq!(pdu.payload, svc::encode_chunks(b"to the server")[0]);
+    }
+
+    /// A held chunk takes its keystream when it goes out, so traffic that was not held can pass it.
+    #[test]
+    fn a_channel_message_held_while_suspended_is_protected_at_its_release() {
+        let (client, mut server) = standard_pair();
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .unwrap()
+            .with_standard_security(Some(client));
+        let flag = |server: &mut justrdp_security::standard::StandardSecurity, flag| {
+            server_channel_frame(CLIPRDR, &server.protect_slow_path(0, &flag_chunk(flag)))
+        };
+        let suspend = flag(&mut server, crate::svc::CHANNEL_FLAG_SUSPEND);
+        sm.process_bytes(&suspend).unwrap();
+        assert!(sm.send_channel(CLIPRDR, b"held").unwrap().is_empty());
+
+        let shutdown = sm.request_shutdown();
+        server
+            .unprotect_slow_path(&client_user_data(&shutdown[0]))
+            .expect("what passed the held chunk decrypts");
+
+        let resume = flag(&mut server, crate::svc::CHANNEL_FLAG_RESUME);
+        let outputs = sm.process_bytes(&resume).unwrap();
+        let [SessionOutput::WriteBytes(released)] = outputs.as_slice() else {
+            panic!("{outputs:?}");
+        };
+        let pdu = server
+            .unprotect_slow_path(&client_user_data(released))
+            .expect("the held chunk decrypts after it");
+        assert_eq!(pdu.payload, svc::encode_chunks(b"held")[0]);
     }
 }

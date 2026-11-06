@@ -491,7 +491,8 @@ in-session query.
 
 ## Standard RDP Security needs a reconfigured server
 
-`a_server_that_accepts_only_standard_security_paints_its_logon_screen` (#599) reads its server from
+`a_server_that_accepts_only_standard_security_paints_its_logon_screen` (#599) and
+`a_standard_security_session_logs_on_uses_a_channel_and_outlives_key_updates` (#600) read their server from
 `JUSTRDP_STANDARD_SECURITY_SERVER` (`host:port`). On the WS2019 VM the registry values under
 `HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp` are `SecurityLayer=2`,
 `UserAuthentication=1`, `MinEncryptionLevel=2` normally; the test wants the first two at 0, and every

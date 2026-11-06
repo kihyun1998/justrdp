@@ -35,7 +35,8 @@ got `enhanced RDP security not allowed by server`.
 4. **An unencrypted PDU is refused at a level where the server must encrypt**, except the four whose
    own sections allow it at any level: licensing (2.2.1.12), Auto-Detect Request (2.2.14.3), Initiate
    Multitransport Request (2.2.15.1) and Heartbeat (2.2.16.1). The layer reads this from the flags,
-   whatever the phase, so an attacker can still inject those four. FreeRDP accepts whatever the flag
+   whatever the phase, so an attacker can still inject those four; the connect machine reads a
+   licensing PDU only while licensing runs, and ignores the other three. FreeRDP accepts whatever the flag
    says, for every PDU.
 5. **The core exposes the server certificate to the host and does not verify its signature.** Trust
    is the host's (ADR-0005), and it cannot judge what it cannot see. The signature proves nothing: the

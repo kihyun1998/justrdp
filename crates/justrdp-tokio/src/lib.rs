@@ -13215,6 +13215,262 @@ mod tests {
         .await
     }
 
+    /// A session under Standard RDP Security that a person could use (#600): a password typed at
+    /// the logon screen logs on, the clipboard channel answers both ways, and both directions
+    /// run past a key update with every MAC checked. It signs out when it ends. The server is
+    /// `JUSTRDP_STANDARD_SECURITY_SERVER`, `host:port`, and the account `JUSTRDP_TEST_*`.
+    #[tokio::test]
+    #[ignore = "requires a server accepting only Standard RDP Security, named by \
+                JUSTRDP_STANDARD_SECURITY_SERVER, and JUSTRDP_TEST_* env vars"]
+    async fn a_standard_security_session_logs_on_uses_a_channel_and_outlives_key_updates() {
+        use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
+
+        struct Session {
+            machine: SessionStateMachine,
+            stream: SessionStream,
+            channel: u16,
+            clipboard: Clipboard,
+            logged_on: bool,
+            list_answered: bool,
+            frames: usize,
+        }
+
+        impl Session {
+            async fn write(&mut self, frames: Vec<Vec<u8>>) {
+                for frame in frames {
+                    write_frame(&mut self.stream, &frame).await.unwrap();
+                }
+            }
+
+            async fn send(&mut self, events: &[InputEvent]) {
+                let frames = self.machine.encode_input(events);
+                self.write(frames).await;
+            }
+
+            /// Read and answer until `most` has passed. `false` when the server closed.
+            async fn pump(&mut self, most: Duration) -> bool {
+                let end = tokio::time::Instant::now() + most;
+                let mut buf = [0u8; 16 * 1024];
+                loop {
+                    // A stream that is always readable never lets the timeout fire.
+                    if tokio::time::Instant::now() >= end {
+                        return true;
+                    }
+                    let read = tokio::time::timeout_at(end, self.stream.read(&mut buf)).await;
+                    let Ok(read) = read else { return true };
+                    let n = match read {
+                        Ok(0) | Err(_) => return false,
+                        Ok(n) => n,
+                    };
+                    let outputs = self.machine.process_bytes(&buf[..n]).unwrap();
+                    self.handle(outputs).await;
+                    while self.machine.has_pending_input() {
+                        let outputs = self.machine.process_bytes(&[]).unwrap();
+                        self.handle(outputs).await;
+                    }
+                }
+            }
+
+            async fn handle(&mut self, outputs: Vec<SessionOutput>) {
+                for output in outputs {
+                    match output {
+                        SessionOutput::WriteBytes(bytes) => self.write(vec![bytes]).await,
+                        SessionOutput::Frame(_) => self.frames += 1,
+                        SessionOutput::SaveSessionInfo(_) => self.logged_on = true,
+                        SessionOutput::ChannelData { channel, data } => {
+                            assert_eq!(channel, self.channel, "only cliprdr was requested");
+                            for output in self.clipboard.process(&data).unwrap() {
+                                match output {
+                                    ClipboardOutput::Send(message) => {
+                                        let frames =
+                                            self.machine.send_channel(channel, &message).unwrap();
+                                        self.write(frames).await;
+                                    }
+                                    ClipboardOutput::FormatListResponse { ok } => {
+                                        assert!(ok, "the server accepted the Format List");
+                                        self.list_answered = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            async fn click(&mut self, x: u16, y: u16) {
+                use justrdp_pdu::input::{PTRFLAGS_BUTTON1, PTRFLAGS_DOWN, PTRFLAGS_MOVE};
+                for flags in [
+                    PTRFLAGS_MOVE,
+                    PTRFLAGS_DOWN | PTRFLAGS_BUTTON1,
+                    PTRFLAGS_BUTTON1,
+                ] {
+                    self.send(&[InputEvent::Mouse {
+                        flags,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    }])
+                    .await;
+                }
+            }
+
+            async fn type_text(&mut self, text: &str) {
+                for unit in text.encode_utf16() {
+                    self.send(&[
+                        InputEvent::Unicode {
+                            code_unit: unit,
+                            release: false,
+                        },
+                        InputEvent::Unicode {
+                            code_unit: unit,
+                            release: true,
+                        },
+                    ])
+                    .await;
+                    self.pump(Duration::from_millis(15)).await;
+                }
+            }
+
+            async fn enter(&mut self) {
+                self.pump(Duration::from_secs(3)).await;
+                self.send(&tap(0x0D)).await;
+            }
+        }
+
+        let addr: SocketAddr = std::env::var("JUSTRDP_STANDARD_SECURITY_SERVER")
+            .expect("JUSTRDP_STANDARD_SECURITY_SERVER names the server")
+            .parse()
+            .expect("JUSTRDP_STANDARD_SECURITY_SERVER is host:port");
+        let password = std::env::var("JUSTRDP_TEST_PASSWORD").expect("JUSTRDP_TEST_PASSWORD");
+
+        let mut config = legacy_graphics_config();
+        config.requested = SecurityProtocol::from_bits(0);
+        config.security.encryption_methods = 0x01 | 0x02 | 0x08;
+        config.standard_security = Some(generate_client_random().unwrap());
+        config.channels = vec![cliprdr::channel_def()];
+        let capabilities = config.capabilities.clone();
+        let mut outcome = connect_danger(addr, config, test_credentials(), |_| {})
+            .await
+            .unwrap();
+        let security = outcome.standard_security.take();
+        let channel = outcome.mcs.static_channels[0].id;
+        let server =
+            justrdp::ServerAnnouncement::from_capabilities(&outcome.activation.server_capabilities);
+        assert_ne!(
+            server.input_flags
+                & (justrdp_pdu::capability::INPUT_FLAG_FASTPATH_INPUT
+                    | justrdp_pdu::capability::INPUT_FLAG_FASTPATH_INPUT2),
+            0,
+            "the input below goes fast-path"
+        );
+        let machine = SessionStateMachine::new(
+            session_config_from(&outcome, capabilities),
+            outcome.activation.leftover.clone(),
+        )
+        .unwrap()
+        .with_standard_security(security);
+        let (width, height) = outcome.activation.desktop_size;
+        let mut session = Session {
+            machine,
+            stream: outcome.stream,
+            channel,
+            clipboard: Clipboard::without_file_transfer(),
+            logged_on: false,
+            list_answered: false,
+            frames: 0,
+        };
+
+        // The logon screen holds the user name from Client Info; the password goes by input.
+        let leftover = session.machine.process_bytes(&[]).unwrap();
+        session.handle(leftover).await;
+        session.pump(Duration::from_secs(6)).await;
+        assert!(session.frames > 0, "the logon screen painted");
+        session
+            .click(width / 2, (u32::from(height) * 535 / 800) as u16)
+            .await;
+        session.pump(Duration::from_secs(1)).await;
+        session.type_text(&password).await;
+        session.enter().await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        while !(session.logged_on && session.list_answered) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "logged on {}, Format List answered {}",
+                session.logged_on,
+                session.list_answered
+            );
+            assert!(
+                session.pump(Duration::from_secs(1)).await,
+                "the server closed"
+            );
+        }
+
+        // A console scrolling a long listing, and the pointer sweeping, past both key updates.
+        session.pump(Duration::from_secs(15)).await;
+        session.send(&tap(0x1B)).await;
+        session.pump(Duration::from_secs(2)).await;
+        session.click(24, height - 20).await;
+        session.pump(Duration::from_secs(3)).await;
+        session.type_text("powershell").await;
+        session.enter().await;
+        session.pump(Duration::from_secs(6)).await;
+        session
+            .type_text("while ($true) { dir -r C:\\Windows\\System32 }")
+            .await;
+        session.enter().await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(420);
+        let mut sweep = 0u16;
+        loop {
+            let (sent, received) = session.machine.standard_security_packet_counts().unwrap();
+            if sent > 4200 && received > 4200 {
+                eprintln!("#600: {sent} sent, {received} received");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{sent} sent, {received} received"
+            );
+            for _ in 0..100 {
+                sweep = (sweep + 7) % (width / 2);
+                session
+                    .send(&[InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                        wheel_units: 0,
+                        x: width / 2 + sweep,
+                        y: 40,
+                    }])
+                    .await;
+            }
+            assert!(
+                session.pump(Duration::from_millis(100)).await,
+                "the server closed: a MAC it could not verify would look like this"
+            );
+        }
+        eprintln!(
+            "#600: {} frames, dump {}",
+            session.frames,
+            dump_ppm(session.machine.framebuffer(), "justrdp-600-session.ppm").display()
+        );
+
+        // Ctrl+C, then sign out, so the next session starts clean.
+        let ctrl = justrdp::input::scancode_from_windows_vk(0x11).unwrap();
+        let c = justrdp::input::scancode_from_windows_vk(0x43).unwrap();
+        session
+            .send(&[ctrl.press(), c.press(), c.release(), ctrl.release()])
+            .await;
+        session.pump(Duration::from_secs(5)).await;
+        session.type_text("shutdown /l /f").await;
+        session.enter().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        while session.pump(Duration::from_secs(2)).await {
+            assert!(tokio::time::Instant::now() < deadline, "did not sign out");
+        }
+    }
+
     /// `[MS-RDPBCGR]` 5.3.2.1: a server with no method to select closes the connection, which the
     /// WS2019 VM did at FIPS level with a reset (#599). A close here is reported as its refusal.
     #[tokio::test]

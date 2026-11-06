@@ -109,6 +109,12 @@ records the id is not observed: nothing here reads its event log.
 | 3 High | method 2, level 3 | logon screen, 1121 frames |
 | 4 FIPS | none | connection reset after the Connect-Initial |
 
+At level 2 a session is usable (#600): a password typed fast-path at the logon screen logs on, the
+clipboard channel answers a Format List, and a console and pointer sweep reach 4284 PDUs sent and
+6152 received, past a key update each way, with no MAC failure on either side. An earlier run reached
+221,422 received. Whether Salted MAC appeared is not recorded: the default capabilities do not
+advertise it.
+
 With FIPS offered too at level 4, the server selects it and the core refuses it by value. 40 and 56
 bits were never selected, so they rest on the FreeRDP vectors alone. With `SecurityLayer=2` the same
 request is answered `HYBRID_REQUIRED_BY_SERVER`. One server.

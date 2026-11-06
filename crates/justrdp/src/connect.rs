@@ -980,6 +980,16 @@ impl ConnectStateMachine {
             );
             return Ok(Inbound::Ignored);
         }
+        // Licensing may stay in the clear, and only while licensing runs: past it, those bytes
+        // carry no MAC and must not read as share data.
+        if !keep_header && pdu.flags & client_info::SEC_LICENSE_PKT != 0 {
+            tracing::debug!(
+                target: "rdp_standard_security",
+                flags = pdu.flags,
+                "licensing PDU after licensing ignored"
+            );
+            return Ok(Inbound::Ignored);
+        }
         if keep_header {
             let mut out = Vec::with_capacity(4 + pdu.payload.len());
             client_info::encode_basic_security_header(&mut out, pdu.flags);
@@ -4060,20 +4070,23 @@ pub(crate) mod tests {
         }
     }
 
+    /// Licensing may stay in the clear while it runs. Past it, a PDU flagged as licensing carries
+    /// no MAC, so a forged Demand Active wearing the flag is not read.
     #[test]
-    fn a_licensing_pdu_in_the_clear_is_read_under_standard_security() {
+    fn a_clear_licensing_pdu_is_read_only_while_licensing_runs() {
         let (mut sm, _) = standard_joined();
         let actions = sm.process(Event::Received(&server_io_frame(&license_alert(
             license::STATUS_VALID_CLIENT,
         ))));
         assert!(actions.is_empty(), "{actions:?}");
+
+        let mut forged = Vec::new();
+        client_info::encode_basic_security_header(&mut forged, client_info::SEC_LICENSE_PKT);
+        forged.extend_from_slice(&server_demand_active(1920, 1080));
+        let actions = sm.process(Event::Received(&server_io_frame(&forged)));
         assert!(
-            sm.process(Event::Received(&server_io_frame(&license_alert(
-                license::STATUS_VALID_CLIENT
-            ))))
-            .iter()
-            .any(|a| matches!(a, Action::FailWith(_))),
-            "licensing is over, and an unencrypted PDU now has to be encrypted"
+            actions.is_empty(),
+            "no Confirm Active answers it: {actions:?}"
         );
     }
 

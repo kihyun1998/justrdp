@@ -322,6 +322,12 @@ impl StandardSecurity {
         self.salted_mac = salted;
     }
 
+    /// How many PDUs this connection has protected and unprotected so far, in that order. Every
+    /// 4,096 in a direction, that direction's key updates (5.3.7.1).
+    pub fn packet_counts(&self) -> (u32, u32) {
+        (self.outbound.total, self.inbound.total)
+    }
+
     /// This connection's other end, for a test that scripts a server.
     #[cfg(any(test, feature = "test-peer"))]
     pub fn into_server_peer(mut self) -> Self {
