@@ -229,6 +229,7 @@ pub struct StandardSecurity {
     method: EncryptionMethod,
     level: EncryptionLevel,
     mac_key: [u8; 16],
+    salted_mac: bool,
     outbound: Cipher,
     inbound: Cipher,
 }
@@ -307,9 +308,25 @@ impl StandardSecurity {
             method,
             level,
             mac_key,
+            salted_mac: false,
             outbound: Cipher::new(method, encrypt),
             inbound: Cipher::new(method, decrypt),
         })
+    }
+
+    /// Whether [`protect_slow_path`](Self::protect_slow_path) and
+    /// [`protect_fast_path`](Self::protect_fast_path) salt their MAC. Set once both sides have
+    /// advertised `ENC_SALTED_CHECKSUM` in the General Capability Set (5.3.6.1.1). Inbound, each
+    /// PDU's own flags decide.
+    pub fn set_salted_mac(&mut self, salted: bool) {
+        self.salted_mac = salted;
+    }
+
+    /// This connection's other end, for a test that scripts a server.
+    #[cfg(any(test, feature = "test-peer"))]
+    pub fn into_server_peer(mut self) -> Self {
+        core::mem::swap(&mut self.outbound, &mut self.inbound);
+        self
     }
 
     /// The MAC of `plain` (5.3.6.1), salted with `count` when given (5.3.6.1.1).
@@ -324,9 +341,7 @@ impl StandardSecurity {
         out
     }
 
-    /// Sign and encrypt one PDU's data, returning the signature and the ciphertext. `salted` is
-    /// set once both sides have advertised `ENC_SALTED_CHECKSUM` in the General Capability Set
-    /// (5.3.6.1.1).
+    /// Sign and encrypt one PDU's data, returning the signature and the ciphertext.
     pub fn protect(&mut self, plain: &[u8], salted: bool) -> ([u8; MAC_SIGNATURE_SIZE], Vec<u8>) {
         let count = salted.then_some(self.outbound.total);
         let signature = self.signature(plain, count);
@@ -354,7 +369,8 @@ impl StandardSecurity {
 
     /// A slow-path PDU's data: a non-FIPS security header carrying `flags` and [`SEC_ENCRYPT`],
     /// then the encrypted `plain`.
-    pub fn protect_slow_path(&mut self, flags: u16, plain: &[u8], salted: bool) -> Vec<u8> {
+    pub fn protect_slow_path(&mut self, flags: u16, plain: &[u8]) -> Vec<u8> {
+        let salted = self.salted_mac;
         let (signature, ciphertext) = self.protect(plain, salted);
         let checksum = if salted { SEC_SECURE_CHECKSUM } else { 0 };
         let mut out = Vec::with_capacity(4 + MAC_SIGNATURE_SIZE + ciphertext.len());
@@ -390,7 +406,8 @@ impl StandardSecurity {
     }
 
     /// Sign and encrypt a fast-path PDU's data, input or output alike (2.2.8.1.2, 2.2.9.1.2).
-    pub fn protect_fast_path(&mut self, plain: &[u8], salted: bool) -> FastPathBody {
+    pub fn protect_fast_path(&mut self, plain: &[u8]) -> FastPathBody {
+        let salted = self.salted_mac;
         let (signature, ciphertext) = self.protect(plain, salted);
         let mut body = signature.to_vec();
         body.extend_from_slice(&ciphertext);
@@ -475,9 +492,7 @@ mod tests {
 
     /// The server's side of `client`, built by swapping its ciphers.
     fn server_of(method: EncryptionMethod) -> StandardSecurity {
-        let mut peer = client(method);
-        core::mem::swap(&mut peer.outbound, &mut peer.inbound);
-        peer
+        client(method).into_server_peer()
     }
 
     /// Packet `i` of the fixture's traffic.
@@ -683,7 +698,7 @@ mod tests {
             Err(StandardSecurityError::MacMismatch)
         );
 
-        let mut slow = server_of(method).protect_slow_path(0, b"hello", false);
+        let mut slow = server_of(method).protect_slow_path(0, b"hello");
         slow[4] ^= 1;
         assert_eq!(
             client(method).unprotect_slow_path(&slow),
@@ -707,7 +722,8 @@ mod tests {
         let method = EncryptionMethod::Rc4Bit128;
         let (mut sender, mut receiver) = (server_of(method), client(method));
         for (salted, checksum) in [(false, 0), (true, SEC_SECURE_CHECKSUM)] {
-            let bytes = sender.protect_slow_path(SEC_INFO_PKT, b"payload", salted);
+            sender.set_salted_mac(salted);
+            let bytes = sender.protect_slow_path(SEC_INFO_PKT, b"payload");
             assert_eq!(
                 u16::from_le_bytes([bytes[0], bytes[1]]),
                 SEC_INFO_PKT | SEC_ENCRYPT | checksum
@@ -728,7 +744,8 @@ mod tests {
             (false, FASTPATH_ENCRYPTED),
             (true, FASTPATH_ENCRYPTED | FASTPATH_SECURE_CHECKSUM),
         ] {
-            let protected = sender.protect_fast_path(b"update", salted);
+            sender.set_salted_mac(salted);
+            let protected = sender.protect_fast_path(b"update");
             assert_eq!(protected.header_flags, flags);
             assert_eq!(protected.body.len(), 8 + 6);
             assert_eq!(
@@ -784,7 +801,7 @@ mod tests {
     fn a_redirection_pdu_is_decrypted_with_or_without_sec_encrypt() {
         let method = EncryptionMethod::Rc4Bit128;
         let mut sender = server_of(method);
-        let mut bytes = sender.protect_slow_path(SEC_REDIRECTION_PKT, b"route", false);
+        let mut bytes = sender.protect_slow_path(SEC_REDIRECTION_PKT, b"route");
         bytes[..2].copy_from_slice(&SEC_REDIRECTION_PKT.to_le_bytes());
         let pdu = client(method).unprotect_slow_path(&bytes).unwrap();
         assert_eq!(pdu.flags, SEC_REDIRECTION_PKT);

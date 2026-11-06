@@ -6,6 +6,11 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# A scripted server for tests of the crates above this one. Nothing but their dev-dependencies
+# enables it: justrdp is a client, and this is not a server role.
+test-peer = []
+
 [dependencies]
 # The security header and the Security Exchange PDU, as wire types.
 justrdp-pdu.workspace = true

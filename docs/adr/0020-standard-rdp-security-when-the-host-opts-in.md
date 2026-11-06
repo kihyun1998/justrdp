@@ -43,6 +43,16 @@ got `enhanced RDP security not allowed by server`.
    (`certificate_process_server_public_signature`, `libfreerdp/crypto/certificate.c`). The maintainer
    chose this over verifying the signature as well, and over leaving the certificate unexposed.
 
+6. **FIPS is not advertised, and a server's close after the Connect-Initial is reported as its
+   refusal** (`ConnectFailure::StandardSecurityRefusedByServer`). Measured on Windows Server 2019 at
+   `MinEncryptionLevel=4`: offered 40, 56 and 128 bits it resets the connection, so the client never
+   learns the level; offered FIPS too, it selects FIPS and the client can name it. The maintainer was
+   shown four options on 2026-11-06, with these measurements: this one, advertising FIPS by default,
+   leaving the bit to the host, and implementing Triple DES. Advertising what the core cannot honour
+   is what ADR-0016 refuses. This changes #599's acceptance line "a level that is not supported fails
+   with a typed error naming it": the error names the possibilities, because the server's close
+   cannot say which. A server that does select FIPS still gets `UnsupportedMethod` by value.
+
 ## Consequences
 
 - **This protection does not authenticate the server and does not resist an active attacker.** A

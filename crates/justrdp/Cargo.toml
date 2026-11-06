@@ -23,6 +23,8 @@ x509-cert.workspace = true
 tracing = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
+# Scripts a server's side of Standard RDP Security in the connect and session tests.
+justrdp-security = { workspace = true, features = ["test-peer"] }
 # Generates a throwaway self-signed cert so the key-extraction test can assert the extracted
 # bytes are the inner subjectPublicKey (a strict subset of the key pair's full SPKI DER).
 rcgen.workspace = true

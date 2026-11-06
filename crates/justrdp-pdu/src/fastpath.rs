@@ -54,12 +54,21 @@ pub fn is_fastpath(first_byte: u8) -> bool {
     first_byte & 0x03 == 0
 }
 
+/// The two flag bits of a fast-path header and the bytes after its length fields.
+pub fn split_protected(frame: &[u8]) -> Result<(u8, &[u8]), DecodeError> {
+    let mut cur = ReadCursor::new(frame, "fast-path pdu");
+    let header = cur.read_u8()?;
+    let length1 = cur.read_u8()?;
+    if length1 & 0x80 != 0 {
+        cur.read_u8()?; // length2
+    }
+    Ok((header >> 6, cur.read_slice(cur.remaining())?))
+}
+
 /// Total length of the fast-path PDU at the start of `buf` (header included), or
 /// [`DecodeError::NotEnoughBytes`] while the 2–3 header bytes are still incomplete.
 pub fn frame_len(buf: &[u8]) -> Result<usize, DecodeError> {
-    let mut cur = ReadCursor::new(buf, "fast-path header");
-    let header = cur.read_u8()?;
-    if header & 0xC0 != 0 {
+    if buf.first().is_some_and(|header| header & 0xC0 != 0) {
         // FASTPATH_OUTPUT_ENCRYPTED / SECURE_CHECKSUM: impossible under TLS security
         // (encryption level none) — the stream has desynced.
         return Err(DecodeError::InvalidField {
@@ -67,6 +76,14 @@ pub fn frame_len(buf: &[u8]) -> Result<usize, DecodeError> {
             reason: "encrypted fast-path output under TLS transport security",
         });
     }
+    frame_len_under_standard_security(buf)
+}
+
+/// [`frame_len`] for a session under Standard RDP Security, where the header's two flag bits may
+/// be set.
+pub fn frame_len_under_standard_security(buf: &[u8]) -> Result<usize, DecodeError> {
+    let mut cur = ReadCursor::new(buf, "fast-path header");
+    cur.read_u8()?;
     let length1 = cur.read_u8()?;
     if length1 & 0x80 == 0 {
         Ok(length1 as usize)
@@ -236,6 +253,16 @@ mod tests {
         let updates = decode_updates(&pdu).unwrap();
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[1].data, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn encrypted_output_has_a_length_under_standard_security_and_splits() {
+        let frame = [0x80, 0x05, 1, 2, 3];
+        assert_eq!(frame_len_under_standard_security(&frame), Ok(5));
+        assert_eq!(split_protected(&frame), Ok((2, &[1u8, 2, 3][..])));
+        let long = [0xC0, 0x80, 0x04, 9];
+        assert_eq!(frame_len_under_standard_security(&long), Ok(4));
+        assert_eq!(split_protected(&long), Ok((3, &[9u8][..])));
     }
 
     #[test]

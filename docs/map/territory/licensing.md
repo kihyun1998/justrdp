@@ -100,6 +100,9 @@ with 4.8's private exponent. 26 mutations of the layer each turned a named test 
 
 ## Known holes / open
 
+- **Under Standard RDP Security licensing goes out unencrypted**, which 5.3.6 allows, and the Security
+  Exchange still offers `SEC_LICENSE_ENCRYPT_SC`, so an encrypted server message is read. Only the
+  `valid-client` branch was seen (#599).
 - **A zero modulus hangs `encrypt_premaster_secret`.** A server's certificate supplies the modulus
   and the exponent. With a modulus of zero `BigUint::rem` reduces nothing, so `modpow` squares without
   bound. The same arithmetic behind `encrypt_client_random`, its guard removed, ran past 280 s against

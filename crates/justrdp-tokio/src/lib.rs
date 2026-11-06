@@ -29,13 +29,14 @@ use justrdp::{
     DisconnectReason, Event, FrameUpdate, Framebuffer, InputEvent, LicenseEntropy,
     McsConnectResult, ResizeRequest, SessionError, SessionOutput, SessionStateMachine,
 };
+use justrdp_security::standard::{ClientRandom, StandardSecurity};
 use rustls::pki_types::ServerName;
 use sspi::credssp::{ClientMode, ClientState, CredSspClient, CredSspMode, TsRequest};
 use sspi::generator::GeneratorState;
 use sspi::negotiate::NegotiateConfig;
 use sspi::ntlm::NtlmConfig;
 use sspi::{AuthIdentity, Credentials as SspiCredentials, Secret, Username};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -69,8 +70,77 @@ pub struct ConnectOutcome {
     /// from this one), the server's capability sets, and any bytes that followed the Font Map
     /// in the same read (process them before reading the stream).
     pub activation: ActivationResult,
-    /// The TLS-upgraded, NLA-authenticated stream, positioned just past the Font Map PDU.
-    pub stream: TlsStream<TcpStream>,
+    /// The stream, positioned just past the Font Map PDU.
+    pub stream: SessionStream,
+    /// Standard RDP Security's state for
+    /// [`SessionStateMachine::with_standard_security`]. `None` under TLS.
+    pub standard_security: Option<StandardSecurity>,
+}
+
+/// What a session runs over: TLS, or the plain socket under Standard RDP Security (ADR-0020).
+#[derive(Debug)]
+pub enum SessionStream {
+    /// The TLS-upgraded stream.
+    Tls(Box<TlsStream<TcpStream>>),
+    /// The plain socket, whose PDUs the security layer protects.
+    Tcp(TcpStream),
+}
+
+impl AsyncRead for SessionStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            SessionStream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            SessionStream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for SessionStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            SessionStream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            SessionStream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            SessionStream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+            SessionStream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            SessionStream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            SessionStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Generate this connection's client random for [`justrdp::ConnectConfig::standard_security`],
+/// from the same RNG as [`generate_license_entropy`].
+pub fn generate_client_random() -> io::Result<ClientRandom> {
+    let rng = rustls::crypto::ring::default_provider().secure_random;
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes).map_err(|e| {
+        io::Error::other(format!("OS RNG failed generating a client random: {e:?}"))
+    })?;
+    Ok(ClientRandom::new(bytes))
 }
 
 /// Generate fresh per-connection licensing entropy ([`LicenseEntropy`]) from the process RNG
@@ -236,6 +306,17 @@ impl From<SocketAddr> for ServerAddr {
 /// Why the adapter-driven connect failed.
 #[derive(Debug)]
 pub enum ConnectFailure {
+    /// The server closed the connection right after the MCS Connect-Initial of a Standard RDP
+    /// Security connect: it could select no encryption method for what the client offered
+    /// (`[MS-RDPBCGR]` 5.3.2.1). A server at FIPS level does this, since FIPS is not offered
+    /// (ADR-0020), and so does one whose key strength the offer does not fit.
+    StandardSecurityRefusedByServer,
+    /// Under Standard RDP Security, the trust policy refused the server's certificate. Nothing
+    /// was sent after the MCS Connect-Response (ADR-0005, ADR-0020).
+    ServerCertificateRefused {
+        /// Why.
+        reason: String,
+    },
     /// The config advertises something the core cannot honour, so nothing was dialed
     /// ([`justrdp::advertise`], ADR-0016 Decision 3).
     Config(justrdp::ConnectConfigError),
@@ -268,6 +349,13 @@ pub enum ConnectFailure {
 impl std::fmt::Display for ConnectFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ConnectFailure::StandardSecurityRefusedByServer => f.write_str(
+                "the server closed the connection when offered Standard RDP Security: it may \
+                 require FIPS, or a key strength that was not offered",
+            ),
+            ConnectFailure::ServerCertificateRefused { reason } => {
+                write!(f, "server certificate refused: {reason}")
+            }
             ConnectFailure::Config(e) => write!(f, "refused before connecting: {e}"),
             ConnectFailure::Io(e) => write!(f, "i/o error: {e}"),
             ConnectFailure::Protocol(e) => write!(f, "protocol error: {e:?}"),
@@ -440,6 +528,14 @@ async fn connect_inner(
                     queue.extend(sm.process(Event::Connected));
                     announce_stage(&mut sm, &mut announced, &mut on_stage);
                 }
+                Action::ServerCertificate { certificate } => {
+                    trust::evaluate_standard_security_certificate(
+                        &options.trust,
+                        &server.host,
+                        &certificate,
+                    )
+                    .map_err(|reason| ConnectFailure::ServerCertificateRefused { reason })?;
+                }
                 Action::WriteBytes(bytes) => {
                     // Writes target whichever transport is current: plaintext TCP during X.224,
                     // the TLS stream from the upgrade onward (MCS rides TLS).
@@ -574,18 +670,23 @@ async fn connect_inner(
                             "session-active reached without an MCS result",
                         )));
                     };
-                    let Transport::Tls(stream) =
-                        std::mem::replace(&mut transport, Transport::Absent)
-                    else {
-                        return Err(ConnectFailure::Io(io::Error::new(
-                            io::ErrorKind::NotConnected,
-                            "session-active reached without a TLS stream",
-                        )));
+                    let stream = match std::mem::replace(&mut transport, Transport::Absent) {
+                        Transport::Tls(stream) => SessionStream::Tls(stream),
+                        Transport::Tcp(stream) if mcs.selected.bits() == 0 => {
+                            SessionStream::Tcp(stream)
+                        }
+                        Transport::Tcp(_) | Transport::Absent => {
+                            return Err(ConnectFailure::Io(io::Error::new(
+                                io::ErrorKind::NotConnected,
+                                "session-active reached without a TLS stream",
+                            )));
+                        }
                     };
                     return Ok(ConnectOutcome {
                         mcs,
                         activation: result,
-                        stream: *stream,
+                        stream,
+                        standard_security: sm.take_standard_security(),
                     });
                 }
                 Action::FailWith(e) => return Err(ConnectFailure::Protocol(e)),
@@ -595,8 +696,20 @@ async fn connect_inner(
         // The queue drained without a terminal action: the machine needs more bytes — from the
         // plaintext socket during X.224, from the TLS stream during the MCS exchange. The
         // machine reassembles TPKT frames itself, so raw chunks are fine.
-        let n =
-            with_stage_timeout(sm.stage(), timeouts.stage, transport.read(&mut readbuf)).await?;
+        let read =
+            with_stage_timeout(sm.stage(), timeouts.stage, transport.read(&mut readbuf)).await;
+        let n = match read {
+            Err(ConnectFailure::Io(e))
+                if e.kind() == io::ErrorKind::ConnectionReset
+                    && sm.awaiting_standard_security_selection() =>
+            {
+                return Err(ConnectFailure::StandardSecurityRefusedByServer);
+            }
+            other => other?,
+        };
+        if n == 0 && sm.awaiting_standard_security_selection() {
+            return Err(ConnectFailure::StandardSecurityRefusedByServer);
+        }
         if n == 0 {
             return Err(ConnectFailure::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -808,7 +921,7 @@ impl core::error::Error for SessionFailure {}
 /// `Err`. The future may also simply be dropped (the caller owns cancellation); the machine is
 /// borrowed, so the caller keeps access to its framebuffer afterwards.
 pub async fn run_session(
-    stream: &mut TlsStream<TcpStream>,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     machine: &mut SessionStateMachine,
     on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
     on_cursor: impl FnMut(&CursorEvent),
@@ -829,7 +942,7 @@ pub async fn run_session(
 /// after the session starts, and again whenever a lock LED changes). Closing the channel
 /// disables the input branch; the session keeps running output-only.
 pub async fn run_session_with_input(
-    stream: &mut TlsStream<TcpStream>,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     machine: &mut SessionStateMachine,
     mut on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
     mut on_cursor: impl FnMut(&CursorEvent),
@@ -1127,7 +1240,7 @@ pub enum SessionEvent {
 /// [`SessionEvent::DynamicChannelClosed`]);
 /// `on_frame` and `on_cursor` keep the synchronous sink contracts of [`run_session`].
 pub async fn run_session_with_commands(
-    stream: &mut TlsStream<TcpStream>,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     machine: &mut SessionStateMachine,
     mut on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
     mut on_cursor: impl FnMut(&CursorEvent),
@@ -1651,6 +1764,7 @@ mod tests {
                 hardware_id: [0x4A55_5354, 0x5244_5001, 0, 0], // "JUST","RDP\1" — arbitrary
             },
             persistent_bitmaps: Vec::new(),
+            standard_security: None,
         }
     }
 
@@ -8838,7 +8952,7 @@ mod tests {
     /// A session with drawing orders, driven by keystrokes and read until it goes quiet.
     struct OrderDrive {
         machine: SessionStateMachine,
-        stream: tokio_rustls::client::TlsStream<TcpStream>,
+        stream: SessionStream,
         census: OrderCensus,
         frames: usize,
         /// Every rect handed to the host, in order.
@@ -12726,7 +12840,7 @@ mod tests {
         selected: SecurityProtocol,
         server_capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
         machine: SessionStateMachine,
-        stream: TlsStream<TcpStream>,
+        stream: SessionStream,
         pending: Vec<SessionOutput>,
         frames: Vec<FrameUpdate>,
         stages: Vec<String>,
@@ -12745,7 +12859,8 @@ mod tests {
                 session_config_from(&outcome, capabilities),
                 outcome.activation.leftover.clone(),
             )
-            .expect("the desktop size is within MAX_DESKTOP_DIM");
+            .expect("the desktop size is within MAX_DESKTOP_DIM")
+            .with_standard_security(outcome.standard_security);
             let pending = feed_drained(&mut machine, &[]).expect("leftover bytes process");
             Driven {
                 selected: outcome.mcs.selected,
@@ -13098,6 +13213,77 @@ mod tests {
             assert!(colours > 16, "near-monochrome: {colours} colours");
         })
         .await
+    }
+
+    /// `[MS-RDPBCGR]` 5.3.2.1: a server with no method to select closes the connection, which the
+    /// WS2019 VM did at FIPS level with a reset (#599). A close here is reported as its refusal.
+    #[tokio::test]
+    async fn a_close_after_the_connect_initial_is_the_servers_refusal_of_standard_security() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await.unwrap();
+            // A Connection Confirm whose RDP_NEG_RSP selects PROTOCOL_RDP.
+            socket
+                .write_all(&[
+                    0x03, 0x00, 0x00, 0x13, 0x0e, 0xd0, 0x00, 0x00, 0x12, 0x34, 0x00, 0x02, 0x00,
+                    0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ])
+                .await
+                .unwrap();
+            let _ = socket.read(&mut buf).await.unwrap();
+        });
+        let mut config = legacy_graphics_config();
+        config.requested = SecurityProtocol::from_bits(0);
+        config.security.encryption_methods = 0x02;
+        config.standard_security = Some(generate_client_random().unwrap());
+        let failure = connect_danger(addr, config, test_credentials(), |_| {})
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(failure, ConnectFailure::StandardSecurityRefusedByServer),
+            "{failure:?}"
+        );
+        server.await.unwrap();
+    }
+
+    /// A server configured with `SecurityLayer=0` and `UserAuthentication=0` paints its logon
+    /// screen for a host that opted in to Standard RDP Security (#599, ADR-0020). The address is
+    /// `JUSTRDP_STANDARD_SECURITY_SERVER`, `host:port`.
+    #[tokio::test]
+    #[ignore = "requires a server accepting only Standard RDP Security, named by \
+                JUSTRDP_STANDARD_SECURITY_SERVER"]
+    async fn a_server_that_accepts_only_standard_security_paints_its_logon_screen() {
+        let addr: SocketAddr = std::env::var("JUSTRDP_STANDARD_SECURITY_SERVER")
+            .expect("JUSTRDP_STANDARD_SECURITY_SERVER names the server")
+            .parse()
+            .expect("JUSTRDP_STANDARD_SECURITY_SERVER is host:port");
+        let mut config = legacy_graphics_config();
+        config.requested = SecurityProtocol::from_bits(0);
+        config.security.encryption_methods = 0x01 | 0x02 | 0x08;
+        config.standard_security = Some(generate_client_random().unwrap());
+        let screen = login_screen(addr, config).await;
+
+        eprintln!(
+            "#599: {} frames, stages {:?}, dump {}",
+            screen.frames.len(),
+            screen.stages,
+            dump_ppm(&screen.framebuffer, "justrdp-599-logon.ppm").display()
+        );
+        assert_eq!(screen.selected, SecurityProtocol::from_bits(0));
+        assert!(
+            !screen
+                .stages
+                .iter()
+                .any(|s| s == "tls-handshake" || s == "nla-credssp"),
+            "no TLS and no NLA: {:?}",
+            screen.stages
+        );
+        let colours = colour_count(&screen.framebuffer);
+        assert!(colours > 16, "near-monochrome: {colours} colours");
     }
 
     /// Issue #484: the GDI orders VM's logon screen, painted in bitmap updates for a TLS-only

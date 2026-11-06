@@ -1448,6 +1448,7 @@ dependencies = [
  "justrdp",
  "justrdp-codecs",
  "justrdp-pdu",
+ "justrdp-security",
  "rcgen",
  "ring",
  "rustls",
