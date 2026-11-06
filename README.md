@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/kihyun1998/justrdp/actions/workflows/test.yml"><img alt="test" src="https://github.com/kihyun1998/justrdp/actions/workflows/test.yml/badge.svg"></a>
   <a href="https://github.com/kihyun1998/justrdp/actions/workflows/fuzz.yml"><img alt="fuzz" src="https://github.com/kihyun1998/justrdp/actions/workflows/fuzz.yml/badge.svg"></a>
-  <img alt="rust 1.98.1" src="https://img.shields.io/badge/rust-1.98.1-orange">
+  <a href="rust-toolchain.toml"><img alt="rust toolchain" src="https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fkihyun1998%2Fjustrdp%2Fmaster%2Frust-toolchain.toml&query=%24.toolchain.channel&label=rust&color=orange"></a>
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
 </p>
 

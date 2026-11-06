@@ -1,7 +1,7 @@
 //! Differential oracle for the self-owned WireToSurface1 RemoteFX decoder (issue #58,
-//! ADR-0007). `ironrdp-graphics` exposes no assembled RemoteFX decoder — only the transform
-//! *primitives* — so correctness is proven two complementary ways instead of one end-to-end
-//! byte-diff (the ClearCodec recipe):
+//! ADR-0007), built on `ironrdp-graphics`' transform *primitives* rather than on its assembled
+//! `rfx` decoder, so correctness is proven two complementary ways instead of one end-to-end
+//! byte-diff:
 //!
 //! - **(A) stage-boundary**: each inverse stage of our pipeline up to the colour transform
 //!   (RLGR → LL3 delta → dequantize → inverse DWT) is fed the same intermediate buffer as the
@@ -104,14 +104,11 @@ fn to_planes(rgba: &[u8]) -> ([i16; TILE_PIXELS], [i16; TILE_PIXELS], [i16; TILE
 
 // ------------------------------------------------- the harness's spec-correct RLGR encoder
 //
-// The oracle's RLGR1 *encoder* is defective: in Golomb-Rice mode it adapts `kp` by `UP_GR`
-// (4) on a zero value where MS-RDPRFX 3.1.8.1.7 — and FreeRDP's encoder *and* decoder, and
-// the oracle's own decoder — use `UQ_GR` (3). The k-state desyncs after the first GR-coded
-// zero, and the stream decodes to garbage on every spec-correct decoder including ironrdp's
-// own (`oracle_rlgr1_encoder_defect_still_present` below pins this down). So the stream
-// factory entropy stage is this harness encoder: the forward transforms stay the oracle's,
-// and `harness_encoder_is_faithful_by_the_oracles_own_decoder` proves the factory honest
-// with the oracle's *decoder* as the judge — not self-referentially.
+// The stream factory's entropy stage is this harness encoder, written to MS-RDPRFX 3.1.8.1.7,
+// so the streams do not come from the oracle's encoder; the forward transforms stay the
+// oracle's. `harness_encoder_is_faithful_by_the_oracles_own_decoder` proves the factory honest
+// with the oracle's *decoder* as the judge, and `oracle_encoder_round_trips_both_modes` checks
+// that the oracle's encoder agrees.
 
 const KP_MAX: u32 = 80;
 const LS_GR: u32 = 3;
@@ -325,17 +322,14 @@ fn harness_encoder_is_faithful_by_the_oracles_own_decoder() {
     }
 }
 
-/// Canary for the oracle defect the harness encoder works around: `ironrdp-graphics` 0.8's
-/// RLGR1 *encoder* adapts `kp` by `UP_GR` where the spec (and its own decoder, and FreeRDP's
-/// encoder and decoder) use `UQ_GR`, so its RLGR1 round-trip desyncs — while RLGR3 stays
-/// exact. When an oracle upgrade makes this test fail, the defect is fixed upstream: drop
-/// `harness_rlgr_encode` and feed `rfx_encode_component` directly (the #56 pattern).
+/// The oracle's own encoder round-trips both modes through its decoder: for RLGR1 and RLGR3,
+/// oracle-decode(oracle-encode(x)) == x on a noise tile.
 #[test]
-fn oracle_rlgr1_encoder_defect_still_present() {
+fn oracle_encoder_round_trips_both_modes() {
     let (y, _, _) = to_planes(&noise(0x1234_5678));
     let quant = oracle_rfx::Quant::default();
-    let mut mismatches = [0usize; 2];
-    for (idx, (mode, _)) in MODES.into_iter().enumerate() {
+    let expected = forward_coefficients(&y, &quant);
+    for (mode, mode_name) in MODES {
         let mut work = y;
         let mut encoded = vec![0u8; 4 * TILE_PIXELS];
         let len = rfx_encode_component(&mut work, &mut encoded, &quant, mode)
@@ -343,21 +337,16 @@ fn oracle_rlgr1_encoder_defect_still_present() {
         encoded.truncate(len);
         let mut decoded = [0i16; TILE_PIXELS];
         rlgr::decode(mode, &encoded, &mut decoded).expect("oracle decodes its own stream");
-        let expected = forward_coefficients(&y, &quant);
-        mismatches[idx] = expected
+        let mismatches = expected
             .iter()
             .zip(decoded.iter())
             .filter(|(a, b)| a != b)
             .count();
+        assert_eq!(
+            mismatches, 0,
+            "the oracle's {mode_name} round-trip must be exact"
+        );
     }
-    assert!(
-        mismatches[0] > 0,
-        "the oracle's RLGR1 encoder round-trips now — defect fixed upstream, simplify the harness"
-    );
-    assert_eq!(
-        mismatches[1], 0,
-        "the oracle's RLGR3 round-trip must stay exact"
-    );
 }
 
 // ---------------------------------------------------------------- (A) stage-boundary

@@ -27,6 +27,16 @@ pixels in the frame — but nothing records that as a decision.
   decoded or re-emitted from the cache. A cursor never dirties the framebuffer, but each
   `CursorImage` is an owned copy: uncharged, 6,552 Cached Pointers in one 32 KB PDU held 236 MB
   of them in one call's outputs ([Session loop](session-loop-dispatch.md)).
+- **A 4 bpp pointer is refused** (`PointerError::UnsupportedBpp`, #586). `[MS-RDPBCGR]`
+  2.2.9.1.1.4.5 allows it (two palette indices per byte) and the `ironrdp-graphics` 0.11 oracle
+  decodes it, but FreeRDP refuses it too (`color.c`, `freerdp_image_copy_from_pointer_data`
+  takes 1, 8, 16, 24 and 32), and a server sends one only in a 4 bpp session, which justrdp
+  cannot render: no bitmap decoder takes 4 bpp.
+- **A 15 bpp pointer is refused too, in a session depth the core honours** (#590). A New Pointer
+  with `xorBpp` 15 ends the session with `SessionError::Pointer`. xrdp's `libxrdp_send_pointer`
+  accepts 15 and writes it as `xorBpp`. No server has been seen to send one: on 2026-11-06 a 15 bpp
+  session on the WS2019 VM painted 2,502 frames and xrdp 0.9.24's 15 bpp login screen sent two
+  New Pointer updates, neither ending the session.
 - **The XOR/AND mask arithmetic is the same shape as a bitmap decoder's**, which is
   precisely why the 32-bit overflow was found here first (#151) and only then in the
   bitmap decoders (#155).

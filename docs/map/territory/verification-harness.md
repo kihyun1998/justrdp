@@ -36,8 +36,9 @@ everywhere else.
 - **The oracle is scaffolding with a retirement condition, not a standing gate**
   (ADR-0011). A codec's oracle dev-dependency drops once its correctness rests on an
   owned basis: a real-server corpus plus expectations derived independently of our
-  implementation. Progressive is the worked example (#194) — there the oracle decodes
-  **2 of 52** real payloads, so a green diff against it would measure nothing.
+  implementation. Progressive is the worked example (#194) — there the oracle decoded
+  **2 of 52** real payloads, so a green diff against it would have measured nothing. 0.11
+  decodes all 52 (#576); the corpus stays the gate.
 - **An owned basis has two halves, and a corpus is only one of them.** A capture proves
   *acceptance* — that nothing a real server sends is rejected. It cannot prove *values*
   without independently-derived expectations, because the pixels a stream should produce

@@ -1,12 +1,10 @@
 //! Stage-boundary differentials for the RemoteFX **Progressive** inverse pipeline (ADR-0007),
 //! against the `ironrdp-graphics` primitives — and *only* the primitives.
 //!
-//! **The assembled oracle is disqualified here and this file must not grow toward it.**
-//! ADR-0011 / #194 established that `ironrdp_graphics::progressive` decodes 2 of 52 real
-//! payloads, and #168 established that its upgrade pass restarts both bit readers inside the
-//! per-band loop (`progressive.rs:139`) where FreeRDP threads one cursor across all ten bands.
-//! What remains usable is the *pure-math* stage this slice adds: `dwt_extrapolate`, which is a
-//! self-contained transform with no stream state to get wrong.
+//! **The assembled oracle is disqualified here and this file must not grow toward it**
+//! (ADR-0011, #194): Progressive's gate is the real-server corpus and FreeRDP's pixels. What
+//! this file uses is the *pure-math* stage: `dwt_extrapolate`, a self-contained transform with
+//! no stream state to get wrong.
 //!
 //! Even there, agreement is weaker evidence than it looks — the oracle shares justrdp's code
 //! lineage (memory `ironrdp_oracle_shares_lineage`,

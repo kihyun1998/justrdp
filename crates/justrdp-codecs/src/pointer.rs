@@ -11,9 +11,9 @@
 //!
 //! Both masks are stored bottom-up with each scan line padded to a 2-byte boundary; output is
 //! top-down, tightly packed. Self-owned from the start (like [`crate::rle`] / [`crate::planar`]),
-//! with `ironrdp-graphics` as the differential oracle — except 8 bpp (palettized), which the
-//! oracle does not implement, and 1 bpp, where the oracle skips the spec's bottom-up flip;
-//! those two are pinned by hand-computed vectors instead.
+//! with `ironrdp-graphics` as the differential oracle for 16/24/32 bpp. 8 bpp (palettized) and
+//! 1 bpp, where the oracle skips the spec's bottom-up flip, are pinned by hand-computed vectors
+//! instead.
 
 use crate::color::Palette;
 
@@ -322,8 +322,8 @@ mod tests {
     fn eight_bpp_multi_row_flips_bottom_up_and_honors_stride_padding() {
         // 3×2 @8bpp. Odd width forces xor_stride = (3*8).div_ceil(16)*2 = 4 (3 index bytes + 1 pad
         // byte per row), and two rows exercise the bottom-up flip (src_row = height-1-out_row) — the
-        // multi-row + odd-width coverage the single 1×1 vector above lacks (#124). Hand-computed:
-        // the differential oracle does not implement 8 bpp, so this stands on the spec, not a diff.
+        // multi-row + odd-width coverage the single 1×1 vector above lacks (#124). Hand-computed
+        // from the spec, not a diff.
         let mut palette = Palette::default();
         palette.entries[1] = [10, 11, 12];
         palette.entries[2] = [20, 21, 22];
@@ -437,6 +437,12 @@ mod tests {
         assert_eq!(
             decode_pointer(2, 2, 12, &[0; 16], &[0; 4], &Palette::default()),
             Err(PointerError::UnsupportedBpp { bpp: 12 })
+        );
+        // 4 bpp: `[MS-RDPBCGR]` 2.2.9.1.1.4.5 allows it; refused here (#586). A 2x2 shape at 4 bpp
+        // has a 2-byte XOR stride, so 4 bytes is the exact mask length.
+        assert_eq!(
+            decode_pointer(2, 2, 4, &[0; 4], &[0; 4], &Palette::default()),
+            Err(PointerError::UnsupportedBpp { bpp: 4 })
         );
     }
 }

@@ -158,6 +158,11 @@ rather than by capability:
   census did not discharge it, so the slice took the brush path and `check_orders` refuses a
   cache without both blits. Same shape as #296: the traffic seen is not the traffic owed.
 
+- **#590** — colour depth, in the GCC fields and the Bitmap set. A 4 bpp request reached the wire,
+  and what a server sent back was refused mid-session. The allow-list is the depths
+  `color::bytes_per_pixel` takes, which does not make each one a depth every path takes:
+  [the pointer path](../territory/pointer-cursor.md) refuses 15 bpp.
+
 ## Where it will recur
 
 **Whenever a capability, flag, version or feature bit is added to something this client

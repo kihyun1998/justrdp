@@ -23,7 +23,7 @@ here, long before any graphics capability is negotiated.
   policy flags, so they are exposed rather than curated, and the core refuses a bit it cannot
   honour. Which bits, and why, is the table in
   [capability exchange](capability-exchange-activation.md) (#357), which also covers channel
-  options.
+  options and the colour-depth fields (#590).
 
 Adjacent but not governing: [ADR-0001](../../adr/0001-sans-io-state-machine-core.md)
 places the sequence in a state machine.

@@ -47,8 +47,9 @@ Three shapes, and none of them announces itself:
 2. **A "fix" that regresses against real servers.** The oracle rejects a stream a
    real Server 2019 sends, someone treats the divergence as our bug, and the
    corpus-required tolerance is removed. `justrdp-codecs`'s own module doc records
-   that ClearCodec **corrects two bit-level defects in the oracle** which otherwise
-   reject genuine Server 2019 streams — so this is not hypothetical here.
+   that ClearCodec **corrected two bit-level defects the oracle had** (fixed upstream
+   by 0.11, #576), which rejected genuine Server 2019 streams — so this is not
+   hypothetical here.
 
 3. **An owned basis that is derived too narrowly to be independent of anything.** The
    subtlest shape, and the only one that survives *replacing* the oracle: hand-derived
@@ -61,7 +62,7 @@ Three shapes, and none of them announces itself:
    values exactly, so the wrong initial state was the whole of the error.
 
    **Whether the oracle *caused* it is not settled, and the shape does not need it to
-   be.** `kp = 0` is `ironrdp-graphics`'s initial value, so the basis may have adopted
+   be.** `kp = 0` was `ironrdp-graphics`'s initial value, so the basis may have adopted
    the state of the thing it was replacing; but FreeRDP also declares its state
    `WINPR_C_ARRAY_INIT` before assigning `kp`, so a reader who stops at the declaration
    lands on 0 too. Both hypotheses predict the same 8-of-8 fit and nothing separates
@@ -135,6 +136,31 @@ row 1, so it was proven against the real VM and recorded on #170, whose slice mu
 reproduce it. `ironrdp-pdu`'s mouse wheel-rotation decode fix was row 3, because
 justrdp encodes input and has no mouse decode path. Nothing touched ClearCodec,
 NSCodec, pointer or RemoteFX WTS1, so the #127 tolerances were not re-litigated.
+
+Worked example, 0.9 → 0.11 (#576), both changelogs read entry by entry:
+
+- **Row 1: nothing.** No codec is delegated at runtime.
+- **Row 2, and the suite noticed:** RLGR1 `kp` (`UQ_GR`), the Progressive `quality = 0xFF`
+  sentinel, per-context CONTEXT blocks, SRL magnitude coding and per-band stream restarts,
+  ClearCodec's short V-bar field layout, single-entry RLEX palette, RLEX over-fill and NSCodec
+  subcodec, and zgfx multipart splitting at 65535 bytes. Each had a test pinning the old
+  behaviour, and ADR-0011's #576 amendment records what became of each.
+- **Row 2, and nothing noticed:** Progressive keys tiles by surface, clips to REGION
+  rectangles, rounds `q < 6` in `dequantize_component_ccq` and corrects its base quant scale;
+  RLE consumes a foreground pixel only in set-foreground runs and caps dimensions; Planar checks
+  sizes before allocating; zgfx bounds decompression at 64 MiB per segment; pointers decode at 4
+  and 8 bpp with a palette; ClearCodec accepts a glyph hit whose area matches the cached glyph's.
+  No test went red on any of them, which says only that no differential feeds them an input on
+  which the two sides now differ. Two of them were places where our behaviour and the 0.11
+  oracle's differed, adjudicated in #586 against the spec and FreeRDP: ClearCodec now accepts a
+  same-area glyph hit ([bitmap codecs](../territory/bitmap-codecs.md)), and 4 bpp pointers stay
+  refused ([pointer & cursor](../territory/pointer-cursor.md)).
+- **Row 3:** the new `rfx` `TileDecoder`/`MessageDecoder` and `alpha` modules, and every
+  `ironrdp-pdu` change outside the two codecs (redirection, window orders, heartbeat, bulk
+  compression, logon errors). One of these weakens an instrument rather than moving a value:
+  `ironrdp-pdu` now tolerates unknown flag bits and several malformed headers, so the R3
+  acceptance checks in `justrdp/src/connect.rs` that decode our frames with it no longer reject a
+  frame of ours that sets such a bit.
 
 Concretely:
 

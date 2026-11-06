@@ -26,6 +26,31 @@ pub const HONOURED_EARLY_CAPABILITY_FLAGS: ClientEarlyCapabilityFlags =
 /// the session decompresses: MPPC 8K and 64K, NCRUSH, XCRUSH.
 pub const HONOURED_COMPRESSION_TYPES: [u32; 4] = [0, 1, 2, 3];
 
+/// The GCC `highColorDepth` values the core renders.
+pub const HONOURED_HIGH_COLOR_DEPTHS: [u16; 4] = [
+    gcc::HIGH_COLOR_DEPTH_8BPP,
+    gcc::HIGH_COLOR_DEPTH_15BPP,
+    gcc::HIGH_COLOR_DEPTH_16BPP,
+    gcc::HIGH_COLOR_DEPTH_24BPP,
+];
+
+/// The GCC `postBeta2ColorDepth` values the core renders.
+pub const HONOURED_POST_BETA2_COLOR_DEPTHS: [u16; 4] = [
+    gcc::COLOR_DEPTH_8BPP,
+    gcc::COLOR_DEPTH_15BPP,
+    gcc::COLOR_DEPTH_16BPP,
+    gcc::COLOR_DEPTH_24BPP,
+];
+
+/// The GCC `supportedColorDepths` bits the core honours.
+pub const HONOURED_SUPPORTED_COLOR_DEPTHS: u16 = gcc::SUPPORTED_COLOR_DEPTH_24BPP
+    | gcc::SUPPORTED_COLOR_DEPTH_16BPP
+    | gcc::SUPPORTED_COLOR_DEPTH_15BPP
+    | gcc::SUPPORTED_COLOR_DEPTH_32BPP;
+
+/// The Bitmap set's `preferredBitsPerPixel` values the core renders.
+pub const HONOURED_BITS_PER_PIXEL: [u16; 5] = [8, 15, 16, 24, 32];
+
 /// The Client Info `flags` the core honours, `CompressionTypeMask` aside
 /// ([`HONOURED_COMPRESSION_TYPES`]).
 pub const HONOURED_CLIENT_INFO_FLAGS: ClientInfoFlags = ClientInfoFlags::from_bits(
@@ -123,6 +148,14 @@ pub enum ConnectConfigError {
     EarlyCapabilityFlags(ClientEarlyCapabilityFlags),
     /// Client Info `flags` outside [`HONOURED_CLIENT_INFO_FLAGS`]: the refused bits.
     ClientInfoFlags(ClientInfoFlags),
+    /// A GCC Client Core Data colour-depth field outside [`HONOURED_HIGH_COLOR_DEPTHS`],
+    /// [`HONOURED_POST_BETA2_COLOR_DEPTHS`] or [`HONOURED_SUPPORTED_COLOR_DEPTHS`].
+    ColorDepth {
+        /// The field name.
+        field: &'static str,
+        /// The refused value, or for `supportedColorDepths` the refused bits.
+        value: u16,
+    },
     /// A static channel's `options` outside [`HONOURED_CHANNEL_OPTIONS`].
     ChannelOptions {
         /// The channel name.
@@ -168,6 +201,9 @@ impl core::fmt::Display for ConnectConfigError {
                     "Client Info flags {:#010x} cannot be honoured",
                     bits.bits()
                 )
+            }
+            Self::ColorDepth { field, value } => {
+                write!(f, "{field} {value:#06x} cannot be honoured")
             }
             Self::ChannelOptions { channel, options } => write!(
                 f,
@@ -263,6 +299,7 @@ pub fn check(config: &ConnectConfig) -> Result<(), ConnectConfigError> {
             ClientInfoFlags::from_bits(compression_type),
         ));
     }
+    check_color_depths(&config.core)?;
     for channel in &config.channels {
         let options = channel.options & !HONOURED_CHANNEL_OPTIONS;
         if options != 0 {
@@ -304,13 +341,28 @@ pub fn check(config: &ConnectConfig) -> Result<(), ConnectConfigError> {
     check_orders(&config.capabilities)
 }
 
+/// Refuse a Client Core Data colour-depth field outside its allow-list.
+fn check_color_depths(core: &gcc::ClientCoreData) -> Result<(), ConnectConfigError> {
+    let refuse = |field, value| Err(ConnectConfigError::ColorDepth { field, value });
+    if !HONOURED_HIGH_COLOR_DEPTHS.contains(&core.high_color_depth) {
+        return refuse("highColorDepth", core.high_color_depth);
+    }
+    if !HONOURED_POST_BETA2_COLOR_DEPTHS.contains(&core.post_beta2_color_depth) {
+        return refuse("postBeta2ColorDepth", core.post_beta2_color_depth);
+    }
+    let supported = core.supported_color_depths & !HONOURED_SUPPORTED_COLOR_DEPTHS;
+    if supported != 0 {
+        return refuse("supportedColorDepths", supported);
+    }
+    Ok(())
+}
+
 /// The rules between the drawing-order sets: what one set promises another must back.
 fn check_orders(sets: &[CapabilitySet]) -> Result<(), ConnectConfigError> {
     let support = sets.iter().find_map(|set| match set {
         CapabilitySet::Order(o) => Some(o.order_support),
         _ => None,
     });
-    let orders = support.is_some_and(|s| s.iter().any(|&order| order != 0));
     let offscreen = sets.iter().find_map(|set| match set {
         CapabilitySet::OffscreenCache(o) if o.offscreen_support_level != 0 => Some(o),
         _ => None,
@@ -361,16 +413,6 @@ fn check_orders(sets: &[CapabilitySet]) -> Result<(), ConnectConfigError> {
             "GlyphIndex draws from a glyph cache, and none is advertised",
         );
     }
-    let depth = sets.iter().find_map(|set| match set {
-        CapabilitySet::Bitmap(b) => Some(b.preferred_bits_per_pixel),
-        _ => None,
-    });
-    if orders && depth.is_some_and(|bpp| bpp < 8) {
-        return refuse(
-            capability::CAPSET_ORDER,
-            "orders below 8 bpp, which nothing has measured",
-        );
-    }
     Ok(())
 }
 
@@ -385,6 +427,14 @@ fn check_capability_set(set: &CapabilitySet) -> Result<(), ConnectConfigError> {
             capability::CAPSET_GENERAL,
             "extraFlags outside the honoured set",
         ),
+        CapabilitySet::Bitmap(b)
+            if !HONOURED_BITS_PER_PIXEL.contains(&b.preferred_bits_per_pixel) =>
+        {
+            refuse(
+                capability::CAPSET_BITMAP,
+                "preferredBitsPerPixel is a depth no decoder takes",
+            )
+        }
         CapabilitySet::Bitmap(b) if b.drawing_flags & !HONOURED_DRAWING_FLAGS != 0 => refuse(
             capability::CAPSET_BITMAP,
             "drawingFlags outside the honoured set",
@@ -605,6 +655,93 @@ mod tests {
         );
     }
 
+    /// `highColorDepth` and `postBeta2ColorDepth`, over every value: of the depths 2.2.1.3.2
+    /// lists for each, 8, 15, 16 and 24 bpp pass.
+    #[test]
+    fn a_gcc_colour_depth_the_core_cannot_render_is_refused() {
+        let mut config = config();
+        for value in 0..=u16::MAX {
+            config.core.high_color_depth = value;
+            let expected = if matches!(value, 0x0008 | 0x000F | 0x0010 | 0x0018) {
+                Ok(())
+            } else {
+                Err(ConnectConfigError::ColorDepth {
+                    field: "highColorDepth",
+                    value,
+                })
+            };
+            assert_eq!(check(&config), expected, "highColorDepth {value:#06x}");
+        }
+        config.core.high_color_depth = gcc::HIGH_COLOR_DEPTH_24BPP;
+        for value in 0..=u16::MAX {
+            config.core.post_beta2_color_depth = value;
+            let expected = if matches!(value, 0xCA01..=0xCA04) {
+                Ok(())
+            } else {
+                Err(ConnectConfigError::ColorDepth {
+                    field: "postBeta2ColorDepth",
+                    value,
+                })
+            };
+            assert_eq!(check(&config), expected, "postBeta2ColorDepth {value:#06x}");
+        }
+    }
+
+    /// `supportedColorDepths` defines four bits, none of them below 15 bpp. The error names the
+    /// refused bits alone.
+    #[test]
+    fn an_undefined_supported_colour_depth_bit_is_refused() {
+        let mut config = config();
+        for bit in (0..16).map(|n| 1u16 << n) {
+            config.core.supported_color_depths = bit;
+            let expected = if bit <= 0x0008 {
+                Ok(())
+            } else {
+                Err(ConnectConfigError::ColorDepth {
+                    field: "supportedColorDepths",
+                    value: bit,
+                })
+            };
+            assert_eq!(check(&config), expected, "supportedColorDepths {bit:#06x}");
+        }
+        config.core.supported_color_depths = 0x000F;
+        assert_eq!(check(&config), Ok(()));
+        config.core.supported_color_depths = 0x0011;
+        assert_eq!(
+            check(&config),
+            Err(ConnectConfigError::ColorDepth {
+                field: "supportedColorDepths",
+                value: 0x0010,
+            })
+        );
+    }
+
+    /// `preferredBitsPerPixel` over every value, with no orders advertised: exactly the depths
+    /// `color::bytes_per_pixel` takes pass.
+    #[test]
+    fn a_bitmap_set_depth_the_core_cannot_render_is_refused() {
+        for value in 0..=u16::MAX {
+            let result = with_set(CapabilitySet::Bitmap(capability::BitmapCapabilitySet {
+                preferred_bits_per_pixel: value,
+                ..Default::default()
+            }));
+            if matches!(value, 8 | 15 | 16 | 24 | 32) {
+                assert_eq!(result, Ok(()), "{value}");
+            } else {
+                assert_eq!(
+                    refused_type(result),
+                    Some(capability::CAPSET_BITMAP),
+                    "{value}"
+                );
+            }
+            assert_eq!(
+                HONOURED_BITS_PER_PIXEL.contains(&value),
+                justrdp_codecs::color::bytes_per_pixel(value).is_ok(),
+                "{value}"
+            );
+        }
+    }
+
     /// The honoured early flags and Client Info flags, named rather than read back from the
     /// constants, so a flag dropped from an allow-list is seen.
     #[test]
@@ -801,6 +938,7 @@ mod tests {
             .unwrap();
         general.extra_flags |= 0x0002;
         let mut bitmap = capability::BitmapCapabilitySet {
+            preferred_bits_per_pixel: 24,
             drawing_flags: 0x01,
             ..Default::default()
         };
@@ -876,6 +1014,7 @@ mod tests {
                 chunk_size: 1600,
             }),
             CapabilitySet::Bitmap(capability::BitmapCapabilitySet {
+                preferred_bits_per_pixel: 24,
                 drawing_flags: capability::DRAW_ALLOW_DYNAMIC_COLOR_FIDELITY
                     | capability::DRAW_ALLOW_COLOR_SUBSAMPLING
                     | capability::DRAW_ALLOW_SKIP_ALPHA
@@ -1268,7 +1407,7 @@ mod tests {
                         b.preferred_bits_per_pixel = 4;
                     }
                 },
-                capability::CAPSET_ORDER,
+                capability::CAPSET_BITMAP,
             ),
         ];
         for (name, edit, set_type) in cases {

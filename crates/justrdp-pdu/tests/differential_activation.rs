@@ -222,7 +222,7 @@ fn ironrdp_demand_active_decodes_to_the_same_capability_fields() {
         iron_caps::CapabilitySet::Input(iron_caps::Input {
             input_flags: iron_caps::InputFlags::SCANCODES | iron_caps::InputFlags::FASTPATH_INPUT,
             keyboard_layout: 0x0412,
-            keyboard_type: Some(ironrdp_pdu::gcc::KeyboardType::IbmEnhanced),
+            keyboard_type: Some(ironrdp_pdu::gcc::KeyboardType::IBM_ENHANCED),
             keyboard_subtype: 0,
             keyboard_function_key: 12,
             keyboard_ime_filename: String::new(),
