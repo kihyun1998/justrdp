@@ -320,6 +320,16 @@ impl StandardSecurity {
         self.salted_mac = salted;
     }
 
+    /// The key strength the server selected.
+    pub fn method(&self) -> EncryptionMethod {
+        self.method
+    }
+
+    /// The encryption level the server selected.
+    pub fn level(&self) -> EncryptionLevel {
+        self.level
+    }
+
     /// How many PDUs this connection has protected and unprotected so far, in that order. Every
     /// 4,096 in a direction, that direction's key updates (5.3.7.1).
     pub fn packet_counts(&self) -> (u32, u32) {
@@ -662,6 +672,13 @@ mod tests {
             EncryptionLevel::from_wire(0),
             Err(StandardSecurityError::UnsupportedLevel(0))
         );
+    }
+
+    #[test]
+    fn the_selected_method_and_level_can_be_read() {
+        let security = at_level(EncryptionLevel::Low);
+        assert_eq!(security.method(), EncryptionMethod::Rc4Bit128);
+        assert_eq!(security.level(), EncryptionLevel::Low);
     }
 
     #[test]

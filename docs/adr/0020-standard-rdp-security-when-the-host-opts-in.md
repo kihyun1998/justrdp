@@ -57,7 +57,10 @@ got `enhanced RDP security not allowed by server`.
 ## Consequences
 
 - **This protection does not authenticate the server and does not resist an active attacker.** A
-  host that opts in accepts that. The opt-in is the whole control.
+  host that opts in accepts that. The opt-in is the whole control. The method and level arrive in
+  the plaintext Connect-Response, so someone on the path can lower them, and at level 1 the client
+  takes server traffic in the clear. A host that cares reads `StandardSecurity::method` and `level`
+  from `ConnectOutcome::standard_security`; the core sets no minimum.
 - The session's send methods take `&mut self`, because each frame advances the cipher. A host must
   write frames in the order it received them.
 - `justrdp-security` carries a second use of the primitives `license_crypto` already held. `BigUint`
