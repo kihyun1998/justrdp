@@ -9875,6 +9875,22 @@ mod tests {
         (frames.load(std::sync::atomic::Ordering::SeqCst), colours)
     }
 
+    /// The account whose logon runs the #556 workload and then signs itself out.
+    const BASELINE_ACCOUNT: &str = "rdpbench";
+
+    /// Whether `username` is [`BASELINE_ACCOUNT`], whose case Windows ignores.
+    fn runs_the_baseline(username: Option<&str>) -> bool {
+        username.is_some_and(|name| name.eq_ignore_ascii_case(BASELINE_ACCOUNT))
+    }
+
+    #[test]
+    fn only_the_baseline_account_runs_the_baseline() {
+        assert!(runs_the_baseline(Some("rdpbench")));
+        assert!(runs_the_baseline(Some("RDPBench")));
+        assert!(!runs_the_baseline(Some("rdptest")));
+        assert!(!runs_the_baseline(None));
+    }
+
     /// Issue #556: one logon of the `rdpbench` account on the real VM, which runs the office and
     /// heavy workloads and signs itself out, timed from inside: when each connect stage began,
     /// when the first graphics update's bytes arrived, and how long each `FrameUpdate` took from
@@ -9883,6 +9899,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM, its rdpbench account and JUSTRDP_TEST_* env vars"]
     async fn end_to_end_baseline_session_on_the_real_vm() {
+        let username = std::env::var("JUSTRDP_TEST_USERNAME").ok();
+        if !runs_the_baseline(username.as_deref()) {
+            eprintln!("skipped: this test runs only as {BASELINE_ACCOUNT}");
+            return;
+        }
         vm::with_self_ending_vm_session(|vm| async move {
             let start = std::time::Instant::now();
             let mut stages: Vec<(String, u128)> = Vec::new();
