@@ -16,6 +16,38 @@
 use crate::cursor::{ReadCursor, utf16_string};
 use crate::error::DecodeError;
 
+/// `TS_SECURITY_HEADER` flag: the payload is a Security Exchange PDU (`SEC_EXCHANGE_PKT`).
+pub const SEC_EXCHANGE_PKT: u16 = 0x0001;
+/// `TS_SECURITY_HEADER` flag: an Initiate Multitransport Request PDU (`SEC_TRANSPORT_REQ`).
+pub const SEC_TRANSPORT_REQ: u16 = 0x0002;
+/// `TS_SECURITY_HEADER` flag: an Auto-Detect Request PDU (`SEC_AUTODETECT_REQ`).
+pub const SEC_AUTODETECT_REQ: u16 = 0x1000;
+/// `TS_SECURITY_HEADER` flag: a Heartbeat PDU (`SEC_HEARTBEAT`).
+pub const SEC_HEARTBEAT: u16 = 0x4000;
+/// `TS_SECURITY_HEADER` flag: the payload is encrypted and a MAC precedes it (`SEC_ENCRYPT`).
+pub const SEC_ENCRYPT: u16 = 0x0008;
+/// `TS_SECURITY_HEADER` flag: the client can process encrypted licensing PDUs
+/// (`SEC_LICENSE_ENCRYPT_SC`), sent with [`SEC_EXCHANGE_PKT`].
+pub const SEC_LICENSE_ENCRYPT_SC: u16 = 0x0200;
+/// `TS_SECURITY_HEADER` flag: a Standard Security Server Redirection PDU, encrypted
+/// (`SEC_REDIRECTION_PKT`).
+pub const SEC_REDIRECTION_PKT: u16 = 0x0400;
+/// `TS_SECURITY_HEADER` flag: the MAC is salted with the encryption count (`SEC_SECURE_CHECKSUM`).
+pub const SEC_SECURE_CHECKSUM: u16 = 0x0800;
+/// The size of `dataSignature` in the non-FIPS security header and in a fast-path PDU.
+pub const MAC_SIGNATURE_SIZE: usize = 8;
+
+/// The Security Exchange PDU's data (`TS_SECURITY_PACKET`, `[MS-RDPBCGR]` 2.2.1.10.1): a basic
+/// security header, a 32-bit length, then `encrypted_client_random`, which already carries its
+/// 8 trailing zero bytes.
+pub fn encode_security_exchange(encrypted_client_random: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + encrypted_client_random.len());
+    encode_basic_security_header(&mut out, SEC_EXCHANGE_PKT | SEC_LICENSE_ENCRYPT_SC);
+    out.extend_from_slice(&(encrypted_client_random.len() as u32).to_le_bytes());
+    out.extend_from_slice(encrypted_client_random);
+    out
+}
+
 /// `TS_SECURITY_HEADER` flag: the payload is a Client Info PDU (`SEC_INFO_PKT`).
 pub const SEC_INFO_PKT: u16 = 0x0040;
 /// `TS_SECURITY_HEADER` flag: the payload is a licensing PDU (`SEC_LICENSE_PKT`) — the first

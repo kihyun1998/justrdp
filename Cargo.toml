@@ -3,7 +3,7 @@
 # hardens).
 [workspace]
 resolver = "2"
-members = ["crates/justrdp-pdu", "crates/justrdp", "crates/justrdp-codecs", "crates/justrdp-tokio"]
+members = ["crates/justrdp-pdu", "crates/justrdp-security", "crates/justrdp", "crates/justrdp-codecs", "crates/justrdp-tokio"]
 
 [workspace.package]
 edition = "2024"
@@ -13,6 +13,7 @@ repository = "https://github.com/kihyun1998/justrdp"
 
 [workspace.dependencies]
 justrdp-pdu = { path = "crates/justrdp-pdu" }
+justrdp-security = { path = "crates/justrdp-security" }
 justrdp = { path = "crates/justrdp" }
 justrdp-codecs = { path = "crates/justrdp-codecs" }
 # The only external dependency slice-1 introduces: the async runtime the I/O adapter drives the
@@ -55,7 +56,7 @@ rcgen = "0.14"
 # Robustness testing of the hand-rolled, untrusted-input parsers (ADR-0008, issue #97): property
 # tests assert "decode never panics on arbitrary bytes" and round-trip invariants across a wide
 # input space the hand-written differential-oracle vectors do not reach. Dev-dependency only; runs
-# on stable (unlike coverage-guided cargo-fuzz, which is a nightly CI-only lane — issue #99).
+# on stable (unlike coverage-guided cargo-fuzz, which needs nightly and runs only in CI — issue #99).
 proptest = "1"
 # The per-codec benchmarks over the real-server corpora (#555). Dev-dependency only, absent from
 # `cargo tree -e normal`; without plotters and rayon, which a baseline comparison needs neither of.

@@ -74,6 +74,7 @@ The mapping is **derived from the boundary rule** (ADR-0001/0002), not chosen pe
 | RDP-native wire types | `crate:justrdp-pdu` |
 | Connect/session state, dispatch, framebuffer | `crate:justrdp` |
 | Graphics codecs and the differential oracle | `crate:justrdp-codecs` |
+| Legacy RDP cryptography and Standard RDP Security | `crate:justrdp-security` |
 | Sockets, TLS, `sspi`/NLA, and the real-VM tests | `crate:justrdp-tokio` |
 
 A redirection or session feature is therefore almost always `pdu` + `justrdp` (wire types plus

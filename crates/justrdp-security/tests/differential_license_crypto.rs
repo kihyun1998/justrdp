@@ -1,12 +1,12 @@
 //! Differential oracle for the hand-rolled licensing crypto (ADR-0001): the same inputs run
-//! through `justrdp::license_crypto` and through ironrdp's
+//! through `justrdp_security::license_crypto` and through ironrdp's
 //! `ClientNewLicenseRequest::from_server_license_request` (which performs the identical
 //! MS-RDPELE 5.1.3 derivation and 5.1.2 RSA encryption internally) must produce identical
 //! session keys and identical encrypted premaster bytes.
 
-use justrdp::license_crypto;
 use justrdp_pdu::client_info;
 use justrdp_pdu::license;
+use justrdp_security::license_crypto;
 
 use ironrdp_pdu::decode as ironrdp_decode;
 use ironrdp_pdu::rdp::server_license as iron_license;
@@ -98,7 +98,7 @@ fn key_derivation_matches_ironrdp() {
 
 #[test]
 fn rsa_premaster_encryption_matches_independent_known_answers() {
-    // ironrdp 0.8 cannot oracle this one: it treats the proprietary certificate's modulus and
+    // ironrdp 0.11 cannot oracle this one: it treats the proprietary certificate's modulus and
     // exponent — little-endian on the wire (MS-RDPBCGR 2.2.1.4.3.1.1.1) — as big-endian, so
     // its full-path licensing RSA is spec-incorrect (FreeRDP reverses; we reverse). The
     // oracle here is an independent computation instead:
@@ -124,7 +124,7 @@ fn rsa_premaster_encryption_matches_independent_known_answers() {
         ),
     ];
     for (modulus_be, expected_hex) in cases {
-        let ours = license_crypto::encrypt_premaster_secret(&PREMASTER, modulus_be, 65537);
+        let ours = license_crypto::encrypt_premaster_secret(&PREMASTER, modulus_be, 65537).unwrap();
         let ours_hex: String = ours.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(ours_hex, expected_hex.replace(char::is_whitespace, ""));
     }

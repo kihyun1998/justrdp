@@ -53,6 +53,42 @@ pub trait PinStore: Send + Sync + std::fmt::Debug {
     fn store(&self, host: &str, pin: &[u8]) -> io::Result<()>;
 }
 
+/// Apply `policy` to the certificate a server sent under Standard RDP Security (ADR-0020). `Chain`
+/// refuses: no CA chain stands behind a proprietary certificate, and this protection authenticates
+/// nothing by itself. `Tofu` pins the certificate's bytes, under a key of its own so a host's TLS
+/// pin stays apart. The error is the reason, with both fingerprints on a mismatch.
+pub(crate) fn evaluate_standard_security_certificate(
+    policy: &TrustPolicy,
+    host: &str,
+    certificate: &[u8],
+) -> Result<(), String> {
+    match policy {
+        TrustPolicy::DangerAcceptAny => Ok(()),
+        TrustPolicy::Chain => Err(format!(
+            "chain validation cannot apply to Standard RDP Security's certificate from {host}: \
+             use TrustPolicy::Tofu, or TrustPolicy::DangerAcceptAny in a lab"
+        )),
+        TrustPolicy::Tofu(store) => {
+            let key = format!("standard-rdp-security:{host}");
+            let pinned = store
+                .lookup(&key)
+                .map_err(|e| format!("TOFU pin lookup for {host} failed: {e}"))?;
+            match pinned {
+                None => store
+                    .store(&key, certificate)
+                    .map_err(|e| format!("TOFU first-use pin store for {host} failed: {e}")),
+                Some(pinned) if pinned == certificate => Ok(()),
+                Some(pinned) => Err(format!(
+                    "TOFU pin mismatch for {host}: pinned certificate SHA-256 {} but the server \
+                     presented SHA-256 {}",
+                    pin_fingerprint(&pinned),
+                    pin_fingerprint(certificate),
+                )),
+            }
+        }
+    }
+}
+
 /// An in-memory [`PinStore`]: pins live for the lifetime of the process. Useful for tests and
 /// for hosts that load/save pins themselves around it.
 #[derive(Debug, Default)]
@@ -304,6 +340,30 @@ impl ServerCertVerifier for TofuVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_security_certificates_follow_the_trust_policy() {
+        use super::evaluate_standard_security_certificate as evaluate;
+        let chain = evaluate(&TrustPolicy::Chain, "h", b"cert").unwrap_err();
+        assert!(chain.contains("h"), "{chain}");
+        assert_eq!(
+            evaluate(&TrustPolicy::DangerAcceptAny, "h", b"cert"),
+            Ok(())
+        );
+
+        let store = Arc::new(MemoryPinStore::default());
+        let tofu = TrustPolicy::Tofu(store.clone());
+        assert_eq!(evaluate(&tofu, "h", b"cert"), Ok(()), "first use pins");
+        assert_eq!(evaluate(&tofu, "h", b"cert"), Ok(()), "unchanged");
+        let changed = evaluate(&tofu, "h", b"other").unwrap_err();
+        assert!(changed.contains(&pin_fingerprint(b"cert")), "{changed}");
+        assert!(changed.contains(&pin_fingerprint(b"other")), "{changed}");
+        assert_eq!(
+            store.lookup("h").unwrap(),
+            None,
+            "a TLS pin for the host stays apart"
+        );
+    }
 
     /// A unique temp path per test, pre-cleaned so reruns start fresh.
     fn temp_pin_path(tag: &str) -> std::path::PathBuf {

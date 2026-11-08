@@ -27,17 +27,31 @@ decision of its own. That inference has never been written down as a record.
 - The premaster secret and the derived license keys follow `[MS-RDPELE]` 5.1.x
   verbatim; the entropy is host-supplied (`LicenseEntropy`) so the core stays
   deterministic and testable.
+- **A server's modulus is checked before the exponentiation** (`usable_modulus`, #601): with a zero
+  one `BigUint::rem` reduces nothing and `modpow` squares without bound. The same arithmetic with the
+  guard removed ran past 280 s against `u32::MAX` as the exponent. The server supplies both, on the
+  default TLS path too.
 - `BigUint` exists only to do one modular exponentiation — a deliberate refusal to
-  pull an RSA crate into the core for a single operation.
+  pull an RSA crate in for a single operation.
+- **The crypto is a crate of its own** (#597), `justrdp-security`, because a host that relays RDP
+  needs it without the session or the codecs, and `justrdp` depends on `justrdp-codecs`
+  unconditionally. That is the ADR-0001 crate-count rule's "a consumer that needs the part alone".
+  An outside crate depending on it by path has only `justrdp-security` in its `cargo tree`
+  (measured 2026-11-06).
 
 ## Code
 
 - `justrdp-pdu/src/license.rs` — `LicensePreamble`, `ServerLicenseRequest`,
   `ServerCertificate`, `RsaPublicKey`, `PlatformChallenge`, `NewLicense`,
   `encode_new_license_request`, `encode_platform_challenge_response`, `LicenseError`
-- `justrdp/src/license_crypto.rs` — `derive_license_keys`,
-  `encrypt_premaster_secret`, `salted_hash`, `mac_data`, `rc4`, `md5`, `sha1`,
+- `justrdp-security/src/license_crypto.rs` — `derive_license_keys`,
+  `encrypt_premaster_secret`, `usable_modulus`, `salted_hash`, `mac_data`, `rc4`, `md5`, `sha1`,
   `BigUint`, `LicenseKeys`
+- `justrdp-security/src/license_crypto.rs` — `Rc4`, `rsa_public_le`, which
+  `justrdp-security/src/standard.rs` builds Standard RDP Security on: `StandardSecurity`,
+  `ClientRandom`, `EncryptionMethod`, `EncryptionLevel`, `encrypt_client_random`,
+  `StandardSecurityError`
+- `justrdp-pdu/src/client_info.rs` — `encode_security_exchange`
 - `justrdp/src/connect.rs` — `LicenseConfig`, `LicenseEntropy`
 - `justrdp-tokio/src/lib.rs` — `generate_license_entropy`
 - Spec sections cited inline: `[MS-RDPELE]` 2.2.2.5.1, 2.2.2.7, 3.2.5, 5.1.2, 5.1.6
@@ -54,6 +68,14 @@ fired and prints its branch rather than pinning one. One WS2019 box in Remote De
 Administration mode; the RD Session Host role made it send a License Request instead
 ([verification harness](verification-harness.md), #400). No FreeRDP / IronRDP behaviour is
 recorded here.
+
+**Standard RDP Security's arithmetic against FreeRDP** (#598, 2026-11-06, commit `9e9f2148`):
+`libfreerdp/core/security.c` compiled unchanged and driven for 8200 packets each way at 40, 56 and
+128 bits, past two key updates, with every third MAC salted. `justrdp_security::standard` produces
+the same signatures and ciphertexts (`crates/justrdp-security/tests/fixtures/freerdp_vectors/`). The
+spec has no such vector: section 4.1's dump does not state its client random, and 4.8's key is not
+that server's. The RSA value rests on 4.8's key and random, computed outside this code and recovered
+with 4.8's private exponent. 26 mutations of the layer each turned a named test red, or hung it where the guard they removed is the only bound.
 
 ## Cross-cutting invariants
 
@@ -82,6 +104,9 @@ recorded here.
 
 ## Known holes / open
 
+- **Under Standard RDP Security licensing goes out unencrypted**, which 5.3.6 allows, and the Security
+  Exchange still offers `SEC_LICENSE_ENCRYPT_SC`, so an encrypted server message is read. Only the
+  `valid-client` branch was seen (#599).
 - **The grant path is effectively unexercised.** The test VM has no licensing server,
   so only the "error = proceed" branch is proven end-to-end; New License and Platform
   Challenge rest on the differential test alone. **An RD Session Host takes the request

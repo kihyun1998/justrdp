@@ -4,7 +4,7 @@
 
 How this project knows it is right: a differential oracle against
 `ironrdp-graphics` / `ironrdp` for codecs and crypto, a corpus of real Server 2019
-captures for ClearCodec, property tests that assert decoders never panic, a nightly
+captures for ClearCodec, property tests that assert decoders never panic, a weekly
 libFuzzer lane, a coverage discovery job, and a real Windows Server 2019 VM for the
 things only a server can prove. Verification is a territory because it is something
 the system does — and because a claim about correctness here is load-bearing
@@ -18,7 +18,7 @@ everywhere else.
   verification where no assembled oracle exists; the #118 amendment adds
   assembly-layer independence.
 - [ADR-0008](../../adr/0008-robustness-testing-fuzz-and-property.md) — proptest on
-  stable in the PR gate, coverage-guided fuzzing on a nightly CI lane.
+  stable in the PR gate, coverage-guided fuzzing on a weekly CI lane.
 - [ADR-0011](../../adr/0011-zero-ironrdp-terminal-state.md) — the oracle is scaffolding
   with a **retirement** condition, keyed on **role** since its 2026-08-26 amendment. It
   narrows ADR-0003 (phase 3's exit criterion is no longer sufficient on its own) and
@@ -247,7 +247,9 @@ point to compare it with.
 - **justrdp** is `end_to_end_baseline_session_on_the_real_vm` in `justrdp-tokio`, a `--release`
   test binary run with `JUSTRDP_NO_LOG_CAPTURE=1`, so no tracing subscriber listens. Milestones
   are its `try_connect` stage callbacks; first graphics is the arrival of the read that produced
-  the first `FrameUpdate`.
+  the first `FrameUpdate`. Under any other account it returns at once: `rdptest`'s logon
+  runs no workload and never signs out, and an idle desktop's frame a minute keeps resetting the
+  test's 180 s read timeout, which stalled a full `--ignored` run for 170 minutes (#582).
 - **FreeRDP** milestones are its `"%s --> %s"` state transitions (`connection.c`, DEBUG on
   `com.freerdp.core.rdp`) from `INITIAL --> NEGO`; first graphics is the first
   `RecvStartFramePdu`, which 3.32.1 logs at **TRACE** on `com.freerdp.channels.rdpgfx.client`.
@@ -486,8 +488,19 @@ in-session query.
   criterion is an oracle pass.
 - [Licensing](licensing.md) — the differential crypto test is its only proof.
 - [Supply chain & gates](supply-chain-and-gates.md) — which of these run in CI, and
-  which are nightly-only or VM-only.
+  which are weekly-only or VM-only.
 - [Adapter drive loop](adapter-drive-loop.md) — hosts the VM and loopback tests.
+
+## Standard RDP Security needs a reconfigured server
+
+`a_server_that_accepts_only_standard_security_paints_its_logon_screen` (#599) and
+`a_standard_security_session_logs_on_uses_a_channel_and_outlives_key_updates` (#600) read their server from
+`JUSTRDP_STANDARD_SECURITY_SERVER` (`host:port`). On the WS2019 VM the registry values under
+`HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp` are `SecurityLayer=2`,
+`UserAuthentication=1`, `MinEncryptionLevel=2` normally; the test wants the first two at 0, and every
+other VM test fails until they are restored. `rdptest` is not an administrator there (its
+`Administrators` group holds `Administrator` alone, 2026-11-06), so the console changes them. The VM
+has no VMware Tools, so `vmrun` cannot run anything in the guest.
 
 ## Known holes / open
 
@@ -610,7 +623,7 @@ in-session query.
   not copied here.
 - **A capture is a seed only if something else reads it.** #203's Connect-Response fixture is
   the `gcc`/`mcs` seed corpus *and* is asserted by `justrdp-pdu/tests/real_server_connect.rs` in
-  the stable gate, because the lane that consumes it is nightly and would report a stale fixture
+  the stable gate, because the lane that consumes it is weekly and would report a stale fixture
   as a corpus that merely decodes badly — indistinguishable from one doing its job. It is also
   the first server-to-client connect bytes in the repo that no encoder of ours produced, which
   is what makes it an acceptance proof rather than a round-trip.

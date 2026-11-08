@@ -33,7 +33,7 @@ before committing it.
   over `conference-create-response.bin`, and a check that the GCC file is the tail of the MCS one
   (`the_two_fixtures_cannot_drift`) — so regenerating one without the other fails.
 - `.github/scripts/seed_fuzz_corpus.py` — the first two, as the seed corpus of the `mcs` and
-  `gcc` fuzz targets (nightly).
+  `gcc` fuzz targets (weekly lane).
 - `finalization-replies.bin` is also what
   `docs/map/territory/capability-exchange-activation.md`'s `## Reference behaviour` rests on.
 

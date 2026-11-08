@@ -60,7 +60,7 @@ property of the whole untrusted surface.
   targets. Edge and artifacts added by #460.
   Edge added by #237; the code has carried both artifacts since #200.
 - [Verification harness](../territory/verification-harness.md) — the only territory
-  that *enforces* rather than obeys it: proptest in the PR gate, cargo-fuzz nightly.
+  that *enforces* rather than obeys it: proptest in the PR gate, cargo-fuzz weekly.
 
 ## What a violation looks like
 
@@ -81,7 +81,7 @@ that trusts its server too much) rather than as memory safety.
 - **#98** — proptest "decode never panics on arbitrary bytes" + round-trip
   properties, implemented first for the RLE decoder, running on stable in the PR
   gate.
-- **#99** — coverage-guided `cargo-fuzz` on a nightly CI lane, because proptest's
+- **#99** — coverage-guided `cargo-fuzz` on a weekly CI lane, because proptest's
   random sampling does not reach depth. Two automations for one property: that
   duplication *is* the discovery history.
 - **#219** — the lane's **first crash**, which turned the line above from an argument
@@ -644,9 +644,10 @@ target — which is **two** artifacts, not one: `fuzz/fuzz_targets/<name>.rs` *a
 anything, so it reads as covered and is not.
 
 **The lane runs whatever is in the directory** (#200): `fuzz.yml` derives its matrix
-from `ls fuzz/fuzz_targets/` and fails if the manifest disagrees, so a new target is
-covered on the day it lands — but the lane is *nightly*, so it is not covered by the
-PR gate that day. That gap is why the proptest half is not optional.
+from `ls fuzz/fuzz_targets/`, so a new target is in the next run's matrix, and
+`test.yml`'s `fuzz-roster` job fails a PR whose manifest disagrees with the directory (#581).
+That job checks that the target exists, not what it finds: the lane runs *weekly*, so no PR
+gate fuzzes a new target. That gap is why the proptest half is not optional.
 
 This rule used to stop at "a fuzz target in `fuzz/fuzz_targets/`", and #143 and #192
 each satisfied it exactly as written while the lane's hand-kept matrix ran neither

@@ -6,13 +6,17 @@
 //! (Synchronize / Control / Font List ↔ Font Map) → `session-active`.
 
 use crate::advertise::ConnectConfigError;
-use crate::license_crypto;
 use justrdp_pdu::capability::{self, CapabilitySet};
 use justrdp_pdu::client_info;
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::gcc::{ClientGccBlocks, ClientNetworkData, ServerEarlyCapabilityFlags};
 use justrdp_pdu::nego::{NegFailureCode, NegRequest, NegResponse, SecurityProtocol};
 use justrdp_pdu::{finalization, gcc, license, mcs, share, tpkt, x224};
+use justrdp_security::license_crypto;
+use justrdp_security::standard::{
+    ClientRandom, EncryptionLevel, EncryptionMethod, StandardSecurity, StandardSecurityError,
+    encrypt_client_random,
+};
 
 /// Everything the connect sequence needs from the caller, fixed at construction. The GCC fields
 /// — most critically `core.early_capability_flags`, the EGFX gate (ADR-0017) — reach the wire
@@ -30,8 +34,13 @@ pub struct ConnectConfig {
     /// The Client Core Data exactly as it should appear in GCC. Nothing in this struct is
     /// defaulted, derived, or overridden by the machine (except `server_selected_protocol`).
     pub core: gcc::ClientCoreData,
-    /// The Client Security Data (all-zero with TLS transport security).
+    /// The Client Security Data: all-zero with TLS transport security, the methods to offer under
+    /// [`Self::standard_security`].
     pub security: gcc::ClientSecurityData,
+    /// The host's opt-in to Standard RDP Security (ADR-0020), with this connection's client random
+    /// from a cryptographically safe source. `requested` must then be empty. `None` is the default,
+    /// and a server that selects this protection is then refused.
+    pub standard_security: Option<ClientRandom>,
     /// Static virtual channels to request in the Client Network Data, in order. The server
     /// answers with one channel ID per entry.
     pub channels: Vec<gcc::ChannelDef>,
@@ -165,6 +174,13 @@ pub enum Action {
     /// Write these bytes to the socket (the plaintext socket before [`Action::StartTls`], the
     /// TLS stream after).
     WriteBytes(Vec<u8>),
+    /// Under Standard RDP Security, the server's certificate as it sent it, ahead of anything else
+    /// the client sends after the MCS Connect-Response. It authenticates nothing by itself; trust
+    /// is the host's (ADR-0005, ADR-0020), and a host that refuses stops driving the machine.
+    ServerCertificate {
+        /// The `serverCertificate` bytes (`license::ServerCertificate::decode`).
+        certificate: Vec<u8>,
+    },
     /// The X.224 negotiation selected `selected`; the adapter must now upgrade the socket to TLS
     /// (rustls handshake) and hand the server's leaf certificate back via
     /// [`Event::TlsEstablished`]. Under `SSL` the machine answers that with the MCS
@@ -317,6 +333,11 @@ pub enum ConnectError {
     /// HYBRID_EX only: the server's Early User Authorization Result PDU denied access
     /// (`AUTHZ_ACCESS_DENIED`) — user authorization failed, so the connection must be dropped.
     EarlyUserAuthDenied,
+    /// Standard RDP Security refused: a method or level it does not implement, a malformed
+    /// security header, or a wrong MAC (ADR-0020).
+    StandardSecurity(StandardSecurityError),
+    /// The server selected an `encryptionMethod` the client did not offer.
+    UnadvertisedEncryptionMethod(u32),
     /// The server's Core Data echoed a `requestedProtocols` other than the one the client sent
     /// (`[MS-RDPBCGR]` 3.2.5.3.4): the X.224 request was altered on the way. An absent echo is
     /// `PROTOCOL_RDP` (0).
@@ -457,6 +478,32 @@ impl Stage {
     }
 }
 
+/// The server PDUs a connect sequence has no use for: they read as neither licensing nor share
+/// data, whether or not they arrive encrypted.
+const NOT_FOR_THE_CONNECT_SEQUENCE: u16 = client_info::SEC_AUTODETECT_REQ
+    | client_info::SEC_TRANSPORT_REQ
+    | client_info::SEC_HEARTBEAT
+    | client_info::SEC_REDIRECTION_PKT;
+
+/// What the security layer made of one inbound PDU.
+enum Inbound {
+    /// No security layer is in force; the PDU's bytes are the data.
+    Clear,
+    /// The data after the security header, decrypted.
+    Decrypted(Vec<u8>),
+    /// A PDU the connect sequence does not read.
+    Ignored,
+}
+
+impl Inbound {
+    fn or<'a>(&'a self, clear: &'a [u8]) -> &'a [u8] {
+        match self {
+            Inbound::Decrypted(data) => data,
+            Inbound::Clear | Inbound::Ignored => clear,
+        }
+    }
+}
+
 /// The sans-IO RDP connect state machine. Construct it with [`ConnectStateMachine::new`], kick
 /// it off with [`ConnectStateMachine::start`], then feed it [`Event`]s; each call returns the
 /// [`Action`]s the adapter must perform.
@@ -476,6 +523,10 @@ pub struct ConnectStateMachine {
     /// Licensing session keys, present only after a full negotiation ran (the
     /// `STATUS_VALID_CLIENT` short-circuit never derives them).
     license_keys: Option<license_crypto::LicenseKeys>,
+    /// Standard RDP Security's state, from the MCS Connect-Response on.
+    security: Option<StandardSecurity>,
+    /// The Security Exchange PDU's encrypted client random, until it is sent.
+    encrypted_client_random: Option<Vec<u8>>,
     /// Capability-exchange results (valid from Demand Active onward).
     share_id: u32,
     negotiated_size: (u16, u16),
@@ -501,6 +552,8 @@ impl ConnectStateMachine {
             config,
             stage: Stage::TcpConnect,
             inbox: Vec::new(),
+            security: None,
+            encrypted_client_random: None,
             user_channel_id: 0,
             io_channel_id: 0,
             static_channels: Vec::new(),
@@ -680,6 +733,19 @@ impl ConnectStateMachine {
     fn on_frame(&mut self, frame: &[u8]) -> Vec<Action> {
         match self.stage {
             Stage::X224Negotiate => match decode_confirm(frame) {
+                // PROTOCOL_RDP is the empty set, so it is matched by value: only a host that
+                // asked for it reaches the arm, and every other host's refusal is below.
+                Ok(NegResponse::Selected(selected))
+                    if selected.bits() == 0 && self.config.standard_security.is_some() =>
+                {
+                    tracing::debug!(
+                        target: "rdp_x224",
+                        step = "selected",
+                        selected = format_args!("{:#x}", selected.bits()),
+                        "X.224 Connection Confirm"
+                    );
+                    self.start_mcs(selected)
+                }
                 Ok(NegResponse::Selected(selected))
                     if selected.bits() != 0 && self.config.requested.contains(selected) =>
                 {
@@ -722,8 +788,14 @@ impl ConnectStateMachine {
             // channel; the per-stage step functions parse its payload.
             Stage::Licensing { selected } => {
                 match decode_mcs_frame(frame).and_then(mcs::SendDataIndication::decode) {
-                    Ok(ind) => match self.license_step(selected, ind.user_data) {
-                        Ok(actions) => actions,
+                    Ok(ind) => match self.unprotect(ind.user_data, true) {
+                        Ok(Inbound::Ignored) => Vec::new(),
+                        Ok(inbound) => {
+                            match self.license_step(selected, inbound.or(ind.user_data)) {
+                                Ok(actions) => actions,
+                                Err(e) => self.fail(e),
+                            }
+                        }
                         Err(e) => self.fail(e),
                     },
                     Err(e) => self.fail(ConnectError::Decode(e)),
@@ -731,8 +803,14 @@ impl ConnectStateMachine {
             }
             Stage::CapabilityExchange { selected } => {
                 match decode_mcs_frame(frame).and_then(mcs::SendDataIndication::decode) {
-                    Ok(ind) => match self.capability_step(selected, ind.user_data) {
-                        Ok(actions) => actions,
+                    Ok(ind) => match self.unprotect(ind.user_data, false) {
+                        Ok(Inbound::Ignored) => Vec::new(),
+                        Ok(inbound) => {
+                            match self.capability_step(selected, inbound.or(ind.user_data)) {
+                                Ok(actions) => actions,
+                                Err(e) => self.fail(e),
+                            }
+                        }
                         Err(e) => self.fail(e),
                     },
                     Err(e) => self.fail(ConnectError::Decode(e)),
@@ -740,8 +818,14 @@ impl ConnectStateMachine {
             }
             Stage::Finalization { selected } => {
                 match decode_mcs_frame(frame).and_then(mcs::SendDataIndication::decode) {
-                    Ok(ind) => match self.finalization_step(selected, ind.user_data) {
-                        Ok(actions) => actions,
+                    Ok(ind) => match self.unprotect(ind.user_data, false) {
+                        Ok(Inbound::Ignored) => Vec::new(),
+                        Ok(inbound) => {
+                            match self.finalization_step(selected, inbound.or(ind.user_data)) {
+                                Ok(actions) => actions,
+                                Err(e) => self.fail(e),
+                            }
+                        }
                         Err(e) => self.fail(e),
                     },
                     Err(e) => self.fail(ConnectError::Decode(e)),
@@ -769,6 +853,13 @@ impl ConnectStateMachine {
             });
         }
         let blocks = &response.conference.blocks;
+        let mut certificate_action = None;
+        if let Some(client_random) = self.config.standard_security.clone() {
+            match self.begin_standard_security(&blocks.security, &client_random) {
+                Ok(action) => certificate_action = Some(action),
+                Err(e) => return self.fail(e),
+            }
+        }
         let echoed = blocks
             .core
             .client_requested_protocols
@@ -825,14 +916,101 @@ impl ConnectStateMachine {
         );
 
         self.stage = Stage::McsAttach { selected };
-        vec![
-            Action::WriteBytes(tpkt::encode(&x224::encode_data(
-                &mcs::encode_erect_domain_request(),
-            ))),
-            Action::WriteBytes(tpkt::encode(&x224::encode_data(
-                &mcs::encode_attach_user_request(),
-            ))),
-        ]
+        certificate_action
+            .into_iter()
+            .chain([
+                Action::WriteBytes(tpkt::encode(&x224::encode_data(
+                    &mcs::encode_erect_domain_request(),
+                ))),
+                Action::WriteBytes(tpkt::encode(&x224::encode_data(
+                    &mcs::encode_attach_user_request(),
+                ))),
+            ])
+            .collect()
+    }
+
+    /// Check what the server selected, derive the session keys and encrypt the client random.
+    fn begin_standard_security(
+        &mut self,
+        data: &gcc::ServerSecurityData,
+        client_random: &ClientRandom,
+    ) -> Result<Action, ConnectError> {
+        let standard = ConnectError::StandardSecurity;
+        let method = EncryptionMethod::from_wire(data.encryption_method).map_err(standard)?;
+        if self.config.security.encryption_methods & data.encryption_method == 0 {
+            return Err(ConnectError::UnadvertisedEncryptionMethod(
+                data.encryption_method,
+            ));
+        }
+        let level = EncryptionLevel::from_wire(data.encryption_level).map_err(standard)?;
+        let certificate = license::ServerCertificate::decode(&data.server_certificate)
+            .map_err(ConnectError::Decode)?;
+        let key = self.server_license_key(Some(&certificate))?;
+        self.encrypted_client_random =
+            Some(encrypt_client_random(client_random, &key).map_err(standard)?);
+        self.security = Some(
+            StandardSecurity::new(method, level, client_random, &data.server_random)
+                .map_err(standard)?,
+        );
+        tracing::debug!(
+            target: "rdp_standard_security",
+            method = data.encryption_method,
+            level = data.encryption_level,
+            "Standard RDP Security selected"
+        );
+        Ok(Action::ServerCertificate {
+            certificate: data.server_certificate.clone(),
+        })
+    }
+
+    /// The security header's work on one inbound PDU. With `keep_header`, the data handed back
+    /// starts with a basic security header carrying the PDU's flags, as licensing reads it.
+    fn unprotect(&mut self, data: &[u8], keep_header: bool) -> Result<Inbound, ConnectError> {
+        let Some(security) = self.security.as_mut() else {
+            return Ok(Inbound::Clear);
+        };
+        let pdu = security
+            .unprotect_slow_path(data)
+            .map_err(ConnectError::StandardSecurity)?;
+        if pdu.flags & NOT_FOR_THE_CONNECT_SEQUENCE != 0 {
+            tracing::debug!(
+                target: "rdp_standard_security",
+                flags = pdu.flags,
+                "PDU outside the connect sequence ignored"
+            );
+            return Ok(Inbound::Ignored);
+        }
+        // Licensing may stay in the clear, and only while licensing runs: past it, those bytes
+        // carry no MAC and must not read as share data.
+        if !keep_header && pdu.flags & client_info::SEC_LICENSE_PKT != 0 {
+            tracing::debug!(
+                target: "rdp_standard_security",
+                flags = pdu.flags,
+                "licensing PDU after licensing ignored"
+            );
+            return Ok(Inbound::Ignored);
+        }
+        if keep_header {
+            let mut out = Vec::with_capacity(4 + pdu.payload.len());
+            client_info::encode_basic_security_header(&mut out, pdu.flags);
+            out.extend_from_slice(&pdu.payload);
+            return Ok(Inbound::Decrypted(out));
+        }
+        Ok(Inbound::Decrypted(pdu.payload))
+    }
+
+    /// Whether the machine asked for Standard RDP Security and is waiting for the server's choice
+    /// of method and level. A server that cannot make one closes the connection here
+    /// (`[MS-RDPBCGR]` 5.3.2.1), so a close at this point is its refusal.
+    pub fn awaiting_standard_security_selection(&self) -> bool {
+        self.config.standard_security.is_some() && matches!(self.stage, Stage::GccExchange { .. })
+    }
+
+    /// Hand Standard RDP Security's state to the session (the
+    /// [`SessionStateMachine`](crate::SessionStateMachine) continues its ciphers), once the
+    /// machine has reached session-active. `None` under TLS.
+    pub fn take_standard_security(&mut self) -> Option<StandardSecurity> {
+        self.security.take()
     }
 
     /// The Attach User Confirm arrived: record the user channel and either join channels or
@@ -928,60 +1106,91 @@ impl ConnectStateMachine {
     /// exists for it (it is a single fire-and-forget write with no response of its own — the
     /// next inbound PDU is licensing).
     fn finish(&mut self, selected: SecurityProtocol) -> Vec<Action> {
-        let info = client_info::ClientInfo {
-            code_page: 0,
-            flags: self.config.client_info.flags,
-            domain: self.config.client_info.domain.clone(),
-            username: self.config.client_info.username.clone(),
-            // Never a secret here: NLA delegates the real credentials via CredSSP
-            // (ADR-0002 — no secrets in the sans-IO machine).
-            password: String::new(),
-            alternate_shell: self.config.client_info.alternate_shell.clone(),
-            work_dir: self.config.client_info.work_dir.clone(),
-            extra: client_info::ExtendedClientInfo {
-                address_family: self.config.client_info.address_family,
-                address: self.config.client_info.client_address.clone(),
-                dir: self.config.client_info.client_dir.clone(),
-                timezone: self.config.client_info.timezone.clone(),
-                session_id: self.config.client_info.session_id,
-                performance_flags: self.config.client_info.performance_flags,
-                reconnect_cookie: self
-                    .config
-                    .client_info
-                    .reconnect_cookie
-                    .as_ref()
-                    .map(crate::auto_reconnect::client_cookie),
-            },
+        let info =
+            client_info::ClientInfo {
+                code_page: 0,
+                flags: self.config.client_info.flags,
+                domain: self.config.client_info.domain.clone(),
+                username: self.config.client_info.username.clone(),
+                // Never a secret here: NLA delegates the real credentials via CredSSP
+                // (ADR-0002 — no secrets in the sans-IO machine).
+                password: String::new(),
+                alternate_shell: self.config.client_info.alternate_shell.clone(),
+                work_dir: self.config.client_info.work_dir.clone(),
+                extra: client_info::ExtendedClientInfo {
+                    address_family: self.config.client_info.address_family,
+                    address: self.config.client_info.client_address.clone(),
+                    dir: self.config.client_info.client_dir.clone(),
+                    timezone: self.config.client_info.timezone.clone(),
+                    session_id: self.config.client_info.session_id,
+                    performance_flags: self.config.client_info.performance_flags,
+                    reconnect_cookie: self.config.client_info.reconnect_cookie.as_ref().map(
+                        |cookie| {
+                            let random = self.config.standard_security.as_ref();
+                            crate::auto_reconnect::client_cookie(
+                                cookie,
+                                random.map(ClientRandom::as_bytes),
+                            )
+                        },
+                    ),
+                },
+            };
+        let mut actions = Vec::new();
+        let payload = if let Some(security) = self.security.as_mut() {
+            if let Some(encrypted) = self.encrypted_client_random.take() {
+                actions.push(Action::WriteBytes(tpkt::encode(&x224::encode_data(
+                    &mcs::encode_send_data_request(
+                        self.user_channel_id,
+                        self.io_channel_id,
+                        &client_info::encode_security_exchange(&encrypted),
+                    ),
+                ))));
+            }
+            let mut body = Vec::new();
+            info.encode_body_into(&mut body);
+            security.protect_slow_path(client_info::SEC_INFO_PKT, &body)
+        } else {
+            info.encode()
         };
-        let payload = info.encode();
         let frame = tpkt::encode(&x224::encode_data(&mcs::encode_send_data_request(
             self.user_channel_id,
             self.io_channel_id,
             &payload,
         )));
+        actions.push(Action::WriteBytes(frame));
 
         self.stage = Stage::Licensing { selected };
-        vec![
-            Action::WriteBytes(frame),
-            Action::McsConnected {
-                result: McsConnectResult {
-                    selected,
-                    user_channel_id: self.user_channel_id,
-                    io_channel_id: self.io_channel_id,
-                    static_channels: std::mem::take(&mut self.static_channels),
-                    desktop_size: (
-                        self.config.core.desktop_width,
-                        self.config.core.desktop_height,
-                    ),
-                    channel_join_skipped: self.skip_channel_join,
-                },
+        actions.extend([Action::McsConnected {
+            result: McsConnectResult {
+                selected,
+                user_channel_id: self.user_channel_id,
+                io_channel_id: self.io_channel_id,
+                static_channels: std::mem::take(&mut self.static_channels),
+                desktop_size: (
+                    self.config.core.desktop_width,
+                    self.config.core.desktop_height,
+                ),
+                channel_join_skipped: self.skip_channel_join,
             },
-        ]
+        }]);
+        actions
     }
 
     /// Wrap an I/O-channel payload (security header / share PDU and inward) into a complete
     /// outbound frame: MCS Send Data Request → X.224 Data → TPKT.
-    fn send_io(&self, payload: &[u8]) -> Action {
+    fn send_io(&mut self, payload: &[u8]) -> Action {
+        match self.security.as_mut() {
+            Some(security) => {
+                let protected = security.protect_slow_path(0, payload);
+                self.send_clear(&protected)
+            }
+            None => self.send_clear(payload),
+        }
+    }
+
+    /// [`Self::send_io`] without the security layer. A licensing PDU carries its own basic
+    /// security header, and its encryption is optional (`[MS-RDPBCGR]` 5.3.6).
+    fn send_clear(&self, payload: &[u8]) -> Action {
         Action::WriteBytes(tpkt::encode(&x224::encode_data(
             &mcs::encode_send_data_request(self.user_channel_id, self.io_channel_id, payload),
         )))
@@ -1056,7 +1265,13 @@ impl ConnectStateMachine {
                     &entropy.premaster_secret,
                     &key.modulus,
                     key.exponent,
-                );
+                )
+                .ok_or(ConnectError::Decode(
+                    justrdp_pdu::DecodeError::InvalidField {
+                        field: "ServerCertificate.modulus",
+                        reason: "zero, or longer than 512 bytes",
+                    },
+                ))?;
                 let msg = license::encode_new_license_request(
                     self.config.license.platform_id,
                     &entropy.client_random,
@@ -1069,7 +1284,7 @@ impl ConnectStateMachine {
                     branch = "license-request",
                     "server License Request; New License Request sent"
                 );
-                Ok(vec![self.send_io(&msg)])
+                Ok(vec![self.send_clear(&msg)])
             }
             license::MSG_PLATFORM_CHALLENGE => {
                 let challenge =
@@ -1110,7 +1325,7 @@ impl ConnectStateMachine {
                     branch = "platform-challenge",
                     "server Platform Challenge; Platform Challenge Response sent"
                 );
-                Ok(vec![self.send_io(&msg)])
+                Ok(vec![self.send_clear(&msg)])
             }
             license::MSG_NEW_LICENSE | license::MSG_UPGRADE_LICENSE => {
                 let new_license =
@@ -1214,6 +1429,17 @@ impl ConnectStateMachine {
                         self.config.core.desktop_height,
                     ));
                 self.server_capabilities = demand.capability_sets;
+                if let Some(security) = self.security.as_mut() {
+                    let salted = |sets: &[CapabilitySet]| {
+                        sets.iter().any(|set| {
+                            matches!(set, CapabilitySet::General(g)
+                                if g.extra_flags & capability::GENERAL_ENC_SALTED_CHECKSUM != 0)
+                        })
+                    };
+                    security.set_salted_mac(
+                        salted(&self.server_capabilities) && salted(&self.config.capabilities),
+                    );
+                }
 
                 // Echo the negotiated size into our Bitmap set — the one wire fact the machine
                 // writes into the caller's capability list (like `serverSelectedProtocol`).
@@ -1481,6 +1707,7 @@ pub(crate) mod tests {
     fn config_with_flags(flags: ClientEarlyCapabilityFlags) -> ConnectConfig {
         ConnectConfig {
             requested: requested(),
+            standard_security: None,
             correlation_id: None,
             core: justrdp_pdu::gcc::ClientCoreData {
                 version: RDP_VERSION_10_12,
@@ -1879,7 +2106,7 @@ pub(crate) mod tests {
     fn received_confirm_selecting_standard_security_is_rejected() {
         let mut sm = negotiating();
         // PROTOCOL_RDP (0x00) = legacy RC4 Standard Security. It is a (trivial) subset of any
-        // advertised set, so it must be rejected explicitly — justrdp never accepts it.
+        // advertised set, so it must be rejected explicitly for a host that did not opt in.
         let standard = SecurityProtocol::from_bits(0x00);
         let confirm = connection_confirm(standard);
         let actions = sm.process(Event::Received(&confirm));
@@ -3081,7 +3308,7 @@ pub(crate) mod tests {
         //    from the caller's entropy and the certificate's RSA key — byte-exact.
         let actions = sm.process(Event::Received(&server_io_frame(&server_license_request())));
         let encrypted_premaster =
-            license_crypto::encrypt_premaster_secret(&[0x22; 48], &TEST_MODULUS, 65537);
+            license_crypto::encrypt_premaster_secret(&[0x22; 48], &TEST_MODULUS, 65537).unwrap();
         let expected = license::encode_new_license_request(
             license::PLATFORM_ID_NT_POST_52_MICROSOFT,
             &[0x11; 32],
@@ -3534,5 +3761,406 @@ pub(crate) mod tests {
             ),
             "got {actions:?}"
         );
+    }
+
+    // ---- Standard RDP Security (ADR-0020)
+
+    const STANDARD_RANDOM: [u8; 32] = [0x44; 32];
+
+    fn standard_config() -> ConnectConfig {
+        let mut config = config();
+        config.requested = SecurityProtocol::from_bits(0);
+        config.security.encryption_methods = 0x02;
+        config.standard_security = Some(ClientRandom::new(STANDARD_RANDOM));
+        config
+    }
+
+    /// The server's view of [`standard_config`]'s session: it decrypts what the client protects.
+    fn standard_peer() -> StandardSecurity {
+        StandardSecurity::new(
+            EncryptionMethod::Rc4Bit128,
+            EncryptionLevel::ClientCompatible,
+            &ClientRandom::new(STANDARD_RANDOM),
+            &SERVER_RANDOM,
+        )
+        .unwrap()
+        .into_server_peer()
+    }
+
+    /// A Connect-Response selecting `method` and `level`, whose certificate holds [`TEST_MODULUS`].
+    fn standard_connect_response(
+        method: iron_gcc::EncryptionMethod,
+        level: iron_gcc::EncryptionLevel,
+    ) -> Vec<u8> {
+        let blocks = iron_gcc::ServerGccBlocks {
+            core: iron_gcc::ServerCoreData {
+                version: iron_gcc::RdpVersion::V10_12,
+                optional_data: iron_gcc::ServerCoreOptionalData {
+                    client_requested_protocols: None,
+                    early_capability_flags: None,
+                },
+            },
+            network: iron_gcc::ServerNetworkData {
+                io_channel: 1003,
+                channel_ids: vec![1004, 1005],
+            },
+            security: iron_gcc::ServerSecurityData {
+                encryption_method: method,
+                encryption_level: level,
+                server_random: Some(SERVER_RANDOM),
+                server_cert: proprietary_cert(),
+            },
+            message_channel: None,
+            multi_transport_channel: None,
+        };
+        let response = iron_mcs::ConnectResponse {
+            conference_create_response: iron_gcc::ConferenceCreateResponse::new(1002, blocks)
+                .unwrap(),
+            called_connect_id: 0,
+            domain_parameters: iron_mcs::DomainParameters::target(),
+        };
+        frame_mcs(&iron_encode_vec(&response).unwrap())
+    }
+
+    /// A machine that asked for Standard RDP Security and whose Connect-Initial is out.
+    fn standard_awaiting_connect_response(config: ConnectConfig) -> ConnectStateMachine {
+        let mut sm = negotiating_with(config);
+        let actions = sm.process(Event::Received(&connection_confirm(
+            SecurityProtocol::from_bits(0),
+        )));
+        assert!(
+            matches!(actions.as_slice(), [Action::WriteBytes(_)]),
+            "no TLS upgrade: {actions:?}"
+        );
+        sm
+    }
+
+    /// The `userData` of a client MCS Send Data Request frame.
+    fn client_user_data(frame: &[u8]) -> Vec<u8> {
+        let parsed: IronX224<iron_mcs::McsMessage<'_>> = ironrdp_pdu::decode(frame).unwrap();
+        let iron_mcs::McsMessage::SendDataRequest(request) = parsed.0 else {
+            panic!("expected a SendDataRequest");
+        };
+        request.user_data.into_owned()
+    }
+
+    /// Through the channel join: returns the machine and the actions the last confirm produced.
+    fn standard_joined() -> (ConnectStateMachine, Vec<Action>) {
+        standard_joined_with(standard_config())
+    }
+
+    fn standard_joined_with(config: ConnectConfig) -> (ConnectStateMachine, Vec<Action>) {
+        let mut sm = standard_awaiting_connect_response(config);
+        let actions = sm.process(Event::Received(&standard_connect_response(
+            iron_gcc::EncryptionMethod::BIT_128,
+            iron_gcc::EncryptionLevel::ClientCompatible,
+        )));
+        assert_eq!(actions.len(), 3, "{actions:?}");
+        let Action::ServerCertificate { certificate } = &actions[0] else {
+            panic!("the certificate goes first, ahead of every later write: {actions:?}");
+        };
+        assert_eq!(certificate, &proprietary_cert());
+        sm.process(Event::Received(&iron_attach_user_confirm(1007)));
+        let mut last = Vec::new();
+        for id in [1007, 1003, 1004, 1005] {
+            last = sm.process(Event::Received(&iron_channel_join_confirm(1007, id, 0)));
+        }
+        (sm, last)
+    }
+
+    #[test]
+    fn a_host_that_opted_in_requests_protocol_rdp_alone() {
+        let mut sm = ConnectStateMachine::new(standard_config()).unwrap();
+        sm.start();
+        let actions = sm.process(Event::Connected);
+        let [Action::WriteBytes(request)] = actions.as_slice() else {
+            panic!("expected the Connection Request");
+        };
+        // rdpNegData's requestedProtocols, the request's last four bytes.
+        assert_eq!(&request[request.len() - 4..], [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_host_that_opted_in_is_not_given_tls_instead() {
+        let mut sm = negotiating_with(standard_config());
+        let actions = sm.process(Event::Received(&connection_confirm(SecurityProtocol::SSL)));
+        assert_eq!(
+            actions,
+            vec![Action::FailWith(ConnectError::UnsupportedProtocol(
+                SecurityProtocol::SSL
+            ))]
+        );
+    }
+
+    /// `[MS-RDPBCGR]` 3.2.5.3.10: the Security Exchange PDU, with the client random encrypted to
+    /// the certificate's key, then the Client Info PDU under the session keys.
+    #[test]
+    fn the_security_exchange_precedes_an_encrypted_client_info() {
+        let (_, actions) = standard_joined();
+        let [
+            Action::WriteBytes(exchange),
+            Action::WriteBytes(info),
+            Action::McsConnected { .. },
+        ] = actions.as_slice()
+        else {
+            panic!("{actions:?}");
+        };
+        let key = license::RsaPublicKey {
+            modulus: TEST_MODULUS.to_vec(),
+            exponent: 65537,
+        };
+        let encrypted = encrypt_client_random(&ClientRandom::new(STANDARD_RANDOM), &key).unwrap();
+        assert_eq!(
+            exchange,
+            &frame_io(&client_info::encode_security_exchange(&encrypted))
+        );
+
+        let pdu = standard_peer()
+            .unprotect_slow_path(&client_user_data(info))
+            .unwrap();
+        assert_eq!(
+            pdu.flags,
+            client_info::SEC_INFO_PKT | client_info::SEC_ENCRYPT
+        );
+        let username: Vec<u8> = "sm-user"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert!(
+            pdu.payload.windows(username.len()).any(|w| w == username),
+            "the Client Info body decrypts"
+        );
+    }
+
+    /// Licensing and activation under the session keys, end to end, and the state handed on.
+    #[test]
+    fn a_standard_security_connect_reaches_session_active() {
+        let (mut sm, _) = standard_joined();
+        let mut peer = standard_peer();
+        // The Client Info PDU advanced the client's outbound cipher; keep the peer in step.
+        let (_, joined) = standard_joined();
+        let Action::WriteBytes(info) = &joined[1] else {
+            panic!("{joined:?}");
+        };
+        peer.unprotect_slow_path(&client_user_data(info)).unwrap();
+
+        let alert = license_alert(license::STATUS_VALID_CLIENT);
+        let actions = sm.process(Event::Received(&server_io_frame(
+            &peer.protect_slow_path(client_info::SEC_LICENSE_PKT, &alert[4..]),
+        )));
+        assert!(actions.is_empty(), "{actions:?}");
+
+        let actions = sm.process(Event::Received(&server_io_frame(
+            &peer.protect_slow_path(0, &server_demand_active(1920, 1080)),
+        )));
+        let expected = expected_confirm_and_batch(1920, 1080);
+        assert_eq!(actions.len(), expected.len());
+        for (action, expected) in actions.iter().zip(&expected) {
+            let (Action::WriteBytes(frame), Action::WriteBytes(want)) = (action, expected) else {
+                panic!("{action:?}");
+            };
+            let pdu = peer.unprotect_slow_path(&client_user_data(frame)).unwrap();
+            assert_eq!(
+                pdu.flags,
+                client_info::SEC_ENCRYPT,
+                "no salt was advertised"
+            );
+            assert_eq!(&frame_io(&pdu.payload), want);
+        }
+
+        for (pdu_type2, body) in [
+            (
+                share::PDU_TYPE2_SYNCHRONIZE,
+                finalization::Synchronize { target_user: 1007 }.encode(),
+            ),
+            (
+                share::PDU_TYPE2_CONTROL,
+                finalization::Control {
+                    action: finalization::CTRLACTION_COOPERATE,
+                    grant_id: 0,
+                    control_id: 0,
+                }
+                .encode(),
+            ),
+            (
+                share::PDU_TYPE2_CONTROL,
+                finalization::Control {
+                    action: finalization::CTRLACTION_GRANTED_CONTROL,
+                    grant_id: 1007,
+                    control_id: 1002,
+                }
+                .encode(),
+            ),
+        ] {
+            let actions = sm.process(Event::Received(&server_io_frame(
+                &peer.protect_slow_path(0, &server_share_data(pdu_type2, &body)),
+            )));
+            assert!(actions.is_empty(), "{actions:?}");
+        }
+        let actions = sm.process(Event::Received(&server_io_frame(&peer.protect_slow_path(
+            0,
+            &server_share_data(share::PDU_TYPE2_FONT_MAP, &[0, 0, 0, 0, 3, 0, 4, 0]),
+        ))));
+        assert!(
+            matches!(actions.as_slice(), [Action::SessionActive { .. }]),
+            "{actions:?}"
+        );
+
+        // The session continues both ciphers where the connect left them.
+        let mut security = sm.take_standard_security().expect("handed over once");
+        let (signature, ciphertext) = peer.protect(b"next", false);
+        assert_eq!(
+            security.unprotect(&signature, &ciphertext, false).unwrap(),
+            b"next"
+        );
+        assert!(sm.take_standard_security().is_none());
+    }
+
+    /// `[MS-RDPBCGR]` 5.3.6.1.1: the MAC is salted once both sides have advertised it, and only
+    /// then.
+    #[test]
+    fn the_outbound_mac_is_salted_only_when_both_sides_advertised_it() {
+        let salted_set = || {
+            CapabilitySet::General(capability::GeneralCapabilitySet {
+                os_major_type: 1,
+                os_minor_type: 3,
+                extra_flags: capability::GENERAL_ENC_SALTED_CHECKSUM,
+                refresh_rect_support: 0,
+                suppress_output_support: 0,
+            })
+        };
+        for (client, server, expected) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let mut config = standard_config();
+            if client {
+                config.capabilities.push(salted_set());
+            }
+            let (mut sm, joined) = standard_joined_with(config);
+            let mut peer = standard_peer();
+            let Action::WriteBytes(info) = &joined[1] else {
+                panic!("{joined:?}");
+            };
+            let info = peer.unprotect_slow_path(&client_user_data(info)).unwrap();
+            assert_eq!(
+                info.flags & client_info::SEC_SECURE_CHECKSUM,
+                0,
+                "nothing is advertised yet when the Client Info PDU goes"
+            );
+            let alert = license_alert(license::STATUS_VALID_CLIENT);
+            sm.process(Event::Received(&server_io_frame(
+                &peer.protect_slow_path(client_info::SEC_LICENSE_PKT, &alert[4..]),
+            )));
+            let extra = if server {
+                vec![salted_set()]
+            } else {
+                Vec::new()
+            };
+            let actions = sm.process(Event::Received(&server_io_frame(
+                &peer.protect_slow_path(0, &server_demand_active_with(1920, 1080, extra)),
+            )));
+            let Action::WriteBytes(confirm) = &actions[0] else {
+                panic!("{actions:?}");
+            };
+            let pdu = peer
+                .unprotect_slow_path(&client_user_data(confirm))
+                .unwrap();
+            assert_eq!(
+                pdu.flags & client_info::SEC_SECURE_CHECKSUM != 0,
+                expected,
+                "client {client}, server {server}"
+            );
+        }
+    }
+
+    /// Licensing may stay in the clear while it runs. Past it, a PDU flagged as licensing carries
+    /// no MAC, so a forged Demand Active wearing the flag is not read.
+    #[test]
+    fn a_clear_licensing_pdu_is_read_only_while_licensing_runs() {
+        let (mut sm, _) = standard_joined();
+        let actions = sm.process(Event::Received(&server_io_frame(&license_alert(
+            license::STATUS_VALID_CLIENT,
+        ))));
+        assert!(actions.is_empty(), "{actions:?}");
+
+        let mut forged = Vec::new();
+        client_info::encode_basic_security_header(&mut forged, client_info::SEC_LICENSE_PKT);
+        forged.extend_from_slice(&server_demand_active(1920, 1080));
+        let actions = sm.process(Event::Received(&server_io_frame(&forged)));
+        assert!(
+            actions.is_empty(),
+            "no Confirm Active answers it: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_mac_ends_a_standard_security_connect() {
+        let (mut sm, joined) = standard_joined();
+        let mut peer = standard_peer();
+        let Action::WriteBytes(info) = &joined[1] else {
+            panic!("{joined:?}");
+        };
+        peer.unprotect_slow_path(&client_user_data(info)).unwrap();
+        let alert = license_alert(license::STATUS_VALID_CLIENT);
+        let mut pdu = peer.protect_slow_path(client_info::SEC_LICENSE_PKT, &alert[4..]);
+        pdu[4] ^= 1;
+        assert_eq!(
+            sm.process(Event::Received(&server_io_frame(&pdu))),
+            vec![Action::FailWith(ConnectError::StandardSecurity(
+                StandardSecurityError::MacMismatch
+            ))]
+        );
+    }
+
+    #[test]
+    fn an_encryption_level_or_method_the_layer_lacks_fails_naming_it() {
+        let mut fips = standard_config();
+        fips.security.encryption_methods = 0x0B;
+        for (method, level, expected) in [
+            (
+                iron_gcc::EncryptionMethod::FIPS,
+                iron_gcc::EncryptionLevel::Fips,
+                ConnectError::StandardSecurity(StandardSecurityError::UnsupportedMethod(0x10)),
+            ),
+            (
+                iron_gcc::EncryptionMethod::BIT_128,
+                iron_gcc::EncryptionLevel::Fips,
+                ConnectError::StandardSecurity(StandardSecurityError::UnsupportedLevel(4)),
+            ),
+            (
+                iron_gcc::EncryptionMethod::BIT_128,
+                iron_gcc::EncryptionLevel::None,
+                ConnectError::StandardSecurity(StandardSecurityError::UnsupportedLevel(0)),
+            ),
+        ] {
+            let mut sm = standard_awaiting_connect_response(fips.clone());
+            assert_eq!(
+                sm.process(Event::Received(&standard_connect_response(method, level))),
+                vec![Action::FailWith(expected)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_method_the_client_did_not_offer_is_refused() {
+        let mut sm = standard_awaiting_connect_response(standard_config());
+        assert_eq!(
+            sm.process(Event::Received(&standard_connect_response(
+                iron_gcc::EncryptionMethod::BIT_40,
+                iron_gcc::EncryptionLevel::Low,
+            ))),
+            vec![Action::FailWith(
+                ConnectError::UnadvertisedEncryptionMethod(0x01)
+            )]
+        );
+    }
+
+    #[test]
+    fn a_session_under_tls_has_no_standard_security_to_hand_over() {
+        let (mut sm, _) = session_active();
+        assert!(sm.take_standard_security().is_none());
     }
 }

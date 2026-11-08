@@ -34,16 +34,8 @@ count × {
 
 - The self-owned `ClearDecoder` replays the **entire** capture without error — matching the live
   session, which had 0 rejections under the fixed decoder.
-- Where the bootstrap oracle (`ironrdp-graphics`) **succeeds**, the self-owned output is
-  **byte-identical** (ADR-0003 phase-2 acceptance).
-- Where the oracle **rejects** with one of its three defective validations
-  (`shortVBarCacheMiss`, `rlex` suite, `vbarIndex`), the self-owned decoder produces pixels. The
-  differential test asserts all three signatures appear in this corpus, so the #56 fix is
-  genuinely exercised.
-
-The oracle cannot supply a per-stream pixel reference for streams it rejects, so ground truth
-for those is the full-desktop render in the slice-9 EGFX real-VM acceptance test (no Clear-region
-holes).
+- The `ironrdp-graphics` oracle accepts every entry too, and the self-owned output is
+  **byte-identical** to it (ADR-0003 phase-2 acceptance).
 
 ## Provenance
 

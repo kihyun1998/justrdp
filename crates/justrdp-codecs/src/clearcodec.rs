@@ -843,7 +843,7 @@ fn decode_rlex_region(
     Ok(())
 }
 
-// --- RLEX subcodec parsing (MS-RDPEGFX 2.2.4.1.1.3.1.3) ---
+// --- RLEX subcodec parsing (MS-RDPEGFX 2.2.4.1.1.3.1.1) ---
 
 struct RlexSegment {
     start_index: u8,

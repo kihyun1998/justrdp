@@ -9,7 +9,7 @@
 //! - **(B) composed reference**: the oracle's primitives are glued in spec order into a
 //!   reference decoder, with our ICT in place of the oracle's, and our full-payload RGBA must
 //!   match it byte for byte on synthetic TS_RFX streams (container encoded by `ironrdp-pdu`,
-//!   tile payloads by `rfx_encode_component`).
+//!   tile payloads by `harness_rlgr_encode`).
 //!
 //! The ICT is not compared with the oracle's: ours rounds the coefficients as FreeRDP does and
 //! the oracle's truncates them, and the ICT's expectation is FreeRDP's pixels over the

@@ -29,13 +29,14 @@ use justrdp::{
     DisconnectReason, Event, FrameUpdate, Framebuffer, InputEvent, LicenseEntropy,
     McsConnectResult, ResizeRequest, SessionError, SessionOutput, SessionStateMachine,
 };
+use justrdp_security::standard::{ClientRandom, StandardSecurity};
 use rustls::pki_types::ServerName;
 use sspi::credssp::{ClientMode, ClientState, CredSspClient, CredSspMode, TsRequest};
 use sspi::generator::GeneratorState;
 use sspi::negotiate::NegotiateConfig;
 use sspi::ntlm::NtlmConfig;
 use sspi::{AuthIdentity, Credentials as SspiCredentials, Secret, Username};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -69,8 +70,77 @@ pub struct ConnectOutcome {
     /// from this one), the server's capability sets, and any bytes that followed the Font Map
     /// in the same read (process them before reading the stream).
     pub activation: ActivationResult,
-    /// The TLS-upgraded, NLA-authenticated stream, positioned just past the Font Map PDU.
-    pub stream: TlsStream<TcpStream>,
+    /// The stream, positioned just past the Font Map PDU.
+    pub stream: SessionStream,
+    /// Standard RDP Security's state for
+    /// [`SessionStateMachine::with_standard_security`]. `None` under TLS.
+    pub standard_security: Option<StandardSecurity>,
+}
+
+/// What a session runs over: TLS, or the plain socket under Standard RDP Security (ADR-0020).
+#[derive(Debug)]
+pub enum SessionStream {
+    /// The TLS-upgraded stream.
+    Tls(Box<TlsStream<TcpStream>>),
+    /// The plain socket, whose PDUs the security layer protects.
+    Tcp(TcpStream),
+}
+
+impl AsyncRead for SessionStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            SessionStream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            SessionStream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for SessionStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            SessionStream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            SessionStream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            SessionStream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+            SessionStream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            SessionStream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            SessionStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Generate this connection's client random for [`justrdp::ConnectConfig::standard_security`],
+/// from the same RNG as [`generate_license_entropy`].
+pub fn generate_client_random() -> io::Result<ClientRandom> {
+    let rng = rustls::crypto::ring::default_provider().secure_random;
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes).map_err(|e| {
+        io::Error::other(format!("OS RNG failed generating a client random: {e:?}"))
+    })?;
+    Ok(ClientRandom::new(bytes))
 }
 
 /// Generate fresh per-connection licensing entropy ([`LicenseEntropy`]) from the process RNG
@@ -236,6 +306,17 @@ impl From<SocketAddr> for ServerAddr {
 /// Why the adapter-driven connect failed.
 #[derive(Debug)]
 pub enum ConnectFailure {
+    /// The server closed the connection right after the MCS Connect-Initial of a Standard RDP
+    /// Security connect: it could select no encryption method for what the client offered
+    /// (`[MS-RDPBCGR]` 5.3.2.1). A server at FIPS level does this, since FIPS is not offered
+    /// (ADR-0020), and so does one whose key strength the offer does not fit.
+    StandardSecurityRefusedByServer,
+    /// Under Standard RDP Security, the trust policy refused the server's certificate. Nothing
+    /// was sent after the MCS Connect-Response (ADR-0005, ADR-0020).
+    ServerCertificateRefused {
+        /// Why.
+        reason: String,
+    },
     /// The config advertises something the core cannot honour, so nothing was dialed
     /// ([`justrdp::advertise`], ADR-0016 Decision 3).
     Config(justrdp::ConnectConfigError),
@@ -268,6 +349,13 @@ pub enum ConnectFailure {
 impl std::fmt::Display for ConnectFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ConnectFailure::StandardSecurityRefusedByServer => f.write_str(
+                "the server closed the connection when offered Standard RDP Security: it may \
+                 require FIPS, or a key strength that was not offered",
+            ),
+            ConnectFailure::ServerCertificateRefused { reason } => {
+                write!(f, "server certificate refused: {reason}")
+            }
             ConnectFailure::Config(e) => write!(f, "refused before connecting: {e}"),
             ConnectFailure::Io(e) => write!(f, "i/o error: {e}"),
             ConnectFailure::Protocol(e) => write!(f, "protocol error: {e:?}"),
@@ -440,6 +528,14 @@ async fn connect_inner(
                     queue.extend(sm.process(Event::Connected));
                     announce_stage(&mut sm, &mut announced, &mut on_stage);
                 }
+                Action::ServerCertificate { certificate } => {
+                    trust::evaluate_standard_security_certificate(
+                        &options.trust,
+                        &server.host,
+                        &certificate,
+                    )
+                    .map_err(|reason| ConnectFailure::ServerCertificateRefused { reason })?;
+                }
                 Action::WriteBytes(bytes) => {
                     // Writes target whichever transport is current: plaintext TCP during X.224,
                     // the TLS stream from the upgrade onward (MCS rides TLS).
@@ -574,18 +670,23 @@ async fn connect_inner(
                             "session-active reached without an MCS result",
                         )));
                     };
-                    let Transport::Tls(stream) =
-                        std::mem::replace(&mut transport, Transport::Absent)
-                    else {
-                        return Err(ConnectFailure::Io(io::Error::new(
-                            io::ErrorKind::NotConnected,
-                            "session-active reached without a TLS stream",
-                        )));
+                    let stream = match std::mem::replace(&mut transport, Transport::Absent) {
+                        Transport::Tls(stream) => SessionStream::Tls(stream),
+                        Transport::Tcp(stream) if mcs.selected.bits() == 0 => {
+                            SessionStream::Tcp(stream)
+                        }
+                        Transport::Tcp(_) | Transport::Absent => {
+                            return Err(ConnectFailure::Io(io::Error::new(
+                                io::ErrorKind::NotConnected,
+                                "session-active reached without a TLS stream",
+                            )));
+                        }
                     };
                     return Ok(ConnectOutcome {
                         mcs,
                         activation: result,
-                        stream: *stream,
+                        stream,
+                        standard_security: sm.take_standard_security(),
                     });
                 }
                 Action::FailWith(e) => return Err(ConnectFailure::Protocol(e)),
@@ -595,8 +696,20 @@ async fn connect_inner(
         // The queue drained without a terminal action: the machine needs more bytes — from the
         // plaintext socket during X.224, from the TLS stream during the MCS exchange. The
         // machine reassembles TPKT frames itself, so raw chunks are fine.
-        let n =
-            with_stage_timeout(sm.stage(), timeouts.stage, transport.read(&mut readbuf)).await?;
+        let read =
+            with_stage_timeout(sm.stage(), timeouts.stage, transport.read(&mut readbuf)).await;
+        let n = match read {
+            Err(ConnectFailure::Io(e))
+                if e.kind() == io::ErrorKind::ConnectionReset
+                    && sm.awaiting_standard_security_selection() =>
+            {
+                return Err(ConnectFailure::StandardSecurityRefusedByServer);
+            }
+            other => other?,
+        };
+        if n == 0 && sm.awaiting_standard_security_selection() {
+            return Err(ConnectFailure::StandardSecurityRefusedByServer);
+        }
         if n == 0 {
             return Err(ConnectFailure::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -808,7 +921,7 @@ impl core::error::Error for SessionFailure {}
 /// `Err`. The future may also simply be dropped (the caller owns cancellation); the machine is
 /// borrowed, so the caller keeps access to its framebuffer afterwards.
 pub async fn run_session(
-    stream: &mut TlsStream<TcpStream>,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     machine: &mut SessionStateMachine,
     on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
     on_cursor: impl FnMut(&CursorEvent),
@@ -829,7 +942,7 @@ pub async fn run_session(
 /// after the session starts, and again whenever a lock LED changes). Closing the channel
 /// disables the input branch; the session keeps running output-only.
 pub async fn run_session_with_input(
-    stream: &mut TlsStream<TcpStream>,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     machine: &mut SessionStateMachine,
     mut on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
     mut on_cursor: impl FnMut(&CursorEvent),
@@ -1127,7 +1240,7 @@ pub enum SessionEvent {
 /// [`SessionEvent::DynamicChannelClosed`]);
 /// `on_frame` and `on_cursor` keep the synchronous sink contracts of [`run_session`].
 pub async fn run_session_with_commands(
-    stream: &mut TlsStream<TcpStream>,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     machine: &mut SessionStateMachine,
     mut on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
     mut on_cursor: impl FnMut(&CursorEvent),
@@ -1651,6 +1764,7 @@ mod tests {
                 hardware_id: [0x4A55_5354, 0x5244_5001, 0, 0], // "JUST","RDP\1" — arbitrary
             },
             persistent_bitmaps: Vec::new(),
+            standard_security: None,
         }
     }
 
@@ -8838,7 +8952,7 @@ mod tests {
     /// A session with drawing orders, driven by keystrokes and read until it goes quiet.
     struct OrderDrive {
         machine: SessionStateMachine,
-        stream: tokio_rustls::client::TlsStream<TcpStream>,
+        stream: SessionStream,
         census: OrderCensus,
         frames: usize,
         /// Every rect handed to the host, in order.
@@ -9761,6 +9875,22 @@ mod tests {
         (frames.load(std::sync::atomic::Ordering::SeqCst), colours)
     }
 
+    /// The account whose logon runs the #556 workload and then signs itself out.
+    const BASELINE_ACCOUNT: &str = "rdpbench";
+
+    /// Whether `username` is [`BASELINE_ACCOUNT`], whose case Windows ignores.
+    fn runs_the_baseline(username: Option<&str>) -> bool {
+        username.is_some_and(|name| name.eq_ignore_ascii_case(BASELINE_ACCOUNT))
+    }
+
+    #[test]
+    fn only_the_baseline_account_runs_the_baseline() {
+        assert!(runs_the_baseline(Some("rdpbench")));
+        assert!(runs_the_baseline(Some("RDPBench")));
+        assert!(!runs_the_baseline(Some("rdptest")));
+        assert!(!runs_the_baseline(None));
+    }
+
     /// Issue #556: one logon of the `rdpbench` account on the real VM, which runs the office and
     /// heavy workloads and signs itself out, timed from inside: when each connect stage began,
     /// when the first graphics update's bytes arrived, and how long each `FrameUpdate` took from
@@ -9769,6 +9899,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the live RDP test VM, its rdpbench account and JUSTRDP_TEST_* env vars"]
     async fn end_to_end_baseline_session_on_the_real_vm() {
+        let username = std::env::var("JUSTRDP_TEST_USERNAME").ok();
+        if !runs_the_baseline(username.as_deref()) {
+            eprintln!("skipped: this test runs only as {BASELINE_ACCOUNT}");
+            return;
+        }
         vm::with_self_ending_vm_session(|vm| async move {
             let start = std::time::Instant::now();
             let mut stages: Vec<(String, u128)> = Vec::new();
@@ -12726,7 +12861,7 @@ mod tests {
         selected: SecurityProtocol,
         server_capabilities: Vec<justrdp_pdu::capability::CapabilitySet>,
         machine: SessionStateMachine,
-        stream: TlsStream<TcpStream>,
+        stream: SessionStream,
         pending: Vec<SessionOutput>,
         frames: Vec<FrameUpdate>,
         stages: Vec<String>,
@@ -12745,7 +12880,8 @@ mod tests {
                 session_config_from(&outcome, capabilities),
                 outcome.activation.leftover.clone(),
             )
-            .expect("the desktop size is within MAX_DESKTOP_DIM");
+            .expect("the desktop size is within MAX_DESKTOP_DIM")
+            .with_standard_security(outcome.standard_security);
             let pending = feed_drained(&mut machine, &[]).expect("leftover bytes process");
             Driven {
                 selected: outcome.mcs.selected,
@@ -13098,6 +13234,333 @@ mod tests {
             assert!(colours > 16, "near-monochrome: {colours} colours");
         })
         .await
+    }
+
+    /// A session under Standard RDP Security that a person could use (#600): a password typed at
+    /// the logon screen logs on, the clipboard channel answers both ways, and both directions
+    /// run past a key update with every MAC checked. It signs out when it ends. The server is
+    /// `JUSTRDP_STANDARD_SECURITY_SERVER`, `host:port`, and the account `JUSTRDP_TEST_*`.
+    #[tokio::test]
+    #[ignore = "requires a server accepting only Standard RDP Security, named by \
+                JUSTRDP_STANDARD_SECURITY_SERVER, and JUSTRDP_TEST_* env vars"]
+    async fn a_standard_security_session_logs_on_uses_a_channel_and_outlives_key_updates() {
+        use justrdp::cliprdr::{self, Clipboard, ClipboardOutput};
+
+        struct Session {
+            machine: SessionStateMachine,
+            stream: SessionStream,
+            channel: u16,
+            clipboard: Clipboard,
+            logged_on: bool,
+            list_answered: bool,
+            frames: usize,
+        }
+
+        impl Session {
+            async fn write(&mut self, frames: Vec<Vec<u8>>) {
+                for frame in frames {
+                    write_frame(&mut self.stream, &frame).await.unwrap();
+                }
+            }
+
+            async fn send(&mut self, events: &[InputEvent]) {
+                let frames = self.machine.encode_input(events);
+                self.write(frames).await;
+            }
+
+            /// Read and answer until `most` has passed. `false` when the server closed.
+            async fn pump(&mut self, most: Duration) -> bool {
+                let end = tokio::time::Instant::now() + most;
+                let mut buf = [0u8; 16 * 1024];
+                loop {
+                    // A stream that is always readable never lets the timeout fire.
+                    if tokio::time::Instant::now() >= end {
+                        return true;
+                    }
+                    let read = tokio::time::timeout_at(end, self.stream.read(&mut buf)).await;
+                    let Ok(read) = read else { return true };
+                    let n = match read {
+                        Ok(0) | Err(_) => return false,
+                        Ok(n) => n,
+                    };
+                    let outputs = self.machine.process_bytes(&buf[..n]).unwrap();
+                    self.handle(outputs).await;
+                    while self.machine.has_pending_input() {
+                        let outputs = self.machine.process_bytes(&[]).unwrap();
+                        self.handle(outputs).await;
+                    }
+                }
+            }
+
+            async fn handle(&mut self, outputs: Vec<SessionOutput>) {
+                for output in outputs {
+                    match output {
+                        SessionOutput::WriteBytes(bytes) => self.write(vec![bytes]).await,
+                        SessionOutput::Frame(_) => self.frames += 1,
+                        SessionOutput::SaveSessionInfo(_) => self.logged_on = true,
+                        SessionOutput::ChannelData { channel, data } => {
+                            assert_eq!(channel, self.channel, "only cliprdr was requested");
+                            for output in self.clipboard.process(&data).unwrap() {
+                                match output {
+                                    ClipboardOutput::Send(message) => {
+                                        let frames =
+                                            self.machine.send_channel(channel, &message).unwrap();
+                                        self.write(frames).await;
+                                    }
+                                    ClipboardOutput::FormatListResponse { ok } => {
+                                        assert!(ok, "the server accepted the Format List");
+                                        self.list_answered = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            async fn click(&mut self, x: u16, y: u16) {
+                use justrdp_pdu::input::{PTRFLAGS_BUTTON1, PTRFLAGS_DOWN, PTRFLAGS_MOVE};
+                for flags in [
+                    PTRFLAGS_MOVE,
+                    PTRFLAGS_DOWN | PTRFLAGS_BUTTON1,
+                    PTRFLAGS_BUTTON1,
+                ] {
+                    self.send(&[InputEvent::Mouse {
+                        flags,
+                        wheel_units: 0,
+                        x,
+                        y,
+                    }])
+                    .await;
+                }
+            }
+
+            async fn type_text(&mut self, text: &str) {
+                for unit in text.encode_utf16() {
+                    self.send(&[
+                        InputEvent::Unicode {
+                            code_unit: unit,
+                            release: false,
+                        },
+                        InputEvent::Unicode {
+                            code_unit: unit,
+                            release: true,
+                        },
+                    ])
+                    .await;
+                    self.pump(Duration::from_millis(15)).await;
+                }
+            }
+
+            async fn enter(&mut self) {
+                self.pump(Duration::from_secs(3)).await;
+                self.send(&tap(0x0D)).await;
+            }
+        }
+
+        let addr: SocketAddr = std::env::var("JUSTRDP_STANDARD_SECURITY_SERVER")
+            .expect("JUSTRDP_STANDARD_SECURITY_SERVER names the server")
+            .parse()
+            .expect("JUSTRDP_STANDARD_SECURITY_SERVER is host:port");
+        let password = std::env::var("JUSTRDP_TEST_PASSWORD").expect("JUSTRDP_TEST_PASSWORD");
+
+        let mut config = legacy_graphics_config();
+        config.requested = SecurityProtocol::from_bits(0);
+        config.security.encryption_methods = 0x01 | 0x02 | 0x08;
+        config.standard_security = Some(generate_client_random().unwrap());
+        config.channels = vec![cliprdr::channel_def()];
+        let capabilities = config.capabilities.clone();
+        let mut outcome = connect_danger(addr, config, test_credentials(), |_| {})
+            .await
+            .unwrap();
+        let security = outcome.standard_security.take();
+        let channel = outcome.mcs.static_channels[0].id;
+        let server =
+            justrdp::ServerAnnouncement::from_capabilities(&outcome.activation.server_capabilities);
+        assert_ne!(
+            server.input_flags
+                & (justrdp_pdu::capability::INPUT_FLAG_FASTPATH_INPUT
+                    | justrdp_pdu::capability::INPUT_FLAG_FASTPATH_INPUT2),
+            0,
+            "the input below goes fast-path"
+        );
+        let machine = SessionStateMachine::new(
+            session_config_from(&outcome, capabilities),
+            outcome.activation.leftover.clone(),
+        )
+        .unwrap()
+        .with_standard_security(security);
+        let (width, height) = outcome.activation.desktop_size;
+        let mut session = Session {
+            machine,
+            stream: outcome.stream,
+            channel,
+            clipboard: Clipboard::without_file_transfer(),
+            logged_on: false,
+            list_answered: false,
+            frames: 0,
+        };
+
+        // The logon screen holds the user name from Client Info; the password goes by input.
+        let leftover = session.machine.process_bytes(&[]).unwrap();
+        session.handle(leftover).await;
+        session.pump(Duration::from_secs(6)).await;
+        assert!(session.frames > 0, "the logon screen painted");
+        session
+            .click(width / 2, (u32::from(height) * 535 / 800) as u16)
+            .await;
+        session.pump(Duration::from_secs(1)).await;
+        session.type_text(&password).await;
+        session.enter().await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        while !(session.logged_on && session.list_answered) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "logged on {}, Format List answered {}",
+                session.logged_on,
+                session.list_answered
+            );
+            assert!(
+                session.pump(Duration::from_secs(1)).await,
+                "the server closed"
+            );
+        }
+
+        // A console scrolling a long listing, and the pointer sweeping, past both key updates.
+        session.pump(Duration::from_secs(15)).await;
+        session.send(&tap(0x1B)).await;
+        session.pump(Duration::from_secs(2)).await;
+        session.click(24, height - 20).await;
+        session.pump(Duration::from_secs(3)).await;
+        session.type_text("powershell").await;
+        session.enter().await;
+        session.pump(Duration::from_secs(6)).await;
+        session
+            .type_text("while ($true) { dir -r C:\\Windows\\System32 }")
+            .await;
+        session.enter().await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(420);
+        let mut sweep = 0u16;
+        loop {
+            let (sent, received) = session.machine.standard_security_packet_counts().unwrap();
+            if sent > 4200 && received > 4200 {
+                eprintln!("#600: {sent} sent, {received} received");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{sent} sent, {received} received"
+            );
+            for _ in 0..100 {
+                sweep = (sweep + 7) % (width / 2);
+                session
+                    .send(&[InputEvent::Mouse {
+                        flags: justrdp_pdu::input::PTRFLAGS_MOVE,
+                        wheel_units: 0,
+                        x: width / 2 + sweep,
+                        y: 40,
+                    }])
+                    .await;
+            }
+            assert!(
+                session.pump(Duration::from_millis(100)).await,
+                "the server closed: a MAC it could not verify would look like this"
+            );
+        }
+        eprintln!(
+            "#600: {} frames, dump {}",
+            session.frames,
+            dump_ppm(session.machine.framebuffer(), "justrdp-600-session.ppm").display()
+        );
+
+        // Ctrl+C, then sign out, so the next session starts clean.
+        let ctrl = justrdp::input::scancode_from_windows_vk(0x11).unwrap();
+        let c = justrdp::input::scancode_from_windows_vk(0x43).unwrap();
+        session
+            .send(&[ctrl.press(), c.press(), c.release(), ctrl.release()])
+            .await;
+        session.pump(Duration::from_secs(5)).await;
+        session.type_text("shutdown /l /f").await;
+        session.enter().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        while session.pump(Duration::from_secs(2)).await {
+            assert!(tokio::time::Instant::now() < deadline, "did not sign out");
+        }
+    }
+
+    /// `[MS-RDPBCGR]` 5.3.2.1: a server with no method to select closes the connection, which the
+    /// WS2019 VM did at FIPS level with a reset (#599). A close here is reported as its refusal.
+    #[tokio::test]
+    async fn a_close_after_the_connect_initial_is_the_servers_refusal_of_standard_security() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await.unwrap();
+            // A Connection Confirm whose RDP_NEG_RSP selects PROTOCOL_RDP.
+            socket
+                .write_all(&[
+                    0x03, 0x00, 0x00, 0x13, 0x0e, 0xd0, 0x00, 0x00, 0x12, 0x34, 0x00, 0x02, 0x00,
+                    0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ])
+                .await
+                .unwrap();
+            let _ = socket.read(&mut buf).await.unwrap();
+        });
+        let mut config = legacy_graphics_config();
+        config.requested = SecurityProtocol::from_bits(0);
+        config.security.encryption_methods = 0x02;
+        config.standard_security = Some(generate_client_random().unwrap());
+        let failure = connect_danger(addr, config, test_credentials(), |_| {})
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(failure, ConnectFailure::StandardSecurityRefusedByServer),
+            "{failure:?}"
+        );
+        server.await.unwrap();
+    }
+
+    /// A server configured with `SecurityLayer=0` and `UserAuthentication=0` paints its logon
+    /// screen for a host that opted in to Standard RDP Security (#599, ADR-0020). The address is
+    /// `JUSTRDP_STANDARD_SECURITY_SERVER`, `host:port`.
+    #[tokio::test]
+    #[ignore = "requires a server accepting only Standard RDP Security, named by \
+                JUSTRDP_STANDARD_SECURITY_SERVER"]
+    async fn a_server_that_accepts_only_standard_security_paints_its_logon_screen() {
+        let addr: SocketAddr = std::env::var("JUSTRDP_STANDARD_SECURITY_SERVER")
+            .expect("JUSTRDP_STANDARD_SECURITY_SERVER names the server")
+            .parse()
+            .expect("JUSTRDP_STANDARD_SECURITY_SERVER is host:port");
+        let mut config = legacy_graphics_config();
+        config.requested = SecurityProtocol::from_bits(0);
+        config.security.encryption_methods = 0x01 | 0x02 | 0x08;
+        config.standard_security = Some(generate_client_random().unwrap());
+        let screen = login_screen(addr, config).await;
+
+        eprintln!(
+            "#599: {} frames, stages {:?}, dump {}",
+            screen.frames.len(),
+            screen.stages,
+            dump_ppm(&screen.framebuffer, "justrdp-599-logon.ppm").display()
+        );
+        assert_eq!(screen.selected, SecurityProtocol::from_bits(0));
+        assert!(
+            !screen
+                .stages
+                .iter()
+                .any(|s| s == "tls-handshake" || s == "nla-credssp"),
+            "no TLS and no NLA: {:?}",
+            screen.stages
+        );
+        let colours = colour_count(&screen.framebuffer);
+        assert!(colours > 16, "near-monochrome: {colours} colours");
     }
 
     /// Issue #484: the GDI orders VM's logon screen, painted in bitmap updates for a TLS-only
@@ -14063,10 +14526,8 @@ mod tests {
     /// `clear-NNNN.bin` each) plus a `manifest.tsv` recording each stream's dimensions and
     /// decode status (`ok` / `err:<msg>`).
     ///
-    /// The payloads whose status carries the `rlex: suite exceeds region pixel count` or
-    /// `shortVBarCacheMiss` signatures are exactly the oracle-rejected corpus #56 needs: the
-    /// bootstrap oracle cannot arbitrate them, so they must be harvested from a real server, not
-    /// synthesised. This test only *proves capture works* and summarises what the VM emitted —
+    /// A row's `err:` status names a stream the self-owned decoder rejected. This test only
+    /// *proves capture works* and summarises what the VM emitted —
     /// it does not assert a particular signature appears, because which regions a server
     /// Clear-codes is non-deterministic. Curate the committed fixtures from the dump afterwards
     /// (the manifest's `err:` rows point at the streams worth keeping).
@@ -14298,15 +14759,9 @@ mod tests {
             parse_errors.is_empty(),
             "the self-owned parser rejected a stream the real server sent: {parse_errors:?}"
         );
-        // `decoded_ok` is deliberately reported and **not** asserted. The bootstrap oracle still
-        // rejects this server's first-pass tiles — it indexes the progressive-quant table by
-        // `quality` without honouring the 0xFF full-quality sentinel that FreeRDP special-cases
-        // — so gating on it here would make this fix hostage to a defect it cannot reach.
-        // That is #194's subject, and #172 is what removes the oracle from this path.
+        // `decoded_ok` is reported and **not** asserted: this test's claim is about the parser.
         if decoded_ok == 0 {
-            eprintln!(
-                "  note: the bootstrap oracle decoded none of them — expected while #194 is open"
-            );
+            eprintln!("  note: the decoder decoded none of them");
         }
         })
         .await

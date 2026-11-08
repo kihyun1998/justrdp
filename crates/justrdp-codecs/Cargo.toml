@@ -19,7 +19,8 @@ justrdp-pdu.workspace = true
 # The most overloaded entry in the workspace — three of ADR-0011's five roles (2026-08-26 table):
 #   * **R1 verifier** — diff our decode output against ironrdp's on identical bytes.
 #   * **R2 generator** — its compressor/encoder authors the streams our decoders then read
-#     (`tests/differential_rfx.rs:18`, `src/clearcodec.rs:965`). **No corpus ends this one.**
+#     (`tests/differential_rfx.rs`, `round_trips_the_oracle_encoder` in `src/clearcodec.rs`).
+#     **No corpus ends this one.**
 #   * **R5 stage-boundary math** (ADR-0007) — `dwt_extrapolate`, kept deliberately by ADR-0011's
 #     #169 amendment.
 # **What ends it (ADR-0011):** R1 drops per codec on an owned basis, *except* where an amendment

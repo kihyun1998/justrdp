@@ -71,6 +71,8 @@ Virtual workspace, edition 2024; members in `Cargo.toml`, plus `fuzz/` outside t
 (nightly).
 
 - `justrdp-pdu` — PDUs, no dependencies.
+- `justrdp-security` — the legacy RDP cryptography, on `justrdp-pdu` alone, for a host that needs it without
+  the session or the codecs.
 - `justrdp` — the sans-IO core.
 - `justrdp-codecs` — every codec, owned. `ironrdp-graphics` is a **dev-dependency oracle only**;
   the runtime graph holds no `ironrdp` (ADR-0011).

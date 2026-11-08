@@ -11,8 +11,8 @@
 //! space that basis cannot cover — thousands of generated streams, and the history window
 //! carrying across them.
 //!
-//! The 65535-byte segment cap of `[MS-RDPEGFX]` 3.1.8.1 is the decoder's own check, held by
-//! `src/zgfx.rs`'s unit tests rather than here.
+//! The segment output cap is the decoder's own check, held by `src/zgfx.rs`'s unit tests rather
+//! than here.
 //!
 //! [`oracle-agreement-is-not-independence`]: https://github.com/kihyun1998/justrdp/blob/master/docs/map/invariant/oracle-agreement-is-not-independence.md
 

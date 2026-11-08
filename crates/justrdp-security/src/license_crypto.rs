@@ -7,8 +7,8 @@
 //!
 //! **Not general-purpose cryptography.** MD5/SHA-1/RC4/unpadded RSA are broken primitives by
 //! modern standards; they exist here solely because the licensing wire format requires them.
-//! Nothing outside the licensing exchange and auto-reconnect (`[MS-RDPBCGR]` 5.5, whose
-//! verifier is HMAC-MD5 by the same frozen spec) may use this module.
+//! Nothing outside the licensing exchange, auto-reconnect (`[MS-RDPBCGR]` 5.5, whose verifier is
+//! HMAC-MD5 by the same frozen spec) and [`crate::standard`] may use this module.
 
 /// One MD5 digest (RFC 1321). Used by the licensing key derivation and MAC.
 pub fn md5(data: &[u8]) -> [u8; 16] {
@@ -139,25 +139,51 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
 /// RC4-encrypt (or decrypt — the cipher is symmetric) `data` with `key`. Each licensing
 /// message uses a fresh keystream (MS-RDPELE resets the cipher per message).
 pub fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut s: [u8; 256] = core::array::from_fn(|i| i as u8);
-    let mut j = 0usize;
-    for i in 0..256 {
-        j = (j + s[i] as usize + key[i % key.len()] as usize) % 256;
-        s.swap(i, j);
-    }
-    let (mut i, mut j) = (0usize, 0usize);
-    data.iter()
-        .map(|&byte| {
-            i = (i + 1) % 256;
-            j = (j + s[i] as usize) % 256;
+    let mut cipher = Rc4::new(key);
+    let mut out = data.to_vec();
+    cipher.apply(&mut out);
+    out
+}
+
+/// An RC4 keystream that continues across calls. `key` must not be empty.
+#[derive(Clone)]
+pub struct Rc4 {
+    s: [u8; 256],
+    i: usize,
+    j: usize,
+}
+
+impl Rc4 {
+    /// Run the key schedule.
+    pub fn new(key: &[u8]) -> Self {
+        let mut s: [u8; 256] = core::array::from_fn(|i| i as u8);
+        let mut j = 0usize;
+        for i in 0..256 {
+            j = (j + s[i] as usize + key[i % key.len()] as usize) % 256;
             s.swap(i, j);
-            byte ^ s[(s[i] as usize + s[j] as usize) % 256]
-        })
-        .collect()
+        }
+        Self { s, i: 0, j: 0 }
+    }
+
+    /// XOR the next `data.len()` keystream bytes into `data`.
+    pub fn apply(&mut self, data: &mut [u8]) {
+        for byte in data {
+            self.i = (self.i + 1) % 256;
+            self.j = (self.j + self.s[self.i] as usize) % 256;
+            self.s.swap(self.i, self.j);
+            *byte ^= self.s[(self.s[self.i] as usize + self.s[self.j] as usize) % 256];
+        }
+    }
+}
+
+impl core::fmt::Debug for Rc4 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Rc4(..)")
+    }
 }
 
 /// `SaltedHash` (MS-RDPELE 5.1.3): `MD5(salt ‖ SHA1(input ‖ salt ‖ salt1 ‖ salt2))`.
-fn salted_hash(salt: &[u8], salt1: &[u8], salt2: &[u8], input: &[u8]) -> [u8; 16] {
+pub(crate) fn salted_hash(salt: &[u8], salt1: &[u8], salt2: &[u8], input: &[u8]) -> [u8; 16] {
     let sha = sha1(&[input, salt, salt1, salt2].concat());
     md5(&[salt, &sha].concat())
 }
@@ -212,20 +238,41 @@ pub fn mac_data(mac_salt: &[u8; 16], data: &[u8]) -> [u8; 16] {
 /// Textbook RSA for the premaster secret (MS-RDPELE 5.1.2.1): interpret the secret as a
 /// little-endian integer, raise to the certificate's public exponent mod its modulus, and emit
 /// the result little-endian with 8 trailing zero bytes (the proprietary blob convention,
-/// matching FreeRDP). `modulus_be` is **big-endian** — [`crate::connect`] reverses the wire's
+/// matching FreeRDP). `modulus_be` is **big-endian** — the connect machine in `justrdp` reverses the wire's
 /// little-endian modulus when parsing the certificate, per MS-RDPBCGR 2.2.1.4.3.1.1.1. (Do not
-/// oracle this against ironrdp 0.8: it skips that reversal, so its full-path licensing RSA is
+/// oracle this against ironrdp 0.11: it skips that reversal, so its full-path licensing RSA is
 /// spec-incorrect — see the differential test notes.)
+///
+/// The result is `modulus_be.len() + 8` bytes. `None` for a zero modulus or one past 512 bytes.
 pub fn encrypt_premaster_secret(
     premaster_secret: &[u8],
     modulus_be: &[u8],
     exponent: u32,
-) -> Vec<u8> {
-    let m = BigUint::from_bytes_le(premaster_secret);
-    let n = BigUint::from_bytes_be(modulus_be);
-    let c = m.modpow(exponent, &n);
-    let mut out = c.to_bytes_le();
+) -> Option<Vec<u8>> {
+    if !usable_modulus(modulus_be) {
+        return None;
+    }
+    let mut out = rsa_public_le(premaster_secret, modulus_be, exponent);
     out.resize(out.len() + 8, 0);
+    Some(out)
+}
+
+/// The longest modulus accepted, in bytes.
+const MAX_MODULUS_SIZE: usize = 512;
+
+/// Whether a server's modulus can be used: not zero, whose exponentiation would never reduce, and
+/// not past [`MAX_MODULUS_SIZE`].
+pub(crate) fn usable_modulus(modulus_be: &[u8]) -> bool {
+    modulus_be.len() <= MAX_MODULUS_SIZE && modulus_be.iter().any(|&b| b != 0)
+}
+
+/// `data^exponent mod modulus`, with `data` and the result little-endian and the result exactly
+/// `modulus_be.len()` bytes. `modulus_be` must not be zero.
+pub(crate) fn rsa_public_le(data: &[u8], modulus_be: &[u8], exponent: u32) -> Vec<u8> {
+    let m = BigUint::from_bytes_le(data);
+    let n = BigUint::from_bytes_be(modulus_be);
+    let mut out = m.modpow(exponent, &n).to_bytes_le();
+    out.resize(modulus_be.len(), 0);
     out
 }
 
@@ -469,7 +516,7 @@ mod tests {
 
     #[test]
     fn encrypted_premaster_carries_proprietary_padding() {
-        let out = encrypt_premaster_secret(&[0x42; 48], &[0xC3; 64], 65537);
+        let out = encrypt_premaster_secret(&[0x42; 48], &[0xC3; 64], 65537).unwrap();
         // Result is at most modulus-sized, plus exactly 8 trailing zero bytes.
         assert!(out.len() <= 64 + 8);
         assert_eq!(&out[out.len() - 8..], &[0; 8]);
@@ -491,5 +538,24 @@ mod tests {
         let mac = mac_data(&salt, b"hello");
         assert_ne!(mac, mac_data(&salt, b"hellp"));
         assert_ne!(mac, mac_data(&[8u8; 16], b"hello"));
+    }
+
+    /// 1^e mod n is 1, whose little-endian form ends in zeros a trimming encoder would drop.
+    #[test]
+    fn the_encrypted_premaster_fills_its_buffer_whatever_its_value() {
+        let modulus = [0xC3; 64];
+        let mut secret = [0u8; 48];
+        secret[0] = 1;
+        let encrypted = encrypt_premaster_secret(&secret, &modulus, 65537).unwrap();
+        assert_eq!(encrypted.len(), 72);
+        assert_eq!(encrypted[0], 1);
+        assert!(encrypted[1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn an_unusable_modulus_is_refused_before_the_exponentiation() {
+        for modulus in [vec![], vec![0; 64], vec![0xFF; MAX_MODULUS_SIZE + 1]] {
+            assert_eq!(encrypt_premaster_secret(&[1; 48], &modulus, u32::MAX), None);
+        }
     }
 }

@@ -42,8 +42,9 @@ and NLA to [`sspi`](https://github.com/Devolutions/sspi-rs).
 | Crate | Role | Depends on |
 |---|---|---|
 | [`justrdp-pdu`](crates/justrdp-pdu) | RDP wire-format PDUs: encode and decode | nothing |
+| [`justrdp-security`](crates/justrdp-security) | The legacy RDP cryptography, usable without the rest of justrdp | `justrdp-pdu` |
 | [`justrdp-codecs`](crates/justrdp-codecs) | Bitmap and surface codecs, decoding to RGBA8888 | `justrdp-pdu` |
-| [`justrdp`](crates/justrdp) | The sans-IO core: connect and session state machines, virtual channels, framebuffer | `justrdp-pdu`, `justrdp-codecs` |
+| [`justrdp`](crates/justrdp) | The sans-IO core: connect and session state machines, virtual channels, framebuffer | `justrdp-pdu`, `justrdp-security`, `justrdp-codecs` |
 | [`justrdp-tokio`](crates/justrdp-tokio) | The Tokio adapter: socket, TLS handshake and trust, CredSSP, per-stage timeouts, session runner | `justrdp`, `tokio`, `rustls`, `sspi` |
 
 `tokio`, `rustls` and `sspi` may appear only in `justrdp-tokio`.
@@ -146,7 +147,7 @@ More detail:
 - **Differential and corpus tests.** Codecs are checked against byte streams captured from a real
   Windows Server and against expected output derived independently of the decoder.
 - **Property tests and fuzzing.** Every decoder of untrusted input has `proptest` properties
-  ("never panics") and a `cargo-fuzz` target run in a nightly CI lane (`fuzz/`, outside the
+  ("never panics") and a `cargo-fuzz` target run in a weekly CI lane (`fuzz/`, outside the
   workspace).
 - **A 32-bit overflow lane.** Dimension overflow guards are proven on a 32-bit target.
 - **Real VM runs.** Connect and session behaviour is verified against a real Windows Server 2019

@@ -31,10 +31,10 @@ attacker-controlled bytes in the repo.
   IronRDP is explicitly *not* the goal, and byte-identical output is the only
   accepted evidence.
 - **Tolerances are corpus-driven, not spec-driven.** ClearCodec accepts RLEX runs
-  that overflow the declared rect (clipping them) and skips the NSCodec subcodec
-  path where FreeRDP rejects — both are required by real Server 2019 streams (#127).
-  These are recorded as deliberate divergences against #127 and memory
-  `clearcodec_corpus_required_tolerances`.
+  that overflow the declared rect, clipping them, which real Server 2019 streams
+  require (#127). This is recorded as a deliberate divergence against #127 and memory
+  `clearcodec_corpus_required_tolerances`. The NSCodec subcodec those streams also
+  carry is decoded (`decode_nscodec_region`, epic #132).
 - **A ClearCodec glyph hit draws the cached pixels as any rectangle of the same area** (#586).
   `[MS-RDPEGFX]` 4.1.1.5 stores a glyph as a linear pixel stream with no dimensions and hits a
   2x8 glyph as 4x4 and as 8x2; the `ironrdp-graphics` 0.11 oracle does the same. A hit of a
@@ -409,7 +409,7 @@ reference behaviour as data rather than as citations.
   `Progressive`); slice 6 (#172) wired it into `justrdp::egfx` and retired the bootstrap
   delegation. What the wiring inverted, and why a green test had to be inverted with it:
   `justrdp::egfx` used to free Progressive state on `RESETGRAPHICS` and on
-  `DELETEENCODINGCONTEXT`, which is correct for the id-keyed bootstrap oracle (#83) and a
+  `DELETEENCODINGCONTEXT`, which is correct for the id-keyed bootstrap decoder (#83) and a
   **desync** once the store is keyed by surface — the server's encoder keeps its reference
   frames across a reset and `RFX_TILE_DIFFERENCE` adds against them. Both frees are gone;
   `DELETESURFACE` and the `CREATESURFACE` replace path are the only things that free now.
@@ -483,5 +483,5 @@ reference behaviour as data rather than as citations.
   what is and is not asserted, is the table in
   [decoder dimension overflow on 32-bit](../invariant/decoder-dimension-overflow-32bit.md).
 - H.264 (epic #21) has neither an implementation nor an oracle.
-- The fuzz lane is nightly-only, so a newly added target is unguarded on the day it
-  lands (ADR-0008).
+- The fuzz lane runs weekly and on no PR, so a newly added target is unfuzzed until its
+  next run (ADR-0008).

@@ -1,0 +1,22 @@
+[package]
+name = "justrdp-security"
+description = "The legacy RDP cryptography, usable without the rest of justrdp."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# A scripted server for tests of the crates above this one. Nothing but their dev-dependencies
+# enables it: justrdp is a client, and this is not a server role.
+test-peer = []
+
+[dependencies]
+# The security header and the Security Exchange PDU, as wire types.
+justrdp-pdu.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# The differential oracle in `tests/differential_license_crypto.rs`, role R1 verifier in ADR-0011's
+# role table.
+ironrdp-pdu = "0.11.0"

@@ -14,7 +14,8 @@ belong to server redirection (#24).
 
 ## Governing decisions
 
-**None.** No ADR is about this exchange.
+[ADR-0020](../../adr/0020-standard-rdp-security-when-the-host-opts-in.md) decides that Standard RDP
+Security is selectable, and only by a host that opted in. No ADR is about the rest of this exchange.
 
 Adjacent but not governing: [ADR-0001](../../adr/0001-sans-io-state-machine-core.md)
 decides that this runs as a pure state transition rather than inline in a socket
@@ -43,8 +44,12 @@ deciding the exchange itself.
   the client cannot complete; xrdp selects `SSL` from that request. That the path exists is the
   maintainer's call (2026-10-16), made over keeping NLA mandatory and dropping `SSL` from the
   default request, or deferring both. The test VM refuses a TLS-only connect
-  (`HYBRID_REQUIRED_BY_SERVER`); xrdp and the Windows Server 2008 R2 VM accept one (#484). Standard RDP Security (RC4) is not
-  supported at all.
+  (`HYBRID_REQUIRED_BY_SERVER`); xrdp and the Windows Server 2008 R2 VM accept one (#484).
+- **Standard RDP Security is a path of its own, off unless the host opts in** (ADR-0020, #599).
+  `ConnectConfig::standard_security` carries the client random and requires an empty `requested`,
+  because `PROTOCOL_RDP` is 0 and cannot join a set. A selection of 0 from any other host stays
+  refused. The selection leads straight to the Connect-Initial on the plain socket, and the security
+  exchange happens after the channel join (`justrdp_security::standard`, [licensing](licensing.md)).
 - **The request is checked twice against a downgrade.** The Connection Request and Confirm are
   plaintext, so an attacker can strip `HYBRID` from the request and a server that allows TLS-only
   then selects `SSL` honestly. Two checks stand against it. `SSL` is honoured only when the host
@@ -72,7 +77,7 @@ deciding the exchange itself.
 - `justrdp-pdu/src/x224.rs` — `encode_connection_request`,
   `decode_connection_confirm`, `encode_data`, `decode_data`
 - `justrdp/src/connect.rs` — `ConnectStateMachine`, `Stage`, `Action::StartTls`,
-  `decode_confirm`
+  `decode_confirm`, `Action::ServerCertificate`, `ConnectStateMachine::take_standard_security`
 - Stage strings: `tcp-connect`, `x224-negotiate`
 
 ## Reference behaviour
@@ -88,11 +93,31 @@ carrying a spec-valid `RDP_NEG_CORRELATION_INFO` reaches session-active and pain
 ones, each tried once by mutating the encoder: a length of 0x23, the flag with no structure after
 it, and an id starting with 0x0D. That test therefore proves the server tolerates the field, not
 that the encoding is right; the bytes rest on 2.2.1.1.2 and agree with IronRDP's `CorrelationInfo`
-(master). The pinned `ironrdp-pdu` 0.9.0 oracle cannot check them: its `ConnectionRequest`
-decoder refuses any request with `CORRELATION_INFO_PRESENT` (a `TODO(#111)` in its `nego.rs`). The refusal of 0x00 / 0xF4 / 0x0D
+(master). `ironrdp-pdu` 0.11 decodes the field (`CorrelationInfo::read` in its `nego.rs`), and no
+differential test feeds it these bytes. The refusal of 0x00 / 0xF4 / 0x0D
 rests on FreeRDP's server (`nego_process_correlation_info`, `libfreerdp/core/nego.c` at
 `18513805`), which fails the request on each, not on anything this VM does. Whether the VM
 records the id is not observed: nothing here reads its event log.
+
+**Standard RDP Security on Windows Server 2019** (#599, 2026-11-06), `SecurityLayer=0`,
+`UserAuthentication=0`, requested `0x0`, offering 40, 56 and 128 bits. The server selects `0x0`, then:
+
+| `MinEncryptionLevel` | Selected | Result |
+|---|---|---|
+| 1 Low | method 2, level 1 | logon screen, 1131 frames |
+| 2 Client Compatible | method 2, level 2 | logon screen, 1124 frames |
+| 3 High | method 2, level 3 | logon screen, 1121 frames |
+| 4 FIPS | none | connection reset after the Connect-Initial |
+
+At level 2 a session is usable (#600): a password typed fast-path at the logon screen logs on, the
+clipboard channel answers a Format List, and a console and pointer sweep reach 4284 PDUs sent and
+6152 received, past a key update each way, with no MAC failure on either side. An earlier run reached
+221,422 received. Whether Salted MAC appeared is not recorded: the default capabilities do not
+advertise it.
+
+With FIPS offered too at level 4, the server selects it and the core refuses it by value. 40 and 56
+bits were never selected, so they rest on the FreeRDP vectors alone. With `SecurityLayer=2` the same
+request is answered `HYBRID_REQUIRED_BY_SERVER`. One server.
 
 **No implementation comparison for the security selection.** This repo keeps no verified
 external-fact store (see the hub's *what the map cannot answer*), so apart from the correlation
