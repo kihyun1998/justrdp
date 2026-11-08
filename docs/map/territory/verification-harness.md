@@ -247,7 +247,9 @@ point to compare it with.
 - **justrdp** is `end_to_end_baseline_session_on_the_real_vm` in `justrdp-tokio`, a `--release`
   test binary run with `JUSTRDP_NO_LOG_CAPTURE=1`, so no tracing subscriber listens. Milestones
   are its `try_connect` stage callbacks; first graphics is the arrival of the read that produced
-  the first `FrameUpdate`.
+  the first `FrameUpdate`. Under any other account it returns at once: `rdptest`'s logon
+  runs no workload and never signs out, and an idle desktop's frame a minute keeps resetting the
+  test's 180 s read timeout, which stalled a full `--ignored` run for 170 minutes (#582).
 - **FreeRDP** milestones are its `"%s --> %s"` state transitions (`connection.c`, DEBUG on
   `com.freerdp.core.rdp`) from `INITIAL --> NEGO`; first graphics is the first
   `RecvStartFramePdu`, which 3.32.1 logs at **TRACE** on `com.freerdp.channels.rdpgfx.client`.
