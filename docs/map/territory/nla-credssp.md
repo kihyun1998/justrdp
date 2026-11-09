@@ -54,7 +54,7 @@ and binding the exchange to the server's public key.
   `Credentials`, the `Action::StartNla` arm
 - `justrdp/src/connect.rs` — `Action::StartNla`, `Event::NlaComplete`,
   `ConnectStateMachine`
-- `Cargo.toml` — `sspi = "=0.23.0"`, the exact pin ADR-0004 requires (the
+- `Cargo.toml` — `sspi = "=0.23.1"`, the exact pin ADR-0004 requires (the
   `[patch.crates-io]` bridge that used to sit here was removed 2026-08-10)
 - Stage string: `nla-credssp`
 
@@ -84,13 +84,34 @@ defect), #689 (the maintainer's rework that fixed it).
 ## Known holes / open
 
 - **The version-bump gate ADR-0004 requires is satisfied for the current pin** (`sspi
-  = "=0.23.0"`, 2026-10-12, Dependabot #413). `connect_reaches_session_active_against_real_vm`
-  — the whole X.224 → TLS → CredSSP → MCS/GCC → activation sequence against the live
-  test VM — passes, as do `first_frames_render_the_desktop_against_real_vm` and the
-  loopback full-CredSSP test (`connect_completes_credssp_against_a_loopback_server`). The
-  bump took in 0.22.1, which stopped NTLM MIC generation resetting the RC4 sealing state
-  CredSSP's `pubKeyAuth` is wrapped with, so it touched this path; 0.23.0 itself changed only
-  Kerberos and `winscard`, neither of which this client builds. The pin before it (`=0.22.0`,
+  = "=0.23.1"`, 2026-11-09, Dependabot #582). 0.23.1 leaves `src/ntlm` as it was and changes
+  `src/negotiate`, `src/credssp` and username parsing. The client now exchanges `mechListMIC`
+  whenever the server sent one; an NTLM logon other than Guest already did, so only a Guest
+  account changes. `Username::new` and `Username::parse` now drop a `.\` in front of an
+  already-qualified name, which both arms of `Credentials::to_sspi` reach. The main suite ran on a clone of the WS2019
+  VM at `.131`, because the maintainer needed the original: 66 of 67 passed. The two
+  Standard RDP Security tests need their own server and did not run. The row probe passed on
+  WS2008 R2 and Win11, and the five GDI orders tests passed on WS2008 R2. Three results were
+  not clean:
+  - `capture_progressive_corpus_against_real_vm` fails on the clone (it never reaches its
+    2,000 lit pixels) with 0.23.1 and with 0.23.0, and passed with 0.23.1 on the original.
+  - The two audio input tests ran five times with each version, on Win11: PCM passed 3 of 5
+    with 0.23.1 and 5 of 5 with 0.23.0; A-law passed 1 of 5 and 2 of 5. A-law fails on both
+    versions. PCM failed only on 0.23.1 here, at the rate [Audio input](audio-input.md) measured
+    before this bump (13 of 34). Five runs cannot tell the rates apart, and `sspi` is called
+    only during CredSSP, before the session starts.
+- **`picky-krb` 0.13.1 understates two of its minimums.** It declares `picky-asn1-der ^0.5` and
+  `picky-asn1-x509 ^0.15` but does not compile below 0.5.7 and 0.15.5, so a lockfile that keeps
+  older ones fails to build once `sspi` 0.23.1 brings it in. `Cargo.lock` holds those two
+  versions; no `[patch.crates-io]` is involved.
+- **The pin before it** (`=0.23.0`, 2026-10-12, Dependabot #413) passed
+  `connect_reaches_session_active_against_real_vm` — the whole X.224 → TLS → CredSSP →
+  MCS/GCC → activation sequence against the live test VM —
+  `first_frames_render_the_desktop_against_real_vm` and the loopback full-CredSSP test
+  (`connect_completes_credssp_against_a_loopback_server`). That bump took in 0.22.1, which
+  stopped NTLM MIC generation resetting the RC4 sealing state CredSSP's `pubKeyAuth` is
+  wrapped with, so it touched this path; 0.23.0 itself changed only Kerberos and `winscard`,
+  neither of which this client builds. The pin before it (`=0.22.0`,
   2026-10-06) passed the same gate. The first exact pin after the fork bridge (`=0.21.3`,
   2026-08-10) passed the same gate; see ADR-0004's *Result* section for that run and
   for the suite's session-isolation caveat.
