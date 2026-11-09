@@ -504,7 +504,7 @@ overflow, so ③ lists it and the adjudication clears it:
 ls fuzz/fuzz_targets/
 
 # ② what parses untrusted bytes — no longer justrdp-pdu alone (#241)
-rg --files crates/justrdp-pdu/src crates/justrdp/src crates/justrdp-tokio/src -g '*.rs'
+rg --files crates/justrdp-pdu/src crates/justrdp-security/src crates/justrdp/src crates/justrdp-tokio/src -g '*.rs'
 
 # ③ what CONSUMES an already-parsed wire value as arithmetic — ADR-0012's class (#238).
 #    An over-approximation on purpose: it lists candidates, and the adjudication is the
@@ -513,7 +513,7 @@ rg --files crates/justrdp-pdu/src crates/justrdp/src crates/justrdp-tokio/src -g
 #    is NOT sufficient — it answers "no" for a zero extent, over a live hang (#262). Ask the
 #    second half above with it, and run ④ for the sites it cannot describe.
 rg -U "pub fn [a-z_0-9]+ *(<[^>]*>)? *\([^)]*\b(u8|u16|u32|usize|i8|i16|i32)\b" \
-   crates/justrdp-codecs/src crates/justrdp/src
+   crates/justrdp-codecs/src crates/justrdp-security/src crates/justrdp/src
 
 # ④ what LOOPS over a wire-derived count — the half ③'s membership question answers "no" to,
 #    and the half neither ①, ② nor `decoder-dimension-overflow-32bit.md` can see (#262). That
@@ -523,10 +523,10 @@ rg -U "pub fn [a-z_0-9]+ *(<[^>]*>)? *\([^)]*\b(u8|u16|u32|usize|i8|i16|i32)\b" 
 #    loop rather than being refused above it; and — added by #268 — is the body's magnitude
 #    funded by bytes this same cursor consumed, or by state a previous message established?
 #    A `usize::from(<u16>)` verdict answers only the first.
-rg -n 'for [a-z_0-9]+ in 0\.\.' crates/justrdp-codecs/src crates/justrdp/src crates/justrdp-pdu/src
+rg -n 'for [a-z_0-9]+ in 0\.\.' crates/justrdp-codecs/src crates/justrdp-security/src crates/justrdp/src crates/justrdp-pdu/src
 
 # and what each already carries, to subtract:
-rg -n 'fn [a-z_0-9]+_never_panics' crates/justrdp-codecs/src crates/justrdp/src crates/justrdp-pdu/src
+rg -n 'fn [a-z_0-9]+_never_panics' crates/justrdp-codecs/src crates/justrdp-security/src crates/justrdp/src crates/justrdp-pdu/src
 ```
 
 **④ adjudicated in full on 2026-08-31, because an over-approximation nobody has walked is a

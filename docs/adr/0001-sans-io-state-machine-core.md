@@ -163,6 +163,11 @@ The codec-level corpora in `crates/justrdp-codecs/tests/fixtures/` are replayed 
 ones carved from `crates/justrdp/tests/fixtures/session/` too, to check them against a fresh carve;
 that is a check of where the bytes came from, not a second replay.
 
+**Note (2026-11-09, #603): a fixture can hold a second implementation's test vector.**
+`crates/justrdp/tests/fixtures/x509_chain/` is copied from IronRDP's tests, because no server here
+sends an X.509 chain. Its `README.md` says so and that the capture's origin is unknown, and
+`differential_x509_chain_ironrdp.rs` compares against the key IronRDP's test expects.
+
 **`fuzz/` is out of the workspace, by design.** `cargo <cmd> --workspace` does not build it,
 so it has its own gate: `test.yml` runs `cargo check --manifest-path fuzz/Cargo.toml` on every
 PR (#578). Until then this was a blind spot left to a manual run, and a rename or a public-path

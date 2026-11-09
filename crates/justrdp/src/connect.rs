@@ -2894,7 +2894,11 @@ pub(crate) mod tests {
 
     /// A Server License Request opening the full negotiation.
     fn server_license_request() -> Vec<u8> {
-        let cert = proprietary_cert();
+        server_license_request_with(&proprietary_cert())
+    }
+
+    /// A Server License Request carrying `cert`.
+    fn server_license_request_with(cert: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&SERVER_RANDOM);
         body.extend_from_slice(&0x0006_0000u32.to_le_bytes()); // ProductInfo.dwVersion
@@ -2907,9 +2911,21 @@ pub(crate) mod tests {
         body.extend_from_slice(&1u32.to_le_bytes());
         body.extend_from_slice(&0x0003u16.to_le_bytes()); // certificate blob
         body.extend_from_slice(&(cert.len() as u16).to_le_bytes());
-        body.extend_from_slice(&cert);
+        body.extend_from_slice(cert);
         body.extend_from_slice(&0u32.to_le_bytes()); // ScopeCount 0
         license_message(license::MSG_LICENSE_REQUEST, &body)
+    }
+
+    /// A CERT_CHAIN_VERSION_2 server certificate holding `chain`, root first.
+    fn x509_chain_cert(chain: &[&[u8]]) -> Vec<u8> {
+        let mut cert = Vec::new();
+        cert.extend_from_slice(&2u32.to_le_bytes());
+        cert.extend_from_slice(&(chain.len() as u32).to_le_bytes());
+        for blob in chain {
+            cert.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+            cert.extend_from_slice(blob);
+        }
+        cert
     }
 
     /// The keys both sides derive in the synthetic full negotiation (the test plays server).
@@ -3297,6 +3313,32 @@ pub(crate) mod tests {
             ),
             "got {actions:?}"
         );
+    }
+
+    #[test]
+    fn a_license_request_with_an_x509_chain_encrypts_to_the_key_of_its_last_certificate() {
+        const LICENSE_SERVER: &[u8] =
+            include_bytes!("../tests/fixtures/x509_chain/license_server.der");
+        const SERVER: &[u8] = include_bytes!("../tests/fixtures/x509_chain/server.der");
+        const SERVER_PUBLIC_KEY: &[u8] =
+            include_bytes!("../tests/fixtures/x509_chain/server_public_key.der");
+
+        let mut sm = licensing();
+        let actions = sm.process(Event::Received(&server_io_frame(
+            &server_license_request_with(&x509_chain_cert(&[LICENSE_SERVER, SERVER])),
+        )));
+
+        let modulus_in_der = &SERVER_PUBLIC_KEY[9..265];
+        let encrypted_premaster =
+            license_crypto::encrypt_premaster_secret(&[0x22; 48], modulus_in_der, 65537).unwrap();
+        let expected = license::encode_new_license_request(
+            license::PLATFORM_ID_NT_POST_52_MICROSOFT,
+            &[0x11; 32],
+            &encrypted_premaster,
+            "sm-user",
+            "sm-test",
+        );
+        assert_eq!(actions, vec![Action::WriteBytes(frame_io(&expected))]);
     }
 
     #[test]

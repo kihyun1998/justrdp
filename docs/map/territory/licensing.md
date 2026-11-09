@@ -12,7 +12,9 @@ the RSA public-key operation.
 
 ## Governing decisions
 
-**None.** No ADR is about licensing.
+[ADR-0020](../../adr/0020-standard-rdp-security-when-the-host-opts-in.md) on what the server's
+certificate is for, and its #603 amendment on who reaches the key in an X.509 chain. No ADR is about
+the licensing exchange itself.
 
 Adjacent but not governing: [ADR-0002](../../adr/0002-dependency-boundary.md)
 decides that security-critical *non-RDP* crypto is delegated — licensing crypto is
@@ -36,8 +38,8 @@ decision of its own. That inference has never been written down as a record.
 - **The crypto is a crate of its own** (#597), `justrdp-security`, because a host that relays RDP
   needs it without the session or the codecs, and `justrdp` depends on `justrdp-codecs`
   unconditionally. That is the ADR-0001 crate-count rule's "a consumer that needs the part alone".
-  An outside crate depending on it by path has only `justrdp-security` in its `cargo tree`
-  (measured 2026-11-06).
+  An outside crate depending on it by path has only `justrdp-security` and `justrdp-pdu` in its
+  `cargo tree -e normal` (measured 2026-11-09).
 
 ## Code
 
@@ -53,6 +55,8 @@ decision of its own. That inference has never been written down as a record.
   `StandardSecurityError`
 - `justrdp-pdu/src/client_info.rs` — `encode_security_exchange`
 - `justrdp/src/connect.rs` — `LicenseConfig`, `LicenseEntropy`
+- `justrdp/tests/differential_x509_chain_ironrdp.rs` — `a_host_reaches_the_key_from_the_last_certificate_of_the_chain`,
+  `the_servers_certificate_is_not_an_ordinary_rsa_certificate`
 - `justrdp-tokio/src/lib.rs` — `generate_license_entropy`
 - Spec sections cited inline: `[MS-RDPELE]` 2.2.2.5.1, 2.2.2.7, 3.2.5, 5.1.2, 5.1.6
 
@@ -66,8 +70,7 @@ New License) has never been observed live here; it is proven against the scripte
 is its state, so `connect_reaches_session_active_against_real_vm` asserts that a licensing record
 fired and prints its branch rather than pinning one. One WS2019 box in Remote Desktop for
 Administration mode; the RD Session Host role made it send a License Request instead
-([verification harness](verification-harness.md), #400). No FreeRDP / IronRDP behaviour is
-recorded here.
+([verification harness](verification-harness.md), #400).
 
 **Standard RDP Security's arithmetic against FreeRDP** (#598, 2026-11-06, commit `9e9f2148`):
 `libfreerdp/core/security.c` compiled unchanged and driven for 8200 packets each way at 40, 56 and
@@ -76,6 +79,20 @@ the same signatures and ciphertexts (`crates/justrdp-security/tests/fixtures/fre
 spec has no such vector: section 4.1's dump does not state its client random, and 4.8's key is not
 that server's. The RSA value rests on 4.8's key and random, computed outside this code and recovered
 with 4.8's private exponent. 26 mutations of the layer each turned a named test red, or hung it where the guard they removed is the only bound.
+
+**Which certificate form a server sends** (#603, 2026-11-09). Read from Server Security Data with
+`JUSTRDP_CONNECT_CAPTURE_FILE`, requesting Standard RDP Security:
+
+| Server | `dwVersion` | Key | Method, level |
+|---|---|---|---|
+| Windows at `192.168.136.131`, Korean UI, edition not read, `SecurityLayer=0`, `UserAuthentication=0`, Server Core version `0x0008000B` | 1, permanent, Proprietary | 2048 bits | 2, 2 |
+| xrdp 0.9.24, `security_layer=negotiate`, `crypt_level=high` | 1, permanent, Proprietary | 2048 bits | 2, 3 |
+
+`[MS-RDPBCGR]` 5.3.3.2 gives this form to a server with no certificate from a license server.
+Whether the Windows server has a license server was not read. **No server here has sent a chain.** The chain under `crates/justrdp/tests/fixtures/x509_chain/` is from
+IronRDP's tests and does not say where it was captured. It decodes through `server_license_key` and
+through the steps ADR-0020's amendment gives a host, to the key IronRDP expects. Its server
+certificate has public-key algorithm `1.3.14.3.2.15` and five critical extensions.
 
 ## Cross-cutting invariants
 

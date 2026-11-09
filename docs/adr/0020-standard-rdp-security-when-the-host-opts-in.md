@@ -1,6 +1,6 @@
 # 0020 — Standard RDP Security exists, off unless the host opts in
 
-- Status: Accepted
+- Status: Accepted — amended 2026-11-09 (#603); see the Amendment below
 - Date: 2026-11-06
 - Kind: **judgement**. The maintainer chose it; a better derivation does not reopen it.
 - Issue: #596
@@ -73,3 +73,39 @@ got `enhanced RDP security not allowed by server`.
   from a chain needs an X.509 parser, which `justrdp` has through `x509-cert` and this crate does not.
 - **Any server below Windows Server 2019**, unmeasured when this was decided.
 - **Turning it on by default**, the relay itself, and a server role are out of scope.
+
+## Amendment (2026-11-09, #603): a host using this layer alone keeps the X.509 step
+
+**Kind: judgement.** The maintainer chose it; a better derivation does not reopen it.
+
+`justrdp-security` gains no X.509 parser. A host that receives a chain takes these steps itself:
+`ServerCertificate::decode`, the chain's last certificate, its `subjectPublicKey` from the host's own
+parser, then `RsaPublicKey::from_pkcs1_der`. `crates/justrdp/tests/differential_x509_chain_ironrdp.rs`
+runs them.
+
+The reasons it was recommended on: no consumer has met a chain; a host that terminates a client's TLS
+probably links an X.509 parser already; and moving to (a) later breaks nothing.
+
+What the maintainer was shown:
+
+- Two servers asked for Standard RDP Security, a Windows server and xrdp 0.9.24, each sent a
+  Proprietary Certificate. `[MS-RDPBCGR]` 5.3.3.2 says a chain comes from a server issued one by a
+  Domain or Enterprise License Server, and that a server without one falls back to this form.
+- A chain from IronRDP's tests goes through the steps above and gives the key IronRDP expects.
+- **(a)** `x509-cert` in this crate: 8 runtime crates and 6 build-time ones, the ADR-0001 row changed,
+  and a choice between moving the CredSSP binding's parser here or keeping a second caller the
+  existing fuzz target does not reach.
+- **(b)** Walking the DER by hand in `justrdp-pdu`: no dependency, an owned parser of untrusted input
+  with its property, fuzz target and mutations, and a second parser beside the `x509-cert` the core
+  already holds.
+- **(c)** This one, plus the test.
+
+**A host's X.509 parser has to accept the server's certificate.** In the chain above its public-key
+algorithm is `1.3.14.3.2.15` rather than `rsaEncryption`, and all five extensions are critical.
+`rustls-webpki` 0.103.15 rejects an unknown critical extension on its default path, so a host cannot
+assume any parser works. `x509-cert` reads the key and looks at neither.
+
+**What this did not cover:** a real server that sends a chain, since none was reachable; what the
+relaying consumer already links, since its source was not read; `justrdp-security` re-exporting
+`justrdp-pdu`'s types, so the host depends on both crates. Moving to (a) later adds to the API and
+breaks nothing.
