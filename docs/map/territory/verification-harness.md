@@ -500,7 +500,9 @@ in-session query.
 `UserAuthentication=1`, `MinEncryptionLevel=2` normally; the test wants the first two at 0, and every
 other VM test fails until they are restored. `rdptest` is not an administrator there (its
 `Administrators` group holds `Administrator` alone, 2026-11-06), so the console changes them. The VM
-has no VMware Tools, so `vmrun` cannot run anything in the guest.
+has no VMware Tools, so `vmrun` cannot run anything in the guest. Restart `TermService` after changing
+them: on 2026-11-09 a Windows server still refused `PROTOCOL_RDP` with failure code 5 after the values
+were set, and selected it once the service had restarted.
 
 ## Known holes / open
 

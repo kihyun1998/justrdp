@@ -128,9 +128,9 @@ pub struct RsaPublicKey {
 
 impl RsaPublicKey {
     /// Parse a DER `RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }` —
-    /// the inner `subjectPublicKey` of an X.509 RSA certificate. This is the only ASN.1 the
-    /// licensing path needs, so it is hand-walked here rather than pulling a DER dependency
-    /// into this crate (ADR-0001 Amendment).
+    /// the inner `subjectPublicKey` of an X.509 RSA certificate. This is the only ASN.1 this
+    /// crate reads, so it is hand-walked here rather than pulling a DER dependency into this
+    /// crate (ADR-0001 Amendment).
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, DecodeError> {
         let mut cur = ReadCursor::new(der, "RSAPublicKey DER");
         read_der_tag(&mut cur, 0x30)?; // SEQUENCE (length implicitly bounds the cursor)
