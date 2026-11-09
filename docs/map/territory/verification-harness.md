@@ -502,7 +502,14 @@ other VM test fails until they are restored. `rdptest` is not an administrator t
 `Administrators` group holds `Administrator` alone, 2026-11-06), so the console changes them. The VM
 has no VMware Tools, so `vmrun` cannot run anything in the guest. Restart `TermService` after changing
 them: on 2026-11-09 a Windows server still refused `PROTOCOL_RDP` with failure code 5 after the values
-were set, and selected it once the service had restarted.
+were set, and selected it once the service had restarted. The restart can hang: on the same day
+`net start TermService` answered that the service was starting or stopping, and RDP stayed unreachable.
+Recover from the VM console, rebooting if the service stays stuck.
+
+xrdp logs `received wrong flags, likely decrypt not working` for a Client Info without the `0x33` bits
+(`RDP_LOGON_NORMAL`, `libxrdp/xrdp_sec.c` at v0.9.24). That check reads the flags. `legacy_graphics_config`
+sets neither `0x02` nor `0x20`, so pointing these tests at xrdp fails there whether or not decryption is
+right (2026-11-09).
 
 ## Known holes / open
 
