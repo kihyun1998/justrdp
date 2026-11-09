@@ -2504,8 +2504,6 @@ mod tests {
     /// A loopback RDP server that speaks the whole pre-MCS sequence for real: X.224 confirm
     /// (HYBRID selected), TLS with a throwaway cert, then a complete CredSSP exchange driven by
     /// sspi's `CredSspServer` — the genuine peer of the `CredSspClient` the adapter runs.
-    /// Requires the ADR-0004 fork-bridge (Devolutions/sspi-rs#688): the released 0.21.0 server
-    /// drops its final SPNEGO token and can never finish against a Negotiate-NTLM client.
     /// The returned receiver yields the delegated account name once the server reaches
     /// `Finished`, after which it drops the connection (the client is in `capability-exchange`
     /// by then).
