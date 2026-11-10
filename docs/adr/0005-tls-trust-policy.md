@@ -1,6 +1,6 @@
 # 0005 — TLS server trust: chain validation by default via the OS trust store, TOFU and accept-any as explicit opt-ins
 
-- Status: Accepted
+- Status: Accepted — scope of "credentials are never offered to an unauthenticated peer" narrowed by the Amendment below (#614, 2026-11-10)
 - Date: 2026-06-11
 - Closes the build plan's "(a) chain vs (b) TOFU" question tracked by issue #36
 
@@ -26,3 +26,7 @@ Trust failures of every policy surface as the existing typed `ConnectFailure::Tl
 - The trust decision is the host's, the enforcement is ours: interactive allow-once/allow-always UX stays out of the library (hosts get the typed error plus `pin_fingerprint` to build it).
 - Out of scope, deliberately: CRL/OCSP revocation (tracked for a future decision in epic #425), RD Gateway certificates (epic #23), and pin-store schema/profile integration beyond the minimal trait.
 - `rustls-platform-verifier` joins the ADR-0002 dependency set as a leaf, security-critical, non-RDP crate on the rustls side of the boundary (OS bindings: `windows-sys` / Security.framework / JNI — no aws-lc, no new crypto).
+
+## Amendment (2026-11-10, #614): the guarantee belongs to `connect`
+
+`justrdp_tokio::run_credssp` runs the CredSSP leg over a stream the caller took through TLS. The Decision's "credentials are never offered to an unauthenticated peer" holds for `connect`, which applies `TrustPolicy` itself. A host calling `run_credssp` directly holds that decision, which matches this record's "the trust decision is the host's". `tls_server_public_key` reads the key and verifies nothing.

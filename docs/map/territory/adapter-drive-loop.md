@@ -40,7 +40,8 @@ read as the adapter growing a third of its size.
 - **One timeout seam.** Every stage's I/O goes through `with_stage_timeout`, so the
   timeout/error policy exists once and a failure is reported *with its stage name*.
 - **Three entry points, increasing in capability**: `connect`,
-  `connect_with_timeouts`, `connect_with_options`; and three session runners:
+  `connect_with_timeouts`, `connect_with_options`; `run_credssp` for a host that needs only
+  the CredSSP leg; and three session runners:
   `run_session`, `run_session_with_input`, `run_session_with_commands`.
 - **Cancellation is a token, not a drop** — `tokio-util`'s `CancellationToken` lets
   a resize or teardown race the select loop safely. The loop sees it between machine calls
