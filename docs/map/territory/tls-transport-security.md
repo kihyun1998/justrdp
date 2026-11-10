@@ -42,7 +42,8 @@ the extraction of the server's `subjectPublicKey`, which is not a TLS concern at
 - `justrdp-tokio/src/trust.rs` — `TrustPolicy`, `FilePinStore`, `MemoryPinStore`,
   `pin_fingerprint`
 - `justrdp/src/tls.rs` — `extract_subject_public_key`, `TlsCertError`
-- `justrdp-tokio/src/lib.rs` — `Transport`, the `Action::StartTls` arm
+- `justrdp-tokio/src/lib.rs` — `Transport`, the `Action::StartTls` arm, `peer_certificate`,
+  `tls_server_public_key` (the key for a host running `run_credssp` itself; it verifies nothing)
 - Stage string: `tls-handshake`
 
 ## Reference behaviour

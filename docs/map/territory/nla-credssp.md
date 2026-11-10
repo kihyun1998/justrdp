@@ -39,10 +39,21 @@ and binding the exchange to the server's public key.
   with a fatal `internal_error` alert. CredSSP over TLS 1.3 works against the same VM; no
   TLS-version pin is needed. Widening the package list is #45's work.
 - **HYBRID_EX adds a fourth message**: after CredSSP finishes, the server sends a
-  4-byte Early User Authorization Result PDU that the adapter reads before MCS. Left
-  unread, capability exchange desyncs and hangs.
-- **No secret enters the sans-IO machine.** Credentials are a `connect()` input the adapter
-  holds; the machine's `Action::StartNla` carries only the selected protocol and the
+  4-byte Early User Authorization Result PDU that `connect` reads before MCS, and that a
+  host calling `run_credssp` directly reads itself. Left unread, capability exchange desyncs
+  and hangs.
+- **`run_credssp` is public for a host that runs X.224 and TLS itself** (#614); `connect` calls
+  the same function, over any `AsyncRead + AsyncWrite` stream.
+  - It takes `&mut S` and returns no leftover bytes. The framing reads declared lengths and
+    nothing follows the client's final message, so nothing is read past the last `TsRequest`.
+    A test pins the server's next bytes staying on the stream. The maintainer chose this on
+    2026-11-10 over returning the stream with a `leftover` field that would always be empty.
+  - `Ok(())` is not admission: under HYBRID_EX the Early User Authorization Result can still
+    deny the user.
+  - The peer's identity is the caller's. The account name and NTLM response are sent before
+    `pubKeyAuth` is checked; only the delegated password waits for it.
+- **No secret enters the sans-IO machine.** Credentials are an input to `connect()` or
+  `run_credssp` that the adapter holds; the machine's `Action::StartNla` carries only the selected protocol and the
   server key it extracted itself. This is why `justrdp-pdu` has no `TSRequest` codec and the
   core hand-rolls none of the CredSSP crypto (ADR-0002).
 - Credentials are host-supplied and `Debug` is implemented by hand so a password
@@ -50,7 +61,7 @@ and binding the exchange to the server's public key.
 
 ## Code
 
-- `justrdp-tokio/src/lib.rs` — `run_credssp`, `write_ts_request`, `read_ts_request`,
+- `justrdp-tokio/src/lib.rs` — `run_credssp`, `credssp_spn`, `write_ts_request`, `read_ts_request`,
   `Credentials`, the `Action::StartNla` arm
 - `justrdp/src/connect.rs` — `Action::StartNla`, `Event::NlaComplete`,
   `ConnectStateMachine`
@@ -78,11 +89,16 @@ defect), #689 (the maintainer's rework that fixed it).
   NLA failure surfaces as a stage-named connect failure, not an MCS error.
 - [Supply chain & gates](supply-chain-and-gates.md) — the fork bridge is a
   dependency-graph fact with a removal obligation attached.
-- [Verification harness](verification-harness.md) — the loopback full-CredSSP test
-  exists only because the fork made it possible; it is CI's only positive NLA path.
+- [Verification harness](verification-harness.md) — the full-CredSSP tests against sspi's own
+  server, through `connect` and through `run_credssp`, are CI's only positive NLA paths.
 
 ## Known holes / open
 
+- **A wrong password was measured on one server.** Called directly against the WS2019 VM on
+  2026-11-10, `run_credssp` returned `Nla` with `STATUS_LOGON_FAILURE`; with the right password
+  it returned `Ok` and the 4-byte result `00 00 00 00` was read from the stream next. A server
+  that ends the stream or sends a fatal TLS alert would be `Io`; no run has shown which servers
+  do that. `sspi` reads `errorCode` only from a peer at version 3 or later.
 - **The version-bump gate ADR-0004 requires is satisfied for the current pin** (`sspi
   = "=0.23.1"`, 2026-11-09, Dependabot #582). 0.23.1 leaves `src/ntlm` as it was and changes
   `src/negotiate`, `src/credssp` and username parsing. The client now exchanges `mechListMIC`

@@ -284,12 +284,12 @@ impl ServerAddr {
             port,
         }
     }
+}
 
-    /// The CredSSP service principal name for this server: `TERMSRV/<host>`, with the host in
-    /// whatever form the caller dialed (hostname-based SPNs are what Kerberos requires — #45).
-    fn credssp_spn(&self) -> String {
-        format!("TERMSRV/{}", self.host)
-    }
+/// The CredSSP service principal name for `host`: `TERMSRV/<host>`, with the host in whatever form
+/// the caller dialed (hostname-based SPNs are what Kerberos requires — #45).
+fn credssp_spn(host: &str) -> String {
+    format!("TERMSRV/{host}")
 }
 
 /// Dial by raw socket address: the host becomes the IP literal, so SNI and the SPN carry the IP —
@@ -589,15 +589,7 @@ async fn connect_inner(
                             });
                         }
                     };
-                    let cert = established
-                        .get_ref()
-                        .1
-                        .peer_certificates()
-                        .and_then(|certs| certs.first())
-                        .ok_or_else(|| ConnectFailure::TlsHandshake {
-                            reason: "server presented no certificate".to_string(),
-                        })?
-                        .clone();
+                    let cert = peer_certificate(&established)?.clone();
                     tracing::debug!("tls handshake complete; extracting server public key");
                     queue.extend(sm.process(Event::TlsEstablished(cert.as_ref())));
                     transport = Transport::Tls(Box::new(established));
@@ -621,7 +613,7 @@ async fn connect_inner(
                         key_len = server_public_key.len(),
                         "starting CredSSP / NLA token exchange"
                     );
-                    run_credssp(stream, server_public_key, &credentials, &server).await?;
+                    run_credssp(stream, server_public_key, &credentials, &server.host).await?;
                     tracing::debug!("CredSSP exchange complete");
                     queue.extend(sm.process(Event::NlaComplete));
                     announce_stage(&mut sm, &mut announced, &mut on_stage);
@@ -1504,10 +1496,51 @@ async fn with_stage_timeout<T>(
     }
 }
 
+/// The server's leaf certificate on an established TLS stream.
+fn peer_certificate<IO>(
+    stream: &TlsStream<IO>,
+) -> Result<&rustls::pki_types::CertificateDer<'_>, ConnectFailure> {
+    stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .ok_or_else(|| ConnectFailure::TlsHandshake {
+            reason: "server presented no certificate".to_string(),
+        })
+}
+
+/// The `subjectPublicKey` of the server's leaf certificate on an established TLS stream, in the
+/// form [`run_credssp`] binds to: the inner BIT STRING contents, not the whole SPKI.
+pub fn tls_server_public_key<IO>(stream: &TlsStream<IO>) -> Result<Vec<u8>, ConnectFailure> {
+    justrdp::tls::extract_subject_public_key(peer_certificate(stream)?.as_ref())
+        .map_err(|e| ConnectFailure::Protocol(ConnectError::TlsHandshake(e)))
+}
+
 /// Drive the CredSSP / NLA token exchange to completion over the (already TLS-upgraded) `stream`,
 /// binding `pubKeyAuth` to `server_public_key` and delegating `credentials` once the SPNEGO/NTLM
 /// handshake finalizes. `sspi` owns the protocol; we only shuttle its `TsRequest`s over TLS
 /// (ADR-0002; `docs/map/territory/nla-credssp.md`).
+///
+/// [`connect`] runs this same exchange. Calling it directly is for a host that performs the
+/// X.224 exchange and TLS itself:
+///
+/// - `server_public_key` is the certificate's inner `subjectPublicKey`, not the whole SPKI:
+///   [`tls_server_public_key`] for a [`TlsStream`], or
+///   [`justrdp::tls::extract_subject_public_key`] for a leaf certificate from another TLS stack.
+/// - `server_name` is the host as dialed; the SPN is `TERMSRV/<server_name>`.
+/// - The caller decides whether to trust the peer on `stream`. The exchange sends the account
+///   name and the NTLM response before `pubKeyAuth` is checked; only the delegated password waits
+///   for that check.
+/// - Nothing is read past the last server `TsRequest`, so what the server sends next stays on
+///   `stream`.
+/// - `Ok(())` means the client sent its final message, not that the user was admitted. Under
+///   HYBRID_EX the caller reads the 4-byte Early User Authorization Result from `stream` before
+///   anything else, and that result can still deny the user.
+/// - No timeout applies; the caller bounds the returned future.
+///
+/// A logon the server refuses with a `TsRequest` `errorCode` is [`ConnectFailure::Nla`]. A failure
+/// of `stream`, including a server that ends it instead of answering, is [`ConnectFailure::Io`].
 ///
 /// This slice drives **NTLM only** — but wrapped in SPNEGO (`ClientMode::Negotiate` with a package
 /// list pinned to `ntlm`), which is what Windows servers expect ("per spec we should always use the
@@ -1515,18 +1548,21 @@ async fn with_stage_timeout<T>(
 /// with a fatal `internal_error` alert (proven on the real VM). The package list excludes Kerberos /
 /// PKU2U so `sspi` never yields a KDC network request; if it ever does (AD / Kerberos,
 /// epic #45), we surface it as an `Nla` failure rather than reach out.
-async fn run_credssp(
-    stream: &mut TlsStream<TcpStream>,
+pub async fn run_credssp<S>(
+    stream: &mut S,
     server_public_key: Vec<u8>,
     credentials: &Credentials,
-    server: &ServerAddr,
-) -> Result<(), ConnectFailure> {
+    server_name: &str,
+) -> Result<(), ConnectFailure>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let nla_err = |e: sspi::Error| ConnectFailure::Nla {
         reason: e.to_string(),
     };
     // The CredSSP SPN identifies the target service; RDP uses `TERMSRV/<host>`, with the host as
     // dialed (hostname when available — the form Kerberos will require, #45).
-    let spn = server.credssp_spn();
+    let spn = credssp_spn(server_name);
     let client_computer_name =
         std::env::var("COMPUTERNAME").unwrap_or_else(|_| "justrdp".to_string());
     let negotiate = NegotiateConfig::new(
@@ -1574,9 +1610,9 @@ async fn run_credssp(
     }
 }
 
-/// Encode a `TsRequest` (BER) and write it to the TLS stream.
+/// Encode a `TsRequest` (BER) and write it to `stream`.
 async fn write_ts_request(
-    stream: &mut TlsStream<TcpStream>,
+    stream: &mut (impl AsyncWrite + Unpin),
     ts: &TsRequest,
 ) -> Result<(), ConnectFailure> {
     fn nla(e: impl std::fmt::Display) -> ConnectFailure {
@@ -1590,12 +1626,14 @@ async fn write_ts_request(
     Ok(())
 }
 
-/// Read one BER-framed `TsRequest` from the TLS stream. A TSRequest is a DER `SEQUENCE` (`0x30`)
+/// Read one BER-framed `TsRequest` from `reader`. A TSRequest is a DER `SEQUENCE` (`0x30`)
 /// whose length prefix tells us exactly how many bytes to read, so we frame it precisely rather
 /// than guessing a buffer size (TLS records may split a single TSRequest across reads). The
 /// framing — the length cap, the over-wide rejection, mid-frame reassembly — is pinned by the
 /// `connect`-level tests against a loopback TLS server replying with crafted TSRequest bytes.
-async fn read_ts_request(reader: &mut TlsStream<TcpStream>) -> Result<TsRequest, ConnectFailure> {
+async fn read_ts_request(
+    reader: &mut (impl AsyncRead + Unpin),
+) -> Result<TsRequest, ConnectFailure> {
     let mut frame = Vec::with_capacity(64);
     // Tag + first length byte.
     let mut head = [0u8; 2];
@@ -2170,14 +2208,14 @@ mod tests {
         // carry the IP — exactly the pre-ServerAddr behavior.
         let sa: SocketAddr = "192.0.2.7:3389".parse().unwrap();
         assert_eq!(ServerAddr::from(sa), ServerAddr::new("192.0.2.7", 3389));
-        assert_eq!(ServerAddr::from(sa).credssp_spn(), "TERMSRV/192.0.2.7");
+        assert_eq!(credssp_spn(&ServerAddr::from(sa).host), "TERMSRV/192.0.2.7");
     }
 
     #[test]
     fn credssp_spn_uses_the_host_as_dialed() {
         // Hostname in, hostname out: the SPN form Kerberos requires (#45).
         let server = ServerAddr::new("vm.example.test", 3389);
-        assert_eq!(server.credssp_spn(), "TERMSRV/vm.example.test");
+        assert_eq!(credssp_spn(&server.host), "TERMSRV/vm.example.test");
     }
 
     /// Like `mock_tls_server`, but also reports the SNI the client's ClientHello carried (or
@@ -2501,6 +2539,79 @@ mod tests {
         }
     }
 
+    /// The server side of a CredSSP exchange over `stream`, driven by sspi's `CredSspServer`: the
+    /// genuine peer of the `CredSspClient` the adapter runs. Returns the delegated account name,
+    /// or `None` if the client went away or the exchange failed, in which case the client has
+    /// been sent the `TsRequest` carrying the error. `after_last_reply` is written in the same
+    /// write as the server's last `TsRequest`, the one carrying `pubKeyAuth`.
+    async fn serve_credssp<S>(
+        stream: &mut S,
+        public_key: Vec<u8>,
+        proxy: SingleUser,
+        after_last_reply: &[u8],
+    ) -> Option<String>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        use sspi::credssp::{CredSspServer, ServerMode, ServerState};
+
+        // Mirror the client's SPNEGO-wrapped-NTLM configuration on the acceptor side.
+        let negotiate = NegotiateConfig::new(
+            Box::new(NtlmConfig::default()),
+            Some("ntlm,!kerberos,!pku2u".to_string()),
+            "mockserver".to_string(),
+        );
+        let mut server =
+            CredSspServer::new(public_key, proxy, ServerMode::Negotiate(negotiate)).unwrap();
+
+        let encode = |ts: &TsRequest| {
+            let mut out = Vec::with_capacity(usize::from(ts.buffer_len().unwrap()));
+            ts.encode_ts_request(&mut out).unwrap();
+            out
+        };
+        let mut inbox: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            // One TSRequest per client write, and the client awaits our reply before the
+            // next — so accumulate until the buffer parses as a complete TSRequest.
+            let ts_request = loop {
+                if !inbox.is_empty()
+                    && let Ok(ts) = TsRequest::from_buffer(&inbox)
+                {
+                    inbox.clear();
+                    break ts;
+                }
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return None;
+                }
+                inbox.extend_from_slice(&buf[..n]);
+            };
+            let state = match server.process(ts_request).start() {
+                GeneratorState::Completed(result) => result,
+                GeneratorState::Suspended(_) => panic!("NTLM never needs a KDC round trip"),
+            };
+            match state {
+                Ok(ServerState::ReplyNeeded(reply)) => {
+                    let mut out = encode(&reply);
+                    if reply.pub_key_auth.is_some() {
+                        out.extend_from_slice(after_last_reply);
+                    }
+                    stream.write_all(&out).await.unwrap();
+                }
+                Ok(ServerState::Finished(identity)) => {
+                    return Some(identity.username.account_name().to_string());
+                }
+                Err(error) => {
+                    if let Some(ts) = error.ts_request {
+                        stream.write_all(&encode(&ts)).await.unwrap();
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+
     /// A loopback RDP server that speaks the whole pre-MCS sequence for real: X.224 confirm
     /// (HYBRID selected), TLS with a throwaway cert, then a complete CredSSP exchange driven by
     /// sspi's `CredSspServer` — the genuine peer of the `CredSspClient` the adapter runs.
@@ -2511,8 +2622,6 @@ mod tests {
         username: &str,
         password: &str,
     ) -> (SocketAddr, tokio::sync::oneshot::Receiver<String>) {
-        use sspi::credssp::{CredSspServer, ServerMode, ServerState};
-
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.der().clone();
         // The exact bytes the client binds pubKeyAuth to: the cert's inner subjectPublicKey,
@@ -2538,54 +2647,11 @@ mod tests {
             .await
             .unwrap(); // select HYBRID: the client proceeds to TLS + NLA
             let mut tls = acceptor.accept(sock).await.unwrap();
-
-            // Mirror the client's SPNEGO-wrapped-NTLM configuration on the acceptor side.
-            let negotiate = NegotiateConfig::new(
-                Box::new(NtlmConfig::default()),
-                Some("ntlm,!kerberos,!pku2u".to_string()),
-                "mockserver".to_string(),
-            );
-            let mut server =
-                CredSspServer::new(public_key, proxy, ServerMode::Negotiate(negotiate)).unwrap();
-
-            let mut inbox: Vec<u8> = Vec::new();
-            let mut buf = [0u8; 4096];
-            loop {
-                // One TSRequest per client write, and the client awaits our reply before the
-                // next — so accumulate until the buffer parses as a complete TSRequest.
-                let ts_request = loop {
-                    if !inbox.is_empty()
-                        && let Ok(ts) = TsRequest::from_buffer(&inbox)
-                    {
-                        inbox.clear();
-                        break ts;
-                    }
-                    let n = tls.read(&mut buf).await.unwrap();
-                    if n == 0 {
-                        return; // client gave up mid-exchange — the test will fail on stages
-                    }
-                    inbox.extend_from_slice(&buf[..n]);
-                };
-                let state = match server.process(ts_request).start() {
-                    GeneratorState::Completed(result) => {
-                        result.expect("mock CredSSP server step failed")
-                    }
-                    GeneratorState::Suspended(_) => panic!("NTLM never needs a KDC round trip"),
-                };
-                match state {
-                    ServerState::ReplyNeeded(reply) => {
-                        let mut out = Vec::with_capacity(usize::from(reply.buffer_len().unwrap()));
-                        reply.encode_ts_request(&mut out).unwrap();
-                        tls.write_all(&out).await.unwrap();
-                    }
-                    ServerState::Finished(identity) => {
-                        // The delegated TSCredentials arrived: CredSSP is complete. Report the
-                        // authenticated account and drop the connection — the client is already
-                        // past NLA, so it fails (cleanly) in capability-exchange.
-                        let _ = finished_tx.send(identity.username.account_name().to_string());
-                        return;
-                    }
-                }
+            if let Some(account) = serve_credssp(&mut tls, public_key, proxy, &[]).await {
+                // The delegated TSCredentials arrived: CredSSP is complete. Report the
+                // authenticated account and drop the connection — the client is already
+                // past NLA, so it fails (cleanly) in capability-exchange.
+                let _ = finished_tx.send(account);
             }
         });
         (addr, finished_rx)
@@ -2618,6 +2684,185 @@ mod tests {
         // ...and the server side really finished CredSSP with the delegated credentials.
         let delegated = finished_rx.await.expect("the mock server reached Finished");
         assert_eq!(delegated, "test");
+    }
+
+    /// A stand-in for the bound `subjectPublicKey`; both ends of an in-memory exchange use it.
+    const TEST_SERVER_KEY: &[u8] = &[0x5A; 32];
+
+    fn single_user(password: &str) -> SingleUser {
+        SingleUser {
+            username: "test".to_string(),
+            password: password.to_string(),
+        }
+    }
+
+    fn require_send<T: Send>(value: T) -> T {
+        value
+    }
+
+    #[tokio::test]
+    async fn run_credssp_completes_over_a_callers_stream_and_leaves_the_servers_next_bytes_on_it() {
+        const NEXT_BYTES: [u8; 4] = [0x0B, 0xAD, 0xF0, 0x0D];
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let peer = tokio::spawn(async move {
+            serve_credssp(
+                &mut server,
+                TEST_SERVER_KEY.to_vec(),
+                single_user("test"),
+                &NEXT_BYTES,
+            )
+            .await
+        });
+
+        require_send(run_credssp(
+            &mut client,
+            TEST_SERVER_KEY.to_vec(),
+            &test_credentials(),
+            "vm.example.test",
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(peer.await.unwrap().as_deref(), Some("test"));
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, NEXT_BYTES);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn run_credssp_reports_a_failed_logon_as_nla_and_exposes_no_password() {
+        const PASSWORD: &str = "this-password-stays-out-of-logs";
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let peer = tokio::spawn(async move {
+            serve_credssp(
+                &mut server,
+                TEST_SERVER_KEY.to_vec(),
+                single_user("the-right-password"),
+                &[],
+            )
+            .await
+        });
+        let credentials = Credentials {
+            username: "test".to_string(),
+            password: PASSWORD.to_string(),
+            domain: None,
+        };
+
+        let err = run_credssp(
+            &mut client,
+            TEST_SERVER_KEY.to_vec(),
+            &credentials,
+            "vm.example.test",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            peer.await.unwrap(),
+            None,
+            "the server must refuse the logon"
+        );
+        match &err {
+            ConnectFailure::Nla { reason } => assert!(
+                reason.contains("error status"),
+                "expected the server-reported CredSSP error, got: {reason}"
+            ),
+            other => panic!("expected an Nla failure, got {other:?}"),
+        }
+        assert!(
+            logs_contain("TERMSRV/vm.example.test"),
+            "the exchange's logs must be captured"
+        );
+        assert!(!logs_contain(PASSWORD));
+        assert!(!format!("{err} {err:?}").contains(PASSWORD));
+    }
+
+    #[tokio::test]
+    async fn run_credssp_reports_a_closed_stream_as_io() {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let peer = tokio::spawn(async move {
+            let mut first_request = [0u8; 1];
+            server.read_exact(&mut first_request).await.unwrap();
+        });
+
+        let err = run_credssp(
+            &mut client,
+            TEST_SERVER_KEY.to_vec(),
+            &test_credentials(),
+            "vm.example.test",
+        )
+        .await
+        .unwrap_err();
+
+        peer.await.unwrap();
+        assert!(
+            matches!(err, ConnectFailure::Io(_)),
+            "expected an Io failure, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_credssp_refuses_an_oversized_ts_request() {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let _peer = tokio::spawn(async move {
+            let mut first_request = [0u8; 1];
+            server.read_exact(&mut first_request).await.unwrap();
+            server
+                .write_all(&[0x30, 0x84, 0x00, 0xFF, 0xFF, 0xFF])
+                .await
+                .unwrap();
+            // Holds the stream open: only the length cap can end the read.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(server);
+        });
+
+        let err = run_credssp(
+            &mut client,
+            TEST_SERVER_KEY.to_vec(),
+            &test_credentials(),
+            "vm.example.test",
+        )
+        .await
+        .unwrap_err();
+
+        match &err {
+            ConnectFailure::Nla { reason } => {
+                assert!(reason.contains("exceeds"), "unexpected reason: {reason}")
+            }
+            other => panic!("expected an over-cap Nla rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_server_public_key_is_the_certificates_subject_public_key() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let expected = ck.signing_key.public_key_raw().to_vec();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(
+            ck.cert.der().clone(),
+            ck.signing_key.serialize_der(),
+        )));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _peer = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            let mut scratch = [0u8; 1];
+            let _ = tls.read(&mut scratch).await;
+        });
+
+        let connector = TlsConnector::from(Arc::new(
+            client_config(&TrustPolicy::DangerAcceptAny, "localhost").unwrap(),
+        ));
+        let tls = connector
+            .connect(
+                ServerName::try_from("localhost").unwrap(),
+                TcpStream::connect(addr).await.unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tls_server_public_key(&tls).unwrap(), expected);
     }
 
     #[tokio::test]
