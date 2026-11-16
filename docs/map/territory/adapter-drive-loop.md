@@ -35,12 +35,20 @@ read as the adapter growing a third of its size.
   applies to the certificate the server sent: `Chain` refuses it, `Tofu` pins its bytes under a key of
   its own, `DangerAcceptAny` passes.
 
+- **A connect may run inside an RD Gateway tunnel** (#613): `connect_inner` is generic over the
+  wire it dials (`ConnectWire`), a `TcpStream` or a `GatewayStream`. `connect_over_gateway` hands
+  it a tunnel already open, so `tcp-connect` completes at once, and the session comes back as
+  `SessionStream::GatewayTls` or `SessionStream::Gateway`. The core connect machine is the same
+  one ([RD Gateway](rd-gateway.md)).
+
 - **Policy is injected, never decided here either** — the host supplies credentials,
   the trust policy, the frame sink and the cursor sink; the adapter wires them.
 - **One timeout seam.** Every stage's I/O goes through `with_stage_timeout`, so the
-  timeout/error policy exists once and a failure is reported *with its stage name*.
+  timeout/error policy exists once and a failure is reported *with its stage name*. Opening an
+  RD Gateway tunnel has its own, `in_stage`, because its failure is a `GatewayFailure`.
 - **Three entry points, increasing in capability**: `connect`,
-  `connect_with_timeouts`, `connect_with_options`; `run_credssp` for a host that needs only
+  `connect_with_timeouts`, `connect_with_options`; `open_gateway` and `connect_over_gateway`
+  for a server behind an RD Gateway; `run_credssp` for a host that needs only
   the CredSSP leg; and three session runners:
   `run_session`, `run_session_with_input`, `run_session_with_commands`.
 - **Cancellation is a token, not a drop** — `tokio-util`'s `CancellationToken` lets
@@ -115,8 +123,9 @@ read as the adapter growing a third of its size.
 ## Code
 
 - `justrdp-tokio/src/lib.rs` — `connect`, `connect_with_timeouts`,
-  `connect_with_options`, `connect_inner`, `with_stage_timeout`, `announce_stage`,
-  `configure_session_socket`, `Transport`, `ConnectOutcome`, `ConnectOptions`,
+  `connect_with_options`, `connect_over_gateway`, `connect_inner`, `ConnectWire`, `dial_tcp`,
+  `with_stage_timeout`, `announce_stage`,
+  `configure_session_socket`, `Transport`, `SessionStream`, `ConnectOutcome`, `ConnectOptions`,
   `ConnectTimeouts`, `ConnectFailure`, `Credentials`, `ServerAddr`, `run_session`,
   `run_session_with_input`, `run_session_with_commands`, `SessionCommand`,
   `SessionEvent`, `SessionFailure`, `generate_license_entropy`, `write_frame`,
@@ -147,6 +156,8 @@ read as the adapter growing a third of its size.
   platform toggle-flag read.
 - [Verification harness](verification-harness.md) — the loopback CredSSP test and
   every VM test live here.
+- [RD Gateway](rd-gateway.md) — the second wire `connect_inner` runs over, and the stream a
+  session inside a tunnel reads and writes.
 
 ## Known holes / open
 

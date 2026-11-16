@@ -1,0 +1,1051 @@
+//! The RD Gateway client sequence over the HTTP transport (MS-TSGU 3.7.5.2 to 3.7.5.4), as a
+//! sans-IO state machine: handshake, tunnel create with a PAA cookie, tunnel authorize, channel
+//! create, then the target's bytes inside data packets.
+//!
+//! [`GatewayStateMachine::receive`] takes the bytes the gateway sent, in any split, and frames
+//! them into packets by `packetLength`. [`GatewayStateMachine::send`] wraps bytes for the target.
+//! The transport under it (TLS, the WebSocket upgrade and framing) is the adapter's.
+
+use justrdp_pdu::error::DecodeError;
+use justrdp_pdu::tsgu::{
+    self, ChannelCreate, HandshakeRequest, Packet, PacketHeader, TunnelAuth, TunnelCreate,
+    UnicodeString,
+};
+
+pub use justrdp_pdu::tsgu::PaaCookie;
+
+/// The `capsFlags` the tunnel create advertises (MS-TSGU 2.2.5.3.9): none.
+pub const ADVERTISED_CAPS: u32 = 0;
+
+/// The longest packet the gateway may send: an `HTTP_TUNNEL_RESPONSE` whose `serverCert` and
+/// `consentMsg` are both 65,535 bytes.
+pub const MAX_PACKET_LEN: usize = 131_116;
+
+/// The most bytes one data packet carries: `cbDataLen` is a `u16` (MS-TSGU 2.2.10.6).
+pub const MAX_DATA_LEN: usize = 65_535;
+
+/// The stage label while the handshake response is awaited.
+pub const STAGE_HANDSHAKE: &str = "gateway-handshake";
+/// The stage label while the tunnel response is awaited.
+pub const STAGE_TUNNEL_CREATE: &str = "gateway-tunnel-create";
+/// The stage label while the tunnel authorization response is awaited.
+pub const STAGE_TUNNEL_AUTH: &str = "gateway-tunnel-auth";
+/// The stage label while the channel response is awaited.
+pub const STAGE_CHANNEL_CREATE: &str = "gateway-channel-create";
+/// The stage label once the Gateway Channel is open.
+pub const STAGE_CHANNEL_OPEN: &str = "gateway-channel-open";
+
+/// What the gateway sequence needs from the host. Its `Debug` prints the cookie's length and
+/// never its bytes.
+#[derive(Debug, Clone)]
+pub struct GatewayConfig {
+    /// The PAA cookie the host obtained for this gateway.
+    pub paa_cookie: PaaCookie,
+    /// The target server's name, as the gateway resolves it.
+    pub target_host: String,
+    /// The target server's port.
+    pub target_port: u16,
+    /// The client's name, sent in the tunnel authorization.
+    pub client_name: String,
+}
+
+/// A [`GatewayConfig`] whose field does not fit its length prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayConfigError(tsgu::EncodeError);
+
+impl core::fmt::Display for GatewayConfigError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "the gateway config cannot be sent: {}", self.0)
+    }
+}
+
+impl core::error::Error for GatewayConfigError {}
+
+/// What the gateway granted with the Gateway Channel.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayChannel {
+    /// `tunnelId` of the tunnel response.
+    pub tunnel_id: Option<u32>,
+    /// `channelId` of the channel response.
+    pub channel_id: Option<u32>,
+    /// `capsFlags` of the tunnel response: the capabilities the gateway negotiated.
+    pub negotiated_caps: Option<u32>,
+    /// `redirFlags` of the tunnel authorization response: the device redirections the gateway's
+    /// policy allows, as `HTTP_TUNNEL_REDIR_*` flags (MS-TSGU 2.2.5.3.7).
+    pub redir_flags: Option<u32>,
+    /// `idleTimeout` of the tunnel authorization response, in minutes. `None` unless the gateway
+    /// negotiated `HTTP_CAPABILITY_IDLE_TIMEOUT`. The timer is the client's (MS-TSGU 3.5.2.1) and
+    /// nothing here runs it.
+    pub idle_timeout_minutes: Option<u32>,
+}
+
+/// Why the gateway sequence failed, and the stage it was in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayError {
+    /// The stage label, one of the `STAGE_*` constants.
+    pub stage: &'static str,
+    /// What went wrong.
+    pub kind: GatewayErrorKind,
+}
+
+/// What went wrong in a gateway stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayErrorKind {
+    /// The gateway answered the stage's request with a non-zero `errorCode` or `statusCode`.
+    Refused {
+        /// The code, an HRESULT.
+        code: u32,
+    },
+    /// A packet declared a `packetLength` over [`MAX_PACKET_LEN`].
+    PacketTooLong {
+        /// The declared `packetLength`.
+        packet_length: u32,
+    },
+    /// A packet arrived that the stage does not admit.
+    UnexpectedPacket {
+        /// Its `packetType`.
+        packet_type: u16,
+    },
+    /// A packet did not decode.
+    Decode(DecodeError),
+    /// Bytes were handed to [`GatewayStateMachine::send`] while the Gateway Channel was not open.
+    ChannelNotOpen,
+}
+
+impl core::fmt::Display for GatewayError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}: {}", self.stage, self.kind)
+    }
+}
+
+impl core::fmt::Display for GatewayErrorKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            GatewayErrorKind::Refused { code } => {
+                write!(f, "the gateway refused with code {code:#010x}")
+            }
+            GatewayErrorKind::PacketTooLong { packet_length } => write!(
+                f,
+                "a packet declares {packet_length} bytes, over the {MAX_PACKET_LEN}-byte limit"
+            ),
+            GatewayErrorKind::UnexpectedPacket { packet_type } => {
+                write!(f, "unexpected packet type {packet_type:#x}")
+            }
+            GatewayErrorKind::Decode(e) => write!(f, "{e}"),
+            GatewayErrorKind::ChannelNotOpen => f.write_str("the gateway channel is not open"),
+        }
+    }
+}
+
+impl core::error::Error for GatewayError {}
+
+/// What the adapter does next. Its `Debug` prints the length of bytes and never the bytes: the
+/// tunnel create among them carries the cookie.
+#[derive(Clone, PartialEq, Eq)]
+pub enum GatewayAction {
+    /// Send these packets to the gateway.
+    WriteBytes(Vec<u8>),
+    /// The Gateway Channel is open: bytes for the target go through
+    /// [`GatewayStateMachine::send`] from here on.
+    ChannelOpen(GatewayChannel),
+    /// Bytes the target sent.
+    Data(Vec<u8>),
+    /// The Gateway Channel is closed. Nothing more arrives and nothing more may be sent.
+    Closed {
+        /// The `statusCode` of the gateway's close packet, an HRESULT.
+        status_code: u32,
+    },
+    /// The sequence failed. Nothing more arrives and nothing more may be sent.
+    FailWith(GatewayError),
+}
+
+impl core::fmt::Debug for GatewayAction {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            GatewayAction::WriteBytes(bytes) => f
+                .debug_struct("WriteBytes")
+                .field("len", &bytes.len())
+                .finish(),
+            GatewayAction::ChannelOpen(channel) => {
+                f.debug_tuple("ChannelOpen").field(channel).finish()
+            }
+            GatewayAction::Data(bytes) => {
+                f.debug_struct("Data").field("len", &bytes.len()).finish()
+            }
+            GatewayAction::Closed { status_code } => f
+                .debug_struct("Closed")
+                .field("status_code", status_code)
+                .finish(),
+            GatewayAction::FailWith(error) => f.debug_tuple("FailWith").field(error).finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Handshake,
+    TunnelCreate,
+    TunnelAuth,
+    ChannelCreate,
+    Open,
+    /// The client sent its close packet and awaits the gateway's response.
+    Closing,
+    Closed,
+    Failed,
+}
+
+/// The RD Gateway client sequence. Its `Debug` prints the stage only, since the requests it
+/// holds carry the cookie.
+pub struct GatewayStateMachine {
+    state: State,
+    stage: &'static str,
+    tunnel_create: Vec<u8>,
+    tunnel_auth: Vec<u8>,
+    channel_create: Vec<u8>,
+    /// Received bytes that do not yet make a whole packet.
+    inbox: Vec<u8>,
+    channel: GatewayChannel,
+}
+
+impl core::fmt::Debug for GatewayStateMachine {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GatewayStateMachine")
+            .field("stage", &self.stage)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GatewayStateMachine {
+    /// A machine for `config`, or the field of it that does not fit its length prefix.
+    pub fn new(config: GatewayConfig) -> Result<Self, GatewayConfigError> {
+        let tunnel_create = Packet::TunnelCreate(TunnelCreate {
+            caps_flags: ADVERTISED_CAPS,
+            reauth_tunnel_context: None,
+            paa_cookie: Some(config.paa_cookie),
+        })
+        .encode()
+        .map_err(GatewayConfigError)?;
+        let tunnel_auth = Packet::TunnelAuth(TunnelAuth {
+            client_name: UnicodeString::from_str_nul(&config.client_name),
+            statement_of_health: None,
+        })
+        .encode()
+        .map_err(GatewayConfigError)?;
+        let channel_create = Packet::ChannelCreate(ChannelCreate {
+            resources: vec![UnicodeString::from_str_nul(&config.target_host)],
+            alt_resources: Vec::new(),
+            port: config.target_port,
+            protocol: 3,
+        })
+        .encode()
+        .map_err(GatewayConfigError)?;
+        Ok(Self {
+            state: State::Handshake,
+            stage: STAGE_HANDSHAKE,
+            tunnel_create,
+            tunnel_auth,
+            channel_create,
+            inbox: Vec::new(),
+            channel: GatewayChannel::default(),
+        })
+    }
+
+    /// The current stage label. After a failure or a close it stays the stage that ended.
+    pub fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    /// Whether the Gateway Channel is open.
+    pub fn is_open(&self) -> bool {
+        self.state == State::Open
+    }
+
+    /// The handshake request that opens the sequence.
+    pub fn start(&mut self) -> Vec<GatewayAction> {
+        let request = Packet::HandshakeRequest(HandshakeRequest {
+            ver_major: 1,
+            ver_minor: 0,
+            client_version: 0,
+            extended_auth: tsgu::HTTP_EXTENDED_AUTH_PAA,
+        });
+        vec![GatewayAction::WriteBytes(encode_fixed(&request))]
+    }
+
+    /// Take bytes the gateway sent, in any split, and act on every whole packet in them.
+    pub fn receive(&mut self, bytes: &[u8]) -> Vec<GatewayAction> {
+        let mut actions = Vec::new();
+        if self.is_finished() {
+            return actions;
+        }
+        let mut inbox = core::mem::take(&mut self.inbox);
+        inbox.extend_from_slice(bytes);
+        let mut at = 0;
+        while !self.is_finished() {
+            let rest = &inbox[at..];
+            if rest.len() < tsgu::HEADER_LEN {
+                break;
+            }
+            let header = match PacketHeader::decode(rest) {
+                Ok(header) => header,
+                Err(e) => {
+                    self.fail(GatewayErrorKind::Decode(e), &mut actions);
+                    break;
+                }
+            };
+            let Some(len) = usize::try_from(header.packet_length)
+                .ok()
+                .filter(|len| *len <= MAX_PACKET_LEN)
+            else {
+                self.fail(
+                    GatewayErrorKind::PacketTooLong {
+                        packet_length: header.packet_length,
+                    },
+                    &mut actions,
+                );
+                break;
+            };
+            if rest.len() < len {
+                break;
+            }
+            match Packet::decode(&rest[..len]) {
+                Ok(packet) => self.on_packet(packet, &mut actions),
+                Err(e) => self.fail(GatewayErrorKind::Decode(e), &mut actions),
+            }
+            at += len;
+        }
+        if !self.is_finished() {
+            inbox.drain(..at);
+            self.inbox = inbox;
+        }
+        actions
+    }
+
+    /// Wrap `data` for the target in data packets of at most [`MAX_DATA_LEN`] bytes each.
+    pub fn send(&self, data: &[u8]) -> Result<Vec<u8>, GatewayError> {
+        if self.state != State::Open {
+            return Err(GatewayError {
+                stage: self.stage,
+                kind: GatewayErrorKind::ChannelNotOpen,
+            });
+        }
+        let mut out = Vec::with_capacity(data.len() + 10 * data.len().div_ceil(MAX_DATA_LEN));
+        for chunk in data.chunks(MAX_DATA_LEN) {
+            out.extend_from_slice(&encode_fixed(&Packet::Data(chunk)));
+        }
+        Ok(out)
+    }
+
+    /// Close the Gateway Channel from the client's side (MS-TSGU 3.7.5.4): the close packet to
+    /// send, or nothing when the channel is not open. Data that arrives after it is discarded.
+    pub fn close(&mut self) -> Vec<GatewayAction> {
+        if self.state != State::Open {
+            return Vec::new();
+        }
+        self.state = State::Closing;
+        vec![GatewayAction::WriteBytes(encode_fixed(
+            &Packet::CloseChannel { status_code: 0 },
+        ))]
+    }
+
+    fn is_finished(&self) -> bool {
+        matches!(self.state, State::Closed | State::Failed)
+    }
+
+    fn fail(&mut self, kind: GatewayErrorKind, actions: &mut Vec<GatewayAction>) {
+        self.state = State::Failed;
+        actions.push(GatewayAction::FailWith(GatewayError {
+            stage: self.stage,
+            kind,
+        }));
+    }
+
+    fn enter(&mut self, state: State, stage: &'static str) {
+        tracing::debug!(target: "rdg_stage", stage, "entering gateway stage");
+        self.state = state;
+        self.stage = stage;
+    }
+
+    fn on_packet(&mut self, packet: Packet<'_>, actions: &mut Vec<GatewayAction>) {
+        match (self.state, packet) {
+            (_, Packet::KeepAlive) => {
+                actions.push(GatewayAction::WriteBytes(encode_fixed(&Packet::KeepAlive)));
+            }
+            (_, Packet::Other { packet_type, body }) => {
+                tracing::debug!(
+                    target: "rdg_packet",
+                    packet_type,
+                    len = body.len(),
+                    "skipping a gateway packet"
+                );
+            }
+            (State::Handshake, Packet::HandshakeResponse(response)) => {
+                if response.error_code != 0 {
+                    return self.refuse(response.error_code, actions);
+                }
+                self.enter(State::TunnelCreate, STAGE_TUNNEL_CREATE);
+                actions.push(GatewayAction::WriteBytes(core::mem::take(
+                    &mut self.tunnel_create,
+                )));
+            }
+            (State::TunnelCreate, Packet::TunnelResponse(response)) => {
+                if response.status_code != 0 {
+                    return self.refuse(response.status_code, actions);
+                }
+                self.channel.tunnel_id = response.tunnel_id;
+                self.channel.negotiated_caps = response.caps_flags;
+                self.enter(State::TunnelAuth, STAGE_TUNNEL_AUTH);
+                actions.push(GatewayAction::WriteBytes(core::mem::take(
+                    &mut self.tunnel_auth,
+                )));
+            }
+            (State::TunnelAuth, Packet::TunnelAuthResponse(response)) => {
+                if response.error_code != 0 {
+                    return self.refuse(response.error_code, actions);
+                }
+                self.channel.redir_flags = response.redir_flags;
+                let idle_negotiated = self
+                    .channel
+                    .negotiated_caps
+                    .is_some_and(|caps| caps & tsgu::HTTP_CAPABILITY_IDLE_TIMEOUT != 0);
+                self.channel.idle_timeout_minutes =
+                    response.idle_timeout.filter(|_| idle_negotiated);
+                self.enter(State::ChannelCreate, STAGE_CHANNEL_CREATE);
+                actions.push(GatewayAction::WriteBytes(core::mem::take(
+                    &mut self.channel_create,
+                )));
+            }
+            (State::ChannelCreate, Packet::ChannelResponse(response)) => {
+                if response.error_code != 0 {
+                    return self.refuse(response.error_code, actions);
+                }
+                self.channel.channel_id = response.channel_id;
+                self.enter(State::Open, STAGE_CHANNEL_OPEN);
+                actions.push(GatewayAction::ChannelOpen(self.channel.clone()));
+            }
+            (State::Open, Packet::Data(data)) => actions.push(GatewayAction::Data(data.to_vec())),
+            (State::Open, Packet::CloseChannel { status_code }) => {
+                actions.push(GatewayAction::WriteBytes(encode_fixed(
+                    &Packet::CloseChannelResponse { status_code: 0 },
+                )));
+                self.state = State::Closed;
+                actions.push(GatewayAction::Closed { status_code });
+            }
+            (State::Closing, Packet::CloseChannelResponse { status_code }) => {
+                self.state = State::Closed;
+                actions.push(GatewayAction::Closed { status_code });
+            }
+            (State::Open | State::Closing, packet) => {
+                tracing::debug!(
+                    target: "rdg_packet",
+                    packet_type = packet.packet_type(),
+                    "skipping a gateway packet"
+                );
+            }
+            (_, packet) => {
+                let packet_type = packet.packet_type();
+                self.fail(GatewayErrorKind::UnexpectedPacket { packet_type }, actions);
+            }
+        }
+    }
+
+    fn refuse(&mut self, code: u32, actions: &mut Vec<GatewayAction>) {
+        self.fail(GatewayErrorKind::Refused { code }, actions);
+    }
+}
+
+/// Encode a packet whose fields all fit their length prefixes by construction.
+fn encode_fixed(packet: &Packet<'_>) -> Vec<u8> {
+    packet
+        .encode()
+        .expect("every field of this packet fits its length prefix")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use justrdp_pdu::tsgu::{
+        ChannelResponse, HandshakeResponse, TunnelAuthResponse, TunnelResponse,
+    };
+    use proptest::prelude::*;
+
+    const COOKIE: &str = "tok";
+
+    fn config() -> GatewayConfig {
+        GatewayConfig {
+            paa_cookie: PaaCookie::from_token(COOKIE),
+            target_host: "srv".to_string(),
+            target_port: 3389,
+            client_name: "pc".to_string(),
+        }
+    }
+
+    /// The handshake request with the `extendedAuth` mstsc sends for PAA (#613).
+    const HANDSHAKE_REQUEST: [u8; 14] = [
+        0x01, 0x00, // packetType PKT_TYPE_HANDSHAKE_REQUEST
+        0x00, 0x00, // reserved
+        0x0E, 0x00, 0x00, 0x00, // packetLength 14
+        0x01, // verMajor
+        0x00, // verMinor
+        0x00, 0x00, // clientVersion
+        0x02, 0x00, // ExtendedAuth HTTP_EXTENDED_AUTH_PAA
+    ];
+
+    /// The tunnel create mstsc sends for the cookie "tok" (#613): `capsFlags` 0x3f,
+    /// `fieldsPresent` 0x1, the cookie as UTF-16LE with a NUL.
+    const OBSERVED_TUNNEL_CREATE: [u8; 26] = [
+        0x04, 0x00, // packetType PKT_TYPE_TUNNEL_CREATE
+        0x00, 0x00, // reserved
+        0x1A, 0x00, 0x00, 0x00, // packetLength 26
+        0x3F, 0x00, 0x00, 0x00, // capsFlags
+        0x01, 0x00, // fieldsPresent HTTP_TUNNEL_PACKET_FIELD_PAA_COOKIE
+        0x00, 0x00, // reserved
+        0x08, 0x00, // cbLen
+        b't', 0x00, b'o', 0x00, b'k', 0x00, 0x00, 0x00, // "tok\0"
+    ];
+
+    /// MS-TSGU 2.2.10.14 for the client name "pc", without a statement of health.
+    const TUNNEL_AUTH: [u8; 18] = [
+        0x06, 0x00, // packetType PKT_TYPE_TUNNEL_AUTH
+        0x00, 0x00, // reserved
+        0x12, 0x00, 0x00, 0x00, // packetLength 18
+        0x00, 0x00, // fieldsPresent
+        0x06, 0x00, // cbClientName
+        b'p', 0x00, b'c', 0x00, 0x00, 0x00, // "pc\0"
+    ];
+
+    /// MS-TSGU 2.2.10.2 for the target "srv" on port 3389.
+    const CHANNEL_CREATE: [u8; 24] = [
+        0x08, 0x00, // packetType PKT_TYPE_CHANNEL_CREATE
+        0x00, 0x00, // reserved
+        0x18, 0x00, 0x00, 0x00, // packetLength 24
+        0x01, // numResources
+        0x00, // numAltResources
+        0x3D, 0x0D, // port 3389
+        0x03, 0x00, // protocol
+        0x08, 0x00, // cbLen
+        b's', 0x00, b'r', 0x00, b'v', 0x00, 0x00, 0x00, // "srv\0"
+    ];
+
+    fn handshake_response(error_code: u32) -> Vec<u8> {
+        Packet::HandshakeResponse(HandshakeResponse {
+            error_code,
+            ver_major: 1,
+            ver_minor: 0,
+            server_version: 0,
+            extended_auth: tsgu::HTTP_EXTENDED_AUTH_PAA,
+        })
+        .encode()
+        .unwrap()
+    }
+
+    fn tunnel_response(status_code: u32) -> Vec<u8> {
+        Packet::TunnelResponse(TunnelResponse {
+            server_version: 0,
+            status_code,
+            tunnel_id: Some(7),
+            caps_flags: Some(tsgu::HTTP_CAPABILITY_IDLE_TIMEOUT),
+            soh_request: None,
+            consent_msg: None,
+        })
+        .encode()
+        .unwrap()
+    }
+
+    fn tunnel_auth_response(error_code: u32) -> Vec<u8> {
+        Packet::TunnelAuthResponse(TunnelAuthResponse {
+            error_code,
+            redir_flags: Some(tsgu::HTTP_TUNNEL_REDIR_DISABLE_DRIVE),
+            idle_timeout: Some(30),
+            soh_response: None,
+        })
+        .encode()
+        .unwrap()
+    }
+
+    fn channel_response(error_code: u32) -> Vec<u8> {
+        Packet::ChannelResponse(ChannelResponse {
+            error_code,
+            channel_id: Some(9),
+            udp_port: None,
+            authn_cookie: None,
+        })
+        .encode()
+        .unwrap()
+    }
+
+    fn data_packet(data: &[u8]) -> Vec<u8> {
+        Packet::Data(data).encode().unwrap()
+    }
+
+    fn write(bytes: &[u8]) -> GatewayAction {
+        GatewayAction::WriteBytes(bytes.to_vec())
+    }
+
+    fn granted() -> GatewayChannel {
+        GatewayChannel {
+            tunnel_id: Some(7),
+            channel_id: Some(9),
+            negotiated_caps: Some(tsgu::HTTP_CAPABILITY_IDLE_TIMEOUT),
+            redir_flags: Some(tsgu::HTTP_TUNNEL_REDIR_DISABLE_DRIVE),
+            idle_timeout_minutes: Some(30),
+        }
+    }
+
+    /// A machine driven to an open Gateway Channel.
+    fn open_machine() -> GatewayStateMachine {
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        machine.receive(&handshake_response(0));
+        machine.receive(&tunnel_response(0));
+        machine.receive(&tunnel_auth_response(0));
+        let actions = machine.receive(&channel_response(0));
+        assert_eq!(actions, [GatewayAction::ChannelOpen(granted())]);
+        machine
+    }
+
+    #[test]
+    fn the_sequence_sends_each_request_after_the_response_before_it() {
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        assert_eq!(machine.stage(), STAGE_HANDSHAKE);
+        assert_eq!(machine.start(), [write(&HANDSHAKE_REQUEST)]);
+
+        let mut tunnel_create = OBSERVED_TUNNEL_CREATE;
+        tunnel_create[8..12].copy_from_slice(&ADVERTISED_CAPS.to_le_bytes());
+        assert_eq!(
+            machine.receive(&handshake_response(0)),
+            [write(&tunnel_create)]
+        );
+        assert_eq!(machine.stage(), STAGE_TUNNEL_CREATE);
+
+        assert_eq!(machine.receive(&tunnel_response(0)), [write(&TUNNEL_AUTH)]);
+        assert_eq!(machine.stage(), STAGE_TUNNEL_AUTH);
+
+        assert_eq!(
+            machine.receive(&tunnel_auth_response(0)),
+            [write(&CHANNEL_CREATE)]
+        );
+        assert_eq!(machine.stage(), STAGE_CHANNEL_CREATE);
+        assert!(!machine.is_open());
+
+        assert_eq!(
+            machine.receive(&channel_response(0)),
+            [GatewayAction::ChannelOpen(granted())]
+        );
+        assert_eq!(machine.stage(), STAGE_CHANNEL_OPEN);
+        assert!(machine.is_open());
+    }
+
+    /// ADR-0016: the tunnel create advertises what this client handles, not mstsc's 0x3f. Each
+    /// of the six capabilities asks the client for something it does not do.
+    #[test]
+    fn no_capability_is_advertised() {
+        assert_eq!(ADVERTISED_CAPS, 0);
+    }
+
+    #[test]
+    fn responses_split_at_every_byte_drive_the_same_sequence() {
+        let mut stream = Vec::new();
+        stream.extend(handshake_response(0));
+        stream.extend(tunnel_response(0));
+        stream.extend(tunnel_auth_response(0));
+        stream.extend(channel_response(0));
+        stream.extend(data_packet(b"hello"));
+
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        let mut actions = Vec::new();
+        for byte in stream {
+            actions.extend(machine.receive(&[byte]));
+        }
+        assert_eq!(actions.len(), 5);
+        assert_eq!(actions[2], write(&CHANNEL_CREATE));
+        assert_eq!(actions[3], GatewayAction::ChannelOpen(granted()));
+        assert_eq!(actions[4], GatewayAction::Data(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn several_packets_in_one_read_are_all_acted_on() {
+        let mut machine = open_machine();
+        let mut bytes = data_packet(b"one");
+        bytes.extend(data_packet(b"two"));
+        bytes.extend(&data_packet(b"three")[..5]);
+        assert_eq!(
+            machine.receive(&bytes),
+            [
+                GatewayAction::Data(b"one".to_vec()),
+                GatewayAction::Data(b"two".to_vec()),
+            ]
+        );
+        assert_eq!(
+            machine.receive(&data_packet(b"three")[5..]),
+            [GatewayAction::Data(b"three".to_vec())]
+        );
+    }
+
+    /// Each stage's refusal names that stage and carries the gateway's code.
+    #[test]
+    fn a_refusal_names_the_stage_it_happened_in() {
+        type Step = fn(u32) -> Vec<u8>;
+        let steps: [(Step, &str); 4] = [
+            (handshake_response, STAGE_HANDSHAKE),
+            (tunnel_response, STAGE_TUNNEL_CREATE),
+            (tunnel_auth_response, STAGE_TUNNEL_AUTH),
+            (channel_response, STAGE_CHANNEL_CREATE),
+        ];
+        for refused_at in 0..steps.len() {
+            let mut machine = GatewayStateMachine::new(config()).unwrap();
+            machine.start();
+            for (step, _) in &steps[..refused_at] {
+                machine.receive(&step(0));
+            }
+            let (step, stage) = steps[refused_at];
+            assert_eq!(
+                machine.receive(&step(0x8007_59D8)),
+                [GatewayAction::FailWith(GatewayError {
+                    stage,
+                    kind: GatewayErrorKind::Refused { code: 0x8007_59D8 },
+                })]
+            );
+            assert_eq!(machine.stage(), stage);
+            assert_eq!(machine.receive(&step(0)), [], "nothing follows a failure");
+        }
+    }
+
+    #[test]
+    fn a_response_out_of_order_fails_the_stage() {
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        assert_eq!(
+            machine.receive(&tunnel_response(0)),
+            [GatewayAction::FailWith(GatewayError {
+                stage: STAGE_HANDSHAKE,
+                kind: GatewayErrorKind::UnexpectedPacket {
+                    packet_type: tsgu::PKT_TYPE_TUNNEL_RESPONSE,
+                },
+            })]
+        );
+    }
+
+    /// The header alone refuses an over-long packet, so its body is never awaited.
+    #[test]
+    fn a_packet_length_over_the_limit_fails_on_its_header() {
+        let mut machine = open_machine();
+        let mut header = vec![0x0A, 0x00, 0x00, 0x00];
+        header.extend((MAX_PACKET_LEN as u32 + 1).to_le_bytes());
+        assert_eq!(
+            machine.receive(&header),
+            [GatewayAction::FailWith(GatewayError {
+                stage: STAGE_CHANNEL_OPEN,
+                kind: GatewayErrorKind::PacketTooLong {
+                    packet_length: MAX_PACKET_LEN as u32 + 1,
+                },
+            })]
+        );
+    }
+
+    /// The limit is the longest packet `tsgu` knows a layout for, and it is admitted.
+    #[test]
+    fn the_longest_tunnel_response_is_within_the_limit() {
+        let longest = Packet::TunnelResponse(TunnelResponse {
+            server_version: 0,
+            status_code: 0,
+            tunnel_id: Some(1),
+            caps_flags: Some(0),
+            soh_request: Some(tsgu::SohRequest {
+                nonce: [0; 16],
+                server_cert: UnicodeString::from_bytes(vec![0; 65_535]),
+            }),
+            consent_msg: Some(UnicodeString::from_bytes(vec![0; 65_535])),
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(longest.len(), MAX_PACKET_LEN);
+
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        machine.receive(&handshake_response(0));
+        assert_eq!(machine.receive(&longest), [write(&TUNNEL_AUTH)]);
+    }
+
+    #[test]
+    fn a_packet_that_does_not_decode_fails_the_stage() {
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        // A handshake response whose packetLength covers the header alone.
+        let truncated = [0x02, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00];
+        let actions = machine.receive(&truncated);
+        assert!(matches!(
+            actions.as_slice(),
+            [GatewayAction::FailWith(GatewayError {
+                stage: STAGE_HANDSHAKE,
+                kind: GatewayErrorKind::Decode(DecodeError::InvalidField { .. }),
+            })]
+        ));
+    }
+
+    #[test]
+    fn a_keep_alive_is_answered_in_every_stage() {
+        let keep_alive = Packet::KeepAlive.encode().unwrap();
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        assert_eq!(machine.receive(&keep_alive), [write(&keep_alive)]);
+        assert_eq!(machine.stage(), STAGE_HANDSHAKE);
+
+        let mut machine = open_machine();
+        assert_eq!(machine.receive(&keep_alive), [write(&keep_alive)]);
+        assert!(machine.is_open());
+    }
+
+    /// Service messages, reauth and extended auth were not advertised; one that arrives anyway
+    /// is skipped and the channel carries on.
+    #[test]
+    fn a_packet_type_this_client_does_not_read_is_skipped() {
+        let service_message = Packet::Other {
+            packet_type: tsgu::PKT_TYPE_SERVICE_MESSAGE,
+            body: &[1, 2, 3],
+        }
+        .encode()
+        .unwrap();
+        let mut machine = open_machine();
+        let mut bytes = service_message;
+        bytes.extend(data_packet(b"after"));
+        assert_eq!(
+            machine.receive(&bytes),
+            [GatewayAction::Data(b"after".to_vec())]
+        );
+    }
+
+    #[test]
+    fn data_for_the_target_is_wrapped_in_data_packets_of_at_most_65535_bytes() {
+        let machine = open_machine();
+        assert_eq!(machine.send(b"hi").unwrap(), data_packet(b"hi"));
+
+        let big = vec![0xAB; MAX_DATA_LEN + 1];
+        let mut expected = data_packet(&big[..MAX_DATA_LEN]);
+        expected.extend(data_packet(&big[MAX_DATA_LEN..]));
+        assert_eq!(machine.send(&big).unwrap(), expected);
+    }
+
+    #[test]
+    fn data_is_refused_while_the_channel_is_not_open() {
+        let machine = GatewayStateMachine::new(config()).unwrap();
+        assert_eq!(
+            machine.send(b"hi"),
+            Err(GatewayError {
+                stage: STAGE_HANDSHAKE,
+                kind: GatewayErrorKind::ChannelNotOpen,
+            })
+        );
+    }
+
+    /// MS-TSGU 3.7.5.4, server-initiated: the response goes out and the channel ends.
+    #[test]
+    fn a_close_from_the_gateway_is_answered_and_ends_the_channel() {
+        let mut machine = open_machine();
+        let mut bytes = Packet::CloseChannel {
+            status_code: 0x8007_59F8,
+        }
+        .encode()
+        .unwrap();
+        bytes.extend(data_packet(b"late"));
+        assert_eq!(
+            machine.receive(&bytes),
+            [
+                write(
+                    &Packet::CloseChannelResponse { status_code: 0 }
+                        .encode()
+                        .unwrap()
+                ),
+                GatewayAction::Closed {
+                    status_code: 0x8007_59F8
+                },
+            ]
+        );
+        assert!(!machine.is_open());
+        assert!(machine.send(b"x").is_err());
+        assert_eq!(machine.receive(&data_packet(b"more")), []);
+    }
+
+    /// MS-TSGU 3.7.5.4, client-initiated: data after the close is discarded until the response.
+    #[test]
+    fn a_close_from_the_client_discards_data_until_the_gateway_responds() {
+        let mut machine = open_machine();
+        assert_eq!(
+            machine.close(),
+            [write(
+                &Packet::CloseChannel { status_code: 0 }.encode().unwrap()
+            )]
+        );
+        assert!(machine.send(b"x").is_err());
+        assert_eq!(machine.close(), [], "the close packet is sent once");
+        assert_eq!(machine.receive(&data_packet(b"late")), []);
+        assert_eq!(
+            machine.receive(
+                &Packet::CloseChannelResponse { status_code: 0 }
+                    .encode()
+                    .unwrap()
+            ),
+            [GatewayAction::Closed { status_code: 0 }]
+        );
+    }
+
+    #[test]
+    fn the_idle_timeout_is_reported_only_when_the_gateway_negotiated_it() {
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        machine.receive(&handshake_response(0));
+        let without_idle = Packet::TunnelResponse(TunnelResponse {
+            server_version: 0,
+            status_code: 0,
+            tunnel_id: Some(7),
+            caps_flags: Some(0),
+            soh_request: None,
+            consent_msg: None,
+        })
+        .encode()
+        .unwrap();
+        machine.receive(&without_idle);
+        machine.receive(&tunnel_auth_response(0));
+        let actions = machine.receive(&channel_response(0));
+        assert_eq!(
+            actions,
+            [GatewayAction::ChannelOpen(GatewayChannel {
+                negotiated_caps: Some(0),
+                idle_timeout_minutes: None,
+                ..granted()
+            })]
+        );
+    }
+
+    #[test]
+    fn a_cookie_longer_than_its_length_prefix_is_refused_before_anything_is_sent() {
+        let error = GatewayStateMachine::new(GatewayConfig {
+            paa_cookie: PaaCookie::from_bytes(vec![0; 65_536]),
+            ..config()
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the gateway config cannot be sent: PAACookie is 65536 long, and its length prefix \
+             admits 65535"
+        );
+    }
+
+    /// The cookie's text and its UTF-16LE bytes, in the forms `Debug` could print them.
+    fn assert_cookie_absent(text: &str) {
+        assert!(!text.contains("secret-cookie"), "{text}");
+        assert!(!text.contains("115, 0, 101, 0"), "{text}");
+    }
+
+    #[test]
+    fn the_cookie_is_in_no_debug_output() {
+        let config = GatewayConfig {
+            paa_cookie: PaaCookie::from_token("secret-cookie"),
+            ..config()
+        };
+        assert_cookie_absent(&format!("{config:?}"));
+        let mut machine = GatewayStateMachine::new(config.clone()).unwrap();
+        machine.start();
+        assert_cookie_absent(&format!("{machine:?}"));
+        let failed = machine.receive(&handshake_response(5));
+        assert_cookie_absent(&format!("{failed:?} {machine:?}"));
+
+        // The action that carries the tunnel create, cookie included.
+        let mut machine = GatewayStateMachine::new(config).unwrap();
+        machine.start();
+        let tunnel_create = machine.receive(&handshake_response(0));
+        assert_eq!(
+            format!("{tunnel_create:?}"),
+            "[WriteBytes { len: 46 }]",
+            "the request is printed by its length"
+        );
+    }
+
+    /// One server packet a stage can receive, well formed.
+    fn server_packet() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            any::<u32>().prop_map(|code| handshake_response(code & 1)),
+            any::<u32>().prop_map(|code| tunnel_response(code & 1)),
+            any::<u32>().prop_map(|code| tunnel_auth_response(code & 1)),
+            any::<u32>().prop_map(|code| channel_response(code & 1)),
+            proptest::collection::vec(any::<u8>(), 0..=64).prop_map(|data| data_packet(&data)),
+            Just(Packet::KeepAlive.encode().unwrap()),
+            any::<u32>()
+                .prop_map(|status_code| { Packet::CloseChannel { status_code }.encode().unwrap() }),
+            any::<u32>().prop_map(|status_code| {
+                Packet::CloseChannelResponse { status_code }
+                    .encode()
+                    .unwrap()
+            }),
+        ]
+    }
+
+    /// What the gateway sends in one read: the four responses in order more often than not, then
+    /// well-formed packets, some with a byte overwritten, some cut short, some arbitrary bytes.
+    fn gateway_reads() -> impl Strategy<Value = Vec<Vec<u8>>> {
+        let piece = prop_oneof![
+            6 => server_packet(),
+            2 => (server_packet(), any::<usize>(), any::<u8>()).prop_map(|(mut bytes, at, v)| {
+                let at = at % bytes.len();
+                bytes[at] = v;
+                bytes
+            }),
+            1 => (server_packet(), any::<usize>()).prop_map(|(mut bytes, at)| {
+                bytes.truncate(at % bytes.len());
+                bytes
+            }),
+            1 => proptest::collection::vec(any::<u8>(), 0..=32),
+        ];
+        (
+            any::<bool>(),
+            proptest::collection::vec(piece, 0..=12),
+            any::<bool>(),
+        )
+            .prop_map(|(opened, mut reads, split)| {
+                if opened {
+                    reads.splice(
+                        0..0,
+                        [
+                            handshake_response(0),
+                            tunnel_response(0),
+                            tunnel_auth_response(0),
+                            channel_response(0),
+                        ],
+                    );
+                }
+                if split {
+                    reads = reads
+                        .concat()
+                        .chunks(3)
+                        .map(<[u8]>::to_vec)
+                        .collect::<Vec<_>>();
+                }
+                reads
+            })
+    }
+
+    proptest! {
+        // ADR-0008: every byte here is the gateway's, and so are packetLength and the order.
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        /// The machine never panics, never holds more than one packet's worth of bytes, and
+        /// says nothing after it failed or closed.
+        #[test]
+        fn receive_never_panics_and_never_buffers_past_the_limit(reads in gateway_reads()) {
+            let mut machine = GatewayStateMachine::new(config()).unwrap();
+            machine.start();
+            let mut finished = false;
+            for read in reads {
+                let actions = machine.receive(&read);
+                prop_assert!(machine.inbox.len() < MAX_PACKET_LEN);
+                if finished {
+                    prop_assert!(actions.is_empty());
+                }
+                finished |= actions.iter().any(|action| {
+                    matches!(action, GatewayAction::FailWith(_) | GatewayAction::Closed { .. })
+                });
+                let _ = machine.send(&read);
+            }
+        }
+    }
+}

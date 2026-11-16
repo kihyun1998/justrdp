@@ -81,6 +81,8 @@ defect), #689 (the maintainer's rework that fixed it).
 
 ## Blast radius
 
+- [RD Gateway](rd-gateway.md) — through a gateway the exchange runs over the target's TLS
+  inside the tunnel, a `TlsStream<GatewayStream>`.
 - [TLS transport security & trust](tls-transport-security.md) — supplies the bound
   public key; a change to its extraction silently breaks the binding.
 - [X.224 negotiation](x224-negotiation.md) — decides whether NLA runs, and whether

@@ -1443,6 +1443,7 @@ dependencies = [
  "justrdp-codecs",
  "justrdp-pdu",
  "justrdp-security",
+ "proptest",
  "rcgen",
  "ring",
  "rustls",

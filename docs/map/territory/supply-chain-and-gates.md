@@ -120,8 +120,8 @@ like any other.
   features (`resolver.md`, "When building multiple packages in a workspace … you will need to
   build them via separate `cargo` invocations"). It derives the member list from
   `cargo metadata --no-deps`, for the reason the next bullet gives. It checks default features
-  only. `justrdp`'s `fuzzing`, the workspace's one non-default feature, is built alone by the
-  `Fuzz crate builds` step through `fuzz/Cargo.toml`.
+  only. The workspace's two non-default features, `justrdp`'s `fuzzing` and `justrdp-tokio`'s
+  (#613), are built by the `Fuzz crate builds` step through `fuzz/Cargo.toml`.
 - **A workflow may not keep its own copy of a list the repo already answers** (#200).
   `fuzz.yml`'s matrix was a hand-kept transcription of `ls fuzz/fuzz_targets/` and
   drifted twice in silence — `nscodec` (#143) and `progressive` (#192) each shipped a

@@ -361,6 +361,9 @@ Measured with throwaway probes and by mutating the adapter's command handler
 
 ## Blast radius
 
+- [RD Gateway](rd-gateway.md) — inside a tunnel the gateway's keep-alives and pings are
+  answered from the stream's read side, so a runner that stops reading stops answering them,
+  and a runner that ends on a read error does not say why the gateway closed.
 - [Framebuffer & frame delivery](framebuffer-frame-delivery.md) — every bitmap
   update lands there, and the frame-sink contract is shared.
 - [Bitmap codecs](bitmap-codecs.md) — slow-path bitmap updates route here by codec.

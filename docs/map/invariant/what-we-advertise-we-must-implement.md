@@ -70,6 +70,9 @@ about what we owe; both start at the same bytes.
   flags, where advertising `SUPPORT_DYN_VC_GFX_PROTOCOL` is what makes EGFX exist at all.
 - [Drawing orders](../territory/drawing-orders.md) — a Revision 2 bitmap cache obliges MemBlt
   and Mem3Blt both (#460).
+- [RD Gateway](../territory/rd-gateway.md) — the tunnel create's `capsFlags` is 0, where
+  `mstsc.exe` sends all six capabilities. The idle timeout was advertised while #613 was
+  written and taken out by its review: the timer it promises is the client's, and none runs.
 
 ## What a violation looks like
 

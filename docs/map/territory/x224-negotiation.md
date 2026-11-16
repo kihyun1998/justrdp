@@ -67,7 +67,9 @@ deciding the exchange itself.
   the id and clears it without one, whatever `flags` holds. The ids 2.2.1.1.2 says SHOULD NOT be
   sent (a first byte of 0x00 or 0xF4, or any 0x0D byte) are refused by `advertise::check`: the
   spec only advises against them, but FreeRDP's server fails a Connection Request carrying one.
-  The same id is meant to reach RD Gateway and UDP transports (#23, #16).
+  The same id is meant to reach RD Gateway and UDP transports (#23, #16). The RD Gateway
+  upgrade request does not carry it yet: it sends no `RDG-Correlation-Id`
+  ([RD Gateway](rd-gateway.md)).
 
 ## Code
 
@@ -148,8 +150,9 @@ on has never been written down for this territory.
 
 - **No governing record**, per the sentinel above: the strict/tolerant line for a
   *security* downgrade is stated in ADR-0009 only as the side it is not on.
-- RD Gateway (epic #23) changes what "the socket" is before this exchange happens;
-  nothing here anticipates it.
+- Through an RD Gateway (#613) this exchange runs unchanged inside the tunnel: the machine is
+  handed a `GatewayStream` where it would have dialed ([RD Gateway](rd-gateway.md)). No real
+  gateway has carried it yet.
 - **Where the echo check could refuse a server that is not hostile, unmeasured.** A TLS-capable
   server that omits `clientRequestedProtocols` reads as `PROTOCOL_RDP` and fails, and so does a
   TLS-terminating proxy that negotiates with the backend on its own and forwards the backend's

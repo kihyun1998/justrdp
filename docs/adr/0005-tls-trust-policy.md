@@ -30,3 +30,17 @@ Trust failures of every policy surface as the existing typed `ConnectFailure::Tl
 ## Amendment (2026-11-10, #614): the guarantee belongs to `connect`
 
 `justrdp_tokio::run_credssp` runs the CredSSP leg over a stream the caller took through TLS. The Decision's "credentials are never offered to an unauthenticated peer" holds for `connect`, which applies `TrustPolicy` itself. A host calling `run_credssp` directly holds that decision, which matches this record's "the trust decision is the host's". `tls_server_public_key` reads the key and verifies nothing.
+
+## Amendment (2026-11-16, #613): an RD Gateway's certificate has its own policy
+
+- Kind: **judgement**. The maintainer chose it at #613's confirm stop; the maintainer reopens it.
+
+Consequences left RD Gateway certificates out of scope. A connection through a gateway has two
+TLS handshakes: the client's with the gateway, and the client's with the target inside the
+tunnel. Each is checked under its own `TrustPolicy`, and the host chooses both:
+`GatewayOptions::trust` for the gateway and `ConnectOptions::trust` for the target. Both default
+to `Chain`. A gateway the policy refuses fails the `gateway-tls-handshake` stage before the
+upgrade request, so the PAA cookie is never sent to it.
+
+What it did not cover: pin-store keys. `Tofu` keys a pin by host name, so one store shared by
+both policies holds one pin for a name the gateway and a target share.

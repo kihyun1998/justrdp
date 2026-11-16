@@ -57,6 +57,8 @@ hand-rolled here, but it decides the dependency, not the encoders.
 
 ## Blast radius
 
+- [RD Gateway](rd-gateway.md) — `tsgu` reads its packets through `ReadCursor`, and the
+  gateway's bytes are framed by `packetLength` before a TPKT frame is seen.
 - [Session loop & PDU dispatch](session-loop-dispatch.md) — its read loop is built
   on `frame_len` / `is_fastpath`.
 - [MCS / GCC channel setup](mcs-gcc-channel-setup.md) — the only consumer of BER and

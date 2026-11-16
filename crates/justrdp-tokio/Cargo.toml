@@ -28,6 +28,13 @@ ring = { workspace = true }
 # over the TLS stream; the sans-IO core never sees a TSRequest.
 sspi = { workspace = true }
 
+[features]
+# The fuzz seam (#613), off by default: re-exports the WebSocket frame reader and the upgrade
+# response check through `justrdp_tokio::fuzzing` for `fuzz/`, as `justrdp`'s `fuzzing` does for
+# the graphics processor. `test.yml` builds it in its `Fuzz crate builds` step and lints it
+# through the clippy step's `--all-features`.
+fuzzing = []
+
 [dev-dependencies]
 # "sync" feeds the SNI observed by the mock TLS server back to the test (oneshot channel).
 # "test-util" gives the VM harness's frame-acknowledgement primitives (#198) virtual time, so
@@ -63,3 +70,5 @@ rcgen = { workspace = true }
 # violation shape 3). Left open deliberately by #225.
 ironrdp-graphics = "0.11"
 justrdp-codecs.workspace = true
+# No-panic properties for the WebSocket frame reader and the upgrade response check (ADR-0008).
+proptest.workspace = true

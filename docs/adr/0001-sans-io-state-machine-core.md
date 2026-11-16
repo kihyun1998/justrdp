@@ -168,6 +168,12 @@ that is a check of where the bytes came from, not a second replay.
 sends an X.509 chain. Its `README.md` says so and that the capture's origin is unknown, and
 `differential_x509_chain_ironrdp.rs` compares against the key IronRDP's test expects.
 
+**Note (2026-11-16, #613): the adapter row also holds the owned WebSocket client.**
+`crates/justrdp-tokio/src/websocket.rs` and `gateway.rs` are the RD Gateway transport, placed there
+by [ADR-0002's amendment](0002-dependency-boundary.md) of the same day. The frame reader and the
+upgrade response check in `websocket.rs` do no I/O; the fuzz crate reaches them through
+`justrdp-tokio`'s `fuzzing` feature. The MS-TSGU sequence is `crates/justrdp/src/gateway.rs`.
+
 **`fuzz/` is out of the workspace, by design.** `cargo <cmd> --workspace` does not build it,
 so it has its own gate: `test.yml` runs `cargo check --manifest-path fuzz/Cargo.toml` on every
 PR (#578). Until then this was a blind spot left to a manual run, and a rename or a public-path

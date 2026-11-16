@@ -72,6 +72,12 @@ wrote, unapplied.
   Indicators' `unitId`, the first site to take **way #3 in advance** (#305): not decoded,
   because 2.2.8.2.1.1 says the client SHOULD ignore it, so a field would have had no reader
   by the spec's own instruction.
+- [RD Gateway](../territory/rd-gateway.md) — `tsgu` decodes every optional field of the four
+  responses, and the sequence reads the ones a host can act on (`redirFlags`, `idleTimeout`,
+  the ids, the negotiated capabilities). The rest belong to capabilities the client does not
+  advertise or to the UDP transport, and the territory lists them (#613). **The handshake
+  response's version and `ExtendedAuth` are an open instance**: the answer to what the client
+  asked for, read by nothing.
 
 ## What a violation looks like
 

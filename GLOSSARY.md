@@ -25,6 +25,14 @@ are seven, entered in order:
 6. **activation**: synchronize, control and font exchange that finalize the session.
 7. **session-active**: entered on successful activation; lasts until disconnect.
 
+**Gateway Stage**:
+A labelled step of opening a Gateway Channel, announced like a Connect Stage and named in a
+failure. There are eight, entered in order: **gateway-tcp-connect**, **gateway-tls-handshake**,
+**gateway-websocket-upgrade**, **gateway-handshake**, **gateway-tunnel-create**,
+**gateway-tunnel-auth**, **gateway-channel-create**, and **gateway-channel-open**, after which
+the Connect Stages run inside the tunnel.
+_Avoid_: counting these among the Connect Stages
+
 **Session**:
 A live RDP session after activation, lasting until disconnect or a fatal error.
 
