@@ -111,7 +111,9 @@ What the choice was made on: `tungstenite`'s client handshake refuses any method
 (`[MS-TSGU]` 2.2.3.1.2). WebSocket is neither security-critical nor delegated by this record's
 rule, and the part of it a gateway needs is a frame header and one hash.
 
-What it did not cover: which crate holds the parts of that client that do no I/O (the frame
-reader and the upgrade response check). They are in `justrdp-tokio` with the rest, which makes
-the `fuzz/` crate depend on `justrdp-tokio` to reach them
-([RD Gateway](../map/territory/rd-gateway.md)).
+The parts of that client that do no I/O (the frame reader and the upgrade response check) stay
+in `justrdp-tokio` with the rest, and the `fuzz/` crate depends on `justrdp-tokio` to reach them
+([RD Gateway](../map/territory/rd-gateway.md)). Kind: **judgement**, the maintainer's at #613's
+close (2026-11-16), shown the cost: `fuzz/Cargo.lock` about 2,300 lines longer and the fuzz
+crate check 21 to 25 s warm, against 10.5 to 16.5 s cold before (#578); the alternative shown
+was moving the two parsers into the core.

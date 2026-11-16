@@ -232,10 +232,14 @@ logon message configured its tunnel response carries no consent field at all, no
 it refuses 0 with the messaging settings as installed; and it accepts the upgrade request
 without FreeRDP's `User-Agent` and `Content-Length`.
 
+**A consent message, accepted** (#613, 2026-11-16, the same gateway with a logon message set in
+its Messaging properties to a file holding `justrdp consent test`). The tunnel response came
+with `fieldsPresent` 0x13 (tunnel id, caps, consent message), and the message as 42 bytes:
+UTF-16LE with a terminating NUL, the length counting the NUL. The test accepted it and the
+connect reached session-active.
+
 **Still open after it**:
 
-- what a gateway with a logon message configured sends, and so a whole connect after an
-  accepted consent message;
 - what the gateway sends when the target ends the connection: a close packet and its status, or
   the end of the stream. The run ended at session-active;
 - **the nonce length of the tunnel response.** `[MS-TSGU]` 2.2.10.21 says 16 bytes (a GUID) and
@@ -305,9 +309,9 @@ without FreeRDP's `User-Agent` and `Content-Length`.
   a reset or an end of the socket, which a tunnel may report differently.
 - **`RDG-User-Id` is not sent.** `[MS-TSGU]` 3.3.5.1 says the request SHOULD carry it; it is
   the user's name, for the gateway's event log.
-- **No test runs a whole connect after an accepted consent message.** The stand-in gateway of
-  the adapter's unit tests sends one and opens the tunnel; `relay_gateway`, which the loopback
-  connect runs through, sends none.
+- **Only the real-gateway test runs a whole connect after an accepted consent message.** The
+  stand-in gateway of the adapter's unit tests sends one and opens the tunnel; `relay_gateway`,
+  which the loopback connect runs through, sends none.
 - **`RDG-Correlation-Id` is not sent.** `[MS-TSGU]` 2.2.3.2.2 makes it optional, and equal to
   the Connection Request's `RDP_NEG_CORRELATION_INFO` when present. `open_gateway` runs before
   the connect config exists, so it does not know that id
