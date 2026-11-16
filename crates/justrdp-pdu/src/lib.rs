@@ -42,6 +42,7 @@ pub mod sound;
 pub mod surface_commands;
 pub mod svc;
 pub mod tpkt;
+pub mod tsgu;
 pub mod update;
 pub mod x224;
 
