@@ -42,8 +42,13 @@ and binding the exchange to the server's public key.
   4-byte Early User Authorization Result PDU that `connect` reads before MCS, and that a
   host calling `run_credssp` directly reads itself. Left unread, capability exchange desyncs
   and hangs.
-- **`run_credssp` is public for a host that runs X.224 and TLS itself** (#614); `connect` calls
-  the same function, over any `AsyncRead + AsyncWrite` stream.
+- **`run_credssp` is public for a host that runs X.224 and TLS itself** (#614); `connect` runs
+  the same loop, `drive_credssp`, over any `AsyncRead + AsyncWrite` stream.
+  - Only `connect` bounds it (#615): each read that waits for a server `TsRequest` gets
+    `ConnectTimeouts::stage` and fails with `Timeout { stage: "nla-credssp" }`. `run_credssp` applies no
+    timeout and its caller bounds the future, since a host running its own X.224 and TLS
+    holds its own timeout policy. The per-read grain is the
+    [adapter's](adapter-drive-loop.md) one timeout rule.
   - It takes `&mut S` and returns no leftover bytes. The framing reads declared lengths and
     nothing follows the client's final message, so nothing is read past the last `TsRequest`.
     A test pins the server's next bytes staying on the stream. The maintainer chose this on
@@ -61,7 +66,7 @@ and binding the exchange to the server's public key.
 
 ## Code
 
-- `justrdp-tokio/src/lib.rs` — `run_credssp`, `credssp_spn`, `write_ts_request`, `read_ts_request`,
+- `justrdp-tokio/src/lib.rs` — `run_credssp`, `drive_credssp`, `credssp_spn`, `write_ts_request`, `read_ts_request`,
   `Credentials`, the `Action::StartNla` arm
 - `justrdp/src/connect.rs` — `Action::StartNla`, `Event::NlaComplete`,
   `ConnectStateMachine`

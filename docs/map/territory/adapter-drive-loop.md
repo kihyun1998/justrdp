@@ -45,7 +45,14 @@ read as the adapter growing a third of its size.
   the trust policy, the frame sink, the cursor sink and the answer to an RD Gateway's consent
   message; the adapter wires them.
 - **One timeout seam.** Every stage's I/O goes through `with_stage_timeout`, so the
-  timeout/error policy exists once and a failure is reported *with its stage name*. Opening an
+  timeout/error policy exists once and a failure is reported *with its stage name*. In the
+  X.224, CredSSP and MCS stages the bound is per read, not per stage as a whole: each X.224/MCS
+  read, and in `nla-credssp` each read that waits for a server `TsRequest` (#615), gets the full
+  `ConnectTimeouts::stage`, so a CredSSP exchange of several round trips may take longer than
+  `stage` in total. A whole-exchange bound would fail a slow server that answers every message in
+  time, and would not match what `ConnectTimeouts` promises. Writes in those stages are not
+  bounded. The TLS handshake and each gateway-opening stage are bounded as a whole, their writes
+  included. No bound covers the whole connect; a host that wants one wraps the `connect` future. Opening an
   RD Gateway tunnel has its own, `in_stage`, because its failure is a `GatewayFailure`. One wait
   is under no timeout: the host's answer to a gateway's consent message
   ([RD Gateway](rd-gateway.md)).

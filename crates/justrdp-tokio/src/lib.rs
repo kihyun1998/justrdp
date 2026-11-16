@@ -64,8 +64,8 @@ pub use trust::{FilePinStore, MemoryPinStore, PinStore, TrustPolicy, pin_fingerp
 
 /// Timeout for the TCP dial.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Timeout for each post-TCP connect stage (X.224 round trip, TLS handshake, …). These
-/// share one bound, applied per stage rather than cumulatively.
+/// Timeout for each post-TCP connect wait (an X.224 round trip, the TLS handshake, each NLA/MCS
+/// read). These share one bound, applied to each wait rather than cumulatively.
 const STAGE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Upper bound on a single CredSSP `TsRequest` we will buffer from the server. A real TSRequest is a
 /// few KB at most (NTLM / SPNEGO tokens; Kerberos PACs are larger but still modest); this caps a
@@ -467,14 +467,18 @@ pub async fn connect(
 /// The per-stage timeout policy for [`connect`]: how long the TCP dial may take, and how long
 /// each subsequent connect stage (an X.224 round trip, the TLS handshake, each NLA/MCS read)
 /// may sit idle before the connect fails with [`ConnectFailure::Timeout`] carrying the stage
-/// name. [`connect`] uses [`ConnectTimeouts::default`] (10 s dial / 15 s per stage,
-/// each stage bounded on its own, not cumulatively); hosts with tighter UX budgets inject their own
+/// name. In `nla-credssp` the bound applies to each read that waits for a server `TsRequest`
+/// (and to the HYBRID_EX Early User Authorization Result), not to the exchange as a whole, so
+/// an exchange of several round trips may take longer than `stage` in total. Its writes, like
+/// the MCS ones, are not bounded. [`connect`] uses [`ConnectTimeouts::default`] (10 s dial / 15 s per wait,
+/// each wait bounded on its own, not cumulatively); hosts with tighter UX budgets inject their own
 /// via [`connect_with_timeouts`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectTimeouts {
     /// Timeout for the TCP dial.
     pub tcp_connect: Duration,
-    /// Timeout for each post-TCP connect stage, applied per stage rather than cumulatively.
+    /// Timeout for each post-TCP connect wait (an X.224 round trip, the TLS handshake, each
+    /// NLA/MCS read), applied to each on its own rather than cumulatively.
     pub stage: Duration,
 }
 
@@ -709,7 +713,14 @@ async fn connect_inner<W: ConnectWire>(
                         key_len = server_public_key.len(),
                         "starting CredSSP / NLA token exchange"
                     );
-                    run_credssp(stream, server_public_key, &credentials, &server.host).await?;
+                    drive_credssp(
+                        stream,
+                        server_public_key,
+                        &credentials,
+                        &server.host,
+                        Some(timeouts.stage),
+                    )
+                    .await?;
                     tracing::debug!("CredSSP exchange complete");
                     queue.extend(sm.process(Event::NlaComplete));
                     announce_stage(&mut sm, &mut announced, &mut on_stage);
@@ -1577,17 +1588,18 @@ pub fn keyboard_toggle_flags() -> u8 {
     0
 }
 
-/// Await `fut` under the stage's timeout, mapping the outcome into a [`ConnectFailure`]: an I/O
-/// error becomes `Io`, and an elapsed timeout becomes `Timeout { stage }`. Every connect stage
-/// wraps its I/O through this single seam so the timeout/error policy lives in one place.
-async fn with_stage_timeout<T>(
+/// Await `fut` under the stage's timeout, mapping the outcome into a [`ConnectFailure`]: an error
+/// becomes its `ConnectFailure` (an I/O error is `Io`), and an elapsed timeout becomes
+/// `Timeout { stage }`. Every connect stage wraps its I/O through this single seam so the
+/// timeout/error policy lives in one place.
+async fn with_stage_timeout<T, E: Into<ConnectFailure>>(
     stage: &'static str,
     dur: Duration,
-    fut: impl Future<Output = io::Result<T>>,
+    fut: impl Future<Output = Result<T, E>>,
 ) -> Result<T, ConnectFailure> {
     match tokio::time::timeout(dur, fut).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(ConnectFailure::Io(e)),
+        Ok(Err(e)) => Err(e.into()),
         Err(_) => Err(ConnectFailure::Timeout { stage }),
     }
 }
@@ -1653,6 +1665,22 @@ pub async fn run_credssp<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    drive_credssp(stream, server_public_key, credentials, server_name, None).await
+}
+
+/// The CredSSP exchange behind [`run_credssp`] and [`connect`]. With `read_timeout`, each read
+/// that waits for a server `TsRequest` is bounded on its own, and one that elapses fails with
+/// [`ConnectFailure::Timeout`] for the `nla-credssp` stage; writes are unbounded.
+async fn drive_credssp<S>(
+    stream: &mut S,
+    server_public_key: Vec<u8>,
+    credentials: &Credentials,
+    server_name: &str,
+    read_timeout: Option<Duration>,
+) -> Result<(), ConnectFailure>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let nla_err = |e: sspi::Error| ConnectFailure::Nla {
         reason: e.to_string(),
     };
@@ -1696,7 +1724,12 @@ where
         match client_state {
             ClientState::ReplyNeeded(ts) => {
                 write_ts_request(stream, &ts).await?;
-                ts_request = read_ts_request(stream).await?;
+                ts_request = match read_timeout {
+                    None => read_ts_request(stream).await?,
+                    Some(bound) => {
+                        with_stage_timeout("nla-credssp", bound, read_ts_request(stream)).await?
+                    }
+                };
             }
             ClientState::FinalMessage(ts) => {
                 write_ts_request(stream, &ts).await?;
@@ -2639,12 +2672,14 @@ mod tests {
     /// genuine peer of the `CredSspClient` the adapter runs. Returns the delegated account name,
     /// or `None` if the client went away or the exchange failed, in which case the client has
     /// been sent the `TsRequest` carrying the error. `after_last_reply` is written in the same
-    /// write as the server's last `TsRequest`, the one carrying `pubKeyAuth`.
+    /// write as the server's last `TsRequest`, the one carrying `pubKeyAuth`. Each reply is
+    /// written `reply_delay` after the client's `TsRequest` it answers was read.
     async fn serve_credssp<S>(
         stream: &mut S,
         public_key: Vec<u8>,
         proxy: SingleUser,
         after_last_reply: &[u8],
+        reply_delay: Duration,
     ) -> Option<String>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -2693,6 +2728,7 @@ mod tests {
                     if reply.pub_key_auth.is_some() {
                         out.extend_from_slice(after_last_reply);
                     }
+                    tokio::time::sleep(reply_delay).await;
                     stream.write_all(&out).await.unwrap();
                 }
                 Ok(ServerState::Finished(identity)) => {
@@ -2713,10 +2749,11 @@ mod tests {
     /// sspi's `CredSspServer` — the genuine peer of the `CredSspClient` the adapter runs.
     /// The returned receiver yields the delegated account name once the server reaches
     /// `Finished`, after which it drops the connection (the client is in `capability-exchange`
-    /// by then).
+    /// by then). Each CredSSP reply is sent `reply_delay` after the request it answers.
     async fn mock_credssp_server(
         username: &str,
         password: &str,
+        reply_delay: Duration,
     ) -> (SocketAddr, tokio::sync::oneshot::Receiver<String>) {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.der().clone();
@@ -2743,7 +2780,9 @@ mod tests {
             .await
             .unwrap(); // select HYBRID: the client proceeds to TLS + NLA
             let mut tls = acceptor.accept(sock).await.unwrap();
-            if let Some(account) = serve_credssp(&mut tls, public_key, proxy, &[]).await {
+            if let Some(account) =
+                serve_credssp(&mut tls, public_key, proxy, &[], reply_delay).await
+            {
                 // The delegated TSCredentials arrived: CredSSP is complete. Report the
                 // authenticated account and drop the connection — the client is already
                 // past NLA, so it fails (cleanly) in capability-exchange.
@@ -2758,7 +2797,7 @@ mod tests {
         // The full NLA loop through public `connect`, in CI (previously real-VM-only):
         // NEGOTIATE → CHALLENGE → AUTHENTICATE+mechListMIC → accept-completed+mechListMIC →
         // pubKeyAuth → server pubKeyAuth → TSCredentials.
-        let (addr, finished_rx) = mock_credssp_server("test", "test").await;
+        let (addr, finished_rx) = mock_credssp_server("test", "test", Duration::ZERO).await;
 
         let mut stages = Vec::new();
         let err = connect_danger(addr, test_config(), test_credentials(), |s| {
@@ -2780,6 +2819,90 @@ mod tests {
         // ...and the server side really finished CredSSP with the delegated credentials.
         let delegated = finished_rx.await.expect("the mock server reached Finished");
         assert_eq!(delegated, "test");
+    }
+
+    #[tokio::test]
+    async fn connect_times_out_in_nla_credssp_when_the_server_stops_answering() {
+        // The server reads the client's first TSRequest and never answers, socket held open.
+        let addr = mock_tls_server_replying_to_nla(Vec::new(), true).await;
+        let options = ConnectOptions {
+            timeouts: ConnectTimeouts {
+                stage: Duration::from_millis(300),
+                ..ConnectTimeouts::default()
+            },
+            trust: TrustPolicy::DangerAcceptAny,
+        };
+
+        let mut stages = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_with_options(
+                addr,
+                test_config(),
+                test_credentials(),
+                |s| stages.push(s.to_string()),
+                options,
+            ),
+        )
+        .await;
+
+        let err = result
+            .expect("connect must fail within the stage bound, not hang")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConnectFailure::Timeout {
+                    stage: "nla-credssp"
+                }
+            ),
+            "expected an nla-credssp timeout, got {err:?}"
+        );
+        assert_eq!(stages.last().map(String::as_str), Some("nla-credssp"));
+    }
+
+    #[tokio::test]
+    async fn connect_bounds_each_credssp_read_not_the_whole_exchange() {
+        // Every server reply comes inside the stage bound, but the exchange as a whole outlasts it.
+        let stage = Duration::from_millis(1000);
+        let (addr, finished_rx) =
+            mock_credssp_server("test", "test", Duration::from_millis(600)).await;
+        let options = ConnectOptions {
+            timeouts: ConnectTimeouts {
+                stage,
+                ..ConnectTimeouts::default()
+            },
+            trust: TrustPolicy::DangerAcceptAny,
+        };
+
+        let mut stages: Vec<(String, std::time::Instant)> = Vec::new();
+        let err = connect_with_options(
+            addr,
+            test_config(),
+            test_credentials(),
+            |s| stages.push((s.to_string(), std::time::Instant::now())),
+            options,
+        )
+        .await
+        .unwrap_err();
+
+        let entered = |name: &str| {
+            stages
+                .iter()
+                .find(|(s, _)| s == name)
+                .map(|(_, at)| *at)
+                .unwrap_or_else(|| panic!("never entered {name}: {stages:?}"))
+        };
+        let credssp = entered("capability-exchange") - entered("nla-credssp");
+        assert!(
+            credssp > stage,
+            "the exchange took {credssp:?}, inside the {stage:?} bound: nothing tells per-read from whole-exchange"
+        );
+        assert!(
+            matches!(err, ConnectFailure::Io(_)),
+            "expected the post-NLA drop as Io, got {err:?}"
+        );
+        assert_eq!(finished_rx.await.as_deref(), Ok("test"));
     }
 
     /// A stand-in RD Gateway on loopback, over TLS with a throwaway certificate. It grants the
@@ -2861,7 +2984,7 @@ mod tests {
     /// exchange are the target's own.
     #[tokio::test]
     async fn connect_runs_x224_tls_and_credssp_through_a_gateway_tunnel() {
-        let (target, finished_rx) = mock_credssp_server("test", "test").await;
+        let (target, finished_rx) = mock_credssp_server("test", "test", Duration::ZERO).await;
         let gateway = relay_gateway().await;
 
         let mut gateway_stages = Vec::new();
@@ -3070,6 +3193,7 @@ mod tests {
                 TEST_SERVER_KEY.to_vec(),
                 single_user("test"),
                 &NEXT_BYTES,
+                Duration::ZERO,
             )
             .await
         });
@@ -3100,6 +3224,7 @@ mod tests {
                 TEST_SERVER_KEY.to_vec(),
                 single_user("the-right-password"),
                 &[],
+                Duration::ZERO,
             )
             .await
         });
