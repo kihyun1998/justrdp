@@ -194,9 +194,21 @@ card, PAA and NTLM) and a tunnel response (`statusCode` 0x800759E9, `fieldsPrese
 the gateway checked the cookie before it refused is not known. The bytes are replayed by
 `the_refusal_a_windows_gateway_sent_names_the_tunnel_create_and_its_code`.
 
-**No real RD Gateway has opened a tunnel for this client yet**, and none has sent it a consent
-message: the run with `capsFlags` 0x4 is #613's to record. The run reads its
-gateway, target and cookie from the environment, so none is committed:
+**The same gateway opened a tunnel for `capsFlags` 0x4 and the connect reached session-active**
+(#613, 2026-11-16, the gateway relaying to its own listener). Every gateway stage passed, then
+`tcp-connect` to `session-active` ran inside the tunnel: X.224, the target's TLS, NLA (NTLM) and
+activation, desktop 1280×800. The gateway's MS-TSGU packets before the first data packet:
+
+- tunnel response: `statusCode` 0, `fieldsPresent` 0x3 (tunnel id 2, `capsFlags` 0x4). No
+  consent message and no `SOH_REQ`;
+- tunnel authorize response: `errorCode` 0, `fieldsPresent` 0x3, `redirFlags` 0x9 (drive and
+  clipboard redirection disabled), `idleTimeout` 0;
+- channel response: `errorCode` 0, `fieldsPresent` 0x7: channel id 1, UDP port 3391 and a
+  1,451-byte `authnCookie`, read in that order.
+
+The refusal of 0 and this run used the role's messaging settings as installed: the lab setup
+changed none of them. The run reads its gateway, target and cookie from the environment, so
+none is committed:
 
 | Variable | Holds |
 |---|---|
@@ -215,24 +227,23 @@ WebSocket frames are read, so the cookie is not in it. A consent message would b
 response's `authnCookie` would be, and so are the target's bytes (TLS records). Read it before
 committing it.
 
-**What that run should settle**, none of it measured:
+**What the run settled**: a Windows gateway opens a tunnel for `capsFlags` 0x4 alone; with no
+logon message configured its tunnel response carries no consent field at all, not an empty one;
+it refuses 0 with the messaging settings as installed; and it accepts the upgrade request
+without FreeRDP's `User-Agent` and `Content-Length`.
 
-- whether a Windows gateway opens a tunnel for `capsFlags` 0x4 alone, and what its tunnel
-  response then carries: a consent message or none, and an empty one or text. No reference
-  client sends 0x4 alone;
-- whether the gateway that refused 0 was configured to allow only clients with consent
-  signing, or refuses by default: 2.2.6 ties the code to that setting, and the setting of the
-  measured gateway was not recorded;
-- whether it accepts the upgrade request without the headers FreeRDP adds. IronRDP's request
-  carries about the same set as this one;
+**Still open after it**:
+
+- what a gateway with a logon message configured sends, and so a whole connect after an
+  accepted consent message;
 - what the gateway sends when the target ends the connection: a close packet and its status, or
-  the end of the stream;
+  the end of the stream. The run ended at session-active;
 - **the nonce length of the tunnel response.** `[MS-TSGU]` 2.2.10.21 says 16 bytes (a GUID) and
   `tsgu` follows it; FreeRDP's `rdg.c` skips 20 and IronRDP's `ironrdp-mstsgu` reads a `u16`,
   neither with a reason. It is present only under `fieldsPresent` 0x4
   (`HTTP_TUNNEL_RESPONSE_FIELD_SOH_REQ`), which a gateway should not set for a client that did
   not advertise `HTTP_CAPABILITY_TYPE_QUAR_SOH`. If the capture shows that bit, keep the bytes:
-  they settle it.
+  they settle it. The run's tunnel response did not set it.
 
 ## Cross-cutting invariants
 
@@ -294,7 +305,6 @@ committing it.
   a reset or an end of the socket, which a tunnel may report differently.
 - **`RDG-User-Id` is not sent.** `[MS-TSGU]` 3.3.5.1 says the request SHOULD carry it; it is
   the user's name, for the gateway's event log.
-- **No real gateway has opened a tunnel for this client** (see `## Reference behaviour`).
 - **No test runs a whole connect after an accepted consent message.** The stand-in gateway of
   the adapter's unit tests sends one and opens the tunnel; `relay_gateway`, which the loopback
   connect runs through, sends none.
