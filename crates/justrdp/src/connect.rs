@@ -169,7 +169,7 @@ pub struct McsConnectResult {
 /// these are its only outputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Open the TCP socket to the server.
+    /// Open the byte stream to the server: a TCP socket, or a tunnel through an RD Gateway.
     Connect,
     /// Write these bytes to the socket (the plaintext socket before [`Action::StartTls`], the
     /// TLS stream after).
