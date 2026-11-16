@@ -8,16 +8,19 @@ the TLS and CredSSP sub-protocols that deliberately live outside the core, and t
 drives the session: reading bytes, delivering frames and cursor events to
 host-supplied sinks, accepting input and resize commands, and cancelling cleanly.
 
-**Its size is a finding, not a detail.** The adapter file is 4875 lines, of which
-**1032 are code** and the rest tests. `CLAUDE.md` and `justrdp/src/lib.rs` used to
-call it *"~30 lines"* — true of the *drive loop* (a match over `Action`), false of
-the crate, and it shipped verbatim to docs.rs. Both were corrected when this map was
-written; the number above is what to keep it honest against.
+**Its size is a finding, not a detail.** Measured 2026-11-16 (#615): the crate's four files
+hold 21,299 lines, of which **3,349 come before each file's `#[cfg(test)]` module** and the
+rest are tests: `lib.rs` 1,805 of 17,695, `gateway.rs` 758 of 2,190, `websocket.rs` 447 of
+940, `trust.rs` 339 of 474. The non-test count includes doc comments. `CLAUDE.md` and
+`justrdp/src/lib.rs` used to call the adapter *"~30 lines"*, which is true of the *drive
+loop* (a match over `Action`) and false of the crate, and it shipped verbatim to docs.rs. Both
+were corrected when this map was written; the numbers above are what to keep it honest
+against, measured the same way each time.
 
-The two numbers have since moved apart, which is the point of keeping both: the total
-grew by ~1250 lines across #197 and #198 and the **code count did not move at all**,
-because every line of both was harness. A single "lines in this file" figure would have
-read as the adapter growing a third of its size.
+Keep both numbers, because they move apart: on 2026-08-20 this note gave 4,875 lines with
+1,032 of code (counted by a method it did not record), and the ~1,250 lines #197 and #198
+added were all harness. A single "lines in this file" figure would have read as the adapter
+growing a third of its size.
 
 ## Governing decisions
 
