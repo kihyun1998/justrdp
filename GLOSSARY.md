@@ -120,3 +120,9 @@ _Avoid_: host channel, channel helper
 A Virtual Channel whose protocol the core runs to its end, such as the Graphics Pipeline and
 Display Control.
 _Avoid_: internal channel, DVC processor
+
+**Gateway Channel**:
+The connection an RD Gateway opens to the target server inside a tunnel and relays the RDP bytes
+over (MS-TSGU `HTTP_CHANNEL_PACKET`). It is what `tsgu::ChannelCreate` and `tsgu::ChannelResponse`
+name, and it is not a Virtual Channel.
+_Avoid_: calling it a Virtual Channel, or a Virtual Channel a gateway channel
