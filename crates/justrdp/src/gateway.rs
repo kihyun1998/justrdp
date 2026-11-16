@@ -15,6 +15,14 @@ use justrdp_pdu::tsgu::{
 
 pub use justrdp_pdu::tsgu::PaaCookie;
 
+/// The protocol version the handshake request sends and the handshake response has to name, as
+/// (`verMajor`, `verMinor`).
+const VERSION: (u8, u8) = (1, 0);
+
+/// The `ExtendedAuth` the handshake request sends, and the flag the handshake response has to
+/// carry: PAA.
+const EXTENDED_AUTH: u16 = tsgu::HTTP_EXTENDED_AUTH_PAA;
+
 /// The `capsFlags` the tunnel create advertises (MS-TSGU 2.2.5.3.9): consent messaging.
 pub const ADVERTISED_CAPS: u32 = tsgu::HTTP_CAPABILITY_MESSAGING_CONSENT_SIGN;
 
@@ -114,6 +122,19 @@ pub enum GatewayErrorKind {
     /// The host declined the gateway's consent message
     /// ([`GatewayStateMachine::decline_consent`]).
     ConsentDeclined,
+    /// The handshake response named a version other than 1.0, the one this client sends.
+    VersionMismatch {
+        /// `verMajor` of the handshake response.
+        major: u8,
+        /// `verMinor` of the handshake response.
+        minor: u8,
+    },
+    /// The handshake response's `ExtendedAuth` lacks `HTTP_EXTENDED_AUTH_PAA`, the one
+    /// authentication this client asks for.
+    PaaNotOffered {
+        /// `ExtendedAuth` of the handshake response, `HTTP_EXTENDED_AUTH_*` flags.
+        extended_auth: u16,
+    },
 }
 
 impl core::fmt::Display for GatewayError {
@@ -140,6 +161,15 @@ impl core::fmt::Display for GatewayErrorKind {
             GatewayErrorKind::ConsentDeclined => {
                 f.write_str("the gateway's consent message was declined")
             }
+            GatewayErrorKind::VersionMismatch { major, minor } => write!(
+                f,
+                "the gateway answered version {major}.{minor}, not {}.{}",
+                VERSION.0, VERSION.1
+            ),
+            GatewayErrorKind::PaaNotOffered { extended_auth } => write!(
+                f,
+                "the gateway's ExtendedAuth {extended_auth:#06x} does not offer PAA"
+            ),
         }
     }
 }
@@ -285,10 +315,10 @@ impl GatewayStateMachine {
     /// The handshake request that opens the sequence.
     pub fn start(&mut self) -> Vec<GatewayAction> {
         let request = Packet::HandshakeRequest(HandshakeRequest {
-            ver_major: 1,
-            ver_minor: 0,
+            ver_major: VERSION.0,
+            ver_minor: VERSION.1,
             client_version: 0,
-            extended_auth: tsgu::HTTP_EXTENDED_AUTH_PAA,
+            extended_auth: EXTENDED_AUTH,
         });
         vec![GatewayAction::WriteBytes(encode_fixed(&request))]
     }
@@ -431,6 +461,14 @@ impl GatewayStateMachine {
             (State::Handshake, Packet::HandshakeResponse(response)) => {
                 if response.error_code != 0 {
                     return self.refuse(response.error_code, actions);
+                }
+                if (response.ver_major, response.ver_minor) != VERSION {
+                    let (major, minor) = (response.ver_major, response.ver_minor);
+                    return self.fail(GatewayErrorKind::VersionMismatch { major, minor }, actions);
+                }
+                if response.extended_auth & EXTENDED_AUTH == 0 {
+                    let extended_auth = response.extended_auth;
+                    return self.fail(GatewayErrorKind::PaaNotOffered { extended_auth }, actions);
                 }
                 self.enter(State::TunnelCreate, STAGE_TUNNEL_CREATE);
                 actions.push(GatewayAction::WriteBytes(core::mem::take(
@@ -592,6 +630,18 @@ mod tests {
             ver_minor: 0,
             server_version: 0,
             extended_auth: tsgu::HTTP_EXTENDED_AUTH_PAA,
+        })
+        .encode()
+        .unwrap()
+    }
+
+    fn handshake_response_answering(ver_major: u8, ver_minor: u8, extended_auth: u16) -> Vec<u8> {
+        Packet::HandshakeResponse(HandshakeResponse {
+            error_code: 0,
+            ver_major,
+            ver_minor,
+            server_version: 0,
+            extended_auth,
         })
         .encode()
         .unwrap()
@@ -892,6 +942,109 @@ mod tests {
                     kind: GatewayErrorKind::Refused { code: 0x8007_59E9 },
                 }),
             ]
+        );
+    }
+
+    /// MS-TSGU 3.7.3: a gateway that answers another version gets no tunnel create, and so no
+    /// cookie.
+    #[test]
+    fn a_handshake_response_with_another_version_fails_before_the_cookie_is_sent() {
+        for (major, minor) in [(1, 1), (2, 0), (0, 0)] {
+            let mut machine = GatewayStateMachine::new(config()).unwrap();
+            machine.start();
+            assert_eq!(
+                machine.receive(&handshake_response_answering(
+                    major,
+                    minor,
+                    tsgu::HTTP_EXTENDED_AUTH_PAA
+                )),
+                [GatewayAction::FailWith(GatewayError {
+                    stage: STAGE_HANDSHAKE,
+                    kind: GatewayErrorKind::VersionMismatch { major, minor },
+                })],
+                "version {major}.{minor}"
+            );
+            assert_eq!(machine.stage(), STAGE_HANDSHAKE);
+            assert_eq!(machine.receive(&tunnel_response(0)), [], "nothing follows");
+        }
+    }
+
+    /// The client asked for PAA alone; a gateway that does not offer it gets no cookie.
+    #[test]
+    fn a_handshake_response_without_paa_fails_before_the_cookie_is_sent() {
+        let without_paa = [
+            0,
+            tsgu::HTTP_EXTENDED_AUTH_SC,
+            tsgu::HTTP_EXTENDED_AUTH_SC | tsgu::HTTP_EXTENDED_AUTH_SSPI_NTLM,
+            !tsgu::HTTP_EXTENDED_AUTH_PAA,
+        ];
+        for extended_auth in without_paa {
+            let mut machine = GatewayStateMachine::new(config()).unwrap();
+            machine.start();
+            assert_eq!(
+                machine.receive(&handshake_response_answering(1, 0, extended_auth)),
+                [GatewayAction::FailWith(GatewayError {
+                    stage: STAGE_HANDSHAKE,
+                    kind: GatewayErrorKind::PaaNotOffered { extended_auth },
+                })],
+                "ExtendedAuth {extended_auth:#06x}"
+            );
+            assert_eq!(machine.stage(), STAGE_HANDSHAKE);
+            assert_eq!(machine.receive(&tunnel_response(0)), [], "nothing follows");
+        }
+    }
+
+    /// A refusal is reported as one whatever the version and `ExtendedAuth` beside it.
+    #[test]
+    fn a_refused_handshake_reports_its_code_before_any_mismatch() {
+        let refused = Packet::HandshakeResponse(HandshakeResponse {
+            error_code: 0x8007_59D8,
+            ver_major: 0,
+            ver_minor: 0,
+            server_version: 0,
+            extended_auth: 0,
+        })
+        .encode()
+        .unwrap();
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        assert_eq!(
+            machine.receive(&refused),
+            [GatewayAction::FailWith(GatewayError {
+                stage: STAGE_HANDSHAKE,
+                kind: GatewayErrorKind::Refused { code: 0x8007_59D8 },
+            })]
+        );
+    }
+
+    /// PAA among other offers is a match: the Windows gateway of #613 answered 0x7.
+    #[test]
+    fn a_handshake_response_offering_paa_among_others_sends_the_cookie() {
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        assert_eq!(
+            machine.receive(&handshake_response_answering(1, 0, 0x7)),
+            [write(&TUNNEL_CREATE)]
+        );
+    }
+
+    #[test]
+    fn a_handshake_mismatch_is_displayed_with_what_the_gateway_answered() {
+        let version = GatewayError {
+            stage: STAGE_HANDSHAKE,
+            kind: GatewayErrorKind::VersionMismatch { major: 2, minor: 0 },
+        };
+        assert_eq!(
+            version.to_string(),
+            "gateway-handshake: the gateway answered version 2.0, not 1.0"
+        );
+        let paa = GatewayError {
+            stage: STAGE_HANDSHAKE,
+            kind: GatewayErrorKind::PaaNotOffered { extended_auth: 0x5 },
+        };
+        assert_eq!(
+            paa.to_string(),
+            "gateway-handshake: the gateway's ExtendedAuth 0x0005 does not offer PAA"
         );
     }
 
@@ -1232,6 +1385,9 @@ mod tests {
     fn server_packet() -> impl Strategy<Value = Vec<u8>> {
         prop_oneof![
             any::<u32>().prop_map(|code| handshake_response(code & 1)),
+            (any::<u8>(), any::<u8>(), any::<u16>()).prop_map(|(major, minor, auth)| {
+                handshake_response_answering(major & 1, minor & 1, auth & 0x7)
+            }),
             any::<u32>().prop_map(|code| tunnel_response(code & 1)),
             "[a-z]{0,8}".prop_map(|text| tunnel_response_with_consent(&text)),
             any::<u32>().prop_map(|code| tunnel_auth_response(code & 1)),
