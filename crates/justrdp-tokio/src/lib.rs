@@ -2869,6 +2869,7 @@ mod tests {
             gateway,
             gateway_config(target),
             |s| gateway_stages.push(s.to_string()),
+            async |_: &str| false,
             GatewayOptions {
                 trust: TrustPolicy::DangerAcceptAny,
                 ..GatewayOptions::default()
@@ -2935,6 +2936,7 @@ mod tests {
             ServerAddr::new("localhost", gateway.port()),
             gateway_config(target),
             |_| {},
+            async |_: &str| false,
             GatewayOptions::default(),
         )
         .await
@@ -2955,6 +2957,7 @@ mod tests {
             addr,
             gateway_config(addr),
             |_| {},
+            async |_: &str| false,
             GatewayOptions::default(),
         )
         .await
@@ -2975,7 +2978,8 @@ mod tests {
     /// - `JUSTRDP_TEST_USERNAME`, `JUSTRDP_TEST_PASSWORD`, `JUSTRDP_TEST_DOMAIN`: the target's
     ///   logon, as for the real-VM tests.
     ///
-    /// Both certificates are accepted unchecked, as a lab's are self-signed.
+    /// Both certificates are accepted unchecked, as a lab's are self-signed. A consent message
+    /// the gateway sends is printed and accepted.
     #[tokio::test]
     #[ignore = "requires a real RD Gateway and the JUSTRDP_TEST_GATEWAY* env vars"]
     async fn a_real_rd_gateway_reaches_the_target_server() {
@@ -3009,6 +3013,10 @@ mod tests {
                 client_name: "justrdp".to_string(),
             },
             |stage| eprintln!("gateway stage: {stage}"),
+            async |message: &str| {
+                eprintln!("gateway consent message, accepted: {message:?}");
+                true
+            },
             GatewayOptions {
                 trust: TrustPolicy::DangerAcceptAny,
                 ..GatewayOptions::default()
@@ -12985,6 +12993,7 @@ mod tests {
             relay_gateway().await,
             gateway_config(target),
             |_| {},
+            async |_: &str| false,
             GatewayOptions {
                 trust: TrustPolicy::DangerAcceptAny,
                 ..GatewayOptions::default()

@@ -1,6 +1,7 @@
 //! The RD Gateway client sequence over the HTTP transport (MS-TSGU 3.7.5.2 to 3.7.5.4), as a
-//! sans-IO state machine: handshake, tunnel create with a PAA cookie, tunnel authorize, channel
-//! create, then the target's bytes inside data packets.
+//! sans-IO state machine: handshake, tunnel create with a PAA cookie, the host's answer to a
+//! consent message when the gateway sends one, tunnel authorize, channel create, then the
+//! target's bytes inside data packets.
 //!
 //! [`GatewayStateMachine::receive`] takes the bytes the gateway sent, in any split, and frames
 //! them into packets by `packetLength`. [`GatewayStateMachine::send`] wraps bytes for the target.
@@ -14,8 +15,8 @@ use justrdp_pdu::tsgu::{
 
 pub use justrdp_pdu::tsgu::PaaCookie;
 
-/// The `capsFlags` the tunnel create advertises (MS-TSGU 2.2.5.3.9): none.
-pub const ADVERTISED_CAPS: u32 = 0;
+/// The `capsFlags` the tunnel create advertises (MS-TSGU 2.2.5.3.9): consent messaging.
+pub const ADVERTISED_CAPS: u32 = tsgu::HTTP_CAPABILITY_MESSAGING_CONSENT_SIGN;
 
 /// The longest packet the gateway may send: an `HTTP_TUNNEL_RESPONSE` whose `serverCert` and
 /// `consentMsg` are both 65,535 bytes.
@@ -110,6 +111,9 @@ pub enum GatewayErrorKind {
     Decode(DecodeError),
     /// Bytes were handed to [`GatewayStateMachine::send`] while the Gateway Channel was not open.
     ChannelNotOpen,
+    /// The host declined the gateway's consent message
+    /// ([`GatewayStateMachine::decline_consent`]).
+    ConsentDeclined,
 }
 
 impl core::fmt::Display for GatewayError {
@@ -133,18 +137,30 @@ impl core::fmt::Display for GatewayErrorKind {
             }
             GatewayErrorKind::Decode(e) => write!(f, "{e}"),
             GatewayErrorKind::ChannelNotOpen => f.write_str("the gateway channel is not open"),
+            GatewayErrorKind::ConsentDeclined => {
+                f.write_str("the gateway's consent message was declined")
+            }
         }
     }
 }
 
 impl core::error::Error for GatewayError {}
 
-/// What the adapter does next. Its `Debug` prints the length of bytes and never the bytes: the
-/// tunnel create among them carries the cookie.
+/// What the adapter does next. Its `Debug` prints the length of bytes and of text, never their
+/// content: the tunnel create among them carries the cookie.
 #[derive(Clone, PartialEq, Eq)]
 pub enum GatewayAction {
     /// Send these packets to the gateway.
     WriteBytes(Vec<u8>),
+    /// The gateway's tunnel response carried a consent message (MS-TSGU 2.2.10.21). The
+    /// sequence waits until the host answers with [`GatewayStateMachine::accept_consent`] or
+    /// [`GatewayStateMachine::decline_consent`].
+    ConsentRequested {
+        /// The message the gateway's administrator set: the `consentMsg` text up to its first
+        /// NUL, with an unpaired surrogate as U+FFFD. It may be empty, and it is otherwise
+        /// unchecked: control characters are kept.
+        message: String,
+    },
     /// The Gateway Channel is open: bytes for the target go through
     /// [`GatewayStateMachine::send`] from here on.
     ChannelOpen(GatewayChannel),
@@ -166,6 +182,10 @@ impl core::fmt::Debug for GatewayAction {
                 .debug_struct("WriteBytes")
                 .field("len", &bytes.len())
                 .finish(),
+            GatewayAction::ConsentRequested { message } => f
+                .debug_struct("ConsentRequested")
+                .field("len", &message.len())
+                .finish(),
             GatewayAction::ChannelOpen(channel) => {
                 f.debug_tuple("ChannelOpen").field(channel).finish()
             }
@@ -185,6 +205,8 @@ impl core::fmt::Debug for GatewayAction {
 enum State {
     Handshake,
     TunnelCreate,
+    /// The tunnel response carried a consent message and the host has not answered it.
+    Consent,
     TunnelAuth,
     ChannelCreate,
     Open,
@@ -347,6 +369,34 @@ impl GatewayStateMachine {
         ))]
     }
 
+    /// The host accepts the consent message [`GatewayAction::ConsentRequested`] handed it: the
+    /// tunnel authorization to send (MS-TSGU 3.7.5.2 step 6), or nothing when no consent
+    /// message awaits an answer.
+    pub fn accept_consent(&mut self) -> Vec<GatewayAction> {
+        if self.state != State::Consent {
+            return Vec::new();
+        }
+        vec![self.authorize_tunnel()]
+    }
+
+    /// The host declines the consent message [`GatewayAction::ConsentRequested`] handed it: the
+    /// sequence fails in the tunnel create stage with [`GatewayErrorKind::ConsentDeclined`], or
+    /// nothing happens when no consent message awaits an answer. No Gateway Channel exists yet,
+    /// so no packet is sent; the adapter closes the connection (MS-TSGU 3.7.5.4).
+    pub fn decline_consent(&mut self) -> Vec<GatewayAction> {
+        let mut actions = Vec::new();
+        if self.state == State::Consent {
+            self.fail(GatewayErrorKind::ConsentDeclined, &mut actions);
+        }
+        actions
+    }
+
+    /// Enter the tunnel authorization stage; the request to send.
+    fn authorize_tunnel(&mut self) -> GatewayAction {
+        self.enter(State::TunnelAuth, STAGE_TUNNEL_AUTH);
+        GatewayAction::WriteBytes(core::mem::take(&mut self.tunnel_auth))
+    }
+
     fn is_finished(&self) -> bool {
         matches!(self.state, State::Closed | State::Failed)
     }
@@ -393,10 +443,18 @@ impl GatewayStateMachine {
                 }
                 self.channel.tunnel_id = response.tunnel_id;
                 self.channel.negotiated_caps = response.caps_flags;
-                self.enter(State::TunnelAuth, STAGE_TUNNEL_AUTH);
-                actions.push(GatewayAction::WriteBytes(core::mem::take(
-                    &mut self.tunnel_auth,
-                )));
+                match response.consent_msg {
+                    Some(consent) => {
+                        self.state = State::Consent;
+                        actions.push(GatewayAction::ConsentRequested {
+                            message: consent.to_string_lossy(),
+                        });
+                    }
+                    None => {
+                        let request = self.authorize_tunnel();
+                        actions.push(request);
+                    }
+                }
             }
             (State::TunnelAuth, Packet::TunnelAuthResponse(response)) => {
                 if response.error_code != 0 {
@@ -490,13 +548,14 @@ mod tests {
         0x02, 0x00, // ExtendedAuth HTTP_EXTENDED_AUTH_PAA
     ];
 
-    /// The tunnel create mstsc sends for the cookie "tok" (#613): `capsFlags` 0x3f,
-    /// `fieldsPresent` 0x1, the cookie as UTF-16LE with a NUL.
-    const OBSERVED_TUNNEL_CREATE: [u8; 26] = [
+    /// The tunnel create for the cookie "tok": what mstsc sends (#613) except `capsFlags`, which
+    /// is `HTTP_CAPABILITY_MESSAGING_CONSENT_SIGN` where mstsc sends 0x3f. `fieldsPresent` 0x1,
+    /// the cookie as UTF-16LE with a NUL.
+    const TUNNEL_CREATE: [u8; 26] = [
         0x04, 0x00, // packetType PKT_TYPE_TUNNEL_CREATE
         0x00, 0x00, // reserved
         0x1A, 0x00, 0x00, 0x00, // packetLength 26
-        0x3F, 0x00, 0x00, 0x00, // capsFlags
+        0x04, 0x00, 0x00, 0x00, // capsFlags HTTP_CAPABILITY_MESSAGING_CONSENT_SIGN
         0x01, 0x00, // fieldsPresent HTTP_TUNNEL_PACKET_FIELD_PAA_COOKIE
         0x00, 0x00, // reserved
         0x08, 0x00, // cbLen
@@ -609,11 +668,9 @@ mod tests {
         assert_eq!(machine.stage(), STAGE_HANDSHAKE);
         assert_eq!(machine.start(), [write(&HANDSHAKE_REQUEST)]);
 
-        let mut tunnel_create = OBSERVED_TUNNEL_CREATE;
-        tunnel_create[8..12].copy_from_slice(&ADVERTISED_CAPS.to_le_bytes());
         assert_eq!(
             machine.receive(&handshake_response(0)),
-            [write(&tunnel_create)]
+            [write(&TUNNEL_CREATE)]
         );
         assert_eq!(machine.stage(), STAGE_TUNNEL_CREATE);
 
@@ -635,11 +692,207 @@ mod tests {
         assert!(machine.is_open());
     }
 
-    /// ADR-0016: the tunnel create advertises what this client handles, not mstsc's 0x3f. Each
-    /// of the six capabilities asks the client for something it does not do.
+    /// ADR-0016: the tunnel create advertises what this client handles, not mstsc's 0x3f.
     #[test]
-    fn no_capability_is_advertised() {
-        assert_eq!(ADVERTISED_CAPS, 0);
+    fn consent_signing_is_the_one_capability_advertised() {
+        assert_eq!(ADVERTISED_CAPS, 0x4);
+    }
+
+    /// A tunnel response that carries `text` as its consent message.
+    fn tunnel_response_with_consent(text: &str) -> Vec<u8> {
+        Packet::TunnelResponse(TunnelResponse {
+            server_version: 0,
+            status_code: 0,
+            tunnel_id: Some(7),
+            caps_flags: Some(
+                tsgu::HTTP_CAPABILITY_IDLE_TIMEOUT | tsgu::HTTP_CAPABILITY_MESSAGING_CONSENT_SIGN,
+            ),
+            soh_request: None,
+            consent_msg: Some(UnicodeString::from_str_nul(text)),
+        })
+        .encode()
+        .unwrap()
+    }
+
+    /// A machine that received a consent message and awaits the host's answer.
+    fn machine_awaiting_consent() -> GatewayStateMachine {
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        machine.receive(&handshake_response(0));
+        assert_eq!(
+            machine.receive(&tunnel_response_with_consent("Agree?")),
+            [GatewayAction::ConsentRequested {
+                message: "Agree?".to_string(),
+            }]
+        );
+        machine
+    }
+
+    /// MS-TSGU 3.7.5.2 step 5: the consent message goes to the host, and the tunnel
+    /// authorization is not sent until the host accepts.
+    #[test]
+    fn a_consent_message_holds_the_sequence_until_the_host_accepts() {
+        let mut machine = machine_awaiting_consent();
+        assert_eq!(machine.stage(), STAGE_TUNNEL_CREATE);
+        assert_eq!(machine.receive(&[]), [], "nothing is sent while it waits");
+
+        assert_eq!(machine.accept_consent(), [write(&TUNNEL_AUTH)]);
+        assert_eq!(machine.stage(), STAGE_TUNNEL_AUTH);
+        assert_eq!(machine.accept_consent(), [], "the answer is taken once");
+        assert_eq!(machine.decline_consent(), []);
+
+        assert_eq!(
+            machine.receive(&tunnel_auth_response(0)),
+            [write(&CHANNEL_CREATE)]
+        );
+        assert_eq!(
+            machine.receive(&channel_response(0)),
+            [GatewayAction::ChannelOpen(GatewayChannel {
+                negotiated_caps: Some(
+                    tsgu::HTTP_CAPABILITY_IDLE_TIMEOUT
+                        | tsgu::HTTP_CAPABILITY_MESSAGING_CONSENT_SIGN
+                ),
+                ..granted()
+            })]
+        );
+    }
+
+    #[test]
+    fn declining_the_consent_message_fails_the_tunnel_create() {
+        let mut machine = machine_awaiting_consent();
+        assert_eq!(
+            machine.decline_consent(),
+            [GatewayAction::FailWith(GatewayError {
+                stage: STAGE_TUNNEL_CREATE,
+                kind: GatewayErrorKind::ConsentDeclined,
+            })]
+        );
+        assert_eq!(machine.stage(), STAGE_TUNNEL_CREATE);
+        assert_eq!(
+            machine.accept_consent(),
+            [],
+            "a declined tunnel stays ended"
+        );
+        assert_eq!(machine.decline_consent(), []);
+        assert_eq!(machine.receive(&tunnel_auth_response(0)), []);
+    }
+
+    /// An answer no consent message asked for does nothing, in every other state.
+    #[test]
+    fn a_consent_answer_nothing_asked_for_is_ignored() {
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        assert_eq!(machine.accept_consent(), []);
+        assert_eq!(machine.decline_consent(), []);
+        assert_eq!(machine.stage(), STAGE_HANDSHAKE);
+        assert_eq!(
+            machine.receive(&handshake_response(0)),
+            [write(&TUNNEL_CREATE)],
+            "the sequence carries on"
+        );
+
+        let mut machine = open_machine();
+        assert_eq!(machine.accept_consent(), []);
+        assert_eq!(machine.decline_consent(), []);
+        assert!(machine.is_open());
+    }
+
+    #[test]
+    fn a_keep_alive_is_answered_while_consent_is_awaited_and_a_response_is_not_admitted() {
+        let keep_alive = Packet::KeepAlive.encode().unwrap();
+        let mut machine = machine_awaiting_consent();
+        assert_eq!(machine.receive(&keep_alive), [write(&keep_alive)]);
+        assert_eq!(
+            machine.receive(&tunnel_auth_response(0)),
+            [GatewayAction::FailWith(GatewayError {
+                stage: STAGE_TUNNEL_CREATE,
+                kind: GatewayErrorKind::UnexpectedPacket {
+                    packet_type: tsgu::PKT_TYPE_TUNNEL_AUTH_RESPONSE,
+                },
+            })]
+        );
+        assert_eq!(machine.accept_consent(), []);
+    }
+
+    /// A consent message that is present and empty is still the host's to answer.
+    #[test]
+    fn an_empty_consent_message_is_still_handed_to_the_host() {
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        machine.receive(&handshake_response(0));
+        let empty = Packet::TunnelResponse(TunnelResponse {
+            server_version: 0,
+            status_code: 0,
+            tunnel_id: Some(7),
+            caps_flags: None,
+            soh_request: None,
+            consent_msg: Some(UnicodeString::from_bytes(Vec::new())),
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(
+            machine.receive(&empty),
+            [GatewayAction::ConsentRequested {
+                message: String::new(),
+            }]
+        );
+    }
+
+    /// A refused tunnel create has no consent message to answer, whatever its fields say.
+    #[test]
+    fn a_refused_tunnel_response_asks_for_no_consent() {
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        machine.receive(&handshake_response(0));
+        let refused = Packet::TunnelResponse(TunnelResponse {
+            server_version: 0,
+            status_code: 0x8007_59E9,
+            tunnel_id: None,
+            caps_flags: None,
+            soh_request: None,
+            consent_msg: Some(UnicodeString::from_str_nul("Agree?")),
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(
+            machine.receive(&refused),
+            [GatewayAction::FailWith(GatewayError {
+                stage: STAGE_TUNNEL_CREATE,
+                kind: GatewayErrorKind::Refused { code: 0x8007_59E9 },
+            })]
+        );
+    }
+
+    /// What the RD Gateway role of Windows Server 2019 sent a client whose tunnel create
+    /// advertised no capability (#613): a handshake response with `ExtendedAuth` 0x7, then a
+    /// tunnel response with `statusCode` `E_PROXY_CAPABILITYMISMATCH` and no optional field.
+    const WS2019_REFUSAL_OF_NO_CAPABILITY: [u8; 36] = [
+        0x02, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00,
+        0x00, // PKT_TYPE_HANDSHAKE_RESPONSE, 18 bytes
+        0x00, 0x00, 0x00, 0x00, // errorCode
+        0x01, 0x00, 0x00, 0x00, // version 1.0, serverVersion 0
+        0x07, 0x00, // ExtendedAuth
+        0x05, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, // PKT_TYPE_TUNNEL_RESPONSE, 18 bytes
+        0x00, 0x00, // serverVersion
+        0xE9, 0x59, 0x07, 0x80, // statusCode 0x800759E9
+        0x00, 0x00, // fieldsPresent
+        0x00, 0x00, // reserved
+    ];
+
+    #[test]
+    fn the_refusal_a_windows_gateway_sent_names_the_tunnel_create_and_its_code() {
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        assert_eq!(
+            machine.receive(&WS2019_REFUSAL_OF_NO_CAPABILITY),
+            [
+                write(&TUNNEL_CREATE),
+                GatewayAction::FailWith(GatewayError {
+                    stage: STAGE_TUNNEL_CREATE,
+                    kind: GatewayErrorKind::Refused { code: 0x8007_59E9 },
+                }),
+            ]
+        );
     }
 
     #[test]
@@ -764,7 +1017,13 @@ mod tests {
         let mut machine = GatewayStateMachine::new(config()).unwrap();
         machine.start();
         machine.receive(&handshake_response(0));
-        assert_eq!(machine.receive(&longest), [write(&TUNNEL_AUTH)]);
+        assert_eq!(
+            machine.receive(&longest),
+            [GatewayAction::ConsentRequested {
+                message: String::new(),
+            }]
+        );
+        assert_eq!(machine.accept_consent(), [write(&TUNNEL_AUTH)]);
     }
 
     #[test]
@@ -961,11 +1220,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_consent_message_is_printed_by_its_length() {
+        let action = GatewayAction::ConsentRequested {
+            message: "Agree?".to_string(),
+        };
+        assert_eq!(format!("{action:?}"), "ConsentRequested { len: 6 }");
+    }
+
     /// One server packet a stage can receive, well formed.
     fn server_packet() -> impl Strategy<Value = Vec<u8>> {
         prop_oneof![
             any::<u32>().prop_map(|code| handshake_response(code & 1)),
             any::<u32>().prop_map(|code| tunnel_response(code & 1)),
+            "[a-z]{0,8}".prop_map(|text| tunnel_response_with_consent(&text)),
             any::<u32>().prop_map(|code| tunnel_auth_response(code & 1)),
             any::<u32>().prop_map(|code| channel_response(code & 1)),
             proptest::collection::vec(any::<u8>(), 0..=64).prop_map(|data| data_packet(&data)),
@@ -1029,15 +1297,26 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(2048))]
 
         /// The machine never panics, never holds more than one packet's worth of bytes, and
-        /// says nothing after it failed or closed.
+        /// says nothing after it failed or closed. A consent answer is given after every read,
+        /// asked for or not.
         #[test]
         fn receive_never_panics_and_never_buffers_past_the_limit(reads in gateway_reads()) {
             let mut machine = GatewayStateMachine::new(config()).unwrap();
             machine.start();
             let mut finished = false;
             for read in reads {
-                let actions = machine.receive(&read);
+                let mut actions = machine.receive(&read);
                 prop_assert!(machine.inbox.len() < MAX_PACKET_LEN);
+                let asked = actions
+                    .iter()
+                    .any(|action| matches!(action, GatewayAction::ConsentRequested { .. }));
+                let answer = if read.len() % 2 == 0 {
+                    machine.accept_consent()
+                } else {
+                    machine.decline_consent()
+                };
+                prop_assert!(asked || answer.is_empty());
+                actions.extend(answer);
                 if finished {
                     prop_assert!(actions.is_empty());
                 }

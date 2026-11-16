@@ -74,10 +74,10 @@ wrote, unapplied.
   by the spec's own instruction.
 - [RD Gateway](../territory/rd-gateway.md) — `tsgu` decodes every optional field of the four
   responses, and the sequence reads the ones a host can act on (`redirFlags`, `idleTimeout`,
-  the ids, the negotiated capabilities). The rest belong to capabilities the client does not
-  advertise or to the UDP transport, and the territory lists them (#613). **The handshake
-  response's version and `ExtendedAuth` are an open instance**: the answer to what the client
-  asked for, read by nothing.
+  the ids, the negotiated capabilities, the consent message). The rest belong to capabilities
+  the client does not advertise or to the UDP transport, and the territory lists them (#613).
+  **The handshake response's version and `ExtendedAuth` are an open instance**: the answer to
+  what the client asked for, read by nothing.
 
 ## What a violation looks like
 

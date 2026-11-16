@@ -42,10 +42,13 @@ read as the adapter growing a third of its size.
   one ([RD Gateway](rd-gateway.md)).
 
 - **Policy is injected, never decided here either** — the host supplies credentials,
-  the trust policy, the frame sink and the cursor sink; the adapter wires them.
+  the trust policy, the frame sink, the cursor sink and the answer to an RD Gateway's consent
+  message; the adapter wires them.
 - **One timeout seam.** Every stage's I/O goes through `with_stage_timeout`, so the
   timeout/error policy exists once and a failure is reported *with its stage name*. Opening an
-  RD Gateway tunnel has its own, `in_stage`, because its failure is a `GatewayFailure`.
+  RD Gateway tunnel has its own, `in_stage`, because its failure is a `GatewayFailure`. One wait
+  is under no timeout: the host's answer to a gateway's consent message
+  ([RD Gateway](rd-gateway.md)).
 - **Three entry points, increasing in capability**: `connect`,
   `connect_with_timeouts`, `connect_with_options`; `open_gateway` and `connect_over_gateway`
   for a server behind an RD Gateway; `run_credssp` for a host that needs only

@@ -55,7 +55,8 @@ const CLOSE_NORMAL: [u8; 2] = 1000u16.to_be_bytes();
 /// `Default` validates the gateway's certificate against the OS trust store.
 #[derive(Debug, Clone, Default)]
 pub struct GatewayOptions {
-    /// The TCP dial timeout, and the timeout of each stage after it.
+    /// The TCP dial timeout, and the timeout of each stage after it. The host's answer to a
+    /// consent message is under neither.
     pub timeouts: ConnectTimeouts,
     /// How to decide whether the gateway's TLS certificate is trusted.
     pub trust: TrustPolicy,
@@ -159,6 +160,8 @@ pub struct GatewayStream {
     out_pos: usize,
     /// The read buffer, kept between reads.
     chunk: Vec<u8>,
+    /// A consent message the gateway sent and the host has not answered.
+    consent: Option<String>,
     /// The `statusCode` of the gateway's close packet.
     closed: Option<u32>,
     /// The gateway sent a WebSocket close frame, or the connection ended.
@@ -204,6 +207,11 @@ impl GatewayStream {
         self.pending_out() > 0 || self.unflushed
     }
 
+    /// Whether the gateway closed the Gateway Channel, the WebSocket or the connection.
+    fn gateway_ended(&self) -> bool {
+        self.closed.is_some() || self.io_ended
+    }
+
     /// Queue one masked frame.
     fn queue_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), GatewayFailureKind> {
         let mut mask = [0u8; 4];
@@ -232,9 +240,17 @@ impl GatewayStream {
                 }
             }
         }
-        for action in self.machine.receive(&data) {
+        let actions = self.machine.receive(&data);
+        self.act(actions)?;
+        fed.map_err(GatewayFailureKind::WebSocket)
+    }
+
+    /// Carry out what the machine asked for.
+    fn act(&mut self, actions: Vec<GatewayAction>) -> Result<(), GatewayFailureKind> {
+        for action in actions {
             match action {
                 GatewayAction::WriteBytes(packets) => self.queue_frame(OPCODE_BINARY, &packets)?,
+                GatewayAction::ConsentRequested { message } => self.consent = Some(message),
                 GatewayAction::Data(bytes) => self.readable.extend_from_slice(&bytes),
                 GatewayAction::ChannelOpen(channel) => self.channel = channel,
                 GatewayAction::Closed { status_code } => self.closed = Some(status_code),
@@ -243,7 +259,7 @@ impl GatewayStream {
                 }
             }
         }
-        fed.map_err(GatewayFailureKind::WebSocket)
+        Ok(())
     }
 
     /// Write queued frames until none remain, and flush them.
@@ -291,7 +307,8 @@ impl GatewayStream {
         result
     }
 
-    /// Drive the sequence until it leaves `stage`.
+    /// Drive the sequence until it leaves `stage`, or until a consent message awaits the host
+    /// with every request written and the gateway still there.
     fn poll_leave_stage(
         &mut self,
         cx: &mut Context<'_>,
@@ -302,7 +319,7 @@ impl GatewayStream {
             if self.machine.stage() != stage {
                 return Poll::Ready(Ok(()));
             }
-            if self.closed.is_some() || self.io_ended {
+            if self.gateway_ended() {
                 return Poll::Ready(Err(match self.closed {
                     None if !self.close_sent => GatewayFailureKind::Io(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -310,6 +327,9 @@ impl GatewayStream {
                     )),
                     status_code => GatewayFailureKind::Closed { status_code },
                 }));
+            }
+            if self.consent.is_some() {
+                return Poll::Ready(Ok(()));
             }
             ready!(self.poll_fill(cx))?;
         }
@@ -468,11 +488,20 @@ impl AsyncWrite for GatewayStream {
 /// [`justrdp::gateway::STAGE_CHANNEL_OPEN`]. A failure carries the stage it happened in. The
 /// cookie is written to the gateway and to nothing else.
 ///
+/// `on_consent` is called with the consent message of the gateway's tunnel response, when it
+/// carries one: the text its administrator set, which may be empty. It is what the gateway sent,
+/// unchecked, so it may hold control characters. Returning `true` accepts it
+/// and the sequence carries on. Returning `false` declines it: the connection to the gateway is
+/// closed and the failure is [`justrdp::gateway::GatewayErrorKind::ConsentDeclined`] in
+/// [`justrdp::gateway::STAGE_TUNNEL_CREATE`]. No timeout bounds the answer, and nothing is read
+/// from or written to the gateway while it is awaited.
+///
 /// Run the connection over the returned stream with [`crate::connect_over_gateway`].
 pub async fn open_gateway(
     gateway: impl Into<ServerAddr>,
     config: GatewayConfig,
     mut on_stage: impl FnMut(&str),
+    on_consent: impl AsyncFnMut(&str) -> bool,
     options: GatewayOptions,
 ) -> Result<GatewayStream, GatewayFailure> {
     let gateway = gateway.into();
@@ -518,6 +547,7 @@ pub async fn open_gateway(
         &host_header(&gateway),
         machine,
         on_stage,
+        on_consent,
         timeouts.stage,
     )
     .await
@@ -598,12 +628,14 @@ fn guid_text(bytes: [u8; 16]) -> String {
 }
 
 /// The WebSocket upgrade and the MS-TSGU sequence over `io`, which already reaches the gateway.
-/// `host_header` is the `Host` header's value; `stage_timeout` bounds each stage on its own.
+/// `host_header` is the `Host` header's value; `stage_timeout` bounds each stage on its own, and
+/// not the host's answer to a consent message.
 async fn open_over<S>(
     mut io: S,
     host_header: &str,
     mut machine: GatewayStateMachine,
     mut on_stage: impl FnMut(&str),
+    mut on_consent: impl AsyncFnMut(&str) -> bool,
     stage_timeout: Duration,
 ) -> Result<GatewayStream, GatewayFailure>
 where
@@ -665,6 +697,7 @@ where
         out: Vec::new(),
         out_pos: 0,
         chunk: Vec::new(),
+        consent: None,
         closed: None,
         io_ended: false,
         ended: None,
@@ -702,6 +735,22 @@ where
             Ok(step) => step,
             Err(_) => Err(GatewayFailureKind::Timeout),
         };
+        if step.is_err() || stream.gateway_ended() {
+            continue;
+        }
+        if let Some(message) = stream.consent.take() {
+            tracing::debug!(len = message.len(), "the RD Gateway sent a consent message");
+            let answer = if on_consent(&message).await {
+                stream.machine.accept_consent()
+            } else {
+                stream.machine.decline_consent()
+            };
+            step = stream.act(answer);
+            if step.is_err() {
+                // The WebSocket close frame, then the connection's shutdown.
+                let _ = tokio::time::timeout(stage_timeout, stream.shutdown()).await;
+            }
+        }
     }
     tracing::debug!(channel = ?stream.channel, "the RD Gateway channel is open");
     Ok(stream)
@@ -711,8 +760,8 @@ where
 pub(crate) mod tests {
     use super::*;
     use justrdp::gateway::{
-        ADVERTISED_CAPS, PaaCookie, STAGE_CHANNEL_CREATE, STAGE_CHANNEL_OPEN, STAGE_HANDSHAKE,
-        STAGE_TUNNEL_AUTH, STAGE_TUNNEL_CREATE,
+        PaaCookie, STAGE_CHANNEL_CREATE, STAGE_CHANNEL_OPEN, STAGE_HANDSHAKE, STAGE_TUNNEL_AUTH,
+        STAGE_TUNNEL_CREATE,
     };
     use justrdp_pdu::tsgu::{
         self, ChannelResponse, HandshakeResponse, Packet, TunnelAuthResponse, TunnelResponse,
@@ -857,6 +906,25 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// A tunnel response that carries `text` as its consent message.
+    fn tunnel_response_with_consent(text: &str) -> Vec<u8> {
+        Packet::TunnelResponse(TunnelResponse {
+            server_version: 0,
+            status_code: 0,
+            tunnel_id: Some(7),
+            caps_flags: Some(tsgu::HTTP_CAPABILITY_MESSAGING_CONSENT_SIGN),
+            soh_request: None,
+            consent_msg: Some(tsgu::UnicodeString::from_str_nul(text)),
+        })
+        .encode()
+        .unwrap()
+    }
+
+    /// The host's answer for a test whose gateway sends no consent message.
+    async fn never_asked(_: &str) -> bool {
+        panic!("the gateway sent no consent message");
+    }
+
     fn tunnel_auth_response() -> Vec<u8> {
         Packet::TunnelAuthResponse(TunnelAuthResponse {
             error_code: 0,
@@ -917,9 +985,16 @@ pub(crate) mod tests {
             gateway.open_channel().await;
             gateway
         });
-        let stream = open_over(client, "gw.example", machine("tok"), |_| {}, TIMEOUT)
-            .await
-            .unwrap();
+        let stream = open_over(
+            client,
+            "gw.example",
+            machine("tok"),
+            |_| {},
+            never_asked,
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
         (stream, serve.await.unwrap())
     }
 
@@ -930,11 +1005,12 @@ pub(crate) mod tests {
         0x02, 0x00, // ExtendedAuth HTTP_EXTENDED_AUTH_PAA
     ];
 
-    /// The tunnel create mstsc sends for the cookie "tok" (#613): `capsFlags` 0x3f,
-    /// `fieldsPresent` 0x1, the cookie as UTF-16LE with a NUL.
-    const OBSERVED_TUNNEL_CREATE: [u8; 26] = [
+    /// The tunnel create for the cookie "tok": what mstsc sends (#613) except `capsFlags`, which
+    /// is `HTTP_CAPABILITY_MESSAGING_CONSENT_SIGN` where mstsc sends 0x3f. `fieldsPresent` 0x1,
+    /// the cookie as UTF-16LE with a NUL.
+    const TUNNEL_CREATE: [u8; 26] = [
         0x04, 0x00, 0x00, 0x00, 0x1A, 0x00, 0x00, 0x00, // header, packetLength 26
-        0x3F, 0x00, 0x00, 0x00, // capsFlags
+        0x04, 0x00, 0x00, 0x00, // capsFlags HTTP_CAPABILITY_MESSAGING_CONSENT_SIGN
         0x01, 0x00, 0x00, 0x00, // fieldsPresent PAA_COOKIE, reserved
         0x08, 0x00, b't', 0x00, b'o', 0x00, b'k', 0x00, 0x00, 0x00, // "tok\0"
     ];
@@ -969,6 +1045,7 @@ pub(crate) mod tests {
             "gw.example",
             machine("tok"),
             |stage| stages.push(stage.to_string()),
+            never_asked,
             TIMEOUT,
         )
         .await
@@ -996,11 +1073,8 @@ pub(crate) mod tests {
         }
         assert!(!request.to_ascii_lowercase().contains("authorization"));
 
-        // The request bytes match the observed client except for capsFlags.
-        let mut tunnel_create = OBSERVED_TUNNEL_CREATE;
-        tunnel_create[8..12].copy_from_slice(&ADVERTISED_CAPS.to_le_bytes());
         assert_eq!(requests[0], HANDSHAKE_REQUEST);
-        assert_eq!(requests[1], tunnel_create);
+        assert_eq!(requests[1], TUNNEL_CREATE);
         assert_eq!(requests[2], TUNNEL_AUTH);
         assert_eq!(requests[3], CHANNEL_CREATE);
 
@@ -1077,9 +1151,16 @@ pub(crate) mod tests {
             gateway.send(&channel_response()).await;
             gateway
         });
-        open_over(client, "gw.example", machine("tok"), |_| {}, TIMEOUT)
-            .await
-            .unwrap();
+        open_over(
+            client,
+            "gw.example",
+            machine("tok"),
+            |_| {},
+            never_asked,
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
         serve.await.unwrap();
     }
 
@@ -1245,9 +1326,16 @@ pub(crate) mod tests {
             gateway.open_channel().await;
             gateway
         });
-        let mut stream = open_over(client, "gw.example", machine("tok"), |_| {}, TIMEOUT)
-            .await
-            .unwrap();
+        let mut stream = open_over(
+            client,
+            "gw.example",
+            machine("tok"),
+            |_| {},
+            never_asked,
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
         let (gateway_reads, mut gateway_writes) = tokio::io::split(serve.await.unwrap().io);
 
         let flood = tokio::spawn(async move {
@@ -1370,6 +1458,7 @@ pub(crate) mod tests {
             "gw.example",
             machine("tok"),
             |stage| stages.push(stage.to_string()),
+            never_asked,
             TIMEOUT,
         )
         .await
@@ -1385,6 +1474,310 @@ pub(crate) mod tests {
                 STAGE_CHANNEL_CREATE,
                 STAGE_CHANNEL_OPEN,
             ]
+        );
+    }
+
+    /// MS-TSGU 3.7.5.2 step 5: the consent message goes to the host, once, and nothing is sent
+    /// until the host answers, however long that takes.
+    #[tokio::test(start_paused = true)]
+    async fn a_consent_message_waits_for_the_host_and_an_accepted_one_opens_the_tunnel() {
+        let (client, mut gateway) = pipe();
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<bool>();
+        let serve = tokio::spawn(async move {
+            gateway.upgrade().await;
+            gateway.read_packets().await;
+            gateway.send(&handshake_response(0)).await;
+            gateway.read_packets().await;
+            gateway.send(&tunnel_response_with_consent("Agree?")).await;
+            // Three times what a stage may take.
+            let early = tokio::time::timeout(Duration::from_secs(3), gateway.io.read_u8()).await;
+            assert!(
+                early.is_err(),
+                "a request went out before the host answered"
+            );
+            answer_tx.send(true).unwrap();
+            let tunnel_auth = gateway.read_packets().await;
+            gateway.send(&tunnel_auth_response()).await;
+            let channel_create = gateway.read_packets().await;
+            gateway.send(&channel_response()).await;
+            (tunnel_auth, channel_create)
+        });
+
+        let mut stages = Vec::new();
+        let mut asked = Vec::new();
+        let mut answer_rx = Some(answer_rx);
+        let stream = open_over(
+            client,
+            "gw.example",
+            machine("tok"),
+            |stage| stages.push(stage.to_string()),
+            async |message: &str| {
+                asked.push(message.to_string());
+                answer_rx.take().expect("asked once").await.unwrap()
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let (tunnel_auth, channel_create) = serve.await.unwrap();
+
+        assert_eq!(asked, ["Agree?"]);
+        assert_eq!(tunnel_auth, TUNNEL_AUTH);
+        assert_eq!(channel_create, CHANNEL_CREATE);
+        assert_eq!(
+            stages,
+            [
+                STAGE_WEBSOCKET_UPGRADE,
+                STAGE_HANDSHAKE,
+                STAGE_TUNNEL_CREATE,
+                STAGE_TUNNEL_AUTH,
+                STAGE_CHANNEL_CREATE,
+                STAGE_CHANNEL_OPEN,
+            ]
+        );
+        assert_eq!(
+            stream.channel().negotiated_caps,
+            Some(tsgu::HTTP_CAPABILITY_MESSAGING_CONSENT_SIGN)
+        );
+    }
+
+    /// MS-TSGU 3.7.5.4: no channel exists yet, so a declined tunnel ends with the connection's
+    /// close and no tunnel authorization.
+    #[tokio::test]
+    async fn a_declined_consent_message_closes_the_connection_and_fails_the_tunnel_create() {
+        let (client, mut gateway) = pipe();
+        let serve = tokio::spawn(async move {
+            gateway.upgrade().await;
+            gateway.read_packets().await;
+            gateway.send(&handshake_response(0)).await;
+            gateway.read_packets().await;
+            gateway.send(&tunnel_response_with_consent("Agree?")).await;
+            let first = gateway.try_read_frame().await;
+            let second = gateway.try_read_frame().await;
+            (first, second)
+        });
+
+        let mut stages = Vec::new();
+        let mut asked = 0;
+        let failure = open_over(
+            client,
+            "gw.example",
+            machine("tok"),
+            |stage| stages.push(stage.to_string()),
+            async |_: &str| {
+                asked += 1;
+                false
+            },
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        let (first, second) = serve.await.unwrap();
+
+        assert_eq!(asked, 1);
+        assert_eq!(first, Some((OPCODE_CLOSE, CLOSE_NORMAL.to_vec())));
+        assert_eq!(second, None, "nothing follows the close frame");
+        assert_eq!(failure.stage, STAGE_TUNNEL_CREATE);
+        assert!(
+            matches!(
+                failure.kind,
+                GatewayFailureKind::Protocol(GatewayErrorKind::ConsentDeclined)
+            ),
+            "{failure:?}"
+        );
+        assert_eq!(
+            failure.to_string(),
+            "RD Gateway failed during gateway-tunnel-create: the gateway's consent message was \
+             declined"
+        );
+        assert_eq!(
+            stages,
+            [
+                STAGE_WEBSOCKET_UPGRADE,
+                STAGE_HANDSHAKE,
+                STAGE_TUNNEL_CREATE
+            ]
+        );
+    }
+
+    /// A consent message that arrives in the same read as the response before it is still the
+    /// host's to answer, and the responses after its answer open the tunnel.
+    #[tokio::test]
+    async fn a_consent_message_in_the_same_read_as_the_handshake_response_is_asked() {
+        let (client, mut gateway) = pipe();
+        let serve = tokio::spawn(async move {
+            gateway.upgrade().await;
+            let mut both = handshake_response(0);
+            both.extend(tunnel_response_with_consent("Agree?"));
+            gateway.send(&both).await;
+            gateway.read_packets().await;
+            gateway.read_packets().await;
+            let tunnel_auth = gateway.read_packets().await;
+            gateway.send(&tunnel_auth_response()).await;
+            gateway.read_packets().await;
+            gateway.send(&channel_response()).await;
+            (tunnel_auth, gateway)
+        });
+        let mut asked = Vec::new();
+        open_over(
+            client,
+            "gw.example",
+            machine("tok"),
+            |_| {},
+            async |message: &str| {
+                asked.push(message.to_string());
+                true
+            },
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(serve.await.unwrap().0, TUNNEL_AUTH);
+        assert_eq!(asked, ["Agree?"]);
+    }
+
+    /// The requests the consent message answers are with the gateway before the host is asked,
+    /// so nothing of them goes out after a decline.
+    #[tokio::test(start_paused = true)]
+    async fn the_requests_are_sent_before_the_host_is_asked() {
+        let (client, mut gateway) = pipe();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<()>();
+        let serve = tokio::spawn(async move {
+            let request = gateway.read_request().await;
+            let key = request
+                .lines()
+                .find_map(|line| line.strip_prefix("Sec-WebSocket-Key: "))
+                .unwrap();
+            // The 101 response and both responses in one write, before any request is read.
+            let mut bytes = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                websocket::accept_for(key)
+            )
+            .into_bytes();
+            let mut both = handshake_response(0);
+            both.extend(tunnel_response_with_consent("Agree?"));
+            bytes.extend([0x82, both.len() as u8]);
+            bytes.extend(both);
+            gateway.io.write_all(&bytes).await.unwrap();
+            let handshake = gateway.read_packets().await;
+            let tunnel_create = gateway.read_packets().await;
+            seen_tx.send(()).unwrap();
+            let after = gateway.try_read_frame().await;
+            (handshake, tunnel_create, after)
+        });
+        let mut seen_rx = Some(seen_rx);
+        let failure = open_over(
+            client,
+            "gw.example",
+            machine("tok"),
+            |_| {},
+            async |_: &str| {
+                let seen = seen_rx.take().expect("asked once");
+                tokio::time::timeout(Duration::from_secs(5), seen)
+                    .await
+                    .expect("both requests reach the gateway before the host is asked")
+                    .unwrap();
+                false
+            },
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        let (handshake, tunnel_create, after) = serve.await.unwrap();
+        assert_eq!(handshake, HANDSHAKE_REQUEST);
+        assert_eq!(tunnel_create, TUNNEL_CREATE);
+        assert_eq!(after, Some((OPCODE_CLOSE, CLOSE_NORMAL.to_vec())));
+        assert!(matches!(
+            failure.kind,
+            GatewayFailureKind::Protocol(GatewayErrorKind::ConsentDeclined)
+        ));
+    }
+
+    /// One binary frame holding `packets`, then a WebSocket close frame, in one write.
+    async fn send_then_close(gateway: &mut StandIn<DuplexStream>, packets: &[u8]) {
+        let mut bytes = vec![0x82, packets.len() as u8];
+        bytes.extend_from_slice(packets);
+        bytes.extend([0x88, 0x00]);
+        gateway.io.write_all(&bytes).await.unwrap();
+    }
+
+    /// A gateway that closes in the read that carried its consent message has no tunnel to
+    /// consent to: the host is not asked.
+    #[tokio::test]
+    async fn a_gateway_that_closes_with_its_consent_message_does_not_ask_the_host() {
+        let failure = failure_against(
+            |mut gateway| async move {
+                gateway.upgrade().await;
+                gateway.read_packets().await;
+                gateway.send(&handshake_response(0)).await;
+                gateway.read_packets().await;
+                send_then_close(&mut gateway, &tunnel_response_with_consent("Agree?")).await;
+                std::future::pending::<()>().await;
+            },
+            TIMEOUT,
+        )
+        .await;
+        assert_eq!(failure.stage, STAGE_TUNNEL_CREATE);
+        assert!(
+            matches!(
+                failure.kind,
+                GatewayFailureKind::Closed { status_code: None }
+            ),
+            "{failure:?}"
+        );
+    }
+
+    /// The same when the handshake response shares that read, so the stage changed in it.
+    #[tokio::test]
+    async fn a_gateway_that_closes_in_the_read_that_changed_the_stage_does_not_ask_the_host() {
+        let failure = failure_against(
+            |mut gateway| async move {
+                gateway.upgrade().await;
+                gateway.read_packets().await;
+                let mut both = handshake_response(0);
+                both.extend(tunnel_response_with_consent("Agree?"));
+                send_then_close(&mut gateway, &both).await;
+                std::future::pending::<()>().await;
+            },
+            TIMEOUT,
+        )
+        .await;
+        assert_eq!(failure.stage, STAGE_TUNNEL_CREATE);
+        assert!(
+            matches!(
+                failure.kind,
+                GatewayFailureKind::Closed { status_code: None }
+            ),
+            "{failure:?}"
+        );
+    }
+
+    /// A packet the stage does not admit, in the read that carried the consent message, fails
+    /// the tunnel create before the host is asked.
+    #[tokio::test]
+    async fn a_packet_out_of_order_after_the_consent_message_does_not_ask_the_host() {
+        let failure = failure_against(
+            |mut gateway| async move {
+                gateway.upgrade().await;
+                gateway.read_packets().await;
+                gateway.send(&handshake_response(0)).await;
+                gateway.read_packets().await;
+                let mut both = tunnel_response_with_consent("Agree?");
+                both.extend(channel_response());
+                gateway.send(&both).await;
+                std::future::pending::<()>().await;
+            },
+            TIMEOUT,
+        )
+        .await;
+        assert_eq!(failure.stage, STAGE_TUNNEL_CREATE);
+        assert!(
+            matches!(
+                failure.kind,
+                GatewayFailureKind::Protocol(GatewayErrorKind::UnexpectedPacket { .. })
+            ),
+            "{failure:?}"
         );
     }
 
@@ -1416,6 +1809,7 @@ pub(crate) mod tests {
             "gw.example",
             machine("tok"),
             |stage| stages.push(stage.to_string()),
+            never_asked,
             TIMEOUT,
         )
         .await
@@ -1472,9 +1866,16 @@ pub(crate) mod tests {
     {
         let (client, gateway) = pipe();
         let server = tokio::spawn(serve(gateway));
-        let failure = open_over(client, "gw.example", machine("tok"), |_| {}, stage_timeout)
-            .await
-            .expect_err("the tunnel must not open");
+        let failure = open_over(
+            client,
+            "gw.example",
+            machine("tok"),
+            |_| {},
+            never_asked,
+            stage_timeout,
+        )
+        .await
+        .expect_err("the tunnel must not open");
         server.abort();
         assert!(
             failure
@@ -1726,9 +2127,16 @@ pub(crate) mod tests {
             let requests = gateway.open_channel().await;
             (requests, gateway)
         });
-        let mut stream = open_over(client, "gw.example", machine(COOKIE), |_| {}, TIMEOUT)
-            .await
-            .unwrap();
+        let mut stream = open_over(
+            client,
+            "gw.example",
+            machine(COOKIE),
+            |_| {},
+            never_asked,
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
         let (requests, mut gateway) = serve.await.unwrap();
         let cookie_utf16: Vec<u8> = COOKIE.encode_utf16().flat_map(u16::to_le_bytes).collect();
         assert!(
