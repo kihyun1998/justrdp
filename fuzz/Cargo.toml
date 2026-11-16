@@ -391,3 +391,11 @@ path = "fuzz_targets/ncrush.rs"
 test = false
 doc = false
 bench = false
+
+# tsgu (#612): RD Gateway HTTP transport packets.
+[[bin]]
+name = "tsgu"
+path = "fuzz_targets/tsgu.rs"
+test = false
+doc = false
+bench = false

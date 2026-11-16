@@ -180,6 +180,8 @@ ls docs/map/territory/ docs/map/invariant/                                     #
 connect sequence, the session loop, the logon notifications, the graphics path and its drawing
 orders, input, channels and redirection, audio, the wire layer, the adapter, verification and the
 supply chain. Unbuilt protocol areas
-(RD Gateway, H.264, multi-monitor…)
+(H.264, multi-monitor…)
 have **no territory** — they live as `epic` issues in the tracker (the roster), and a
-territory appears when the first slice lands.
+territory appears when the first slice lands. **RD Gateway is the exception**: its first slice,
+the HTTP transport packets in `justrdp_pdu::tsgu` (#612), has landed and no territory covers it
+yet.
