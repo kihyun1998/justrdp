@@ -8,16 +8,19 @@ the TLS and CredSSP sub-protocols that deliberately live outside the core, and t
 drives the session: reading bytes, delivering frames and cursor events to
 host-supplied sinks, accepting input and resize commands, and cancelling cleanly.
 
-**Its size is a finding, not a detail.** The adapter file is 4875 lines, of which
-**1032 are code** and the rest tests. `CLAUDE.md` and `justrdp/src/lib.rs` used to
-call it *"~30 lines"* — true of the *drive loop* (a match over `Action`), false of
-the crate, and it shipped verbatim to docs.rs. Both were corrected when this map was
-written; the number above is what to keep it honest against.
+**Its size is a finding, not a detail.** Measured 2026-11-16 (#615): the crate's four files
+hold 21,299 lines, of which **3,349 come before each file's `#[cfg(test)]` module** and the
+rest are tests: `lib.rs` 1,805 of 17,695, `gateway.rs` 758 of 2,190, `websocket.rs` 447 of
+940, `trust.rs` 339 of 474. The non-test count includes doc comments. `CLAUDE.md` and
+`justrdp/src/lib.rs` used to call the adapter *"~30 lines"*, which is true of the *drive
+loop* (a match over `Action`) and false of the crate, and it shipped verbatim to docs.rs. Both
+were corrected when this map was written; the numbers above are what to keep it honest
+against, measured the same way each time.
 
-The two numbers have since moved apart, which is the point of keeping both: the total
-grew by ~1250 lines across #197 and #198 and the **code count did not move at all**,
-because every line of both was harness. A single "lines in this file" figure would have
-read as the adapter growing a third of its size.
+Keep both numbers, because they move apart: on 2026-08-20 this note gave 4,875 lines with
+1,032 of code (counted by a method it did not record), and the ~1,250 lines #197 and #198
+added were all harness. A single "lines in this file" figure would have read as the adapter
+growing a third of its size.
 
 ## Governing decisions
 
@@ -45,7 +48,14 @@ read as the adapter growing a third of its size.
   the trust policy, the frame sink, the cursor sink and the answer to an RD Gateway's consent
   message; the adapter wires them.
 - **One timeout seam.** Every stage's I/O goes through `with_stage_timeout`, so the
-  timeout/error policy exists once and a failure is reported *with its stage name*. Opening an
+  timeout/error policy exists once and a failure is reported *with its stage name*. In the
+  X.224, CredSSP and MCS stages the bound is per read, not per stage as a whole: each X.224/MCS
+  read, and in `nla-credssp` each read that waits for a server `TsRequest` (#615), gets the full
+  `ConnectTimeouts::stage`, so a CredSSP exchange of several round trips may take longer than
+  `stage` in total. A whole-exchange bound would fail a slow server that answers every message in
+  time, and would not match what `ConnectTimeouts` promises. Writes in those stages are not
+  bounded. The TLS handshake and each gateway-opening stage are bounded as a whole, their writes
+  included. No bound covers the whole connect; a host that wants one wraps the `connect` future. Opening an
   RD Gateway tunnel has its own, `in_stage`, because its failure is a `GatewayFailure`. One wait
   is under no timeout: the host's answer to a gateway's consent message
   ([RD Gateway](rd-gateway.md)).
