@@ -95,6 +95,36 @@ already holds. See `## Known holes / open` for the rest.
   FreeRDP ends the handshake, the tunnel create and the channel create on `FAILED(hr)` only, so
   it carries on past a positive non-zero code there; its tunnel authorization admits `S_OK` and
   `E_PROXY_QUARANTINE_ACCESSDENIED`. No server has been seen to send a positive code.
+- **The handshake response has to answer version 1.0 and offer PAA, or the cookie is not
+  sent.** `[MS-TSGU]` 3.7.3: "The RDG client MUST match the version and capabilities of the RDG
+  server. If no match can be made, the RDG client SHOULD stop further progress on the protocol
+  connection." The client sends 1.0 and asks for PAA alone, so a response with another
+  `verMajor`.`verMinor` fails `gateway-handshake` with `VersionMismatch`, and one whose
+  `ExtendedAuth` lacks `HTTP_EXTENDED_AUTH_PAA` fails it with `PaaNotOffered`. Both fail before
+  the tunnel create, the request that carries the cookie, is written.
+  - What licenses the refusal is ADR-0009 §3(a), as its 2026-08-25 amendment reads it for a
+    field whose legal values the spec fixes; §1 and §2 are not a partition. It is not a defence
+    against a hostile gateway: the gateway that would receive the cookie is the one that writes
+    `ExtendedAuth`, and it passes by setting 0x2. It keeps the cookie from a gateway that does
+    not offer PAA.
+  - PAA is a bit test, because the response carries what the gateway offers. 2.2.10.11 words
+    `ExtendedAuth` as "the extended authentication requested by the RDG client", which reads as
+    an echo; 3.3.5.3.2 has the gateway include `HTTP_EXTENDED_AUTH_SSPI_NTLM` when it supports
+    NTLM, and the Windows Server 2019 gateway of #613 answered 0x7 (smart card, PAA, NTLM) to a
+    request of 0x2. The measurement decides it, and that gateway passes. 3.3.5.3.2 also has the
+    same rule for NTLM: a client that negotiated it and gets a response without the bit "MUST
+    close the connection".
+  - The version and the flag checked are the ones `start` sends (`VERSION`, `EXTENDED_AUTH`).
+  - A refusal is checked first, so a gateway that refuses with the version zeroed is reported by
+    its code.
+  - `serverVersion` is not checked. 2.2.10.11: "This field is not used and MUST be set to
+    zero." Nothing reads it, so a non-zero value changes nothing this client does.
+  - Prior art: FreeRDP logs both fields and acts on neither (`rdg.c`,
+    `rdg_process_handshake_response`); it takes the NTLM path on what it asked for.
+    `ironrdp-mstsgu` (`lib.rs`, `handshake`) fails on a version other than 1.0 and on a
+    non-zero `serverVersion`, and requires the NTLM bit when it asked for NTLM. The
+    maintainer's IronRDP fork also fails when it asked for PAA and the bit is missing (commit
+    `12b9822f`).
 - **`fieldsPresent` of the tunnel create is 0x1 for a PAA cookie.** The spec contradicts itself:
   2.2.5.3.6 defines `HTTP_TUNNEL_PACKET_FIELD_PAA_COOKIE` as 0x1, and 3.7.5.2 step 1 says "set
   fieldsPresent to 2". `mstsc.exe` and FreeRDP send 0x1.
@@ -166,7 +196,8 @@ already holds. See `## Known holes / open` for the rest.
 - Stage strings: `gateway-tcp-connect`, `gateway-tls-handshake`, `gateway-websocket-upgrade`,
   `gateway-handshake`, `gateway-tunnel-create`, `gateway-tunnel-auth`, `gateway-channel-create`,
   `gateway-channel-open`
-- Spec sections cited inline: `[MS-TSGU]` 2.2.5.3, 2.2.6, 2.2.10, 3.3.5.1, 3.7.5.2 to 3.7.5.4;
+- Spec sections cited inline: `[MS-TSGU]` 2.2.5.3, 2.2.6, 2.2.10, 3.3.5.1, 3.3.5.3.2, 3.7.3,
+  3.7.5.2 to 3.7.5.4;
   RFC 6455 1.3, 4.1, 5.1 to 5.5
 
 ## Reference behaviour
@@ -268,12 +299,9 @@ connect reached session-active.
   decoded and not read. Each belongs to a capability that is not advertised or a transport that
   is not built. `redirFlags`, `idleTimeout`, the ids and the negotiated capabilities reach the
   host in `GatewayChannel`, and `consentMsg` in `on_consent`.
-  **The handshake response's version and `ExtendedAuth` are decoded and not read, and that one
-  is undecided.** The client asked for PAA and `ExtendedAuth` is the gateway's answer.
-  `[MS-TSGU]` 3.7.3 has the version match. FreeRDP reads neither (`rdg.c`,
-  `rdg_process_handshake_response`), IronRDP checks the version, and the maintainer's IronRDP
-  fork fails when the PAA bit is missing (commit `12b9822f`). A gateway without PAA fails the
-  tunnel create one stage later, with its own code.
+  The handshake response's version and `ExtendedAuth` are enforced, and its `serverVersion` is
+  recorded on `HandshakeResponse::server_version` as unchecked; both are under
+  `## Design model`.
 
 ## Blast radius
 

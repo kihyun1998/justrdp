@@ -263,7 +263,8 @@ pub struct HandshakeResponse {
     pub ver_major: u8,
     /// `verMinor`.
     pub ver_minor: u8,
-    /// `serverVersion`; the spec requires zero.
+    /// `serverVersion`; the spec says it is not used and requires zero. Nothing reads it and
+    /// nothing checks it: a gateway that sends another value is not refused for it.
     pub server_version: u16,
     /// `ExtendedAuth`, `HTTP_EXTENDED_AUTH_*` flags (2.2.5.3.2).
     pub extended_auth: u16,

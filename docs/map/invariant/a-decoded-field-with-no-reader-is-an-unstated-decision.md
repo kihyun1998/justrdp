@@ -76,8 +76,10 @@ wrote, unapplied.
   responses, and the sequence reads the ones a host can act on (`redirFlags`, `idleTimeout`,
   the ids, the negotiated capabilities, the consent message). The rest belong to capabilities
   the client does not advertise or to the UDP transport, and the territory lists them (#613).
-  **The handshake response's version and `ExtendedAuth` are an open instance**: the answer to
-  what the client asked for, read by nothing.
+  The handshake response's version and `ExtendedAuth`, the answer to what the client asked
+  for, were an instance read by nothing. **Closed by #621, taking two ways out on one packet**:
+  the version and `ExtendedAuth` are **enforced** (a mismatch fails `gateway-handshake` before
+  the cookie is sent), and `serverVersion` is **recorded** (2.2.10.11 says it is not used).
 
 ## What a violation looks like
 

@@ -1977,6 +1977,52 @@ pub(crate) mod tests {
         );
     }
 
+    /// A gateway that does not offer PAA fails the handshake stage, and the tunnel create, which
+    /// carries the cookie, never reaches it.
+    #[tokio::test]
+    async fn a_gateway_without_paa_fails_the_handshake_stage_and_never_gets_the_cookie() {
+        let (client, mut gateway) = pipe();
+        let serve = tokio::spawn(async move {
+            gateway.upgrade().await;
+            gateway.read_packets().await;
+            let without_paa = Packet::HandshakeResponse(HandshakeResponse {
+                error_code: 0,
+                ver_major: 1,
+                ver_minor: 0,
+                server_version: 0,
+                extended_auth: tsgu::HTTP_EXTENDED_AUTH_SSPI_NTLM,
+            })
+            .encode()
+            .unwrap();
+            gateway.send(&without_paa).await;
+            gateway.try_read_frame().await
+        });
+        let failure = open_over(
+            client,
+            "gw.example",
+            machine("tok"),
+            |_| {},
+            never_asked,
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        let after = serve.await.unwrap();
+        assert_eq!(after, None, "nothing follows the handshake request");
+        assert_eq!(failure.stage, STAGE_HANDSHAKE);
+        assert!(matches!(
+            failure.kind,
+            GatewayFailureKind::Protocol(GatewayErrorKind::PaaNotOffered {
+                extended_auth: tsgu::HTTP_EXTENDED_AUTH_SSPI_NTLM
+            })
+        ));
+        assert_eq!(
+            failure.to_string(),
+            "RD Gateway failed during gateway-handshake: the gateway's ExtendedAuth 0x0004 does \
+             not offer PAA"
+        );
+    }
+
     #[tokio::test]
     async fn a_gateway_that_hangs_up_on_the_tunnel_create_fails_that_stage() {
         let failure = failure_against(
