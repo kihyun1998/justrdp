@@ -43,7 +43,22 @@ use tokio_rustls::client::TlsStream;
 // Re-exported so hosts cancel sessions without naming tokio-util themselves.
 pub use tokio_util::sync::CancellationToken;
 
+mod gateway;
 mod trust;
+mod websocket;
+pub use gateway::{
+    GatewayFailure, GatewayFailureKind, GatewayOptions, GatewayStream, STAGE_TCP_CONNECT,
+    STAGE_TLS_HANDSHAKE, STAGE_WEBSOCKET_UPGRADE, open_gateway,
+};
+pub use websocket::{FrameError, UpgradeError};
+
+/// The `fuzz/` lane's door into the WebSocket client's parsers (#613), not host API. Compiled
+/// only under the `fuzzing` feature, which only `fuzz/` and the lint and doc gates enable.
+#[doc(hidden)]
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    pub use crate::websocket::{Control, FrameDecoder, FrameError, parse_upgrade_response};
+}
 use trust::client_config;
 pub use trust::{FilePinStore, MemoryPinStore, PinStore, TrustPolicy, pin_fingerprint};
 
@@ -77,13 +92,46 @@ pub struct ConnectOutcome {
     pub standard_security: Option<StandardSecurity>,
 }
 
-/// What a session runs over: TLS, or the plain socket under Standard RDP Security (ADR-0020).
+/// What a session runs over: TLS, or the plain stream under Standard RDP Security (ADR-0020),
+/// each either on the socket to the server or on a [`GatewayStream`].
 #[derive(Debug)]
 pub enum SessionStream {
     /// The TLS-upgraded stream.
     Tls(Box<TlsStream<TcpStream>>),
     /// The plain socket, whose PDUs the security layer protects.
     Tcp(TcpStream),
+    /// The server's TLS stream inside an RD Gateway tunnel.
+    GatewayTls(Box<TlsStream<GatewayStream>>),
+    /// The RD Gateway tunnel itself, whose PDUs the security layer protects.
+    Gateway(Box<GatewayStream>),
+}
+
+/// What [`connect_inner`] dials and runs the connect sequence over.
+trait ConnectWire: AsyncRead + AsyncWrite + Unpin + Sized {
+    /// The session stream of a connect that upgraded this wire to TLS.
+    fn tls_session(stream: Box<TlsStream<Self>>) -> SessionStream;
+    /// The session stream of a connect that stayed on this wire.
+    fn plain_session(self) -> SessionStream;
+}
+
+impl ConnectWire for TcpStream {
+    fn tls_session(stream: Box<TlsStream<Self>>) -> SessionStream {
+        SessionStream::Tls(stream)
+    }
+
+    fn plain_session(self) -> SessionStream {
+        SessionStream::Tcp(self)
+    }
+}
+
+impl ConnectWire for GatewayStream {
+    fn tls_session(stream: Box<TlsStream<Self>>) -> SessionStream {
+        SessionStream::GatewayTls(stream)
+    }
+
+    fn plain_session(self) -> SessionStream {
+        SessionStream::Gateway(Box::new(self))
+    }
 }
 
 impl AsyncRead for SessionStream {
@@ -95,6 +143,8 @@ impl AsyncRead for SessionStream {
         match self.get_mut() {
             SessionStream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             SessionStream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            SessionStream::GatewayTls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            SessionStream::Gateway(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -108,6 +158,8 @@ impl AsyncWrite for SessionStream {
         match self.get_mut() {
             SessionStream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             SessionStream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            SessionStream::GatewayTls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            SessionStream::Gateway(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -118,6 +170,8 @@ impl AsyncWrite for SessionStream {
         match self.get_mut() {
             SessionStream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
             SessionStream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            SessionStream::GatewayTls(s) => std::pin::Pin::new(s).poll_flush(cx),
+            SessionStream::Gateway(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -128,6 +182,8 @@ impl AsyncWrite for SessionStream {
         match self.get_mut() {
             SessionStream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             SessionStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            SessionStream::GatewayTls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            SessionStream::Gateway(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -161,14 +217,14 @@ pub fn generate_license_entropy() -> io::Result<LicenseEntropy> {
     })
 }
 
-/// The connect-time transport: plaintext TCP until the X.224 negotiation completes, the TLS
+/// The connect-time transport: the plaintext wire until the X.224 negotiation completes, the TLS
 /// stream after [`Action::StartTls`]. The machine's [`Action::WriteBytes`] and the read loop
 /// always target whichever is current, so the MCS exchange transparently rides TLS.
-enum Transport {
+enum Transport<W> {
     /// Between `Connect` and the TLS upgrade.
-    Tcp(TcpStream),
+    Tcp(W),
     /// From the TLS upgrade onward.
-    Tls(Box<TlsStream<TcpStream>>),
+    Tls(Box<TlsStream<W>>),
     /// Transient state while the TLS upgrade owns the socket, and after the terminal action
     /// consumed the stream.
     Absent,
@@ -180,7 +236,7 @@ async fn write_frame(stream: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> io
     stream.flush().await
 }
 
-impl Transport {
+impl<W: ConnectWire> Transport<W> {
     async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         match self {
             Transport::Tcp(s) => write_frame(s, bytes).await,
@@ -203,7 +259,7 @@ impl Transport {
         }
     }
 
-    fn tls_mut(&mut self) -> Option<&mut TlsStream<TcpStream>> {
+    fn tls_mut(&mut self) -> Option<&mut TlsStream<W>> {
         match self {
             Transport::Tls(s) => Some(s),
             _ => None,
@@ -395,8 +451,11 @@ pub async fn connect(
     credentials: Credentials,
     on_stage: impl FnMut(&str),
 ) -> Result<ConnectOutcome, ConnectFailure> {
+    let server = server.into();
+    let dial = dial_tcp(&server);
     connect_inner(
-        server.into(),
+        server,
+        dial,
         config,
         credentials,
         on_stage,
@@ -441,7 +500,9 @@ pub async fn connect_with_timeouts(
         timeouts,
         ..ConnectOptions::default()
     };
-    connect_inner(server.into(), config, credentials, on_stage, options).await
+    let server = server.into();
+    let dial = dial_tcp(&server);
+    connect_inner(server, dial, config, credentials, on_stage, options).await
 }
 
 /// The adapter-level knobs for [`connect`] that are not protocol configuration: the per-stage
@@ -468,7 +529,43 @@ pub async fn connect_with_options(
     on_stage: impl FnMut(&str),
     options: ConnectOptions,
 ) -> Result<ConnectOutcome, ConnectFailure> {
-    connect_inner(server.into(), config, credentials, on_stage, options).await
+    let server = server.into();
+    let dial = dial_tcp(&server);
+    connect_inner(server, dial, config, credentials, on_stage, options).await
+}
+
+/// Run the connect sequence to `server` over `tunnel`, a Gateway Channel [`open_gateway`] opened
+/// to it: the X.224 negotiation, the server's TLS and NLA all travel inside the tunnel, end to
+/// end with the server.
+///
+/// `server` names the target for TLS SNI, the CredSSP SPN and `options.trust`, as in
+/// [`connect`]; its port is not dialed, since the gateway already reached the target named in
+/// the tunnel's [`justrdp::gateway::GatewayConfig`]. `options.trust` is the target's policy: the
+/// gateway's own was applied by [`open_gateway`]. The `tcp-connect` stage is still announced and
+/// completes at once.
+pub async fn connect_over_gateway(
+    tunnel: GatewayStream,
+    server: impl Into<ServerAddr>,
+    config: ConnectConfig,
+    credentials: Credentials,
+    on_stage: impl FnMut(&str),
+    options: ConnectOptions,
+) -> Result<ConnectOutcome, ConnectFailure> {
+    let dial = std::future::ready(Ok(tunnel));
+    connect_inner(server.into(), dial, config, credentials, on_stage, options).await
+}
+
+/// The TCP dial to `server`, with the session socket options applied.
+fn dial_tcp(server: &ServerAddr) -> impl Future<Output = io::Result<TcpStream>> + use<> {
+    let (host, port) = (server.host.clone(), server.port);
+    async move {
+        // (host, port) resolves DNS names and parses IP literals alike.
+        let s = TcpStream::connect((host.as_str(), port)).await?;
+        // Disable Nagle before any frame rides this socket, so interactive input writes are
+        // not held by Nagle + the server's delayed ACK (#82).
+        configure_session_socket(&s)?;
+        Ok(s)
+    }
 }
 
 /// Apply the connect-time socket options to a freshly dialed session socket.
@@ -486,12 +583,13 @@ fn configure_session_socket(s: &TcpStream) -> io::Result<()> {
 /// The monomorphic body of [`connect`], instrumented once the server identity is concrete.
 #[tracing::instrument(
     name = "connect",
-    skip(config, credentials, on_stage, options),
+    skip(dial, config, credentials, on_stage, options),
     fields(host = %server.host, port = server.port),
     err,
 )]
-async fn connect_inner(
+async fn connect_inner<W: ConnectWire>(
     server: ServerAddr,
+    dial: impl Future<Output = io::Result<W>>,
     config: ConnectConfig,
     credentials: Credentials,
     mut on_stage: impl FnMut(&str),
@@ -500,6 +598,7 @@ async fn connect_inner(
     let timeouts = options.timeouts;
     let mut sm = ConnectStateMachine::new(config).map_err(ConnectFailure::Config)?;
     let mut transport = Transport::Absent;
+    let mut dial = Some(dial);
     let mut readbuf = [0u8; 8192];
     // Filled at the McsConnected milestone; consumed when SessionActive terminates the loop.
     let mut mcs: Option<McsConnectResult> = None;
@@ -512,17 +611,14 @@ async fn connect_inner(
         while let Some(action) = queue.pop_front() {
             match action {
                 Action::Connect => {
-                    // (host, port) resolves DNS names and parses IP literals alike; the original
-                    // host string stays in `server` for SNI / SPN / validation.
-                    let s = with_stage_timeout(
-                        "tcp-connect",
-                        timeouts.tcp_connect,
-                        TcpStream::connect((server.host.as_str(), server.port)),
-                    )
-                    .await?;
-                    // Disable Nagle before any frame rides this socket, so interactive input
-                    // writes are not held by Nagle + the server's delayed ACK (#82).
-                    configure_session_socket(&s)?;
+                    let Some(dial) = dial.take() else {
+                        return Err(ConnectFailure::Io(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "the connect sequence asked for the socket twice",
+                        )));
+                    };
+                    // The original host string stays in `server` for SNI / SPN / validation.
+                    let s = with_stage_timeout("tcp-connect", timeouts.tcp_connect, dial).await?;
                     tracing::debug!("tcp socket connected");
                     transport = Transport::Tcp(s);
                     queue.extend(sm.process(Event::Connected));
@@ -663,9 +759,9 @@ async fn connect_inner(
                         )));
                     };
                     let stream = match std::mem::replace(&mut transport, Transport::Absent) {
-                        Transport::Tls(stream) => SessionStream::Tls(stream),
+                        Transport::Tls(stream) => W::tls_session(stream),
                         Transport::Tcp(stream) if mcs.selected.bits() == 0 => {
-                            SessionStream::Tcp(stream)
+                            stream.plain_session()
                         }
                         Transport::Tcp(_) | Transport::Absent => {
                             return Err(ConnectFailure::Io(io::Error::new(
@@ -2684,6 +2780,270 @@ mod tests {
         // ...and the server side really finished CredSSP with the delegated credentials.
         let delegated = finished_rx.await.expect("the mock server reached Finished");
         assert_eq!(delegated, "test");
+    }
+
+    /// A stand-in RD Gateway on loopback, over TLS with a throwaway certificate. It grants the
+    /// tunnel, dials the target the channel create names, and relays data packets both ways
+    /// until either side ends.
+    async fn relay_gateway() -> SocketAddr {
+        use crate::gateway::tests::StandIn;
+        use justrdp_pdu::tsgu::{Packet, PacketHeader};
+
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(
+            ck.cert.der().clone(),
+            ck.signing_key.serialize_der(),
+        )));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let Ok(tls) = acceptor.accept(sock).await else {
+                return; // the client refused the certificate
+            };
+            let mut gateway = StandIn::new(tls);
+            gateway.upgrade().await;
+            let requests = gateway.open_channel().await;
+            let Ok(Packet::ChannelCreate(create)) = Packet::decode(&requests[3]) else {
+                panic!("the fourth request is the channel create");
+            };
+            let host = create.resources[0].to_string_lossy();
+            let target = TcpStream::connect((host.as_str(), create.port))
+                .await
+                .unwrap();
+            let (mut from_target, mut to_target) = target.into_split();
+            let (from_client, to_client) = tokio::io::split(gateway.io);
+
+            let upstream = tokio::spawn(async move {
+                let mut client = StandIn::new(tokio::io::join(from_client, tokio::io::sink()));
+                while let Some((opcode, payload)) = client.try_read_frame().await {
+                    if opcode != 0x2 {
+                        break;
+                    }
+                    let mut rest = payload.as_slice();
+                    while !rest.is_empty() {
+                        let len = PacketHeader::decode(rest).unwrap().packet_length as usize;
+                        match Packet::decode(rest).unwrap() {
+                            Packet::Data(data) => to_target.write_all(data).await.unwrap(),
+                            _ => return,
+                        }
+                        rest = &rest[len..];
+                    }
+                }
+            });
+            let mut client = StandIn::new(tokio::io::join(tokio::io::empty(), to_client));
+            let mut buf = [0u8; 4096];
+            loop {
+                match from_target.read(&mut buf).await {
+                    Ok(n) if n > 0 => {
+                        let packet = Packet::Data(&buf[..n]).encode().unwrap();
+                        client.send(&packet).await;
+                    }
+                    _ => break,
+                }
+            }
+            upstream.abort();
+        });
+        addr
+    }
+
+    fn gateway_config(target: SocketAddr) -> justrdp::gateway::GatewayConfig {
+        justrdp::gateway::GatewayConfig {
+            paa_cookie: justrdp::gateway::PaaCookie::from_token("tok"),
+            target_host: target.ip().to_string(),
+            target_port: target.port(),
+            client_name: "pc".to_string(),
+        }
+    }
+
+    /// #613: the whole pre-MCS sequence runs end to end with the target inside the tunnel. The
+    /// gateway relays opaque data packets; the X.224 confirm, the target's TLS and the CredSSP
+    /// exchange are the target's own.
+    #[tokio::test]
+    async fn connect_runs_x224_tls_and_credssp_through_a_gateway_tunnel() {
+        let (target, finished_rx) = mock_credssp_server("test", "test").await;
+        let gateway = relay_gateway().await;
+
+        let mut gateway_stages = Vec::new();
+        let tunnel = open_gateway(
+            gateway,
+            gateway_config(target),
+            |s| gateway_stages.push(s.to_string()),
+            async |_: &str| false,
+            GatewayOptions {
+                trust: TrustPolicy::DangerAcceptAny,
+                ..GatewayOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            gateway_stages,
+            [
+                "gateway-tcp-connect",
+                "gateway-tls-handshake",
+                "gateway-websocket-upgrade",
+                "gateway-handshake",
+                "gateway-tunnel-create",
+                "gateway-tunnel-auth",
+                "gateway-channel-create",
+                "gateway-channel-open",
+            ]
+        );
+
+        let mut stages = Vec::new();
+        let err = require_send(connect_over_gateway(
+            tunnel,
+            ServerAddr::new("localhost", 3389),
+            test_config(),
+            test_credentials(),
+            |s| stages.push(s.to_string()),
+            ConnectOptions {
+                trust: TrustPolicy::DangerAcceptAny,
+                ..ConnectOptions::default()
+            },
+        ))
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            stages,
+            [
+                "tcp-connect",
+                "x224-negotiate",
+                "tls-handshake",
+                "nla-credssp",
+                "capability-exchange",
+            ]
+        );
+        // The failure is only the mock target dropping the connection after CredSSP...
+        assert!(
+            matches!(err, ConnectFailure::Io(_)),
+            "expected the post-NLA drop as Io, got {err:?}"
+        );
+        // ...which it finished with the credentials delegated through the tunnel.
+        let delegated = finished_rx.await.expect("the mock target reached Finished");
+        assert_eq!(delegated, "test");
+    }
+
+    /// ADR-0005: the gateway's certificate is checked under the gateway's own policy, whose
+    /// default refuses a certificate no trust store holds, before any request is sent.
+    #[tokio::test]
+    async fn the_default_gateway_trust_refuses_an_untrusted_certificate() {
+        let gateway = relay_gateway().await;
+        let target = SocketAddr::from(([127, 0, 0, 1], 3389));
+        let failure = open_gateway(
+            ServerAddr::new("localhost", gateway.port()),
+            gateway_config(target),
+            |_| {},
+            async |_: &str| false,
+            GatewayOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.stage, "gateway-tls-handshake");
+        assert!(
+            matches!(failure.kind, GatewayFailureKind::Tls { .. }),
+            "{failure:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_is_not_listening_fails_the_tcp_connect_stage() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let failure = open_gateway(
+            addr,
+            gateway_config(addr),
+            |_| {},
+            async |_: &str| false,
+            GatewayOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.stage, "gateway-tcp-connect");
+        assert!(
+            matches!(failure.kind, GatewayFailureKind::Io(_)),
+            "{failure:?}"
+        );
+    }
+
+    /// The acceptance run of #613 against a real RD Gateway, which no CI lane has. It reads:
+    ///
+    /// - `JUSTRDP_TEST_GATEWAY`: the gateway, `host` or `host:port` (443 when omitted);
+    /// - `JUSTRDP_TEST_GATEWAY_TARGET`: the target as the gateway resolves it, `host` or
+    ///   `host:port` (3389 when omitted);
+    /// - `JUSTRDP_TEST_GATEWAY_COOKIE`: the PAA cookie;
+    /// - `JUSTRDP_TEST_USERNAME`, `JUSTRDP_TEST_PASSWORD`, `JUSTRDP_TEST_DOMAIN`: the target's
+    ///   logon, as for the real-VM tests.
+    ///
+    /// Both certificates are accepted unchecked, as a lab's are self-signed. A consent message
+    /// the gateway sends is printed and accepted.
+    #[tokio::test]
+    #[ignore = "requires a real RD Gateway and the JUSTRDP_TEST_GATEWAY* env vars"]
+    async fn a_real_rd_gateway_reaches_the_target_server() {
+        fn endpoint(var: &str, default_port: u16) -> ServerAddr {
+            let value = std::env::var(var).unwrap_or_else(|_| panic!("set {var}"));
+            match value.rsplit_once(':') {
+                Some((host, port)) => ServerAddr::new(
+                    host,
+                    port.parse::<u16>()
+                        .unwrap_or_else(|_| panic!("{var} has a port that is not a number")),
+                ),
+                None => ServerAddr::new(value, default_port),
+            }
+        }
+        let gateway = endpoint("JUSTRDP_TEST_GATEWAY", 443);
+        let target = endpoint("JUSTRDP_TEST_GATEWAY_TARGET", 3389);
+        let cookie =
+            std::env::var("JUSTRDP_TEST_GATEWAY_COOKIE").expect("set JUSTRDP_TEST_GATEWAY_COOKIE");
+        let credentials = Credentials {
+            username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
+            password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
+            domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
+        };
+
+        let tunnel = open_gateway(
+            gateway,
+            justrdp::gateway::GatewayConfig {
+                paa_cookie: justrdp::gateway::PaaCookie::from_token(&cookie),
+                target_host: target.host.clone(),
+                target_port: target.port,
+                client_name: "justrdp".to_string(),
+            },
+            |stage| eprintln!("gateway stage: {stage}"),
+            async |message: &str| {
+                eprintln!("gateway consent message, accepted: {message:?}");
+                true
+            },
+            GatewayOptions {
+                trust: TrustPolicy::DangerAcceptAny,
+                ..GatewayOptions::default()
+            },
+        )
+        .await
+        .expect("the tunnel opens");
+        eprintln!("gateway channel: {:?}", tunnel.channel());
+
+        let outcome = connect_over_gateway(
+            tunnel,
+            target,
+            test_config(),
+            credentials,
+            |stage| eprintln!("connect stage: {stage}"),
+            ConnectOptions {
+                trust: TrustPolicy::DangerAcceptAny,
+                ..ConnectOptions::default()
+            },
+        )
+        .await
+        .expect("the connect reaches session-active through the gateway");
+        assert!(matches!(outcome.stream, SessionStream::GatewayTls(_)));
+        eprintln!(
+            "session active through the gateway: desktop {:?}",
+            outcome.activation.desktop_size
+        );
     }
 
     /// A stand-in for the bound `subjectPublicKey`; both ends of an in-memory exchange use it.
@@ -12592,7 +12952,13 @@ mod tests {
             .connect(ServerName::try_from("localhost").unwrap(), sock)
             .await
             .unwrap();
-        let mut machine = SessionStateMachine::new(
+        let mut machine = terminal_value_machine();
+        run_session(&mut stream, &mut machine, |_, _fb| {}, |_| {}).await
+    }
+
+    /// A fresh session machine for the mock session servers.
+    fn terminal_value_machine() -> SessionStateMachine {
+        SessionStateMachine::new(
             justrdp::SessionConfig {
                 user_channel_id: 1007,
                 io_channel_id: 1003,
@@ -12608,8 +12974,56 @@ mod tests {
             },
             Vec::new(),
         )
-        .expect("the test desktop size is within MAX_DESKTOP_DIM");
-        run_session(&mut stream, &mut machine, |_, _fb| {}, |_| {}).await
+        .expect("the test desktop size is within MAX_DESKTOP_DIM")
+    }
+
+    /// A session runner reads and writes a tunnel as it does a socket: the target's frames
+    /// arrive through the gateway, and the disconnect is attributed the same way.
+    #[tokio::test]
+    async fn a_session_runs_inside_a_gateway_tunnel() {
+        let error_info = justrdp_pdu::share::encode_share_data(
+            1002,
+            0x0001_03EA,
+            justrdp_pdu::share::STREAM_MED,
+            justrdp_pdu::share::PDU_TYPE2_SET_ERROR_INFO,
+            &0x0000_000Cu32.to_le_bytes(),
+        );
+        let target = mock_session_server(vec![server_io_frame(1003, &error_info)]).await;
+        let tunnel = open_gateway(
+            relay_gateway().await,
+            gateway_config(target),
+            |_| {},
+            async |_: &str| false,
+            GatewayOptions {
+                trust: TrustPolicy::DangerAcceptAny,
+                ..GatewayOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let connector = TlsConnector::from(Arc::new(
+            client_config(&TrustPolicy::DangerAcceptAny, "localhost").unwrap(),
+        ));
+        let tls = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tunnel)
+            .await
+            .unwrap();
+        let mut stream = SessionStream::GatewayTls(Box::new(tls));
+        let mut machine = terminal_value_machine();
+
+        let reason = run_session(&mut stream, &mut machine, |_, _fb| {}, |_| {})
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                reason,
+                justrdp::DisconnectReason::ServerDisconnected(
+                    justrdp::ServerDisconnectCause::ErrorInfo(_)
+                )
+            ),
+            "expected the Error Info attribution, got {reason:?}"
+        );
     }
 
     /// A server→client MCS Send Data Indication frame on `channel` (initiator 1002), TPKT

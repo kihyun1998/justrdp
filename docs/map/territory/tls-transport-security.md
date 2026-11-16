@@ -37,10 +37,16 @@ the extraction of the server's `subjectPublicKey`, which is not a TLS concern at
   certificate's key and nothing after the handshake checks the server again. Whatever the
   `TrustPolicy` accepts is the server. The machine does not parse the certificate on this path.
 
+- **A connection through an RD Gateway has two handshakes and two policies** (#613, ADR-0005's
+  2026-11-16 amendment): `GatewayOptions::trust` for the gateway's certificate and
+  `ConnectOptions::trust` for the target's, inside the tunnel. `client_config` builds both.
+  One `PinStore` shared by the two holds one pin for a name both use
+  ([RD Gateway](rd-gateway.md)).
+
 ## Code
 
 - `justrdp-tokio/src/trust.rs` — `TrustPolicy`, `FilePinStore`, `MemoryPinStore`,
-  `pin_fingerprint`
+  `pin_fingerprint`, `client_config`
 - `justrdp/src/tls.rs` — `extract_subject_public_key`, `TlsCertError`
 - `justrdp-tokio/src/lib.rs` — `Transport`, the `Action::StartTls` arm, `peer_certificate`,
   `tls_server_public_key` (the key for a host running `run_credssp` itself; it verifies nothing)
@@ -86,7 +92,6 @@ behavioural question no spec section answers, and it is unrecorded.
 
 - **CRL / OCSP revocation is deliberately out of scope** (ADR-0005; tracked
   for a future decision in epic #425) — a certificate revoked after issuance is accepted.
-- **RD Gateway certificates** are out of scope in the same record (epic #23).
 - **Pin-store schema versioning** is unspecified: `FilePinStore` writes a format
   nothing versions, so a later format change has no migration path.
 - **A wrong trust decision here produces a working session and no error anywhere**, so a

@@ -59,6 +59,11 @@ property of the whole untrusted surface.
   `orders_never_panic` in both `orders` modules, and the `orders` and `session_orders` fuzz
   targets. Edge and artifacts added by #460.
   Edge added by #237; the code has carried both artifacts since #200.
+- [RD Gateway](../territory/rd-gateway.md) — the gateway's bytes cross four parsers before a
+  connect sees them: the upgrade response check, the WebSocket frame reader, the packet framing
+  of `GatewayStateMachine::receive` and `tsgu::Packet::decode`. Each has a property and a fuzz
+  target (#612, #613). The frame reader and the response check are the first parsers in
+  `justrdp-tokio`, so the fuzz crate reaches that crate from #613 on.
 - [Verification harness](../territory/verification-harness.md) — the only territory
   that *enforces* rather than obeys it: proptest in the PR gate, cargo-fuzz weekly.
 

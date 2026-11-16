@@ -31,6 +31,10 @@ justrdp-security = { path = "../crates/justrdp-security" }
 # mechanism, not host API (ADR-0001) — what a host may reach into is #273's open question, so
 # the seam is a feature nothing else enables rather than a widened public surface.
 justrdp = { path = "../crates/justrdp", features = ["fuzzing"] }
+# The adapter, for the WebSocket client's two parsers of the RD Gateway's bytes (#613), which
+# live there with the rest of that client (ADR-0002's 2026-11-16 amendment). `fuzzing`
+# re-exports them through `justrdp_tokio::fuzzing`; the module is private otherwise.
+justrdp-tokio = { path = "../crates/justrdp-tokio", features = ["fuzzing"] }
 
 [workspace]
 
@@ -396,6 +400,23 @@ bench = false
 [[bin]]
 name = "tsgu"
 path = "fuzz_targets/tsgu.rs"
+test = false
+doc = false
+bench = false
+
+# gateway (#613): the RD Gateway client sequence, which frames the gateway's bytes into packets.
+[[bin]]
+name = "gateway"
+path = "fuzz_targets/gateway.rs"
+test = false
+doc = false
+bench = false
+
+# websocket (#613): the WebSocket frame reader and the upgrade response check of the RD Gateway
+# transport.
+[[bin]]
+name = "websocket"
+path = "fuzz_targets/websocket.rs"
 test = false
 doc = false
 bench = false

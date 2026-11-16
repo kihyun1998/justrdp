@@ -482,6 +482,9 @@ in-session query.
 
 ## Blast radius
 
+- [RD Gateway](rd-gateway.md) — a stand-in gateway is scripted in tests (`StandIn` in
+  `justrdp-tokio/src/gateway.rs`, `relay_gateway` in `lib.rs`), and the run against a real one
+  reads the `JUSTRDP_TEST_GATEWAY*` variables that note lists.
 - [Bitmap codecs](bitmap-codecs.md) — every correctness claim there routes through
   here.
 - [EGFX graphics pipeline](egfx-graphics-pipeline.md) — the phase-2 rewrite's exit

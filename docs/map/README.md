@@ -57,7 +57,7 @@ a recurrence test.
 - **Only `.md` files in this repo are nodes.** Issues, epics and source files are
   *text inside* notes, never nodes — so the graph cannot show you the hottest things
   in this repo (epics #10–#29, #45, #158) as first-class objects.
-- **The verified external-fact store covers 15 territories of 23** (re-derived in #460). `## Reference
+- **The verified external-fact store covers 16 territories of 24** (re-derived in #613). `## Reference
   behaviour` reads `**None.**` in the other **8** — derived by the `rg` command under
   *Conventions*, not counted by hand. ADR-0003's byte-exactness ranking and ADR-0009's
   receive-path posture both depend on exactly that comparison, so this remains the map's
@@ -134,7 +134,8 @@ Territories: [x224-negotiation](territory/x224-negotiation.md) ·
 [pdu-constants](territory/pdu-constants.md) ·
 [adapter-drive-loop](territory/adapter-drive-loop.md) ·
 [verification-harness](territory/verification-harness.md) ·
-[supply-chain-and-gates](territory/supply-chain-and-gates.md)
+[supply-chain-and-gates](territory/supply-chain-and-gates.md) ·
+[rd-gateway](territory/rd-gateway.md)
 
 Invariants: [decoder-dimension-overflow-32bit](invariant/decoder-dimension-overflow-32bit.md) ·
 [untrusted-decode-never-panics](invariant/untrusted-decode-never-panics.md) ·
@@ -176,12 +177,10 @@ ls docs/map/territory/ docs/map/invariant/                                     #
 
 ## Coverage
 
-**Complete for what is built**, as of 2026-10-15: 23 territories covering the
+**Complete for what is built**, as of 2026-11-16: 24 territories covering the
 connect sequence, the session loop, the logon notifications, the graphics path and its drawing
-orders, input, channels and redirection, audio, the wire layer, the adapter, verification and the
-supply chain. Unbuilt protocol areas
+orders, input, channels and redirection, audio, the wire layer, the adapter, RD Gateway,
+verification and the supply chain. Unbuilt protocol areas
 (H.264, multi-monitor…)
 have **no territory** — they live as `epic` issues in the tracker (the roster), and a
-territory appears when the first slice lands. **RD Gateway is the exception**: its first slice,
-the HTTP transport packets in `justrdp_pdu::tsgu` (#612), has landed and no territory covers it
-yet.
+territory appears when the first slice lands.

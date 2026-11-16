@@ -97,3 +97,23 @@ The concrete per-directory rule this measurement was taken against is in
 [ADR-0001's Amendment](0001-sans-io-state-machine-core.md) (2026-09-04). It is stated
 there rather than here because it covers file placement across the whole tree, of which
 the dependency boundary is one column.
+
+## Amendment (2026-11-16, #613): the WebSocket client is owned
+
+- Kind: **judgement**. The maintainer chose it at #613's confirm stop; the maintainer reopens it.
+
+The RD Gateway transport rides WebSocket (RFC 6455). The client for it is owned: a small one
+inside `justrdp-tokio`, with no new dependency. The SHA-1 of `Sec-WebSocket-Accept` and the
+randomness of the key and the frame masks come from `ring`, already a dependency of the adapter.
+
+What the choice was made on: `tungstenite`'s client handshake refuses any method but `GET`
+(`src/handshake/client.rs`), and the gateway's upgrade request uses the `RDG_OUT_DATA` method
+(`[MS-TSGU]` 2.2.3.1.2). WebSocket is neither security-critical nor delegated by this record's
+rule, and the part of it a gateway needs is a frame header and one hash.
+
+The parts of that client that do no I/O (the frame reader and the upgrade response check) stay
+in `justrdp-tokio` with the rest, and the `fuzz/` crate depends on `justrdp-tokio` to reach them
+([RD Gateway](../map/territory/rd-gateway.md)). Kind: **judgement**, the maintainer's at #613's
+close (2026-11-16), shown the cost: `fuzz/Cargo.lock` about 2,300 lines longer and the fuzz
+crate check 21 to 25 s warm, against 10.5 to 16.5 s cold before (#578); the alternative shown
+was moving the two parsers into the core.

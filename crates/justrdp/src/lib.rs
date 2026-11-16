@@ -26,6 +26,7 @@ pub mod disconnect;
 mod dvc;
 mod egfx;
 pub mod framebuffer;
+pub mod gateway;
 pub mod input;
 mod orders;
 pub mod rdpdr;
