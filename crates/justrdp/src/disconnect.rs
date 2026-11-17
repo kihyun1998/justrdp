@@ -17,6 +17,12 @@ pub enum ServerDisconnectCause {
         /// The T.125 reason (`justrdp_pdu::mcs::RN_*`).
         reason: u8,
     },
+    /// An X.224 Disconnect Request TPDU (X.224 13.5) — the transport-layer farewell, used when
+    /// neither Error Info nor an MCS ultimatum arrived (both outrank it).
+    DisconnectRequest {
+        /// The X.224 `REASON` octet, as the server sent it.
+        reason: u8,
+    },
 }
 
 /// Why the session ended — the session's terminal value.
@@ -60,9 +66,11 @@ impl DisconnectReason {
             DisconnectReason::ServerDisconnected(ServerDisconnectCause::ProviderUltimatum {
                 reason,
             }) => classify_ultimatum(*reason),
-            DisconnectReason::UnexpectedDisconnect | DisconnectReason::LocalClosed => {
-                DisconnectClass::Unknown
-            }
+            DisconnectReason::ServerDisconnected(ServerDisconnectCause::DisconnectRequest {
+                ..
+            })
+            | DisconnectReason::UnexpectedDisconnect
+            | DisconnectReason::LocalClosed => DisconnectClass::Unknown,
         }
     }
 }
@@ -195,6 +203,21 @@ mod tests {
             0x7F, // out of the T.125 enumeration, preserved verbatim on decode
         ] {
             assert_eq!(ult(reason), DisconnectClass::Unknown, "reason {reason}");
+        }
+    }
+
+    #[test]
+    fn an_x224_disconnect_request_carries_no_reaction() {
+        // Every REASON value, the X.224 13.5.3 enumeration and the rest alike.
+        for reason in 0..=u8::MAX {
+            assert_eq!(
+                DisconnectReason::ServerDisconnected(ServerDisconnectCause::DisconnectRequest {
+                    reason
+                })
+                .class(),
+                DisconnectClass::Unknown,
+                "reason {reason:#x}"
+            );
         }
     }
 }

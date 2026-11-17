@@ -1,6 +1,7 @@
-//! X.224 (ISO 8073 / RFC 905) TPDU layer — only the Connection Request / Connection Confirm
-//! TPDUs RDP uses during security negotiation. RDP carries its `RDP_NEG_REQ` / `RDP_NEG_RSP`
-//! structures in the TPDU *variable part*, so they are counted in the LI byte.
+//! X.224 (ISO 8073 / RFC 905) TPDU layer — the Connection Request / Connection Confirm TPDUs
+//! RDP uses during security negotiation, the class-0 Data TPDU every later PDU rides, and the
+//! Disconnect Request a server may end the connection with. RDP carries its `RDP_NEG_REQ` /
+//! `RDP_NEG_RSP` structures in the TPDU *variable part*, so they are counted in the LI byte.
 
 use crate::cursor::ReadCursor;
 use crate::error::DecodeError;
@@ -91,6 +92,62 @@ pub fn decode_data(tpdu: &[u8]) -> Result<&[u8], DecodeError> {
     cur.read_slice(cur.remaining())
 }
 
+/// Disconnect Request TPDU code (X.224 13.5.3).
+pub const DISCONNECT_REQUEST: u8 = 0x80;
+
+/// Bytes after the LI octet in a DR TPDU before the variable part: code(1) + DST-REF(2) +
+/// SRC-REF(2) + reason(1) (X.224 13.5.3).
+const DR_FIXED_PART_LEN: usize = 6;
+
+/// The LI value X.224 13.2.1 reserves for extensions.
+const LI_RESERVED: u8 = 0xFF;
+
+/// A decoded X.224 Disconnect Request TPDU (X.224 13.5): the peer is ending the transport
+/// connection. DST-REF, SRC-REF, the variable part and any user data are not kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisconnectRequest {
+    /// The `REASON` octet (X.224 13.5.3 d), as sent; values outside the enumeration are kept.
+    pub reason: u8,
+}
+
+impl DisconnectRequest {
+    /// True if `tpdu` carries the Disconnect Request code in its code octet — the pre-test the
+    /// connect machine and the session loop make before decoding a Data TPDU.
+    pub fn matches(tpdu: &[u8]) -> bool {
+        tpdu.get(1) == Some(&DISCONNECT_REQUEST)
+    }
+
+    /// Decode a Disconnect Request TPDU. The header LI declares must be present and hold the
+    /// fixed part; bytes after it are not read.
+    pub fn decode(tpdu: &[u8]) -> Result<Self, DecodeError> {
+        let mut cur = ReadCursor::new(tpdu, "x224 disconnect request");
+        let li = cur.read_u8()?;
+        if cur.read_u8()? != DISCONNECT_REQUEST {
+            return Err(DecodeError::InvalidField {
+                field: "x224.code",
+                reason: "expected Disconnect Request (0x80)",
+            });
+        }
+        if li == LI_RESERVED {
+            return Err(DecodeError::InvalidField {
+                field: "x224.li",
+                reason: "255 is reserved",
+            });
+        }
+        let variable_len =
+            usize::from(li)
+                .checked_sub(DR_FIXED_PART_LEN)
+                .ok_or(DecodeError::InvalidField {
+                    field: "x224.li",
+                    reason: "shorter than the Disconnect Request fixed part",
+                })?;
+        cur.read_slice(4)?; // DST-REF + SRC-REF
+        let reason = cur.read_u8()?;
+        cur.read_slice(variable_len)?;
+        Ok(Self { reason })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +174,120 @@ mod tests {
         ) {
             let _ = decode_data(&tpdu);
         }
+
+        #[test]
+        fn disconnect_request_decode_never_panics_on_arbitrary_input(
+            tpdu in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = DisconnectRequest::matches(&tpdu);
+            let _ = DisconnectRequest::decode(&tpdu);
+        }
+    }
+
+    /// A class-0 DR TPDU (X.224 13.5) with `reason` and `variable` as its variable part.
+    fn disconnect_request(reason: u8, variable: &[u8]) -> Vec<u8> {
+        let mut tpdu = vec![
+            (6 + variable.len()) as u8, // LI = fixed part + variable part
+            0x80,                       // DR
+            0x00,
+            0x00, // DST-REF
+            0x12,
+            0x34, // SRC-REF
+            reason,
+        ];
+        tpdu.extend_from_slice(variable);
+        tpdu
+    }
+
+    #[test]
+    fn disconnect_request_reads_the_reason_octet() {
+        for reason in [0x00, 0x80, 0x85, 0xFF] {
+            let tpdu = disconnect_request(reason, &[]);
+            assert!(DisconnectRequest::matches(&tpdu));
+            assert_eq!(
+                DisconnectRequest::decode(&tpdu),
+                Ok(DisconnectRequest { reason })
+            );
+        }
+    }
+
+    #[test]
+    fn disconnect_request_skips_its_variable_part_and_trailing_bytes() {
+        // Additional-information parameter (code 0xE0, length 2) in the variable part.
+        let mut tpdu = disconnect_request(0x81, &[0xE0, 0x02, 0xAA, 0xBB]);
+        assert_eq!(
+            DisconnectRequest::decode(&tpdu),
+            Ok(DisconnectRequest { reason: 0x81 })
+        );
+        tpdu.extend_from_slice(&[0x01, 0x02]); // user data, which class 0 forbids
+        assert_eq!(
+            DisconnectRequest::decode(&tpdu),
+            Ok(DisconnectRequest { reason: 0x81 })
+        );
+    }
+
+    #[test]
+    fn a_truncated_disconnect_request_is_a_decode_error() {
+        let tpdu = disconnect_request(0x80, &[0xE0, 0x02, 0xAA, 0xBB]);
+        // Every prefix: the header LI declares is not all there.
+        for len in 0..tpdu.len() {
+            assert!(
+                DisconnectRequest::decode(&tpdu[..len]).is_err(),
+                "a {len}-byte prefix decoded"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disconnect_request_whose_li_cannot_hold_the_fixed_part_is_a_decode_error() {
+        // LI = 5 covers code, DST-REF and SRC-REF but not the reason, which follows anyway.
+        let tpdu = [0x05, 0x80, 0x00, 0x00, 0x00, 0x00, 0x80];
+        assert!(DisconnectRequest::matches(&tpdu));
+        assert_eq!(
+            DisconnectRequest::decode(&tpdu),
+            Err(DecodeError::InvalidField {
+                field: "x224.li",
+                reason: "shorter than the Disconnect Request fixed part",
+            })
+        );
+    }
+
+    #[test]
+    fn a_disconnect_request_with_the_reserved_li_is_a_decode_error() {
+        let mut tpdu = vec![0xFF, 0x80, 0x00, 0x00, 0x00, 0x00, 0x80];
+        tpdu.resize(1 + 255, 0);
+        assert_eq!(
+            DisconnectRequest::decode(&tpdu),
+            Err(DecodeError::InvalidField {
+                field: "x224.li",
+                reason: "255 is reserved",
+            })
+        );
+    }
+
+    #[test]
+    fn other_tpdu_codes_are_not_a_disconnect_request() {
+        // Data, Connection Confirm, Disconnect Confirm (0xC0, not used in class 0).
+        for tpdu in [
+            encode_data(&[0x21, 0x80]),
+            vec![0x06, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x00],
+            vec![0x06, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00],
+        ] {
+            assert!(!DisconnectRequest::matches(&tpdu), "{tpdu:02x?}");
+            assert_eq!(
+                DisconnectRequest::decode(&tpdu).unwrap_err(),
+                DecodeError::InvalidField {
+                    field: "x224.code",
+                    reason: "expected Disconnect Request (0x80)",
+                },
+                "{tpdu:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_data_still_rejects_a_disconnect_request() {
+        assert!(decode_data(&disconnect_request(0x80, &[])).is_err());
     }
 
     #[test]

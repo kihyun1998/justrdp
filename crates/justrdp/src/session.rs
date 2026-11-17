@@ -670,6 +670,8 @@ pub struct SessionStateMachine {
     error_info: Option<justrdp_pdu::errinfo::ErrorInfo>,
     /// The reason from a received MCS Disconnect Provider Ultimatum (issue #42).
     ultimatum_reason: Option<u8>,
+    /// The reason from a received X.224 Disconnect Request TPDU.
+    disconnect_request_reason: Option<u8>,
     /// The drdynvc transport + Display Control state (slice-8).
     drdynvc: Drdynvc,
     /// Chunk reassembly for each host static channel, keyed by MCS channel ID.
@@ -773,6 +775,7 @@ impl SessionStateMachine {
             cursor_cache: vec![None; usize::from(cache_size)],
             error_info: None,
             ultimatum_reason: None,
+            disconnect_request_reason: None,
             drdynvc,
             channels,
             suspended: None,
@@ -785,14 +788,18 @@ impl SessionStateMachine {
     }
 
     /// Why the session ended, as far as the server said (issue #42). The adapter calls this
-    /// when the transport closes: a recorded Set Error Info code is the attribution (it
-    /// outranks the generic MCS ultimatum); with neither, the close is
-    /// [`DisconnectReason::UnexpectedDisconnect`].
+    /// when the transport closes: a recorded Set Error Info code is the attribution, then an
+    /// MCS ultimatum, then an X.224 Disconnect Request — the higher layer's word outranks the
+    /// lower's; with none of them, the close is [`DisconnectReason::UnexpectedDisconnect`].
     pub fn disconnect_reason(&self) -> DisconnectReason {
         if let Some(info) = self.error_info {
             DisconnectReason::ServerDisconnected(ServerDisconnectCause::ErrorInfo(info))
         } else if let Some(reason) = self.ultimatum_reason {
             DisconnectReason::ServerDisconnected(ServerDisconnectCause::ProviderUltimatum {
+                reason,
+            })
+        } else if let Some(reason) = self.disconnect_request_reason {
+            DisconnectReason::ServerDisconnected(ServerDisconnectCause::DisconnectRequest {
                 reason,
             })
         } else {
@@ -1218,6 +1225,14 @@ impl SessionStateMachine {
         outputs: &mut Vec<SessionOutput>,
     ) -> Result<(), SessionError> {
         let tpdu = tpkt::decode(frame).map_err(SessionError::Decode)?;
+        if x224::DisconnectRequest::matches(tpdu) {
+            // The server's transport-layer farewell: record the reason for the adapter to
+            // surface at EOF.
+            let request = x224::DisconnectRequest::decode(tpdu).map_err(SessionError::Decode)?;
+            tracing::info!(target: "rdp_x224", reason = request.reason, "X.224 Disconnect Request");
+            self.disconnect_request_reason = Some(request.reason);
+            return Ok(());
+        }
         let body = x224::decode_data(tpdu).map_err(SessionError::Decode)?;
         if mcs::DisconnectProviderUltimatum::matches(body) {
             // The server's last MCS word before closing the socket (issue #42): record the
@@ -4974,6 +4989,88 @@ mod tests {
             sm.disconnect_reason(),
             DisconnectReason::ServerDisconnected(ServerDisconnectCause::ErrorInfo(_))
         ));
+    }
+
+    /// TPKT + an X.224 Disconnect Request TPDU (X.224 13.5) with `reason` and no variable part.
+    fn disconnect_request_frame(reason: u8) -> Vec<u8> {
+        tpkt::encode(&[0x06, 0x80, 0x00, 0x00, 0x00, 0x00, reason])
+    }
+
+    fn ultimatum_frame() -> Vec<u8> {
+        tpkt::encode(&x224::encode_data(
+            &mcs::encode_disconnect_provider_ultimatum(mcs::RN_PROVIDER_INITIATED),
+        ))
+    }
+
+    #[test]
+    fn an_x224_disconnect_request_attributes_the_disconnect() {
+        for reason in [0x80, 0x01] {
+            let mut sm = SessionStateMachine::new(config(), Vec::new())
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let outputs = sm.process_bytes(&disconnect_request_frame(reason)).unwrap();
+            assert!(outputs.is_empty(), "attribution is silent, got {outputs:?}");
+            assert_eq!(
+                sm.disconnect_reason(),
+                DisconnectReason::ServerDisconnected(ServerDisconnectCause::DisconnectRequest {
+                    reason
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_x224_disconnect_request_is_a_typed_error() {
+        let mut sm = SessionStateMachine::new(config(), Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM");
+        assert!(matches!(
+            sm.process_bytes(&tpkt::encode(&[0x06, 0x80, 0x00, 0x00, 0x00, 0x00])),
+            Err(SessionError::Decode(_))
+        ));
+        assert_eq!(
+            sm.disconnect_reason(),
+            DisconnectReason::UnexpectedDisconnect
+        );
+    }
+
+    #[test]
+    fn error_info_and_the_ultimatum_outrank_an_x224_disconnect_request() {
+        let error_info = || {
+            server_data_pdu(
+                share::PDU_TYPE2_SET_ERROR_INFO,
+                &0x0000_000Cu32.to_le_bytes(),
+            )
+        };
+        // Each higher-layer farewell, before and after the Disconnect Request.
+        for (name, frame) in [
+            ("error info", error_info as fn() -> Vec<u8>),
+            ("ultimatum", ultimatum_frame),
+        ] {
+            for request_first in [false, true] {
+                let mut sm = SessionStateMachine::new(config(), Vec::new())
+                    .expect("the test desktop size is within MAX_DESKTOP_DIM");
+                if request_first {
+                    sm.process_bytes(&disconnect_request_frame(0x80)).unwrap();
+                }
+                sm.process_bytes(&frame()).unwrap();
+                if !request_first {
+                    sm.process_bytes(&disconnect_request_frame(0x80)).unwrap();
+                }
+                let reason = sm.disconnect_reason();
+                let won = match name {
+                    "error info" => matches!(
+                        reason,
+                        DisconnectReason::ServerDisconnected(ServerDisconnectCause::ErrorInfo(_))
+                    ),
+                    _ => matches!(
+                        reason,
+                        DisconnectReason::ServerDisconnected(
+                            ServerDisconnectCause::ProviderUltimatum { .. }
+                        )
+                    ),
+                };
+                assert!(won, "{name}, request first: {request_first}: {reason:?}");
+            }
+        }
     }
 
     #[test]

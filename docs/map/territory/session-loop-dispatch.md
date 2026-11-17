@@ -258,6 +258,15 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   The remembered state is kept across a reactivation. On this server a resize cannot reactivate a
   suppressed session (see Reference behaviour); whether another server-initiated reactivation ends
   suppression is unmeasured.
+- **A disconnect is attributed to the highest layer that spoke** (#42, #631). The machine records
+  a Set Error Info code, an MCS Disconnect Provider Ultimatum's reason and an X.224 Disconnect
+  Request's `REASON` as they arrive, and `disconnect_reason` returns them in that order:
+  `ServerDisconnectCause::ErrorInfo`, then `ProviderUltimatum`, then `DisconnectRequest`. The
+  order is a derivation: each layer's word is more specific than the one under it, so the lowest
+  layer's reason says least about why. A Disconnect Request is tested on the TPDU before the Data TPDU is
+  decoded, logged at `rdp_x224` info, and classifies as `DisconnectClass::Unknown` whatever its
+  reason: no X.224 13.5.3 reason names a reaction the host could take. A truncated one is a
+  `SessionError::Decode`.
 
 ## Code
 

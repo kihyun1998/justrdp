@@ -71,13 +71,33 @@ deciding the exchange itself.
   upgrade request does not carry it yet: it sends no `RDG-Correlation-Id`
   ([RD Gateway](rd-gateway.md)).
 
+- **A Disconnect Request TPDU is decoded, and only after the negotiation** (#631). X.224 13.5
+  (ITU-T X.224 11/1995, read from the PDF) gives it the full-octet code `0x80`, a six-octet fixed
+  part (code, DST-REF, SRC-REF, `REASON`) counted in LI, then a variable part, and forbids user
+  data in class 0. `DisconnectRequest::decode` refuses a LI below six, the reserved LI 255
+  (13.2.1), and a frame shorter than the header LI declares; it keeps only `REASON`, raw, and does
+  not read the variable part or anything after it, since the connection ends either way. The
+  connect machine tests for one in the stages that read MCS and the session loop on every slow-path
+  frame (see [MCS / GCC channel setup](mcs-gcc-channel-setup.md) and
+  [Session loop & dispatch](session-loop-dispatch.md)); the negotiation stage does not, so a
+  Disconnect Request in place of the Connection Confirm stays `ConnectError::Decode`. FreeRDP master
+  (`698c704108ff`) treats one as a disconnect only where it reads through `rdp_read_header`
+  (`libfreerdp/core/rdp.c`, called from `rdp_recv_tpkt_pdu`): it logs "terminating" and aborts
+  the connect. Its Connection Confirm read (`tpdu_read_connection_confirm`) and the three MCS reads
+  in `mcs.c` (through `tpdu_read_data`, the Connect-Response among them) fail on any code but the
+  one they expect, so there a Disconnect Request is an error, as it is in this negotiation stage. Its
+  `tpdu_read_header` (`tpdu.c`) checks LI against the TPKT length and seeks past five bytes after
+  the code without reading `REASON`, and checks neither the LI floor nor LI 255: where FreeRDP reads a
+  Disconnect Request as one, a frame this decoder refuses still ends the connection as a disconnect
+  there and as `Decode` here.
+
 ## Code
 
 - `justrdp-pdu/src/nego.rs` — `NegRequest`, `NegResponse`, `NegFailureCode`,
   `SecurityProtocol`, `CORRELATION_INFO_PRESENT` (#441)
 - `justrdp/src/advertise.rs` — `ConnectConfigError::CorrelationId` (#441)
 - `justrdp-pdu/src/x224.rs` — `encode_connection_request`,
-  `decode_connection_confirm`, `encode_data`, `decode_data`
+  `decode_connection_confirm`, `encode_data`, `decode_data`, `DisconnectRequest` (#631)
 - `justrdp/src/connect.rs` — `ConnectStateMachine`, `Stage`, `Action::StartTls`,
   `decode_confirm`, `Action::ServerCertificate`, `ConnectStateMachine::take_standard_security`
 - Stage strings: `tcp-connect`, `x224-negotiate`
@@ -153,6 +173,8 @@ on has never been written down for this territory.
 - Through an RD Gateway (#613) this exchange runs unchanged inside the tunnel: the machine is
   handed a `GatewayStream` where it would have dialed ([RD Gateway](rd-gateway.md)). No real
   gateway has carried it yet.
+- **Whether any real server sends an X.224 Disconnect Request is unmeasured** (#631). The tests
+  build the bytes from X.224 13.5; no capture holds one.
 - **Where the echo check could refuse a server that is not hostile, unmeasured.** A TLS-capable
   server that omits `clientRequestedProtocols` reads as `PROTOCOL_RDP` and fails, and so does a
   TLS-terminating proxy that negotiates with the backend on its own and forwards the backend's
