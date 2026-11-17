@@ -3,7 +3,7 @@
 //! `receive_never_panics_and_never_buffers_past_the_limit` in `justrdp::gateway`.
 //!
 //! `GatewayStateMachine::receive` frames the gateway's bytes into packets by `packetLength`,
-//! decodes each with `tsgu::Packet::decode` and acts on it by stage. The first input byte picks
+//! decodes each with `tsgu::Packet::decode_with_unread` and acts on it by stage. The first input byte picks
 //! what arrives first, so the arms behind it are reached: the four responses of the sequence
 //! (the open channel), or a handshake response and a tunnel response with a consent message
 //! (the pending answer). It also picks how the rest is split across reads. A consent answer

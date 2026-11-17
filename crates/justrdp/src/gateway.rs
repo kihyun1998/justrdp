@@ -360,8 +360,18 @@ impl GatewayStateMachine {
             if rest.len() < len {
                 break;
             }
-            match Packet::decode(&rest[..len]) {
-                Ok(packet) => self.on_packet(packet, &mut actions),
+            match Packet::decode_with_unread(&rest[..len]) {
+                Ok((packet, unread)) => {
+                    if unread != 0 {
+                        tracing::debug!(
+                            target: "rdg_packet",
+                            packet_type = packet.packet_type(),
+                            unread,
+                            "a gateway packet has body bytes after its last field"
+                        );
+                    }
+                    self.on_packet(packet, &mut actions);
+                }
                 Err(e) => self.fail(GatewayErrorKind::Decode(e), &mut actions),
             }
             at += len;
@@ -994,6 +1004,69 @@ mod tests {
         0x00, 0x00, // fieldsPresent
         0x00, 0x00, // reserved
     ];
+
+    /// Each packet of the Windows Server 2019 refusal fills its `packetLength` exactly.
+    #[test]
+    fn the_windows_gateway_packets_leave_no_body_byte_unread() {
+        let (handshake, tunnel) = WS2019_REFUSAL_OF_NO_CAPABILITY.split_at(18);
+        for packet in [handshake, tunnel] {
+            assert_eq!(Packet::decode_with_unread(packet).unwrap().1, 0);
+        }
+    }
+
+    /// Body bytes after a packet's last field are logged with the packet type and their count,
+    /// and the packet is acted on as without them; exact packets, the Windows gateway's among
+    /// them, log nothing.
+    #[test]
+    #[tracing_test::traced_test]
+    fn trailing_body_bytes_are_logged_and_not_refused() {
+        let padded = |bytes: &[u8], n: usize| {
+            let mut out = bytes.to_vec();
+            out.resize(bytes.len() + n, 0);
+            out[4..8].copy_from_slice(&u32::try_from(bytes.len() + n).unwrap().to_le_bytes());
+            out
+        };
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        machine.receive(&WS2019_REFUSAL_OF_NO_CAPABILITY);
+        let mut machine = open_machine();
+        assert_eq!(
+            machine.receive(&data_packet(b"x")),
+            [GatewayAction::Data(b"x".to_vec())]
+        );
+        assert!(!logs_contain("unread="));
+
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        assert_eq!(
+            machine.receive(&padded(&handshake_response(0), 3)),
+            [write(&TUNNEL_CREATE)]
+        );
+        assert_eq!(machine.stage(), STAGE_TUNNEL_CREATE);
+        let mut machine = open_machine();
+        assert_eq!(
+            machine.receive(&padded(&data_packet(b"x"), 2)),
+            [GatewayAction::Data(b"x".to_vec())]
+        );
+        logs_assert(|lines: &[&str]| {
+            let records: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("rdg_packet") && l.contains("unread="))
+                .collect();
+            let expected = [
+                format!("packet_type={} unread=3", tsgu::PKT_TYPE_HANDSHAKE_RESPONSE),
+                format!("packet_type={} unread=2", tsgu::PKT_TYPE_DATA),
+            ];
+            match records.as_slice() {
+                [first, second]
+                    if first.contains(&expected[0]) && second.contains(&expected[1]) =>
+                {
+                    Ok(())
+                }
+                _ => Err(format!("expected {expected:?}, found {records:?}")),
+            }
+        });
+    }
 
     #[test]
     fn the_refusal_a_windows_gateway_sent_names_the_tunnel_create_and_its_code() {
