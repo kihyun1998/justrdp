@@ -28,7 +28,7 @@ like any other.
 
 - **Four gating workflows and one report.** `test.yml` — three jobs: `test`
   (fmt → clippy `-D warnings` → each crate's library alone → `fuzz/` check → `fuzz/` fmt →
-  `cargo test --workspace` → rustdoc `-D warnings`) and `map`
+  `fuzz/` clippy → `cargo test --workspace` → rustdoc `-D warnings`) and `map`
   (`.github/scripts/check_map.py`, toolchain-free so a docs-only PR answers without
   waiting for cargo) and `fuzz-roster` (`.github/scripts/check_fuzz_roster.py`, toolchain-free
   too); `fuzz.yml` (weekly libFuzzer); `supply-chain.yml`
@@ -112,7 +112,10 @@ like any other.
   `cargo fmt --manifest-path fuzz/Cargo.toml --check` on the same pinned toolchain (#624). When it
   was added, 18 of the targets had drifted from rustfmt's output with every gate green. The fuzz
   crate is edition 2021, so rustfmt formats it in the 2021 style edition (import order differs from
-  the 2024 workspace's), and the step follows the crate's own edition.
+  the 2024 workspace's), and the step follows the crate's own edition. Clippy stops there too:
+  `cargo clippy --workspace` never lints `fuzz/fuzz_targets/*.rs`, so the `Fuzz crate clippy` step
+  runs `cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings` (#638).
+  When it was added, one target failed it (`clippy::chunks_exact_to_as_chunks` in `audin.rs`).
 - **A green workspace gate does not mean each crate builds alone** (#572). Clippy
   `--all-targets` and `cargo test` compile dev targets, and under resolver 2 that is exactly
   when dev-dependency features reach the library (the Cargo book, `features.md`, "Dev-dependencies

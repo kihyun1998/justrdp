@@ -93,14 +93,19 @@ jobs:
             exit 1
           fi
 
-      # `fuzz/` is its own workspace, outside every `--workspace` step above and below; this is
-      # the only PR build of it and of `justrdp`'s `fuzzing` feature on its own.
+      # `fuzz/` is its own workspace, outside every `--workspace` step above and below; this and
+      # `Fuzz crate clippy` below are the only PR builds of it and of `justrdp`'s `fuzzing` feature
+      # on its own.
       - name: Fuzz crate builds (fuzz/Cargo.toml)
         run: cargo check --locked --manifest-path fuzz/Cargo.toml
 
       # `Format` above reads only the root workspace; this is the format gate for `fuzz/`.
       - name: Fuzz crate format (fuzz/Cargo.toml)
         run: cargo fmt --manifest-path fuzz/Cargo.toml --check
+
+      # `Clippy` above reads only the root workspace; this is the lint gate for `fuzz/`.
+      - name: Fuzz crate clippy (fuzz/Cargo.toml)
+        run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --workspace
