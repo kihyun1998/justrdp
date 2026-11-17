@@ -59,6 +59,25 @@ already holds. See `## Known holes / open` for the rest.
   (`ironrdp-mstsgu`, `src/lib.rs`). **It was 0 until a Windows gateway refused it** (see
   `## Reference behaviour`): `[MS-TSGU]` 2.2.6 gives `E_PROXY_CAPABILITYMISMATCH` to a client
   without consent signing when the gateway is configured to allow only clients that have it.
+  **A negotiated `capsFlags` bit outside `ADVERTISED_CAPS` is logged, not refused.** The
+  tunnel response stores the value as received in `negotiated_caps`; when it holds a bit this
+  client did not advertise, one debug record under the `rdg_tunnel` target names those bits
+  (`unadvertised`) and the value (`negotiated`). 2.2.10.21 calls the field "the capabilities
+  negotiated by the RDG server" and has no MUST that it be a subset of the client's, so the
+  record marks a mismatch with what this client advertised, not a spec violation (unlike the
+  handshake `serverVersion` record). 3.7.5.2 step 4 has the client "initialize the ADM element
+  Negotiated Capabilities with capsFlags" as received, which is why the value is stored
+  unfiltered. The nearest case in ADR-0009 §2's list is "a capability
+  the server under- or over-advertises"; that list is scoped to rendering-feature
+  self-inconsistency (its 2026-08-25 amendment), so this applies it by analogy, and §3(b)
+  asks for the record. FreeRDP logs every negotiated value at debug
+  with no subset check (`rdg.c`, `rdg_process_tunnel_response_optional`); `ironrdp-mstsgu`
+  decodes the field and reads none (`proto.rs`). Logging only the bits outside
+  `ADVERTISED_CAPS` is **the maintainer's judgement** (#634), confirmed again once the
+  2026-08-25 scoping of §2 was put to them, and chosen over logging every
+  negotiated value as FreeRDP does and over no record with this note alone. It does not cover
+  the `idleTimeout` filter, which drops an `idleTimeout` without the capability negotiated and
+  stays silent.
 - **A consent message stops the sequence until the host answers.** `[MS-TSGU]` 3.7.5.2 step 5
   has the client "pass the consentMsg to the higher layer if it is present" in the tunnel
   response (`fieldsPresent` 0x10, 2.2.10.21). The core emits
