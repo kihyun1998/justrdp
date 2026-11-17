@@ -364,6 +364,13 @@ pub enum ConnectError {
         /// The T.125 `Result` value.
         result: u8,
     },
+    /// The server ended the connect: an MCS Disconnect Provider Ultimatum (T.125) arrived in a
+    /// stage whose frames carry MCS, from the Connect-Response wait through finalization.
+    ProviderUltimatum {
+        /// The T.125 `reason` (`RN_*`), as the server sent it; values outside the enumeration
+        /// are kept.
+        reason: u8,
+    },
     /// The server ended licensing with a License Error PDU whose code is not
     /// `STATUS_VALID_CLIENT` — no license, no session (MS-RDPELE 2.2.2.7).
     LicensingFailed {
@@ -465,10 +472,14 @@ impl Stage {
 
     /// True for the stages that consume raw socket bytes ([`Event::Received`]).
     fn accepts_received(self) -> bool {
+        matches!(self, Stage::X224Negotiate) || self.reads_mcs()
+    }
+
+    /// True for the stages whose frames are X.224 Data TPDUs carrying an MCS PDU.
+    fn reads_mcs(self) -> bool {
         matches!(
             self,
-            Stage::X224Negotiate
-                | Stage::GccExchange { .. }
+            Stage::GccExchange { .. }
                 | Stage::McsAttach { .. }
                 | Stage::ChannelJoin { .. }
                 | Stage::Licensing { .. }
@@ -731,6 +742,17 @@ impl ConnectStateMachine {
     /// Handle one complete TPKT frame according to the current stage. The frame is complete, so
     /// any decode shortfall inside it is a malformed PDU, not a partial read.
     fn on_frame(&mut self, frame: &[u8]) -> Vec<Action> {
+        if self.stage.reads_mcs()
+            && let Ok(body) = decode_mcs_frame(frame)
+            && mcs::DisconnectProviderUltimatum::matches(body)
+        {
+            return match mcs::DisconnectProviderUltimatum::decode(body) {
+                Ok(ultimatum) => self.fail(ConnectError::ProviderUltimatum {
+                    reason: ultimatum.reason,
+                }),
+                Err(e) => self.fail(ConnectError::Decode(e)),
+            };
+        }
         match self.stage {
             Stage::X224Negotiate => match decode_confirm(frame) {
                 // PROTOCOL_RDP is the empty set, so it is matched by value: only a host that
@@ -3803,6 +3825,130 @@ pub(crate) mod tests {
             ),
             "got {actions:?}"
         );
+    }
+
+    // ---- A server's Disconnect Provider Ultimatum during the connect (#607)
+
+    /// The frame #607 captured from xrdp: TPKT + X.224 DT + an ultimatum with `reason` 3
+    /// (`RN_USER_REQUESTED`).
+    const ULTIMATUM_FRAME: [u8; 9] = [0x03, 0x00, 0x00, 0x09, 0x02, 0xF0, 0x80, 0x21, 0x80];
+
+    /// A machine waiting in each of the six stages whose frames carry MCS, with the label
+    /// `stage()` reports there.
+    fn each_mcs_stage() -> Vec<(&'static str, ConnectStateMachine)> {
+        let attaching = {
+            let mut sm = awaiting_connect_response(config());
+            let actions = sm.process(Event::Received(&iron_connect_response(
+                false,
+                vec![1004, 1005],
+            )));
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [Action::WriteBytes(_), Action::WriteBytes(_)]
+                ),
+                "Erect Domain + Attach User: {actions:?}"
+            );
+            sm
+        };
+        vec![
+            ("capability-exchange", awaiting_connect_response(config())),
+            ("capability-exchange", attaching),
+            ("capability-exchange", joining_channels()),
+            ("capability-exchange", licensing()),
+            ("capability-exchange", capability_waiting()),
+            ("activation", finalizing()),
+        ]
+    }
+
+    #[test]
+    fn an_ultimatum_in_each_mcs_stage_ends_the_connect_with_its_reason() {
+        for (i, (label, mut sm)) in each_mcs_stage().into_iter().enumerate() {
+            assert_eq!(sm.stage(), label, "stage #{i} is live before the frame");
+            let actions = sm.process(Event::Received(&ULTIMATUM_FRAME));
+            assert_eq!(
+                actions,
+                vec![Action::FailWith(ConnectError::ProviderUltimatum {
+                    reason: 3
+                })],
+                "stage #{i}"
+            );
+            assert_eq!(
+                sm.stage(),
+                label,
+                "stage #{i} keeps naming the failing stage"
+            );
+            assert_eq!(
+                sm.process(Event::Received(&ULTIMATUM_FRAME)),
+                vec![Action::FailWith(ConnectError::UnexpectedEvent {
+                    stage: label,
+                    event: EventKind::Received,
+                })],
+                "stage #{i} is terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ultimatum_reason_is_read_from_the_frame() {
+        // reason 4 (RN_CHANNEL_PURGED) = 0b100: CHOICE byte 0x20 | 0b10, next byte's MSB 0.
+        let frame = [0x03, 0x00, 0x00, 0x09, 0x02, 0xF0, 0x80, 0x22, 0x00];
+        for (i, (_, mut sm)) in each_mcs_stage().into_iter().enumerate() {
+            assert_eq!(
+                sm.process(Event::Received(&frame)),
+                vec![Action::FailWith(ConnectError::ProviderUltimatum {
+                    reason: 4
+                })],
+                "stage #{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_ultimatum_stays_a_decode_error() {
+        // The ultimatum CHOICE with the byte carrying the reason's low bit cut off.
+        let frame = frame_mcs(&[0x21]);
+        for (i, (_, mut sm)) in each_mcs_stage().into_iter().enumerate() {
+            let actions = sm.process(Event::Received(&frame));
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [Action::FailWith(ConnectError::Decode(_))]
+                ),
+                "stage #{i}: {actions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_that_is_neither_the_ultimatum_nor_the_expected_pdu_stays_a_decode_error() {
+        // DomainMCSPDU CHOICE 0 (plumbDomainIndication): no stage expects it.
+        let frame = frame_mcs(&[0x00, 0x00, 0x00]);
+        for (i, (_, mut sm)) in each_mcs_stage().into_iter().enumerate() {
+            let actions = sm.process(Event::Received(&frame));
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [Action::FailWith(ConnectError::Decode(_))]
+                ),
+                "stage #{i}: {actions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ultimatum_during_x224_negotiation_stays_a_decode_error() {
+        // That stage reads a Connection Confirm, not MCS.
+        let mut sm = negotiating();
+        let actions = sm.process(Event::Received(&ULTIMATUM_FRAME));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::FailWith(ConnectError::Decode(_))]
+            ),
+            "{actions:?}"
+        );
+        assert_eq!(sm.stage(), "x224-negotiate");
     }
 
     // ---- Standard RDP Security (ADR-0020)

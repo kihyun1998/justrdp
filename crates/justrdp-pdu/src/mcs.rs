@@ -346,8 +346,8 @@ pub struct DisconnectProviderUltimatum {
 
 impl DisconnectProviderUltimatum {
     /// True if `body` (the MCS payload of an X.224 Data TPDU) opens with the
-    /// disconnect-provider-ultimatum CHOICE — the session loop's cheap pre-test before
-    /// trying [`SendDataIndication`].
+    /// disconnect-provider-ultimatum CHOICE — the cheap pre-test the connect machine and the
+    /// session loop make before decoding the PDU they expect.
     pub fn matches(body: &[u8]) -> bool {
         body.first()
             .is_some_and(|b| b >> 2 == CHOICE_DISCONNECT_PROVIDER_ULTIMATUM)
@@ -427,7 +427,8 @@ mod tests {
             let _ = ChannelJoinConfirm::decode(&body);
         }
 
-        // `matches` is driven beside `decode` because it is the session loop's pre-test: it is a
+        // `matches` is driven beside `decode` because it is the connect machine's and the session
+        // loop's pre-test: it is a
         // separate `pub fn` over the same server bytes, so a property on `decode` alone leaves it
         // undriven on a surface the invariant's derivation enumerates.
         #[test]
