@@ -34,14 +34,47 @@ already holds. See `## Known holes / open` for the rest.
   into packets by `packetLength`. `justrdp_tokio::GatewayStream` is TLS, the WebSocket and the
   stream a connect runs over.
 - **WebSocket frames carry a byte stream, not messages.** The payload of every binary frame is
-  appended to one stream and split by `packetLength`, as FreeRDP does (`rdg.c`,
-  `rdg_read_all`/`rdg_process_packet`). A packet may span frames and a frame may hold several
+  appended to one stream and split by `packetLength`, as FreeRDP does for every packet but a
+  data packet (`rdg.c`, `rdg_read_all`/`rdg_process_packet`; its data path reads `cbDataLen`
+  bytes instead, below). A packet may span frames and a frame may hold several
   packets. IronRDP's `ironrdp-mstsgu` assumes one message is one packet.
 - **`packetLength` is capped in the core, at `MAX_PACKET_LEN` = 131,116 bytes**: the longest
   packet whose layout `tsgu` knows, a tunnel response with two 65,535-byte strings. The header
   alone refuses a longer one, so its body is never awaited. `tsgu::Packet::decode` itself
   answers `NotEnoughBytes` for any `u32`; a caller that buffers until `needed` without this cap
   holds up to 4 GiB.
+- **Body bytes after a packet's last field are logged, not refused.**
+  `tsgu::Packet::decode_with_unread` returns the packet and how many bytes inside
+  `packetLength` follow its last field: after `Data`'s `cbDataLen`-prefixed data too, the
+  whole body of a keep-alive, and none for `Other`, which keeps its body. `receive` acts on the
+  packet as it would without them, and when the count is not zero writes one debug record under
+  the `rdg_packet` target with `packet_type` and `unread`, never the bytes. A field that runs
+  past `packetLength` is still `InvalidField`, and a packet the padding takes past
+  `MAX_PACKET_LEN` is still `PacketTooLong`.
+  - Ground: `[MS-TSGU]` 2.2.10.9 calls `packetLength` "the length of the packet" and has no
+    MUST that the fields fill it, nor anything about extra bytes. FreeRDP master warns
+    "unparsed data detected" with the type and the count and carries on, for the packets
+    `rdg_process_packet` handles (`rdg.c`, commit `de4109b0a7`, first in 3.22.0); its data
+    path reads `cbDataLen` bytes and does not look at `packetLength`. `ironrdp-mstsgu`
+    (`lib.rs`) differs per packet: an error after the handshake response and an extended auth
+    message, an `assert!` on the tunnel and channel responses, and no check on the tunnel
+    authorization response or a data packet. A decode failure ends the tunnel in every state,
+    so a refusal would put a session-ending failure on a path nothing has observed, the ground
+    ADR-0009's 2026-09-18 amendment kept a skip on. The Windows Server 2019 gateway's
+    committed packets (`## Reference behaviour`) fill `packetLength` exactly; the success
+    run's packets were not committed.
+  - The record catches a layout this decoder gets wrong as much as a gateway that pads:
+    FreeRDP's warning fired on its own unparsed channel response optional fields, and commit
+    `3d8bcd1c71` parsed them "just to avoid warnings about incompletely parsed packets". That
+    is the risk ADR-0009's Consequences names, tolerance masking a bug in our own decoder.
+  - Every occurrence is logged, not the first per machine. The record is at debug under a
+    target the host enables, `rdg_packet` already writes one record per skipped packet, a
+    once-flag would be state on the machine kept for a log line, and it would hide a second
+    packet type that pads after the first.
+  - Tolerating and logging is **the maintainer's judgement** (#629), chosen over refusing
+    trailing bytes in every packet, refusing them after the handshake response only, and
+    recording the tolerance here with no log, with each option's consequences shown. Logging
+    every occurrence is a technical call, made on the reasons above.
 - **Binary frame payload is never held whole.** `FrameDecoder` hands payload on as it arrives, so
   a frame's 63-bit length needs no cap. What is capped: a control frame at 125 bytes (RFC 6455
   5.5), the upgrade response header at 16 KiB, and replies not yet written at 256 KiB.
@@ -200,8 +233,8 @@ already holds. See `## Known holes / open` for the rest.
 
 ## Code
 
-- `justrdp-pdu/src/tsgu.rs` — `Packet`, `PacketHeader`, `PaaCookie`, `UnicodeString`,
-  `TunnelCreate`, `TunnelResponse`, `SohRequest`, `TunnelAuth`, `TunnelAuthResponse`,
+- `justrdp-pdu/src/tsgu.rs` — `Packet`, `decode_with_unread`, `PacketHeader`, `PaaCookie`,
+  `UnicodeString`, `TunnelCreate`, `TunnelResponse`, `SohRequest`, `TunnelAuth`, `TunnelAuthResponse`,
   `ChannelCreate`, `ChannelResponse`, `EncodeError`
 - `justrdp/src/gateway.rs` — `GatewayStateMachine`, `GatewayConfig`, `GatewayAction`,
   `GatewayChannel`, `GatewayError`, `GatewayErrorKind`, `ADVERTISED_CAPS`, `MAX_PACKET_LEN`,

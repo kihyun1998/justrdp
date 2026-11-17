@@ -437,10 +437,19 @@ impl<'a> Packet<'a> {
     /// Decode the packet at the front of `buf`. The packet occupies the
     /// [`PacketHeader::packet_length`] bytes the header declares; bytes after it are not read,
     /// and neither are body bytes after the packet's last field.
+    /// [`Packet::decode_with_unread`] reports how many of those body bytes there are.
     ///
     /// `NotEnoughBytes` means `buf` holds less than the whole packet. A field that runs past
     /// `packetLength` is `InvalidField`.
     pub fn decode(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        Self::decode_with_unread(buf).map(|(packet, _)| packet)
+    }
+
+    /// [`Packet::decode`], with the number of body bytes after the packet's last field, which
+    /// are inside `packetLength` and not read. `Data`'s field is its `cbDataLen`-prefixed data,
+    /// so bytes after that count. `Other` keeps its whole body, so its count is 0; `KeepAlive`
+    /// has no field, so its whole body counts.
+    pub fn decode_with_unread(buf: &'a [u8]) -> Result<(Self, usize), DecodeError> {
         let header = PacketHeader::decode(buf)?;
         let total = header.packet_length as usize;
         if buf.len() < total {
@@ -627,7 +636,10 @@ impl<'a> Packet<'a> {
                 packet_type,
                 body: raw,
             } => {
-                if !matches!(decode_body(*packet_type, &[]), Ok(Packet::Other { .. })) {
+                if !matches!(
+                    decode_body(*packet_type, &[]),
+                    Ok((Packet::Other { .. }, _))
+                ) {
                     return Err(EncodeError::ParsedType {
                         packet_type: *packet_type,
                     });
@@ -650,26 +662,29 @@ impl<'a> Packet<'a> {
     }
 }
 
-fn decode_body(packet_type: u16, body: &[u8]) -> Result<Packet<'_>, DecodeError> {
+/// The packet `body` holds under `packet_type`, and how many of its bytes follow the last field.
+fn decode_body(packet_type: u16, body: &[u8]) -> Result<(Packet<'_>, usize), DecodeError> {
     Ok(match packet_type {
         PKT_TYPE_HANDSHAKE_REQUEST => {
             let mut cur = ReadCursor::new(body, "HTTP_HANDSHAKE_REQUEST_PACKET");
-            Packet::HandshakeRequest(HandshakeRequest {
+            let packet = Packet::HandshakeRequest(HandshakeRequest {
                 ver_major: cur.read_u8()?,
                 ver_minor: cur.read_u8()?,
                 client_version: cur.read_u16_le()?,
                 extended_auth: cur.read_u16_le()?,
-            })
+            });
+            (packet, cur.remaining())
         }
         PKT_TYPE_HANDSHAKE_RESPONSE => {
             let mut cur = ReadCursor::new(body, "HTTP_HANDSHAKE_RESPONSE_PACKET");
-            Packet::HandshakeResponse(HandshakeResponse {
+            let packet = Packet::HandshakeResponse(HandshakeResponse {
                 error_code: cur.read_u32_le()?,
                 ver_major: cur.read_u8()?,
                 ver_minor: cur.read_u8()?,
                 server_version: cur.read_u16_le()?,
                 extended_auth: cur.read_u16_le()?,
-            })
+            });
+            (packet, cur.remaining())
         }
         PKT_TYPE_TUNNEL_CREATE => {
             let mut cur = ReadCursor::new(body, "HTTP_TUNNEL_PACKET");
@@ -686,11 +701,12 @@ fn decode_body(packet_type: u16, body: &[u8]) -> Result<Packet<'_>, DecodeError>
             } else {
                 None
             };
-            Packet::TunnelCreate(TunnelCreate {
+            let packet = Packet::TunnelCreate(TunnelCreate {
                 caps_flags,
                 reauth_tunnel_context,
                 paa_cookie,
-            })
+            });
+            (packet, cur.remaining())
         }
         PKT_TYPE_TUNNEL_RESPONSE => {
             let mut cur = ReadCursor::new(body, "HTTP_TUNNEL_RESPONSE");
@@ -727,14 +743,15 @@ fn decode_body(packet_type: u16, body: &[u8]) -> Result<Packet<'_>, DecodeError>
             } else {
                 None
             };
-            Packet::TunnelResponse(TunnelResponse {
+            let packet = Packet::TunnelResponse(TunnelResponse {
                 server_version,
                 status_code,
                 tunnel_id,
                 caps_flags,
                 soh_request,
                 consent_msg,
-            })
+            });
+            (packet, cur.remaining())
         }
         PKT_TYPE_TUNNEL_AUTH => {
             let mut cur = ReadCursor::new(body, "HTTP_TUNNEL_AUTH_PACKET");
@@ -745,10 +762,11 @@ fn decode_body(packet_type: u16, body: &[u8]) -> Result<Packet<'_>, DecodeError>
             } else {
                 None
             };
-            Packet::TunnelAuth(TunnelAuth {
+            let packet = Packet::TunnelAuth(TunnelAuth {
                 client_name,
                 statement_of_health,
-            })
+            });
+            (packet, cur.remaining())
         }
         PKT_TYPE_TUNNEL_AUTH_RESPONSE => {
             let mut cur = ReadCursor::new(body, "HTTP_TUNNEL_AUTH_RESPONSE");
@@ -770,12 +788,13 @@ fn decode_body(packet_type: u16, body: &[u8]) -> Result<Packet<'_>, DecodeError>
             } else {
                 None
             };
-            Packet::TunnelAuthResponse(TunnelAuthResponse {
+            let packet = Packet::TunnelAuthResponse(TunnelAuthResponse {
                 error_code,
                 redir_flags,
                 idle_timeout,
                 soh_response,
-            })
+            });
+            (packet, cur.remaining())
         }
         PKT_TYPE_CHANNEL_CREATE => {
             let mut cur = ReadCursor::new(body, "HTTP_CHANNEL_PACKET");
@@ -791,12 +810,13 @@ fn decode_body(packet_type: u16, body: &[u8]) -> Result<Packet<'_>, DecodeError>
             for _ in 0..num_alt_resources {
                 alt_resources.push(read_unicode_string(&mut cur)?);
             }
-            Packet::ChannelCreate(ChannelCreate {
+            let packet = Packet::ChannelCreate(ChannelCreate {
                 resources,
                 alt_resources,
                 port,
                 protocol,
-            })
+            });
+            (packet, cur.remaining())
         }
         PKT_TYPE_CHANNEL_RESPONSE => {
             let mut cur = ReadCursor::new(body, "HTTP_CHANNEL_RESPONSE");
@@ -818,31 +838,35 @@ fn decode_body(packet_type: u16, body: &[u8]) -> Result<Packet<'_>, DecodeError>
             } else {
                 None
             };
-            Packet::ChannelResponse(ChannelResponse {
+            let packet = Packet::ChannelResponse(ChannelResponse {
                 error_code,
                 channel_id,
                 udp_port,
                 authn_cookie,
-            })
+            });
+            (packet, cur.remaining())
         }
         PKT_TYPE_DATA => {
             let mut cur = ReadCursor::new(body, "HTTP_DATA_PACKET");
-            Packet::Data(read_blob(&mut cur)?)
+            let packet = Packet::Data(read_blob(&mut cur)?);
+            (packet, cur.remaining())
         }
-        PKT_TYPE_KEEPALIVE => Packet::KeepAlive,
+        PKT_TYPE_KEEPALIVE => (Packet::KeepAlive, body.len()),
         PKT_TYPE_CLOSE_CHANNEL => {
             let mut cur = ReadCursor::new(body, "HTTP_CLOSE_PACKET");
-            Packet::CloseChannel {
+            let packet = Packet::CloseChannel {
                 status_code: cur.read_u32_le()?,
-            }
+            };
+            (packet, cur.remaining())
         }
         PKT_TYPE_CLOSE_CHANNEL_RESPONSE => {
             let mut cur = ReadCursor::new(body, "HTTP_CLOSE_PACKET");
-            Packet::CloseChannelResponse {
+            let packet = Packet::CloseChannelResponse {
                 status_code: cur.read_u32_le()?,
-            }
+            };
+            (packet, cur.remaining())
         }
-        packet_type => Packet::Other { packet_type, body },
+        packet_type => (Packet::Other { packet_type, body }, 0),
     })
 }
 
@@ -905,7 +929,11 @@ mod tests {
 
     /// Decode `bytes` to `expected`, and encode `expected` back to `bytes`.
     fn assert_both_ways(bytes: &[u8], expected: Packet<'_>) {
-        assert_eq!(Packet::decode(bytes).unwrap(), expected, "decode");
+        assert_eq!(
+            Packet::decode_with_unread(bytes).unwrap(),
+            (expected.clone(), 0),
+            "decode"
+        );
         assert_eq!(expected.encode().unwrap(), bytes, "encode");
     }
 
@@ -1438,6 +1466,113 @@ mod tests {
         assert_eq!(PacketHeader::decode(&bytes).unwrap().packet_length, 14);
     }
 
+    /// `bytes` with `n` bytes appended to the body and `packetLength` grown to cover them.
+    fn padded(bytes: &[u8], n: usize) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        out.resize(bytes.len() + n, 0xA5);
+        out[4..8].copy_from_slice(&((bytes.len() + n) as u32).to_le_bytes());
+        out
+    }
+
+    /// Body bytes after the last field are reported, and the packet decodes as it does without
+    /// them, for every parsed type; `Data`'s bytes after its `cbDataLen` data count too.
+    #[test]
+    fn body_bytes_after_the_last_field_are_reported_as_unread() {
+        let packets = [
+            Packet::HandshakeRequest(HandshakeRequest {
+                ver_major: 1,
+                ver_minor: 0,
+                client_version: 0,
+                extended_auth: HTTP_EXTENDED_AUTH_PAA,
+            }),
+            Packet::HandshakeResponse(HandshakeResponse {
+                error_code: 0,
+                ver_major: 1,
+                ver_minor: 0,
+                server_version: 0,
+                extended_auth: HTTP_EXTENDED_AUTH_PAA,
+            }),
+            Packet::TunnelCreate(TunnelCreate {
+                caps_flags: 0x4,
+                reauth_tunnel_context: Some(1),
+                paa_cookie: Some(PaaCookie::from_token("ab")),
+            }),
+            Packet::TunnelResponse(TunnelResponse {
+                server_version: 1,
+                status_code: 0,
+                tunnel_id: Some(2),
+                caps_flags: Some(0x4),
+                soh_request: Some(SohRequest {
+                    nonce: [7; 16],
+                    server_cert: UnicodeString::from_str_nul("C"),
+                }),
+                consent_msg: Some(UnicodeString::from_str_nul("OK")),
+            }),
+            Packet::TunnelAuth(TunnelAuth {
+                client_name: UnicodeString::from_str_nul("n"),
+                statement_of_health: Some(vec![1, 2]),
+            }),
+            Packet::TunnelAuthResponse(TunnelAuthResponse {
+                error_code: 0,
+                redir_flags: Some(0x9),
+                idle_timeout: Some(0),
+                soh_response: Some(vec![3]),
+            }),
+            Packet::ChannelCreate(ChannelCreate {
+                resources: vec![UnicodeString::from_str_nul("t")],
+                alt_resources: vec![UnicodeString::from_str_nul("u")],
+                port: 3389,
+                protocol: 3,
+            }),
+            Packet::ChannelResponse(ChannelResponse {
+                error_code: 0,
+                channel_id: Some(1),
+                udp_port: Some(3391),
+                authn_cookie: Some(vec![4, 5]),
+            }),
+            Packet::Data(&[0x03, 0x00, 0x00, 0x13]),
+            Packet::KeepAlive,
+            Packet::CloseChannel { status_code: 1 },
+            Packet::CloseChannelResponse { status_code: 0 },
+        ];
+        for packet in packets {
+            let exact = packet.encode().unwrap();
+            assert_eq!(
+                Packet::decode_with_unread(&exact).unwrap(),
+                (packet.clone(), 0),
+                "exact {packet:?}"
+            );
+            for n in [1, 3] {
+                assert_eq!(
+                    Packet::decode_with_unread(&padded(&exact, n)).unwrap(),
+                    (packet.clone(), n),
+                    "{packet:?} padded by {n}"
+                );
+            }
+        }
+    }
+
+    /// `Other` keeps every body byte, so none is unread.
+    #[test]
+    fn an_unparsed_packet_type_leaves_no_byte_unread() {
+        let bytes = [
+            0x0B, 0x00, // packetType PKT_TYPE_SERVICE_MESSAGE
+            0x00, 0x00, // reserved
+            0x0B, 0x00, 0x00, 0x00, // packetLength 11
+            0x01, 0x00, 0x7A, // body
+        ];
+        assert_eq!(
+            Packet::decode_with_unread(&bytes).unwrap(),
+            (
+                Packet::Other {
+                    packet_type: PKT_TYPE_SERVICE_MESSAGE,
+                    body: &[0x01, 0x00, 0x7A],
+                },
+                0
+            )
+        );
+    }
+
     #[test]
     fn a_short_header_or_packet_asks_for_more_bytes() {
         assert_eq!(
@@ -1737,8 +1872,10 @@ mod tests {
         /// Whatever decodes re-encodes to a packet that decodes to the same value.
         #[test]
         fn decode_never_panics_and_what_decodes_round_trips(bytes in packet_bytes()) {
-            if let Ok(packet) = Packet::decode(&bytes) {
+            if let Ok((packet, unread)) = Packet::decode_with_unread(&bytes) {
                 let encoded = packet.encode().unwrap();
+                let packet_length = PacketHeader::decode(&bytes).unwrap().packet_length as usize;
+                prop_assert_eq!(encoded.len() + unread, packet_length);
                 prop_assert_eq!(Packet::decode(&encoded).unwrap(), packet);
             }
         }
@@ -1759,8 +1896,10 @@ mod tests {
             if let Some(cut) = cut {
                 bytes.truncate(cut % (bytes.len() + 1));
             }
-            if let Ok(decoded) = Packet::decode(&bytes) {
+            if let Ok((decoded, unread)) = Packet::decode_with_unread(&bytes) {
                 let encoded = decoded.encode().unwrap();
+                let packet_length = PacketHeader::decode(&bytes).unwrap().packet_length as usize;
+                prop_assert_eq!(encoded.len() + unread, packet_length);
                 prop_assert_eq!(Packet::decode(&encoded).unwrap(), decoded);
             }
         }

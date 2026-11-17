@@ -80,7 +80,10 @@ wrote, unapplied.
   for, were an instance read by nothing. **Closed by #621, taking two ways out on one packet**:
   the version and `ExtendedAuth` are **enforced** (a mismatch fails `gateway-handshake` before
   the cookie is sent), and `serverVersion` is **recorded** (2.2.10.11 says it is not used);
-  #628 logs a non-zero one under `rdg_handshake`.
+  #628 logs a non-zero one under `rdg_handshake`. Every packet's `packetLength` is a declared
+  length the fields need not fill: the body bytes after the last field are **recorded** in the
+  territory and counted and logged under `rdg_packet`, not enforced (#629), the way Logon Info
+  took for its declared lengths.
 
 ## What a violation looks like
 

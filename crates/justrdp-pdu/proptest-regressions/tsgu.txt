@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 176a42ca472df1229c311efc65b3790f9bf16406909956fae2e67e827f7c5223 # shrinks to bytes = [5, 0, 0, 0, 23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+cc 2366807351000067f707f51aae016ad3a7c2a5435255c5f3d2e1d20fce39f62f # shrinks to packet = ChannelResponse(ChannelResponse { error_code: 0, channel_id: Some(0), udp_port: None, authn_cookie: None }), edits = [(295886270840378812, 2)], cut = None
