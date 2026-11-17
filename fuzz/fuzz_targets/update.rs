@@ -3,9 +3,9 @@
 //! `*_never_panics_on_arbitrary_input` proptests. `BitmapUpdate::decode` walks a server-declared
 //! rectangle count and per-rectangle lengths.
 
-use libfuzzer_sys::fuzz_target;
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::update::{BitmapUpdate, PaletteUpdate};
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let mut cur = ReadCursor::new(data, "fuzz bitmap update");

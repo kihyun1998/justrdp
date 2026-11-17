@@ -12,7 +12,11 @@ fuzz_target!(|data: &[u8]| {
     let Some((&head, rest)) = data.split_first() else {
         return;
     };
-    let level = if head & 1 == 0 { MppcLevel::Rdp4 } else { MppcLevel::Rdp5 };
+    let level = if head & 1 == 0 {
+        MppcLevel::Rdp4
+    } else {
+        MppcLevel::Rdp5
+    };
     let mut mppc = Mppc::new(level);
     for packet in rest.chunks(97) {
         let _ = mppc.decompress(packet, head & 0xE0);

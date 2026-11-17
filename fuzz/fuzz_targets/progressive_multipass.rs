@@ -34,7 +34,7 @@
 use libfuzzer_sys::arbitrary::{self, Arbitrary};
 use libfuzzer_sys::fuzz_target;
 
-use justrdp_codecs::rfx::progressive::{Scratch, TILE_RGBA_LEN, TileGrid};
+use justrdp_codecs::rfx::progressive::{Scratch, TileGrid, TILE_RGBA_LEN};
 use justrdp_pdu::rfx::progressive::{
     FirstPassTile, ProgressiveCodecQuant, ProgressiveQuant, ProgressiveRegion, UpgradeTile,
 };

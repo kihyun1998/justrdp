@@ -27,7 +27,7 @@ like any other.
 ## Design model
 
 - **Four gating workflows and one report.** `test.yml` — three jobs: `test`
-  (fmt → clippy `-D warnings` → each crate's library alone → `fuzz/` →
+  (fmt → clippy `-D warnings` → each crate's library alone → `fuzz/` check → `fuzz/` fmt →
   `cargo test --workspace` → rustdoc `-D warnings`) and `map`
   (`.github/scripts/check_map.py`, toolchain-free so a docs-only PR answers without
   waiting for cargo) and `fuzz-roster` (`.github/scripts/check_fuzz_roster.py`, toolchain-free
@@ -107,7 +107,12 @@ like any other.
   locally, so without the flag CI would re-resolve it silently and leave the committed lock
   stale. Removing one entry from it turned the step red. It builds the `[[bin]]` targets the
   manifest declares, so a `fuzz_targets/*.rs` with no `[[bin]]` entry is the `fuzz-roster` job's
-  to catch, not this step's.
+  to catch, not this step's. `cargo fmt --all` stops at the same boundary: it formats the root
+  workspace's members and never reads `fuzz/`, so the `Fuzz crate format` step runs
+  `cargo fmt --manifest-path fuzz/Cargo.toml --check` on the same pinned toolchain (#624). When it
+  was added, 18 of the targets had drifted from rustfmt's output with every gate green. The fuzz
+  crate is edition 2021, so rustfmt formats it in the 2021 style edition (import order differs from
+  the 2024 workspace's), and the step follows the crate's own edition.
 - **A green workspace gate does not mean each crate builds alone** (#572). Clippy
   `--all-targets` and `cargo test` compile dev targets, and under resolver 2 that is exactly
   when dev-dependency features reach the library (the Cargo book, `features.md`, "Dev-dependencies

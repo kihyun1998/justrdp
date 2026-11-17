@@ -3,9 +3,9 @@
 //! `decode_never_panics_on_arbitrary_input` proptest. Four `infoType` variants, the Extended one
 //! with two server-length-framed fields.
 
-use libfuzzer_sys::fuzz_target;
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::session_info::SaveSessionInfo;
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let mut cur = ReadCursor::new(data, "fuzz save session info");

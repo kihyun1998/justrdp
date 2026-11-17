@@ -99,14 +99,32 @@ fuzz_target!(|input: Input<'_>| {
     use justrdp_pdu::gcc::*;
     let d = input.data;
     match input.entry {
-        Entry::ConferenceCreateResponse => { let _ = ConferenceCreateResponse::decode(d); },
-        Entry::ServerBlocks => { let _ = ServerGccBlocks::decode(d); },
-        Entry::ServerCore => { let _ = ServerCoreData::decode(d); },
-        Entry::ServerNetwork => { let _ = ServerNetworkData::decode(d); },
-        Entry::ServerSecurity => { let _ = ServerSecurityData::decode(d); },
-        Entry::ClientBlocks => { let _ = ClientGccBlocks::decode(d); },
-        Entry::ClientCore => { let _ = ClientCoreData::decode(d); },
-        Entry::ClientSecurity => { let _ = ClientSecurityData::decode(d); },
-        Entry::ClientNetwork => { let _ = ClientNetworkData::decode(d); },
+        Entry::ConferenceCreateResponse => {
+            let _ = ConferenceCreateResponse::decode(d);
+        }
+        Entry::ServerBlocks => {
+            let _ = ServerGccBlocks::decode(d);
+        }
+        Entry::ServerCore => {
+            let _ = ServerCoreData::decode(d);
+        }
+        Entry::ServerNetwork => {
+            let _ = ServerNetworkData::decode(d);
+        }
+        Entry::ServerSecurity => {
+            let _ = ServerSecurityData::decode(d);
+        }
+        Entry::ClientBlocks => {
+            let _ = ClientGccBlocks::decode(d);
+        }
+        Entry::ClientCore => {
+            let _ = ClientCoreData::decode(d);
+        }
+        Entry::ClientSecurity => {
+            let _ = ClientSecurityData::decode(d);
+        }
+        Entry::ClientNetwork => {
+            let _ = ClientNetworkData::decode(d);
+        }
     }
 });
