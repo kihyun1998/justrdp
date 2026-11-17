@@ -38,6 +38,9 @@ host's rather than the core's. Neither is about this PDU.
   the client store it *"never allowing programmatic access to it"*).
   `ServerAutoReconnect` hand-writes `Debug` to redact it, because it travels inside a
   `SessionOutput` that derives `Debug`; `log_save_session_info` has no field for it.
+  `ClientAutoReconnect` redacts its `securityVerifier` the same way, and `ClientInfo` its
+  `password`: the core writes an empty one, but a host that builds a `ClientInfo` with a
+  password and logs it would otherwise print it (#619).
 - **Three declared lengths are read and deliberately decide nothing** — Logon Info V2's
   `Size`, Logon Info Extended's `Length`, and each `TS_LOGON_INFO_FIELD`'s `cbFieldData`.
   Each is recorded in its decoder's doc rather than enforced, which is way #2 of
@@ -86,7 +89,7 @@ host's rather than the core's. Neither is about this PDU.
 - `justrdp/src/session.rs` — `SessionOutput::SaveSessionInfo`, `log_save_session_info`
 - `justrdp/src/connect.rs` — `ActivationResult`, `ClientInfoConfig`
 - `justrdp/src/auto_reconnect.rs` — `client_cookie`, `security_verifier`, `hmac_md5`
-- `justrdp-pdu/src/client_info.rs` — `ClientAutoReconnect`, `ExtendedClientInfo`
+- `justrdp-pdu/src/client_info.rs` — `ClientInfo`, `ClientAutoReconnect`, `ExtendedClientInfo`
 - `justrdp-pdu/src/capability.rs` — `GENERAL_AUTORECONNECT_SUPPORTED`,
   `default_client_capabilities`
 - `justrdp-tokio/src/lib.rs` — `SessionEvent`,

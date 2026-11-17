@@ -269,7 +269,7 @@ impl core::fmt::Debug for ClientAutoReconnect {
 /// framed form). String fields are always encoded UTF-16; the password field exists because the
 /// wire demands one, and stays empty under NLA where CredSSP already delegated the real
 /// credentials (ADR-0002 keeps secrets out of the sans-IO machine entirely).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ClientInfo {
     /// `CodePage` (0 with UTF-16 strings; carries the ANSI code page only for ANSI clients).
     pub code_page: u32,
@@ -288,6 +288,33 @@ pub struct ClientInfo {
     pub work_dir: String,
     /// The extended info packet.
     pub extra: ExtendedClientInfo,
+}
+
+/// Every field as the derive would print it, except `password`, which prints as `"<redacted>"`
+/// whether or not it is empty.
+impl core::fmt::Debug for ClientInfo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let Self {
+            code_page,
+            flags,
+            domain,
+            username,
+            password: _,
+            alternate_shell,
+            work_dir,
+            extra,
+        } = self;
+        f.debug_struct("ClientInfo")
+            .field("code_page", code_page)
+            .field("flags", flags)
+            .field("domain", domain)
+            .field("username", username)
+            .field("password", &"<redacted>")
+            .field("alternate_shell", alternate_shell)
+            .field("work_dir", work_dir)
+            .field("extra", extra)
+            .finish()
+    }
 }
 
 /// Write `s` as UTF-16LE plus a null terminator, returning the string's byte length
@@ -667,6 +694,21 @@ mod tests {
             "the verifier's first byte leaked: {shown}"
         );
         assert!(!shown.to_lowercase().contains("a0"), "{shown}");
+    }
+
+    #[test]
+    fn the_password_is_not_printed_by_debug() {
+        let mut info = client_info();
+        info.alternate_shell = "shell.exe".to_string();
+        info.work_dir = "C:\\work".to_string();
+        // The derive's output for this value, with the placeholder in place of the password.
+        let expected = r#"ClientInfo { code_page: 0, flags: ClientInfoFlags(196681), domain: "WORKGROUP", username: "rdptest", password: "<redacted>", alternate_shell: "shell.exe", work_dir: "C:\\work", extra: ExtendedClientInfo { address_family: 2, address: "192.168.0.10", dir: "C:\\justrdp", timezone: TimezoneInfo { bias: -540, standard_name: "Korea Standard Time", standard_bias: 0, daylight_name: "Korea Daylight Time", daylight_bias: -60 }, session_id: 0, performance_flags: 7, reconnect_cookie: None } }"#;
+        assert_eq!(format!("{info:?}"), expected, "an empty password");
+        info.password = "Hunter2Secret".to_string();
+        assert_eq!(format!("{info:?}"), expected, "a set password");
+        let pretty = format!("{info:#?}");
+        assert!(!pretty.contains("Hunter2Secret"), "{pretty}");
+        assert!(pretty.contains(r#"password: "<redacted>","#), "{pretty}");
     }
 
     #[test]
