@@ -53,6 +53,13 @@ places the sequence in a state machine.
   not test for one, since that stage reads a Connection Confirm. The host gets the raw T.125
   reason, not a `DisconnectClass`: `classify_ultimatum` reads reason 3 as a user logoff, which
   does not describe a server refusing a connect.
+- **An X.224 Disconnect Request ends the connect in the same six stages** (#631). `on_frame`
+  tests `x224::DisconnectRequest::matches` on the TPDU, before the ultimatum test and before the
+  stage decodes its Data TPDU, and fails with `ConnectError::DisconnectRequest { reason }`
+  carrying the raw X.224 `REASON`. The code octet separates it from everything the stages expect:
+  a Data TPDU carries `0xF0` there. A Disconnect Request cut short stays `ConnectError::Decode`,
+  as does any other TPDU code. X.224 negotiation tests for one too, in place of the Connection
+  Confirm, where X.224 6.6.3 defines it ([X.224 negotiation](x224-negotiation.md)).
 
 ## Code
 
@@ -64,7 +71,8 @@ places the sequence in a state machine.
   `DisconnectProviderUltimatum`, `encode_attach_user_request`, `decode_connect_response`
 - `justrdp-pdu/src/ber.rs`, `justrdp-pdu/src/per.rs` — the two encodings
 - `justrdp/src/connect.rs` — `McsConnectResult`, `StaticChannel`, `decode_mcs_frame`,
-  `Stage::reads_mcs` (the stages that test for the ultimatum)
+  `Stage::reads_mcs` (the stages that test for the ultimatum),
+  `Stage::reads_disconnect_request` (those and X.224 negotiation, for the X.224 Disconnect Request)
 - Stage strings: `sm-user`, `sm-test`, and the MCS half of `capability-exchange`
 
 ## Reference behaviour
@@ -115,7 +123,9 @@ recorded.
 - Which connect stages a real server sends the Disconnect Provider Ultimatum in is not measured.
   It was seen once: xrdp 0.9.24 sent `0300000902f0802180` (reason 3) in `capability-exchange`
   after the channel join, under Standard RDP Security (#603, 2026-11-09). The other five stages
-  are covered by feeding that frame to the sans-IO machine, not by a server.
+  are covered by feeding that frame to the sans-IO machine, not by a server. No server has been
+  seen sending an X.224 Disconnect Request in any stage; the six are covered with bytes built from
+  X.224 13.5.
 - The skip-channel-join path is proven only against the scripted server
   (`skip_channel_join_bypasses_joins_when_both_sides_advertise_it`): the test VM never skips
   (`rdp_mcs` records `skip_channel_join=false`, #429), so no live server has exercised it.

@@ -371,6 +371,15 @@ pub enum ConnectError {
         /// are kept.
         reason: u8,
     },
+    /// The server ended the connect at the transport layer: an X.224 Disconnect Request TPDU
+    /// (X.224 13.5) arrived in place of the Connection Confirm, where X.224 6.6.3 defines it as
+    /// the responder refusing the connection, or in a stage whose frames carry MCS, from the
+    /// Connect-Response wait through finalization.
+    DisconnectRequest {
+        /// The X.224 `REASON` octet, as the server sent it; values outside the enumeration are
+        /// kept.
+        reason: u8,
+    },
     /// The server ended licensing with a License Error PDU whose code is not
     /// `STATUS_VALID_CLIENT` — no license, no session (MS-RDPELE 2.2.2.7).
     LicensingFailed {
@@ -486,6 +495,13 @@ impl Stage {
                 | Stage::CapabilityExchange { .. }
                 | Stage::Finalization { .. }
         )
+    }
+
+    /// The stages that read an X.224 Disconnect Request as the server ending the connect: X.224
+    /// negotiation, where it stands in place of the Connection Confirm, and every stage that
+    /// reads MCS.
+    fn reads_disconnect_request(self) -> bool {
+        matches!(self, Stage::X224Negotiate) || self.reads_mcs()
     }
 }
 
@@ -742,6 +758,17 @@ impl ConnectStateMachine {
     /// Handle one complete TPKT frame according to the current stage. The frame is complete, so
     /// any decode shortfall inside it is a malformed PDU, not a partial read.
     fn on_frame(&mut self, frame: &[u8]) -> Vec<Action> {
+        if self.stage.reads_disconnect_request()
+            && let Ok(tpdu) = tpkt::decode(frame)
+            && x224::DisconnectRequest::matches(tpdu)
+        {
+            return match x224::DisconnectRequest::decode(tpdu) {
+                Ok(request) => self.fail(ConnectError::DisconnectRequest {
+                    reason: request.reason,
+                }),
+                Err(e) => self.fail(ConnectError::Decode(e)),
+            };
+        }
         if self.stage.reads_mcs()
             && let Ok(body) = decode_mcs_frame(frame)
             && mcs::DisconnectProviderUltimatum::matches(body)
@@ -3949,6 +3976,144 @@ pub(crate) mod tests {
             "{actions:?}"
         );
         assert_eq!(sm.stage(), "x224-negotiate");
+    }
+
+    // ---- A server's X.224 Disconnect Request during the connect (#631)
+
+    /// TPKT + an X.224 Disconnect Request TPDU (X.224 13.5) with `reason` and no variable part.
+    fn disconnect_request_frame(reason: u8) -> Vec<u8> {
+        tpkt::encode(&[0x06, 0x80, 0x00, 0x00, 0x00, 0x00, reason])
+    }
+
+    #[test]
+    fn a_disconnect_request_in_each_mcs_stage_ends_the_connect_with_its_reason() {
+        // 0x80 is a class 1-4 reason ("normal disconnect initiated by session entity"), 0x01 a
+        // reason for all classes ("congestion at TSAP"); both are kept raw.
+        for reason in [0x80, 0x01] {
+            let frame = disconnect_request_frame(reason);
+            for (i, (label, mut sm)) in each_mcs_stage().into_iter().enumerate() {
+                assert_eq!(sm.stage(), label, "stage #{i} is live before the frame");
+                assert_eq!(
+                    sm.process(Event::Received(&frame)),
+                    vec![Action::FailWith(ConnectError::DisconnectRequest { reason })],
+                    "stage #{i}, reason {reason:#x}"
+                );
+                assert_eq!(
+                    sm.stage(),
+                    label,
+                    "stage #{i} keeps naming the failing stage"
+                );
+                assert_eq!(
+                    sm.process(Event::Received(&frame)),
+                    vec![Action::FailWith(ConnectError::UnexpectedEvent {
+                        stage: label,
+                        event: EventKind::Received,
+                    })],
+                    "stage #{i} is terminal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_disconnect_request_with_a_variable_part_still_ends_the_connect() {
+        // Additional-information parameter (X.224 13.5.4 a) in the variable part.
+        let frame = tpkt::encode(&[
+            0x0A, 0x80, 0x00, 0x00, 0x00, 0x00, 0x85, 0xE0, 0x02, 0xAA, 0xBB,
+        ]);
+        for (i, (_, mut sm)) in each_mcs_stage().into_iter().enumerate() {
+            assert_eq!(
+                sm.process(Event::Received(&frame)),
+                vec![Action::FailWith(ConnectError::DisconnectRequest {
+                    reason: 0x85
+                })],
+                "stage #{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_disconnect_request_stays_a_decode_error() {
+        // LI declares six header bytes; the reason octet is missing.
+        let frame = tpkt::encode(&[0x06, 0x80, 0x00, 0x00, 0x00, 0x00]);
+        for (i, (_, mut sm)) in each_mcs_stage().into_iter().enumerate() {
+            let actions = sm.process(Event::Received(&frame));
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [Action::FailWith(ConnectError::Decode(_))]
+                ),
+                "stage #{i}: {actions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_non_data_tpdus_stay_a_decode_error() {
+        // Disconnect Confirm (0xC0) and Connection Confirm (0xD0): neither is a Data TPDU.
+        for tpdu in [
+            [0x06, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x80],
+            [0x06, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x00],
+        ] {
+            let frame = tpkt::encode(&tpdu);
+            for (i, (_, mut sm)) in each_mcs_stage().into_iter().enumerate() {
+                let actions = sm.process(Event::Received(&frame));
+                assert!(
+                    matches!(
+                        actions.as_slice(),
+                        [Action::FailWith(ConnectError::Decode(_))]
+                    ),
+                    "stage #{i}, code {:#x}: {actions:?}",
+                    tpdu[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_disconnect_request_in_place_of_the_connection_confirm_ends_the_connect() {
+        // X.224 6.6.3: a responder refusing the connection answers the CR-TPDU with a DR-TPDU.
+        // Two of the reasons X.224 13.5.3 d) gives for all classes: 0x02 "session entity not
+        // attached to TSAP" and 0x01 "congestion at TSAP"; both are kept raw.
+        for reason in [0x02, 0x01] {
+            let frame = disconnect_request_frame(reason);
+            let mut sm = negotiating();
+            assert_eq!(sm.stage(), "x224-negotiate");
+            assert_eq!(
+                sm.process(Event::Received(&frame)),
+                vec![Action::FailWith(ConnectError::DisconnectRequest { reason })],
+                "reason {reason:#x}"
+            );
+            assert_eq!(sm.stage(), "x224-negotiate");
+            assert_eq!(
+                sm.process(Event::Received(&frame)),
+                vec![Action::FailWith(ConnectError::UnexpectedEvent {
+                    stage: "x224-negotiate",
+                    event: EventKind::Received,
+                })],
+                "reason {reason:#x}: terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_or_unexpected_tpdu_in_place_of_the_connection_confirm_stays_a_decode_error() {
+        // A Disconnect Request missing its reason octet, and a Disconnect Confirm (0xC0).
+        for tpdu in [
+            &[0x06, 0x80, 0x00, 0x00, 0x00, 0x00][..],
+            &[0x06, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x80][..],
+        ] {
+            let mut sm = negotiating();
+            let actions = sm.process(Event::Received(&tpkt::encode(tpdu)));
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [Action::FailWith(ConnectError::Decode(_))]
+                ),
+                "{tpdu:02x?}: {actions:?}"
+            );
+            assert_eq!(sm.stage(), "x224-negotiate");
+        }
     }
 
     // ---- Standard RDP Security (ADR-0020)

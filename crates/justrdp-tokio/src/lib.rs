@@ -1015,7 +1015,8 @@ impl core::error::Error for SessionFailure {}
 /// over `activation.server_capabilities`), then pass [`ConnectOutcome::stream`].
 ///
 /// Runs until the transport ends, returning the typed [`DisconnectReason`] (issue #42): the
-/// server's Set Error Info / MCS ultimatum attribution when one arrived before the close,
+/// server's Set Error Info / MCS ultimatum / X.224 Disconnect Request attribution when one
+/// arrived before the close,
 /// [`DisconnectReason::UnexpectedDisconnect`] otherwise. Protocol violations still surface as
 /// `Err`. The future may also simply be dropped (the caller owns cancellation); the machine is
 /// borrowed, so the caller keeps access to its framebuffer afterwards.
