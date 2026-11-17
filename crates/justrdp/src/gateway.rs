@@ -77,7 +77,8 @@ pub struct GatewayChannel {
     pub tunnel_id: Option<u32>,
     /// `channelId` of the channel response.
     pub channel_id: Option<u32>,
-    /// `capsFlags` of the tunnel response: the capabilities the gateway negotiated.
+    /// `capsFlags` of the tunnel response: the capabilities the gateway negotiated, as received,
+    /// which can hold bits outside [`ADVERTISED_CAPS`].
     pub negotiated_caps: Option<u32>,
     /// `redirFlags` of the tunnel authorization response: the device redirections the gateway's
     /// policy allows, as `HTTP_TUNNEL_REDIR_*` flags (MS-TSGU 2.2.5.3.7).
@@ -488,6 +489,15 @@ impl GatewayStateMachine {
                 }
                 self.channel.tunnel_id = response.tunnel_id;
                 self.channel.negotiated_caps = response.caps_flags;
+                let unadvertised = response.caps_flags.unwrap_or(0) & !ADVERTISED_CAPS;
+                if unadvertised != 0 {
+                    tracing::debug!(
+                        target: "rdg_tunnel",
+                        unadvertised,
+                        negotiated = response.caps_flags,
+                        "accepting negotiated capsFlags the client did not advertise"
+                    );
+                }
                 match response.consent_msg {
                     Some(consent) => {
                         self.state = State::Consent;
@@ -753,6 +763,55 @@ mod tests {
     #[test]
     fn consent_signing_is_the_one_capability_advertised() {
         assert_eq!(ADVERTISED_CAPS, 0x4);
+    }
+
+    /// A negotiated `capsFlags` bit outside `ADVERTISED_CAPS` is logged with the bits seen, and
+    /// the sequence goes on to the tunnel authorization with the value stored as received; no
+    /// field, zero and the advertised bit alone log nothing.
+    #[test]
+    #[tracing_test::traced_test]
+    fn negotiated_caps_outside_the_advertised_ones_are_logged_and_not_refused() {
+        let response = |caps_flags| {
+            Packet::TunnelResponse(TunnelResponse {
+                server_version: 0,
+                status_code: 0,
+                tunnel_id: Some(7),
+                caps_flags,
+                soh_request: None,
+                consent_msg: None,
+            })
+            .encode()
+            .unwrap()
+        };
+        let after_tunnel = |caps_flags| {
+            let mut machine = GatewayStateMachine::new(config()).unwrap();
+            machine.start();
+            machine.receive(&handshake_response(0));
+            assert_eq!(
+                machine.receive(&response(caps_flags)),
+                [write(&TUNNEL_AUTH)]
+            );
+            assert_eq!(machine.stage(), STAGE_TUNNEL_AUTH);
+            assert_eq!(machine.channel.negotiated_caps, caps_flags);
+        };
+        for quiet in [None, Some(0), Some(ADVERTISED_CAPS)] {
+            after_tunnel(quiet);
+        }
+        assert!(!logs_contain("rdg_tunnel"));
+
+        let unadvertised = tsgu::HTTP_CAPABILITY_IDLE_TIMEOUT | tsgu::HTTP_CAPABILITY_UDP_TRANSPORT;
+        after_tunnel(Some(ADVERTISED_CAPS | unadvertised));
+        let expected = format!("unadvertised={unadvertised}");
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|l| l.contains("rdg_tunnel") && l.contains(&expected))
+                .count()
+            {
+                1 => Ok(()),
+                n => Err(format!("expected one rdg_tunnel record, found {n}")),
+            }
+        });
     }
 
     /// A tunnel response that carries `text` as its consent message.
