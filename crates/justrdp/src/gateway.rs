@@ -470,6 +470,13 @@ impl GatewayStateMachine {
                     let extended_auth = response.extended_auth;
                     return self.fail(GatewayErrorKind::PaaNotOffered { extended_auth }, actions);
                 }
+                if response.server_version != 0 {
+                    tracing::debug!(
+                        target: "rdg_handshake",
+                        server_version = response.server_version,
+                        "accepting a handshake response with a non-zero serverVersion"
+                    );
+                }
                 self.enter(State::TunnelCreate, STAGE_TUNNEL_CREATE);
                 actions.push(GatewayAction::WriteBytes(core::mem::take(
                     &mut self.tunnel_create,
@@ -1015,6 +1022,43 @@ mod tests {
                 kind: GatewayErrorKind::Refused { code: 0x8007_59D8 },
             })]
         );
+    }
+
+    /// A non-zero handshake `serverVersion` is logged with the value seen, and the sequence
+    /// goes on to the tunnel create; a zero one logs nothing.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_non_zero_handshake_server_version_is_logged_and_not_refused() {
+        let response = |server_version| {
+            Packet::HandshakeResponse(HandshakeResponse {
+                error_code: 0,
+                ver_major: 1,
+                ver_minor: 0,
+                server_version,
+                extended_auth: tsgu::HTTP_EXTENDED_AUTH_PAA,
+            })
+            .encode()
+            .unwrap()
+        };
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        assert_eq!(machine.receive(&response(0)), [write(&TUNNEL_CREATE)]);
+        assert!(!logs_contain("server_version="));
+
+        let mut machine = GatewayStateMachine::new(config()).unwrap();
+        machine.start();
+        assert_eq!(machine.receive(&response(0x0102)), [write(&TUNNEL_CREATE)]);
+        assert_eq!(machine.stage(), STAGE_TUNNEL_CREATE);
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|l| l.contains("rdg_handshake") && l.contains("server_version=258"))
+                .count()
+            {
+                1 => Ok(()),
+                n => Err(format!("expected one rdg_handshake record, found {n}")),
+            }
+        });
     }
 
     /// PAA among other offers is a match: the Windows gateway of #613 answered 0x7.

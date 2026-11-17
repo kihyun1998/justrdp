@@ -118,7 +118,10 @@ already holds. See `## Known holes / open` for the rest.
   - A refusal is checked first, so a gateway that refuses with the version zeroed is reported by
     its code.
   - `serverVersion` is not checked. 2.2.10.11: "This field is not used and MUST be set to
-    zero." Nothing reads it, so a non-zero value changes nothing this client does.
+    zero." Nothing acts on it, so a non-zero value changes nothing this client does. Accepting
+    one is a divergence, so it is logged under the `rdg_handshake` target with the value seen
+    (ADR-0009 §3(b), per-area target as its amendment reads it). The Windows Server 2019
+    gateway of #613 sent 0.
   - Prior art: FreeRDP logs both fields and acts on neither (`rdg.c`,
     `rdg_process_handshake_response`); it takes the NTLM path on what it asked for.
     `ironrdp-mstsgu` (`lib.rs`, `handshake`) fails on a version other than 1.0 and on a
@@ -294,14 +297,16 @@ connect reached session-active.
   written, on the reading that the gateway enforces the idle timer; the timer in 3.3.6.1 is the
   server's session timeout, and the idle one is the client's.
 - [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)
-  — the tunnel response's `serverVersion`, `nonce` and `serverCert`, the tunnel
-  authorization's `SoHResponse`, and the channel response's `udpPort` and `authnCookie` are
-  decoded and not read. Each belongs to a capability that is not advertised or a transport that
-  is not built. `redirFlags`, `idleTimeout`, the ids and the negotiated capabilities reach the
-  host in `GatewayChannel`, and `consentMsg` in `on_consent`.
+  — the tunnel response's `nonce` and `serverCert`, the tunnel authorization's
+  `SoHResponse`, and the channel response's `udpPort` and `authnCookie` are decoded and not
+  read. Each belongs to a capability that is not advertised or a transport that is not built.
+  The tunnel response's `serverVersion` is decoded and not read for another reason: 2.2.10.20
+  calls it the version of the RDGHTTP protocol and fixes no value, so no value it carries is a
+  divergence, and none is logged. `redirFlags`, `idleTimeout`, the ids and the negotiated
+  capabilities reach the host in `GatewayChannel`, and `consentMsg` in `on_consent`.
   The handshake response's version and `ExtendedAuth` are enforced, and its `serverVersion` is
-  recorded on `HandshakeResponse::server_version` as unchecked; both are under
-  `## Design model`.
+  recorded on `HandshakeResponse::server_version` as unchecked and logged when non-zero; all
+  three are under `## Design model`.
 
 ## Blast radius
 

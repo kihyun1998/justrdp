@@ -263,8 +263,8 @@ pub struct HandshakeResponse {
     pub ver_major: u8,
     /// `verMinor`.
     pub ver_minor: u8,
-    /// `serverVersion`; the spec says it is not used and requires zero. Nothing reads it and
-    /// nothing checks it: a gateway that sends another value is not refused for it.
+    /// `serverVersion`; the spec says it is not used and requires zero. A gateway that sends
+    /// another value is not refused for it; the gateway state machine logs the value.
     pub server_version: u16,
     /// `ExtendedAuth`, `HTTP_EXTENDED_AUTH_*` flags (2.2.5.3.2).
     pub extended_auth: u16,
@@ -296,7 +296,8 @@ pub struct SohRequest {
 /// `fieldsPresent` is the set of optional fields that are `Some`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelResponse {
-    /// `serverVersion`.
+    /// `serverVersion`, the version of the RDGHTTP protocol. The spec fixes no value, and
+    /// nothing reads it.
     pub server_version: u16,
     /// `statusCode`.
     pub status_code: u32,
