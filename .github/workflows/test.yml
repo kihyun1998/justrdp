@@ -98,6 +98,10 @@ jobs:
       - name: Fuzz crate builds (fuzz/Cargo.toml)
         run: cargo check --locked --manifest-path fuzz/Cargo.toml
 
+      # `Format` above reads only the root workspace; this is the format gate for `fuzz/`.
+      - name: Fuzz crate format (fuzz/Cargo.toml)
+        run: cargo fmt --manifest-path fuzz/Cargo.toml --check
+
       - name: Test
         run: cargo test --workspace
 

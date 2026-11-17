@@ -4,9 +4,9 @@
 //! deepest license parse — it walks the embedded `ServerCertificate` and proprietary RSA modulus
 //! (a length-driven, OOB-prone path), so this target covers those nested parsers too.
 
-use libfuzzer_sys::fuzz_target;
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::license::ServerLicenseRequest;
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let mut cur = ReadCursor::new(data, "fuzz license-request");

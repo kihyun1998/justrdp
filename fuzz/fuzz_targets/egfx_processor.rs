@@ -52,8 +52,8 @@
 //! records — which is why the payloads here are `Vec<u8>` and not larger structures: the
 //! interesting inputs are short. No seeder writes for this target.
 
-use justrdp::Framebuffer;
 use justrdp::fuzzing::{DvcProcessor as _, GraphicsProcessor};
+use justrdp::Framebuffer;
 use justrdp_pdu::egfx;
 use libfuzzer_sys::arbitrary::{self, Arbitrary};
 use libfuzzer_sys::fuzz_target;

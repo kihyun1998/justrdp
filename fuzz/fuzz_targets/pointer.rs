@@ -3,9 +3,9 @@
 //! `decode_pointer_never_panics` proptest. Both masks must match the stride x height the header
 //! implies, but nothing stops a server from lying — so they are the attacker-controlled surface.
 
+use justrdp_codecs::color::Palette;
 use libfuzzer_sys::arbitrary::{self, Arbitrary};
 use libfuzzer_sys::fuzz_target;
-use justrdp_codecs::color::Palette;
 
 /// `width`/`height` are bounded (u8, widened to u16); `xor`/`and` are the unbounded mask blobs.
 /// `bpp_sel` indexes the five real depths. The palette is the fixed session default — pointer

@@ -65,10 +65,20 @@ fuzz_target!(|input: Input<'_>| {
     // undriven would be a gap the invariant's derivation would keep finding.
     let _ = DisconnectProviderUltimatum::matches(d);
     match input.entry {
-        Entry::ConnectResponse => { let _ = decode_connect_response(d); },
-        Entry::AttachUserConfirm => { let _ = AttachUserConfirm::decode(d); },
-        Entry::SendDataIndication => { let _ = SendDataIndication::decode(d); },
-        Entry::ChannelJoinConfirm => { let _ = ChannelJoinConfirm::decode(d); },
-        Entry::DisconnectProviderUltimatum => { let _ = DisconnectProviderUltimatum::decode(d); },
+        Entry::ConnectResponse => {
+            let _ = decode_connect_response(d);
+        }
+        Entry::AttachUserConfirm => {
+            let _ = AttachUserConfirm::decode(d);
+        }
+        Entry::SendDataIndication => {
+            let _ = SendDataIndication::decode(d);
+        }
+        Entry::ChannelJoinConfirm => {
+            let _ = ChannelJoinConfirm::decode(d);
+        }
+        Entry::DisconnectProviderUltimatum => {
+            let _ = DisconnectProviderUltimatum::decode(d);
+        }
     }
 });

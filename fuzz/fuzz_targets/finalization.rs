@@ -61,9 +61,9 @@
 //! weaker claim than the one it replaces, and it is the true one. The cost is one 300s matrix
 //! job guarding nine branches.
 
-use libfuzzer_sys::fuzz_target;
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::finalization::{Control, FontMap, Synchronize};
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let mut cur = ReadCursor::new(data, "fuzz synchronize");

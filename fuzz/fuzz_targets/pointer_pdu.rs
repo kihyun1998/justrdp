@@ -39,11 +39,11 @@
 //! repo commits no captured pointer PDU — so nothing outside this file depends on the layout, but
 //! it is stated because the next person to add one will need it.
 
-use libfuzzer_sys::arbitrary::{self, Arbitrary};
-use libfuzzer_sys::fuzz_target;
 use justrdp_codecs::color::Palette;
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::pointer::PointerUpdate;
+use libfuzzer_sys::arbitrary::{self, Arbitrary};
+use libfuzzer_sys::fuzz_target;
 
 #[derive(Arbitrary, Debug)]
 struct Input<'a> {

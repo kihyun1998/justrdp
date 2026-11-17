@@ -63,10 +63,10 @@
 //! verbatim. No seeder writes for this target (the repo commits no captured licensing message), so
 //! nothing outside this file depends on the layout yet.
 
-use libfuzzer_sys::arbitrary::{self, Arbitrary};
-use libfuzzer_sys::fuzz_target;
 use justrdp_pdu::cursor::ReadCursor;
 use justrdp_pdu::license;
+use libfuzzer_sys::arbitrary::{self, Arbitrary};
+use libfuzzer_sys::fuzz_target;
 
 /// Which parser `data` is handed to. `Sequence` is the only arm a server reaches as such; the
 /// rest are doors into body parsers that arm otherwise guards behind an eight-byte prefix.
