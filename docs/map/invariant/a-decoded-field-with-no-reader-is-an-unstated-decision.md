@@ -79,7 +79,8 @@ wrote, unapplied.
   The handshake response's version and `ExtendedAuth`, the answer to what the client asked
   for, were an instance read by nothing. **Closed by #621, taking two ways out on one packet**:
   the version and `ExtendedAuth` are **enforced** (a mismatch fails `gateway-handshake` before
-  the cookie is sent), and `serverVersion` is **recorded** (2.2.10.11 says it is not used).
+  the cookie is sent), and `serverVersion` is **recorded** (2.2.10.11 says it is not used);
+  #628 logs a non-zero one under `rdg_handshake`.
 
 ## What a violation looks like
 
