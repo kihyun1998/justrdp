@@ -58,8 +58,8 @@ places the sequence in a state machine.
   stage decodes its Data TPDU, and fails with `ConnectError::DisconnectRequest { reason }`
   carrying the raw X.224 `REASON`. The code octet separates it from everything the stages expect:
   a Data TPDU carries `0xF0` there. A Disconnect Request cut short stays `ConnectError::Decode`,
-  as does any other TPDU code. X.224 negotiation does not test for one
-  ([X.224 negotiation](x224-negotiation.md)).
+  as does any other TPDU code. X.224 negotiation tests for one too, in place of the Connection
+  Confirm, where X.224 6.6.3 defines it ([X.224 negotiation](x224-negotiation.md)).
 
 ## Code
 
@@ -71,7 +71,8 @@ places the sequence in a state machine.
   `DisconnectProviderUltimatum`, `encode_attach_user_request`, `decode_connect_response`
 - `justrdp-pdu/src/ber.rs`, `justrdp-pdu/src/per.rs` — the two encodings
 - `justrdp/src/connect.rs` — `McsConnectResult`, `StaticChannel`, `decode_mcs_frame`,
-  `Stage::reads_mcs` (the stages that test for the ultimatum and the X.224 Disconnect Request)
+  `Stage::reads_mcs` (the stages that test for the ultimatum),
+  `Stage::reads_disconnect_request` (those and X.224 negotiation, for the X.224 Disconnect Request)
 - Stage strings: `sm-user`, `sm-test`, and the MCS half of `capability-exchange`
 
 ## Reference behaviour

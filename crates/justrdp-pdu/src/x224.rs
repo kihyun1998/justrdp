@@ -112,7 +112,8 @@ pub struct DisconnectRequest {
 
 impl DisconnectRequest {
     /// True if `tpdu` carries the Disconnect Request code in its code octet — the pre-test the
-    /// connect machine and the session loop make before decoding a Data TPDU.
+    /// connect machine and the session loop make before decoding the Connection Confirm or a
+    /// Data TPDU.
     pub fn matches(tpdu: &[u8]) -> bool {
         tpdu.get(1) == Some(&DISCONNECT_REQUEST)
     }

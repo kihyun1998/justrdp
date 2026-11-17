@@ -372,8 +372,9 @@ pub enum ConnectError {
         reason: u8,
     },
     /// The server ended the connect at the transport layer: an X.224 Disconnect Request TPDU
-    /// (X.224 13.5) arrived in a stage whose frames carry MCS, from the Connect-Response wait
-    /// through finalization.
+    /// (X.224 13.5) arrived in place of the Connection Confirm, where X.224 6.6.3 defines it as
+    /// the responder refusing the connection, or in a stage whose frames carry MCS, from the
+    /// Connect-Response wait through finalization.
     DisconnectRequest {
         /// The X.224 `REASON` octet, as the server sent it; values outside the enumeration are
         /// kept.
@@ -494,6 +495,13 @@ impl Stage {
                 | Stage::CapabilityExchange { .. }
                 | Stage::Finalization { .. }
         )
+    }
+
+    /// The stages that read an X.224 Disconnect Request as the server ending the connect: X.224
+    /// negotiation, where it stands in place of the Connection Confirm, and every stage that
+    /// reads MCS.
+    fn reads_disconnect_request(self) -> bool {
+        matches!(self, Stage::X224Negotiate) || self.reads_mcs()
     }
 }
 
@@ -750,7 +758,7 @@ impl ConnectStateMachine {
     /// Handle one complete TPKT frame according to the current stage. The frame is complete, so
     /// any decode shortfall inside it is a malformed PDU, not a partial read.
     fn on_frame(&mut self, frame: &[u8]) -> Vec<Action> {
-        if self.stage.reads_mcs()
+        if self.stage.reads_disconnect_request()
             && let Ok(tpdu) = tpkt::decode(frame)
             && x224::DisconnectRequest::matches(tpdu)
         {
@@ -4063,18 +4071,49 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_disconnect_request_during_x224_negotiation_stays_a_decode_error() {
-        // That stage reads a Connection Confirm.
-        let mut sm = negotiating();
-        let actions = sm.process(Event::Received(&disconnect_request_frame(0x80)));
-        assert!(
-            matches!(
-                actions.as_slice(),
-                [Action::FailWith(ConnectError::Decode(_))]
-            ),
-            "{actions:?}"
-        );
-        assert_eq!(sm.stage(), "x224-negotiate");
+    fn a_disconnect_request_in_place_of_the_connection_confirm_ends_the_connect() {
+        // X.224 6.6.3: a responder refusing the connection answers the CR-TPDU with a DR-TPDU.
+        // Two of the reasons X.224 13.5.3 d) gives for all classes: 0x02 "session entity not
+        // attached to TSAP" and 0x01 "congestion at TSAP"; both are kept raw.
+        for reason in [0x02, 0x01] {
+            let frame = disconnect_request_frame(reason);
+            let mut sm = negotiating();
+            assert_eq!(sm.stage(), "x224-negotiate");
+            assert_eq!(
+                sm.process(Event::Received(&frame)),
+                vec![Action::FailWith(ConnectError::DisconnectRequest { reason })],
+                "reason {reason:#x}"
+            );
+            assert_eq!(sm.stage(), "x224-negotiate");
+            assert_eq!(
+                sm.process(Event::Received(&frame)),
+                vec![Action::FailWith(ConnectError::UnexpectedEvent {
+                    stage: "x224-negotiate",
+                    event: EventKind::Received,
+                })],
+                "reason {reason:#x}: terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_or_unexpected_tpdu_in_place_of_the_connection_confirm_stays_a_decode_error() {
+        // A Disconnect Request missing its reason octet, and a Disconnect Confirm (0xC0).
+        for tpdu in [
+            &[0x06, 0x80, 0x00, 0x00, 0x00, 0x00][..],
+            &[0x06, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x80][..],
+        ] {
+            let mut sm = negotiating();
+            let actions = sm.process(Event::Received(&tpkt::encode(tpdu)));
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [Action::FailWith(ConnectError::Decode(_))]
+                ),
+                "{tpdu:02x?}: {actions:?}"
+            );
+            assert_eq!(sm.stage(), "x224-negotiate");
+        }
     }
 
     // ---- Standard RDP Security (ADR-0020)

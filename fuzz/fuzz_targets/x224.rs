@@ -5,7 +5,7 @@
 //! Each entry point takes a server-framed TPDU and reads it by its length indicator —
 //! `decode_connection_confirm` on the connect path (where its variable part carries the
 //! negotiation response), `decode_data` on every session PDU after it, and
-//! `DisconnectRequest` on any frame after the negotiation.
+//! `DisconnectRequest` on any frame from the negotiation on.
 
 use libfuzzer_sys::fuzz_target;
 
