@@ -41,6 +41,18 @@ places the sequence in a state machine.
   hand-rolled in `justrdp-pdu` with no external ASN.1 dependency.
 - The `sm-user` / `sm-test` stage strings mark the Attach-User and channel-join
   round-trips within the state machine.
+- **A Disconnect Provider Ultimatum ends the connect in every stage whose frames carry MCS**
+  (#607): the Connect-Response wait, Attach User, channel join, licensing, capability exchange
+  and finalization. `on_frame` tests `DisconnectProviderUltimatum::matches` on the MCS payload
+  before the stage decodes the PDU it expects, the same pre-test the session loop makes, and
+  fails with `ConnectError::ProviderUltimatum { reason }`. The test cannot take a well-formed
+  expected PDU for an ultimatum: those open with `0x7F` (the BER `[APPLICATION 102]`
+  Connect-Response) or the PER CHOICE bytes `0x2C`–`0x2F` (Attach User Confirm), `0x3C`–`0x3F`
+  (Channel Join Confirm) and `0x68`–`0x6B` (Send Data Indication), and the ultimatum opens with
+  `0x20`–`0x23`. An ultimatum cut short stays `ConnectError::Decode`, and X.224 negotiation does
+  not test for one, since that stage reads a Connection Confirm. The host gets the raw T.125
+  reason, not a `DisconnectClass`: `classify_ultimatum` reads reason 3 as a user logoff, which
+  does not describe a server refusing a connect.
 
 ## Code
 
@@ -49,9 +61,10 @@ places the sequence in a state machine.
   `ChannelDef`, `ServerCoreData`, `ConferenceCreateResponse`
 - `justrdp-pdu/src/mcs.rs` — `ConnectResponse`, `AttachUserConfirm`,
   `ChannelJoinConfirm`, `DomainParameters`, `SendDataIndication`,
-  `encode_attach_user_request`, `decode_connect_response`
+  `DisconnectProviderUltimatum`, `encode_attach_user_request`, `decode_connect_response`
 - `justrdp-pdu/src/ber.rs`, `justrdp-pdu/src/per.rs` — the two encodings
-- `justrdp/src/connect.rs` — `McsConnectResult`, `StaticChannel`, `decode_mcs_frame`
+- `justrdp/src/connect.rs` — `McsConnectResult`, `StaticChannel`, `decode_mcs_frame`,
+  `Stage::reads_mcs` (the stages that test for the ultimatum)
 - Stage strings: `sm-user`, `sm-test`, and the MCS half of `capability-exchange`
 
 ## Reference behaviour
@@ -99,6 +112,10 @@ recorded.
 ## Known holes / open
 
 - Multi-monitor and DPI (epic #27) add GCC monitor data that is not built.
+- Which connect stages a real server sends the Disconnect Provider Ultimatum in is not measured.
+  It was seen once: xrdp 0.9.24 sent `0300000902f0802180` (reason 3) in `capability-exchange`
+  after the channel join, under Standard RDP Security (#603, 2026-11-09). The other five stages
+  are covered by feeding that frame to the sans-IO machine, not by a server.
 - The skip-channel-join path is proven only against the scripted server
   (`skip_channel_join_bypasses_joins_when_both_sides_advertise_it`): the test VM never skips
   (`rdp_mcs` records `skip_channel_join=false`, #429), so no live server has exercised it.
