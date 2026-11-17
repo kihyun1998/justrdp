@@ -602,7 +602,9 @@ Read this before starting so the graph does not read as abstractions.
   design (its own `[workspace]`), so `cargo test --workspace` does not build it.
   `test.yml` runs `cargo check --manifest-path fuzz/Cargo.toml` as its own step (#578), and
   `cargo fmt --manifest-path fuzz/Cargo.toml --check` as another, since `cargo fmt --all` does not
-  read it either (#624).
+  read it either (#624), and
+  `cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings` as a third, since
+  `cargo clippy --workspace` does not lint it (#638).
 - **A green workspace gate does not mean each crate builds alone (#572).** Clippy
   `--all-targets` and `cargo test` build dev targets, which lets dev-dependency features
   reach the library, so `justrdp-tokio` passed every gate and did not build on its own.

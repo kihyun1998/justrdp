@@ -24,8 +24,9 @@ updates:
   # `fuzz` is its own workspace, so the root entry above does not reach it and its lock file
   # would otherwise be a pin nobody watches — the shape ADR-0004's Amendment records, where the
   # `[patch.crates-io]` bridge outlived its exit condition by six weeks because nothing was
-  # looking at it. A bump PR runs `test.yml`'s `Fuzz crate builds` step, so a bump that breaks
-  # the build goes red on its own PR; one that breaks only fuzzing surfaces in the weekly lane.
+  # looking at it. A bump PR runs `test.yml`'s `Fuzz crate builds` and `Fuzz crate clippy` steps,
+  # so a bump that breaks the build or trips a lint goes red on its own PR; one that breaks only
+  # fuzzing surfaces in the weekly lane.
   - package-ecosystem: "cargo"
     directory: "/fuzz"
     schedule:

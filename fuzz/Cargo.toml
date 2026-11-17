@@ -3,8 +3,10 @@
 # libFuzzer's `-timeout` catches hangs (infinite loops) that proptest cannot, and coverage
 # guidance reaches deeper paths than random bytes. Fuzzing requires the nightly toolchain and is
 # effectively Linux-only — it never runs on the maintainer's stable Windows MSVC host. Checking
-# the crate (`cargo check --manifest-path fuzz/Cargo.toml`) and its formatting
-# (`cargo fmt --manifest-path fuzz/Cargo.toml --check`) need neither, and `test.yml` does both.
+# the crate (`cargo check --manifest-path fuzz/Cargo.toml`), its formatting
+# (`cargo fmt --manifest-path fuzz/Cargo.toml --check`) and its lints
+# (`cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings`) need neither, and
+# `test.yml` does all three.
 #
 # Standalone workspace (the empty `[workspace]` below): cargo-fuzz convention, detaches this
 # crate from the parent justrdp workspace so its nightly/libFuzzer build never touches the

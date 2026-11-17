@@ -26,10 +26,8 @@ fuzz_target!(|data: &[u8]| {
                 let _ = input.open_reply(0);
             }
         }
-        let samples: Vec<i16> = message
-            .chunks_exact(2)
-            .map(|s| i16::from_le_bytes([s[0], s[1]]))
-            .collect();
+        let (pairs, _) = message.as_chunks::<2>();
+        let samples: Vec<i16> = pairs.iter().map(|&p| i16::from_le_bytes(p)).collect();
         let _ = input.push(&samples);
         rest = next;
     }
