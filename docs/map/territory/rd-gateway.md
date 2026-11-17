@@ -34,8 +34,9 @@ already holds. See `## Known holes / open` for the rest.
   into packets by `packetLength`. `justrdp_tokio::GatewayStream` is TLS, the WebSocket and the
   stream a connect runs over.
 - **WebSocket frames carry a byte stream, not messages.** The payload of every binary frame is
-  appended to one stream and split by `packetLength`, as FreeRDP does (`rdg.c`,
-  `rdg_read_all`/`rdg_process_packet`). A packet may span frames and a frame may hold several
+  appended to one stream and split by `packetLength`, as FreeRDP does for every packet but a
+  data packet (`rdg.c`, `rdg_read_all`/`rdg_process_packet`; its data path reads `cbDataLen`
+  bytes instead, below). A packet may span frames and a frame may hold several
   packets. IronRDP's `ironrdp-mstsgu` assumes one message is one packet.
 - **`packetLength` is capped in the core, at `MAX_PACKET_LEN` = 131,116 bytes**: the longest
   packet whose layout `tsgu` knows, a tunnel response with two 65,535-byte strings. The header
