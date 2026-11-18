@@ -58,7 +58,7 @@ decision of its own. That inference has never been written down as a record.
 - `justrdp/tests/differential_x509_chain_ironrdp.rs` — `a_host_reaches_the_key_from_the_last_certificate_of_the_chain`,
   `the_servers_certificate_is_not_an_ordinary_rsa_certificate`
 - `justrdp-tokio/src/lib.rs` — `generate_license_entropy`
-- Spec sections cited inline: `[MS-RDPELE]` 2.2.2.5.1, 2.2.2.7, 3.2.5, 5.1.2, 5.1.6
+- Spec sections cited inline: `[MS-RDPELE]` 2.2.2.5.1, 2.2.2.7, 3.2.5, 5.1.2, 5.1.5
 
 ## Reference behaviour
 

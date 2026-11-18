@@ -171,7 +171,7 @@ struct Caches {
     swap_rejected: Vec<bool>,
 }
 
-/// Full V-bar storage capacity (`[MS-RDPEGFX]` 3.3.1.8).
+/// Full V-bar storage capacity (`[MS-RDPEGFX]` 3.3.1.10).
 const VBAR_SLOTS: usize = 32_768;
 
 impl Caches {
@@ -235,7 +235,7 @@ impl<'a> Walk<'a> {
     }
 
     /// The variable-length run shared by the residual and RLEX layers (`[MS-RDPEGFX]`
-    /// 2.2.4.1.1.1.1, 2.2.4.1.1.3.1.1.1).
+    /// 2.2.4.1.1.1.1, 2.2.4.1.1.3.1.1.2).
     fn run_length(&mut self) -> u64 {
         let factor1 = self.u8();
         if factor1 < 0xFF {

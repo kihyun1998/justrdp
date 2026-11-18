@@ -79,7 +79,7 @@ const MAX_COMPRESSED_SEGMENT: usize = MAX_SEGMENT_OUTPUT + 1_000;
 const SEGMENTED_SINGLE: u8 = 0xE0;
 /// `RDP_SEGMENTED_DATA::descriptor` — a segment count and array follow.
 const SEGMENTED_MULTIPART: u8 = 0xE1;
-/// `RDP8_BULK_ENCODED_DATA::header` low nibble — `PACKET_COMPR_TYPE_RDP8` (2.2.5.2).
+/// `RDP8_BULK_ENCODED_DATA::header` low nibble — `PACKET_COMPR_TYPE_RDP8` (2.2.5.3).
 const COMPR_TYPE_RDP8: u8 = 0x04;
 /// `RDP8_BULK_ENCODED_DATA::header` high nibble — `PACKET_COMPRESSED`.
 const PACKET_COMPRESSED: u8 = 0x02;
@@ -484,7 +484,7 @@ impl Zgfx {
         }
     }
 
-    /// `RDP8_BULK_ENCODED_DATA` (`[MS-RDPEGFX]` 2.2.5.2): a type/flags byte and its payload.
+    /// `RDP8_BULK_ENCODED_DATA` (`[MS-RDPEGFX]` 2.2.5.3): a type/flags byte and its payload.
     fn segment(&mut self, data: &[u8], output: &mut Vec<u8>) -> Result<(), ZgfxError> {
         let (&header, body) = data
             .split_first()

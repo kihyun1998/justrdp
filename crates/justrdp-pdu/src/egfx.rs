@@ -576,7 +576,7 @@ pub fn is_specified_capversion(version: u32) -> bool {
     )
 }
 
-/// Encode the client's Caps Advertise (MS-RDPEGFX 2.2.2.16), in preference order.
+/// Encode the client's Caps Advertise (MS-RDPEGFX 2.2.2.18), in preference order.
 pub fn encode_caps_advertise(capsets: &[CapSet]) -> Vec<u8> {
     let body_len = 2 + capsets
         .iter()

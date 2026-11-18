@@ -58,11 +58,11 @@ const KEY_EXCHANGE_ALGORITHM_RSA: u32 = 0x0000_0001;
 /// "Microsoft" (the value mstsc-lineage clients send; MS-RDPELE 2.2.2.2).
 pub const PLATFORM_ID_NT_POST_52_MICROSOFT: u32 = 0x0401_0000;
 
-/// `MACData` length (MS-RDPELE 2.2.1.3 et al.).
+/// `MACData` length (MS-RDPELE 2.2.2.3 et al.).
 pub const MAC_SIZE: usize = 16;
 /// `ServerRandom` / `ClientRandom` length.
 pub const RANDOM_SIZE: usize = 32;
-/// Premaster secret length (MS-RDPELE 5.1.2.1).
+/// Premaster secret length (MS-RDPELE 5.1.1).
 pub const PREMASTER_SECRET_SIZE: usize = 48;
 
 /// The 4-byte preamble every licensing message starts with (after the security header).
@@ -388,7 +388,7 @@ pub fn encode_platform_challenge_response(
     encode_license_message(MSG_PLATFORM_CHALLENGE_RESPONSE, &body)
 }
 
-/// A decoded Server New License / Upgrade License (MS-RDPELE 2.2.2.6 / 2.2.2.3) — the full
+/// A decoded Server New License / Upgrade License (MS-RDPELE 2.2.2.7 / 2.2.2.6) — the full
 /// negotiation's happy ending. The license blob is RC4-encrypted; this slice verifies its MAC
 /// (in the core) and discards it (persistent caching is not built;
 /// `docs/map/territory/licensing.md`).
@@ -413,7 +413,7 @@ impl NewLicense {
     }
 }
 
-/// A decoded License Error Message (MS-RDPELE 2.2.2.7). With
+/// A decoded License Error Message (MS-RDPBCGR 2.2.1.12.1.3). With
 /// [`STATUS_VALID_CLIENT`]/[`ST_NO_TRANSITION`] this is the licensing short-circuit; any other
 /// error code is a licensing failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

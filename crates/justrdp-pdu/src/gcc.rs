@@ -717,7 +717,7 @@ const REQUEST_CONNECT_PDU_SIZE: usize = 12;
 
 /// Encode a GCC Conference Create Request wrapping `blocks` — the `userData` payload of the MCS
 /// Connect-Initial. The wrapper bytes (T.124 key, conference name "1", the "Duca" H.221 key)
-/// are protocol constants fixed by MS-RDPBCGR 2.2.1.3.1.
+/// are protocol constants fixed by MS-RDPBCGR 3.2.5.3.3.
 pub fn encode_conference_create_request(blocks: &ClientGccBlocks) -> Vec<u8> {
     let gcc = blocks.encode();
     let mut out = Vec::with_capacity(gcc.len() + 24);
@@ -753,7 +753,7 @@ pub struct ConferenceCreateResponse {
 }
 
 impl ConferenceCreateResponse {
-    /// Decode the wrapper + server blocks (MS-RDPBCGR 2.2.1.4.1).
+    /// Decode the wrapper + server blocks (MS-RDPBCGR 2.2.1.4).
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut cur = ReadCursor::new(bytes, "conference create response");
         if per::read_choice(&mut cur)? != 0 {
