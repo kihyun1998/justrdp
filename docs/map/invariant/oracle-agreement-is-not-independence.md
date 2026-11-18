@@ -86,7 +86,8 @@ show it.
   tolerances**, backed by the `clearcodec_corpus` fixtures (memory
   `clearcodec_corpus_required_tolerances`). The oracle lost that argument. #587 took the
   RLEX over-fill clip out of that set: the over-fill came from a parse #131 corrected, and
-  no corpus stream over-fills ([bitmap codecs](../territory/bitmap-codecs.md)).
+  no corpus stream over-fills. #643 then replaced the clip with a refusal, as FreeRDP has
+  ([bitmap codecs](../territory/bitmap-codecs.md)).
 - **#194 → #168** — the third shape above, found one slice after the basis landed.
   #194 built an owned basis precisely *because* the oracle could not arbitrate SRL, and
   the basis was still derived at the wrong initial state. The lesson is not that #194

@@ -16,11 +16,16 @@
 //!    `shortVBarYOff < shortVBarYOn`; every column that band would have stored then misses the
 //!    full V-bar cache on a later hit (`vbarIndex`).
 //!
-//! 2. **RLEX region over-fill is clipped, not fatal.** The surplus of a run or suite past the
-//!    region boundary is dropped and an under-run is short-filled, where FreeRDP `clear.c`
-//!    *rejects* an over-region run/suite (`:260`/`:286`/`:321`).
+//! 2. **A residual or RLEX layer may write fewer pixels than its region holds, never more.** A
+//!    residual run, or an RLEX run or suite, that would write past the region's last pixel is a
+//!    [`ClearError`] naming the layer. Fewer is conforming: `[MS-RDPEGFX]` 2.2.4.1.1.1 says the residual layer encodes
+//!    "less than or equal to the number of pixels in the original image", and example 4.1.1.2
+//!    decodes RLEX segments "until there is no more data left". The pixels a layer does not reach
+//!    keep what the tile already held: the residual or bands pixel under an RLEX region, and zero
+//!    bytes where the residual layer stops short.
 //!
-//! **Alpha contract:** ClearCodec carries no alpha; every output pixel's alpha byte is `0xFF`.
+//! **Alpha contract:** ClearCodec carries no alpha; every pixel a layer writes has alpha `0xFF`. A
+//! pixel no layer reaches is zero bytes, alpha included (decision 2).
 
 use std::fmt;
 
@@ -229,7 +234,7 @@ impl Clear {
     }
 
     /// Decode one ClearCodec bitmap stream into `width × height × 4` **BGRA** bytes
-    /// (alpha forced to 0xFF — the wire format carries no alpha).
+    /// (alpha `0xFF` on every pixel a layer writes; see the module's alpha contract).
     ///
     /// When `JUSTRDP_CLEAR_CAPTURE_DIR` is set, the raw payload and its decode status are
     /// dumped there first (see `capture_clear_payload`) — the corpus harness for the #56
@@ -319,7 +324,8 @@ impl ClearDecoder {
         }
     }
 
-    /// Decode one ClearCodec bitmap stream into `width × height × 4` BGRA bytes (alpha `0xFF`).
+    /// Decode one ClearCodec bitmap stream into `width × height × 4` BGRA bytes (alpha `0xFF` on
+    /// every pixel a layer writes; see the module's alpha contract).
     pub fn decode(&mut self, data: &[u8], width: u16, height: u16) -> Result<Vec<u8>, ClearError> {
         let mut c = Cursor::new(data);
         c.ensure(2, "ClearCodecBitmapStream")?;
@@ -428,8 +434,9 @@ impl ClearDecoder {
         Ok(())
     }
 
-    /// Layer 1 — residual BGR run-length background, filling the whole tile row-major. Writes
-    /// are clamped to the output to defeat adversarial run lengths (FreeRDP GHSA-32q9-m5qr-9j2v).
+    /// Layer 1 — residual BGR run-length background, filling the tile row-major. A run past the
+    /// tile's last pixel is an error; a tile the runs do not reach the end of keeps zero bytes
+    /// there (module docs, decision 2).
     fn decode_residual_layer(&self, data: &[u8], output: &mut [u8]) -> Result<(), ClearError> {
         if data.is_empty() {
             return Ok(());
@@ -446,19 +453,16 @@ impl ClearDecoder {
             // triple and is read by the shared reader.
             let run_length = read_run_length(&mut c, "RgbRunSegment")?;
 
-            let pixels_remaining = max_offset.saturating_sub(offset) / 4;
-            let effective_run = u32::try_from(pixels_remaining)
-                .unwrap_or(u32::MAX)
-                .min(run_length);
-            for _ in 0..effective_run {
+            let pixels_remaining = (max_offset - offset) / 4;
+            if cast_usize(run_length) > pixels_remaining {
+                return Err(invalid("residual", "run overruns the tile"));
+            }
+            for _ in 0..run_length {
                 output[offset] = blue;
                 output[offset + 1] = green;
                 output[offset + 2] = red;
                 output[offset + 3] = 0xFF;
                 offset += 4;
-            }
-            if offset >= max_offset {
-                break;
             }
         }
         Ok(())
@@ -804,8 +808,9 @@ fn decode_rlex_region(
         output[dst + 3] = 0xFF;
     };
 
-    // Clip surplus at the region boundary rather than reject, and short-fill under-runs.
-    'segments: for seg in &rlex.segments {
+    // A run or suite past the region's last pixel is an error; pixels after the last segment keep
+    // what the earlier layers painted (module docs, decision 2).
+    for seg in &rlex.segments {
         if usize::from(seg.start_index) >= palette_len {
             return Err(invalid("rlex", "start_index exceeds palette size"));
         }
@@ -815,19 +820,20 @@ fn decode_rlex_region(
 
         // Run: repeat the start color.
         let run_color = rlex.palette[usize::from(seg.start_index)];
+        if cast_usize(seg.run_length) > region_pixels - px {
+            return Err(invalid("rlex", "run overruns the region"));
+        }
         for _ in 0..seg.run_length {
-            if px >= region_pixels {
-                break 'segments;
-            }
             put(px, run_color);
             px += 1;
         }
 
         // Suite: walk the palette gradient start_index..=stop_index inclusive.
+        let suite_len = usize::from(seg.stop_index - seg.start_index) + 1;
+        if suite_len > region_pixels - px {
+            return Err(invalid("rlex", "suite overruns the region"));
+        }
         for palette_idx in seg.start_index..=seg.stop_index {
-            if px >= region_pixels {
-                break 'segments;
-            }
             put(px, rlex.palette[usize::from(palette_idx)]);
             px += 1;
         }
@@ -869,10 +875,11 @@ fn decode_rlex(data: &[u8]) -> Result<RlexData, ClearError> {
         palette.push([b, g, r]);
     }
 
-    // numBits = CLEAR_LOG2_FLOOR[paletteCount - 1] + 1 (FreeRDP `clear.c:200`): the low numBits of
-    // each packed byte hold stopIndex, the upper bits hold suiteDepth, startIndex = stopIndex -
-    // suiteDepth. It is >= 1 even for a single-entry palette (floor(log2(0)) is defined as 0), so a
-    // packed byte is always present — one per segment, no 0-bit special case (#121).
+    // numBits = CLEAR_LOG2_FLOOR[paletteCount - 1] + 1 (FreeRDP `clear_decompress_subcode_rlex`):
+    // the low numBits of each packed byte hold stopIndex, the upper bits hold suiteDepth,
+    // startIndex = stopIndex - suiteDepth. It is >= 1 even for a single-entry palette
+    // (floor(log2(0)) is defined as 0), so a packed byte is always present — one per segment, no
+    // 0-bit special case (#121).
     let stop_index_bits = if palette_count == 1 {
         1
     } else {
@@ -1168,9 +1175,9 @@ mod tests {
         stream
     }
 
-    // RLEX over- and under-region: the surplus is clipped and an under-run short-filled, not
-    // rejected. These assertions pin that behaviour; palette_count=2 keeps them off the
-    // single-palette path.
+    // Pixel counts (module docs, decision 2): a run or suite past the region is refused, a region
+    // that receives fewer pixels than it holds decodes. palette_count=2 keeps the RLEX cases off
+    // the single-palette path.
 
     /// A one-segment RLEX bitmap: palette of 2 BGR colors, packed byte `0x00`
     /// (stopIndex=0, suiteDepth=0, startIndex=0) → `run_length` run px + 1 suite px of palette[0].
@@ -1179,25 +1186,103 @@ mod tests {
     }
 
     #[test]
-    fn rlex_over_region_is_clipped_not_rejected() {
-        // run=5 (+1 suite = 6 px) into a 2-px region: paint the 2 region px, drop the surplus,
-        // succeed — the client must not reject a real server's over-encode.
+    fn rlex_run_overrunning_the_region_is_refused() {
+        // run=5 into a 2-px region.
         let mut out = vec![0u8; 2 * 4];
-        assert!(
-            decode_rlex_region(&rlex_bitmap(5), &mut out, 0, 0, 2, 1, 2).is_ok(),
-            "over-region RLEX must clip, not reject"
+        assert_eq!(
+            decode_rlex_region(&rlex_bitmap(5), &mut out, 0, 0, 2, 1, 2),
+            Err(invalid("rlex", "run overruns the region"))
         );
-        assert_eq!(&out[0..4], &[10, 20, 30, 0xFF]); // palette[0]
-        assert_eq!(&out[4..8], &[10, 20, 30, 0xFF]);
     }
 
     #[test]
-    fn rlex_under_fill_is_tolerated() {
-        // run=0 (+1 suite = 1 px) into a 4-px region: paint what we have, leave the rest, succeed.
-        let mut out = vec![0u8; 4 * 4];
-        assert!(decode_rlex_region(&rlex_bitmap(0), &mut out, 0, 0, 4, 1, 4).is_ok());
+    fn rlex_suite_overrunning_the_region_is_refused() {
+        // run=2 fills the 2-px region; the 1-px suite after it would be the third pixel.
+        let mut out = vec![0u8; 2 * 4];
+        assert_eq!(
+            decode_rlex_region(&rlex_bitmap(2), &mut out, 0, 0, 2, 1, 2),
+            Err(invalid("rlex", "suite overruns the region"))
+        );
+    }
+
+    #[test]
+    fn rlex_under_fill_leaves_the_rest_of_the_region_as_it_was() {
+        // run=0 (+1 suite = 1 px) into a 4-px region that an earlier layer painted 7s.
+        let mut out = vec![7u8; 4 * 4];
+        assert_eq!(
+            decode_rlex_region(&rlex_bitmap(0), &mut out, 0, 0, 4, 1, 4),
+            Ok(())
+        );
         assert_eq!(&out[0..4], &[10, 20, 30, 0xFF]); // 1 suite px painted
-        assert_eq!(&out[4..8], &[0, 0, 0, 0]); // remainder untouched
+        assert_eq!(&out[4..], &[7u8; 12]); // remainder as the earlier layer left it
+    }
+
+    /// A residual-only ClearCodec stream: `runs` as (B, G, R, one-byte run length).
+    fn residual_stream(runs: &[[u8; 4]]) -> Vec<u8> {
+        let residual: Vec<u8> = runs.iter().flatten().copied().collect();
+        let mut stream = vec![0x00, 0x00]; // flags, seq
+        stream.extend_from_slice(&u32::try_from(residual.len()).unwrap().to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes()); // bandsByteCount
+        stream.extend_from_slice(&0u32.to_le_bytes()); // subcodecByteCount
+        stream.extend_from_slice(&residual);
+        stream
+    }
+
+    #[test]
+    fn residual_run_overrunning_the_tile_is_refused() {
+        // 2 + 2 px into a 3-px tile: the second run overruns by one.
+        let stream = residual_stream(&[[1, 2, 3, 2], [4, 5, 6, 2]]);
+        assert_eq!(
+            ClearDecoder::new().decode(&stream, 3, 1),
+            Err(invalid("residual", "run overruns the tile"))
+        );
+    }
+
+    #[test]
+    fn residual_under_fill_decodes_and_leaves_the_rest_zero() {
+        // 2 px into a 3-px tile.
+        let out = ClearDecoder::new()
+            .decode(&residual_stream(&[[1, 2, 3, 2]]), 3, 1)
+            .unwrap();
+        assert_eq!(out, [1, 2, 3, 0xFF, 1, 2, 3, 0xFF, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn residual_exact_fill_paints_the_whole_tile() {
+        let out = ClearDecoder::new()
+            .decode(&residual_stream(&[[1, 2, 3, 1], [4, 5, 6, 2]]), 3, 1)
+            .unwrap();
+        assert_eq!(out, [1, 2, 3, 0xFF, 4, 5, 6, 0xFF, 4, 5, 6, 0xFF]);
+    }
+
+    /// `[MS-RDPEGFX]` 4.1.1.2 (Example 2), the 144-byte stream verbatim: one 78x17 RLEX region,
+    /// no residual or bands layer.
+    const SPEC_EXAMPLE_2: [u8; 144] = [
+        0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x82, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x4e, 0x00, 0x11, 0x00, 0x75, 0x00, 0x00, 0x00, 0x02, 0x0e, 0xff, 0xff,
+        0xff, 0x00, 0x00, 0x00, 0xdb, 0xff, 0xff, 0x00, 0x3a, 0x90, 0xff, 0xb6, 0x66, 0x66, 0xb6,
+        0xff, 0xb6, 0x66, 0x00, 0x90, 0xdb, 0xff, 0x00, 0x00, 0x3a, 0xdb, 0x90, 0x3a, 0x3a, 0x90,
+        0xdb, 0x66, 0x00, 0x00, 0xff, 0xff, 0xb6, 0x64, 0x64, 0x64, 0x11, 0x04, 0x11, 0x4c, 0x11,
+        0x4c, 0x11, 0x4c, 0x11, 0x4c, 0x11, 0x4c, 0x00, 0x47, 0x13, 0x00, 0x01, 0x01, 0x04, 0x00,
+        0x01, 0x00, 0x00, 0x47, 0x16, 0x00, 0x11, 0x02, 0x00, 0x47, 0x29, 0x00, 0x11, 0x01, 0x00,
+        0x49, 0x0a, 0x00, 0x01, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x4a, 0x0a, 0x00, 0x09, 0x00,
+        0x01, 0x00, 0x00, 0x47, 0x05, 0x00, 0x01, 0x01, 0x1c, 0x00, 0x01, 0x00, 0x11, 0x4c, 0x11,
+        0x4c, 0x11, 0x4c, 0x00, 0x47, 0x0d, 0x4d, 0x00, 0x4d,
+    ];
+
+    #[test]
+    fn spec_example_2_fills_its_region_exactly() {
+        // The RLEX bitmap starts after the 14-byte stream header and the 13-byte subcodec header.
+        let rlex = decode_rlex(&SPEC_EXAMPLE_2[27..]).unwrap();
+        let emitted: usize = rlex
+            .segments
+            .iter()
+            .map(|s| cast_usize(s.run_length) + usize::from(s.stop_index - s.start_index) + 1)
+            .sum();
+        assert_eq!(emitted, 78 * 17);
+        let out = ClearDecoder::new().decode(&SPEC_EXAMPLE_2, 78, 17).unwrap();
+        assert_eq!(out.len(), 78 * 17 * 4);
+        assert!(out.as_chunks::<4>().0.iter().all(|px| px[3] == 0xFF));
     }
 
     #[test]
@@ -1210,8 +1295,9 @@ mod tests {
     }
 
     // #121 — single-palette RLEX. FreeRDP `numBits = CLEAR_LOG2_FLOOR[paletteCount-1] + 1` = 1 for
-    // paletteCount==1 (`clear.c:200`), so a packed stop/suite byte is present per segment even for a
-    // one-entry palette. The old 0-bit special case read no packed byte, misparsing genuine streams.
+    // paletteCount==1 (`clear_decompress_subcode_rlex`), so a packed stop/suite byte is present per
+    // segment even for a one-entry palette. The old 0-bit special case read no packed byte,
+    // misparsing genuine streams.
     // (Rendered output for a *valid* single-palette stream is identical either way — one colour — so
     // this is a spec/byte-consumption conformance fix, not an output change; the observable effect is
     // that the packed index byte is now validated.)

@@ -32,8 +32,10 @@ everywhere else.
   a smoke test.
 - **The corpus encodes tolerances that no spec states** — `clearcodec_corpus`
   fixtures are real Server 2019 streams, and the divergences from FreeRDP they force
-  are requirements, not bugs (#127). The RLEX over-fill clip is not one of them: no
-  corpus stream over-fills (#587, [bitmap codecs](bitmap-codecs.md)).
+  are requirements, not bugs (#127). ClearCodec's pixel-count rule is not one of them: no
+  corpus stream over- or under-fills a residual or RLEX region, so refusing the first and
+  accepting the second rest on FreeRDP and the spec (#587, #643,
+  [bitmap codecs](bitmap-codecs.md)).
 - **The oracle is scaffolding with a retirement condition, not a standing gate**
   (ADR-0011). A codec's oracle dev-dependency drops once its correctness rests on an
   owned basis: a real-server corpus plus expectations derived independently of our

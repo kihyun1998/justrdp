@@ -38,7 +38,7 @@ count × {
   **byte-identical** to it (ADR-0003 phase-2 acceptance).
 - A parser in the test, independent of the decoder, counts the shapes #56 fixed: short V-bar
   cache misses the swapped field layout rejects, and full V-bar cache hits. It also asserts that
-  every RLEX region fills its rectangle exactly.
+  every RLEX region and every residual layer fills its rectangle exactly.
 
 ## `replay-text.bin`
 

@@ -2691,6 +2691,131 @@ mod tests {
         );
     }
 
+    /// A WireToSurface1 body carrying ClearCodec `stream` for a 4x1 rect at the surface origin.
+    fn clear_4x1(stream: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&egfx::CODECID_CLEARCODEC.to_le_bytes());
+        b.push(egfx::PIXEL_FORMAT_XRGB_8888);
+        for v in [0u16, 0, 4, 1] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+        b.extend_from_slice(stream);
+        b
+    }
+
+    /// A ClearCodec stream: a residual layer, and one RLEX region at the origin when `rlex` is
+    /// `Some((width, bitmap))`.
+    fn clear_stream(residual: &[u8], rlex: Option<(u16, &[u8])>) -> Vec<u8> {
+        let mut subcodec = Vec::new();
+        if let Some((width, bitmap)) = rlex {
+            for v in [0u16, 0, width, 1] {
+                subcodec.extend_from_slice(&v.to_le_bytes());
+            }
+            subcodec.extend_from_slice(&(bitmap.len() as u32).to_le_bytes());
+            subcodec.push(0x02); // RLEX
+            subcodec.extend_from_slice(bitmap);
+        }
+        let mut s = vec![0x00, 0x00];
+        s.extend_from_slice(&(residual.len() as u32).to_le_bytes());
+        s.extend_from_slice(&0u32.to_le_bytes());
+        s.extend_from_slice(&(subcodec.len() as u32).to_le_bytes());
+        s.extend_from_slice(residual);
+        s.extend_from_slice(&subcodec);
+        s
+    }
+
+    /// Paint the surface's top row grey, process one ClearCodec WireToSurface1 over it, and read
+    /// the row's four pixels back as RGB.
+    fn clear_over_grey(stream: &[u8]) -> Vec<[u8; 3]> {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        feed(
+            &mut p,
+            egfx::CMDID_SOLID_FILL,
+            &solid_fill_body(1, [0x80, 0x80, 0x80, 0], [0, 0, 4, 1]),
+        );
+        assert_eq!(
+            feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &clear_4x1(stream)),
+            vec![],
+            "the session goes on"
+        );
+        map_surface(&mut p, 1, 0, 0);
+        let (fb, _) = flush(&mut p);
+        let row = region(
+            &fb,
+            &FrameUpdate {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+        );
+        row.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| [px[0], px[1], px[2]])
+            .collect()
+    }
+
+    const GREY: [u8; 3] = [0x80; 3];
+    const WHITE: [u8; 3] = [0xFF; 3];
+    /// The RLEX palette's first entry (BGR 10, 20, 30) as RGB.
+    const RLEX_COLOR: [u8; 3] = [30, 20, 10];
+
+    /// One RLEX segment of palette entry 0: `run` run pixels and one suite pixel.
+    fn rlex_run(run: u8) -> [u8; 9] {
+        [2, 10, 20, 30, 40, 50, 60, 0x00, run]
+    }
+
+    /// ClearCodec over-fill is refused through the session path: the region is skipped, so what
+    /// was under it stays, and the session goes on. Under-fill decodes.
+    #[test]
+    fn a_clearcodec_residual_run_past_the_rect_skips_the_region() {
+        let white = |run: u8| clear_stream(&[0xFF, 0xFF, 0xFF, run], None);
+        assert_eq!(
+            clear_over_grey(&white(4)),
+            vec![WHITE; 4],
+            "exact fill paints"
+        );
+        assert_eq!(
+            clear_over_grey(&white(5)),
+            vec![GREY; 4],
+            "over-fill is skipped"
+        );
+        assert_eq!(
+            clear_over_grey(&white(2)),
+            vec![WHITE, WHITE, [0; 3], [0; 3]],
+            "under-fill paints what it carries, and the tile's zero bytes over the rest"
+        );
+    }
+
+    #[test]
+    fn a_clearcodec_rlex_run_past_its_region_skips_the_region() {
+        let white = [0xFF, 0xFF, 0xFF, 4];
+        let rlex = |width: u16, run: u8| clear_stream(&white, Some((width, &rlex_run(run))));
+        assert_eq!(
+            clear_over_grey(&rlex(2, 1)),
+            vec![RLEX_COLOR, RLEX_COLOR, WHITE, WHITE],
+            "exact fill paints"
+        );
+        assert_eq!(
+            clear_over_grey(&rlex(2, 3)),
+            vec![GREY; 4],
+            "a run past it is skipped"
+        );
+        assert_eq!(
+            clear_over_grey(&rlex(2, 2)),
+            vec![GREY; 4],
+            "a suite past it is skipped"
+        );
+        assert_eq!(
+            clear_over_grey(&rlex(2, 0)),
+            vec![RLEX_COLOR, WHITE, WHITE, WHITE],
+            "under-fill leaves the residual under the rest of the region"
+        );
+    }
+
     #[test]
     fn reset_graphics_resizes_the_output() {
         let mut p = GraphicsProcessor::default();

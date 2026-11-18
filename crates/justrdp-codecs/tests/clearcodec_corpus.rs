@@ -15,7 +15,8 @@
 //! 1. The self-owned decoder replays each capture without error, and the `ironrdp-graphics`
 //!    oracle's output is byte-identical to it (ADR-0003 phase-2 acceptance).
 //! 2. A parser in this file, independent of the decoder, counts the shapes the decoder was fixed
-//!    for in `replay.bin` (ADR-0007's coverage rule), and that every RLEX region fills exactly.
+//!    for in `replay.bin` (ADR-0007's coverage rule), and that every RLEX region and every
+//!    residual layer fills exactly.
 //! 3. Every glyph hit in `replay-text.bin` is drawn from the pixels its slot's store decoded to.
 
 use justrdp_codecs::clearcodec::ClearDecoder;
@@ -150,6 +151,12 @@ struct Census {
     /// Full V-bar cache hits on a column last stored by a stream the swapped layout rejects as a
     /// whole, so a decoder reading the swap holds no such column when the hit arrives.
     vbar_hits_on_swap_rejected: usize,
+    /// Streams with a non-empty residual layer.
+    residual_layers: usize,
+    /// Residual layers whose runs emit fewer pixels than `width * height`.
+    residual_under: usize,
+    /// Residual layers whose runs emit more pixels than `width * height`.
+    residual_over: usize,
     /// RLEX subcodec regions.
     rlex_regions: usize,
     /// RLEX regions with a one-entry palette.
@@ -291,9 +298,16 @@ fn walk_stream(i: usize, entry: &Entry, caches: &mut Caches, census: &mut Census
         stream.assert_consumed();
 
         let mut layer = Walk::new(residual, format!("entry {i} residual"));
+        let mut emitted = 0u64;
         while layer.remaining() > 0 {
             layer.bytes(3);
-            layer.run_length();
+            emitted += layer.run_length();
+        }
+        if !residual.is_empty() {
+            census.residual_layers += 1;
+            let pixels = u64::from(entry.width) * u64::from(entry.height);
+            census.residual_under += usize::from(emitted < pixels);
+            census.residual_over += usize::from(emitted > pixels);
         }
 
         let mut layer = Walk::new(bands, format!("entry {i} bands"));
@@ -395,8 +409,8 @@ fn census(entries: &[Entry]) -> Census {
 
 /// ADR-0007's coverage rule for this corpus: it still holds the shapes #56 fixed. A short V-bar
 /// cache miss that the swapped field layout rejects; a full V-bar cache hit on a column only a
-/// stream the swap rejects stored; and single-palette RLEX regions. Every RLEX region fills its
-/// rectangle exactly, so the decoder's RLEX over-fill clip has no stream here to stand on.
+/// stream the swap rejects stored; and single-palette RLEX regions. Every RLEX region and every
+/// residual layer fills its rectangle exactly.
 #[test]
 fn corpus_holds_every_shape_the_decoder_was_fixed_for() {
     let census = census(&load_replay());
@@ -416,6 +430,12 @@ fn corpus_holds_every_shape_the_decoder_was_fixed_for() {
     assert_eq!(
         census.rlex_inexact, 0,
         "an RLEX region does not fill its rectangle exactly: {census:?}"
+    );
+    assert!(census.residual_layers > 0, "no residual layer: {census:?}");
+    assert_eq!(
+        (census.residual_under, census.residual_over),
+        (0, 0),
+        "a residual layer does not fill its tile exactly: {census:?}"
     );
 }
 
@@ -439,7 +459,7 @@ fn text_capture_replays_and_matches_the_oracle() {
 
 /// The typed-text capture holds glyph hits, each drawn into the rectangle its slot was stored
 /// with, and each a copy of the pixels its slot's store decoded to (`[MS-RDPEGFX]` 4.1.1.5). Its
-/// RLEX regions fill their rectangles exactly too.
+/// RLEX regions and residual layers fill their rectangles exactly too.
 #[test]
 fn text_capture_draws_each_glyph_hit_from_its_store() {
     let entries = load_text_replay();
@@ -447,6 +467,12 @@ fn text_capture_draws_each_glyph_hit_from_its_store() {
     assert!(census.glyph_hits > 0, "no glyph hit: {census:?}");
     assert_eq!(census.glyph_hits_reshaped, 0, "{census:?}");
     assert_eq!(census.rlex_inexact, 0, "{census:?}");
+    assert!(census.residual_layers > 0, "{census:?}");
+    assert_eq!(
+        (census.residual_under, census.residual_over),
+        (0, 0),
+        "{census:?}"
+    );
 
     let mut decoder = ClearDecoder::new();
     let mut stored: std::collections::HashMap<u16, Vec<u8>> = std::collections::HashMap::new();
