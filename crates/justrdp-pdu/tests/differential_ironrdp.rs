@@ -42,6 +42,45 @@ fn our_connection_request_decodes_identically_in_ironrdp() {
     assert_eq!(parsed.0.protocol.bits(), protocols.bits());
 }
 
+/// `RDP_NEG_CORRELATION_INFO` (`[MS-RDPBCGR]` 2.2.1.1.2): ironrdp decodes the correlation info
+/// justrdp writes after the request, and its encoder writes the same bytes for the same fields.
+#[test]
+fn our_correlation_info_decodes_identically_in_ironrdp() {
+    let id = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xF0,
+        0x01,
+    ];
+    let protocols = SecurityProtocol::SSL | SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX;
+    let neg = NegRequest {
+        correlation_id: Some(id),
+        ..NegRequest::new(protocols)
+    };
+    let frame =
+        justrdp_pdu::tpkt::encode(&justrdp_pdu::x224::encode_connection_request(&neg.encode()));
+
+    let parsed: X224<IronRequest> = ironrdp_decode(&frame).expect("ironrdp decodes our CR");
+    assert_eq!(parsed.0.protocol.bits(), protocols.bits());
+    assert!(
+        parsed
+            .0
+            .flags
+            .contains(ironrdp_pdu::nego::RequestFlags::CORRELATION_INFO_PRESENT)
+    );
+    assert_eq!(
+        parsed.0.correlation_info.map(|info| info.correlation_id),
+        Some(id)
+    );
+
+    let theirs = ironrdp_encode_vec(&X224(IronRequest {
+        nego_data: None,
+        flags: ironrdp_pdu::nego::RequestFlags::empty(),
+        protocol: IronProtocol::from_bits_retain(protocols.bits()),
+        correlation_info: Some(ironrdp_pdu::nego::CorrelationInfo { correlation_id: id }),
+    }))
+    .unwrap();
+    assert_eq!(frame, theirs);
+}
+
 #[test]
 fn connection_confirm_selected_protocol_matches_ironrdp() {
     // HYBRID_EX (0x08) — the protocol the real test VM selected.
@@ -319,6 +358,15 @@ fn our_client_info_pdu_decodes_identically_in_ironrdp() {
     assert_eq!(info.credentials.username, "rdptest");
     assert_eq!(info.credentials.domain.as_deref(), Some("WORKGROUP"));
     assert_eq!(info.credentials.password, "");
+    assert!(
+        info.password_cookie.is_none(),
+        "the Password field is empty, not opaque bytes"
+    );
+    assert_eq!(
+        info.flags.bits() & !iron_ci::ClientInfoFlags::all().bits(),
+        0,
+        "a flag bit ironrdp-pdu does not define"
+    );
     assert!(info.flags.contains(
         iron_ci::ClientInfoFlags::MOUSE
             | iron_ci::ClientInfoFlags::AUTOLOGON

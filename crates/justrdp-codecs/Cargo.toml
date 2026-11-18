@@ -16,22 +16,28 @@ repository.workspace = true
 justrdp-pdu.workspace = true
 
 [dev-dependencies]
-# The most overloaded entry in the workspace — three of ADR-0011's five roles (2026-08-26 table):
+# The most overloaded entry in the workspace — four of ADR-0011's five roles:
 #   * **R1 verifier** — diff our decode output against ironrdp's on identical bytes.
 #   * **R2 generator** — its compressor/encoder authors the streams our decoders then read
-#     (`tests/differential_rfx.rs`, `round_trips_the_oracle_encoder` in `src/clearcodec.rs`).
+#     (`tests/differential_zgfx.rs`, `rdp6_planar_decodes_ironrdp_encoder_output_identically` in
+#     `tests/differential_ironrdp_graphics.rs`, `forward_coefficients` in
+#     `tests/differential_rfx.rs`, `round_trips_the_oracle_encoder` in `src/clearcodec.rs`).
 #     **No corpus ends this one.**
+#   * **R4 canary** — `oracle_encoder_round_trips_both_modes` in `tests/differential_rfx.rs`, whose
+#     subject is the oracle alone.
 #   * **R5 stage-boundary math** (ADR-0007) — `dwt_extrapolate`, kept deliberately by ADR-0011's
 #     #169 amendment.
 # **What ends it (ADR-0011):** R1 drops per codec on an owned basis, *except* where an amendment
 # keeps it as breadth (zgfx, #189). The entry itself leaves only when the last role does.
 ironrdp-graphics = "0.11"
-# **R2 generator** only (ADR-0011's 2026-08-26 table): constructs the pointer-attribute inputs the
-# ironrdp-graphics pointer oracle consumes (`tests/differential_pointer_ironrdp.rs:12`, issue #41),
-# and the TS_RFX container in `tests/differential_rfx.rs:21`. **What ends it:** we write those
-# encoders. An owned corpus does not: the real-server RemoteFX corpus (#554) spans RLGR1, one
-# quantization table and single-rectangle regions, and every other stream the differential needs
-# is one no server here sends (#558, `differential_rfx.rs:14`).
+# Two of ADR-0011's roles. **R1 verifier**: `tests/differential_pointer_ironrdp.rs` wraps its own mask
+# bytes in this crate's pointer-attribute types (issue #41) for the oracle's decoder to read, and
+# `reference_decode` in `tests/differential_rfx.rs` parses a stream with it. **R2 generator**:
+# `build_stream` in `tests/differential_rfx.rs` encodes the TS_RFX container with it. **What ends R2:**
+# we write that encoder. An owned corpus does not: the real-server RemoteFX corpus (#554) spans
+# RLGR1, one quantization table and single-rectangle regions, and every other stream the
+# differential needs is one no server here sends (#558, the module doc of
+# `tests/differential_rfx.rs`).
 ironrdp-pdu = "0.11"
 # Property-based robustness tests for the untrusted-input codec decoders (ADR-0008, issue #97):
 # "decode never panics on arbitrary bytes". The differential oracle only checks correctness on

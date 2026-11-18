@@ -36,8 +36,21 @@ count × {
   session, which had 0 rejections under the fixed decoder.
 - The `ironrdp-graphics` oracle accepts every entry too, and the self-owned output is
   **byte-identical** to it (ADR-0003 phase-2 acceptance).
+- A parser in the test, independent of the decoder, counts the shapes #56 fixed: short V-bar
+  cache misses the swapped field layout rejects, and full V-bar cache hits. It also asserts that
+  every RLEX region fills its rectangle exactly.
 
-## Provenance
+## `replay-text.bin`
+
+Same format. Captured 2026-11-18 from the same VM (#587) by the
+`capture_clearcodec_text_corpus_against_real_vm` `#[ignore]` test in `justrdp-tokio`: an EGFX
+session that opens Notepad from the Start menu and types three lines of text four times. 781 payloads, 294
+glyph stores and 368 glyph hits, all decoding. `replay.bin` holds no glyph hit, so this file is
+what drives the glyph cache. The tests replay it through one decoder against the oracle and
+assert that it holds glyph hits, each drawn into the rectangle its slot was stored with and
+equal to the pixels its store decoded to.
+
+## `replay.bin` provenance
 
 Captured 2026-06-11 from a normal interactive desktop session (taskbar/tray + open windows).
 Which regions a server Clear-codes is non-deterministic; re-running the capture harness yields a

@@ -15390,6 +15390,127 @@ mod tests {
         .await
     }
 
+    /// Corpus-capture harness for the ClearCodec glyph cache: an EGFX session with
+    /// `JUSTRDP_CLEAR_CAPTURE_DIR` set that opens Notepad from the Start menu and types three lines
+    /// of text four times, so the server stores text glyphs and draws them again by index. Writes
+    /// every payload and `manifest.tsv` to the dump directory, and `replay-text.bin` beside them
+    /// in the format `justrdp-codecs/tests/fixtures/clearcodec/README.md` documents, in arrival
+    /// order. Run with `--nocapture`.
+    #[tokio::test]
+    #[ignore = "requires the live RDP test VM at 192.168.136.136:3389 and JUSTRDP_TEST_* env vars"]
+    async fn capture_clearcodec_text_corpus_against_real_vm() {
+        with_vm_session(|vm| async move {
+            let dump = std::env::temp_dir().join("justrdp-clearcodec-text");
+            let _ = std::fs::remove_dir_all(&dump);
+            std::fs::create_dir_all(&dump).expect("create the capture dir");
+            // SAFETY: set before the session task spins up and removed after it ends; the harness
+            // lock serialises real-VM tests and nothing else touches this var, so no concurrent
+            // reader/writer races the process environment.
+            unsafe {
+                std::env::set_var("JUSTRDP_CLEAR_CAPTURE_DIR", &dump);
+            }
+            let config = test_config(); // EGFX flag ON + drdynvc channel
+            let session_capabilities = config.capabilities.clone();
+            let outcome = vm.connect(config).await;
+            let session_config = session_config_from(&outcome, session_capabilities);
+            let desktop = session_config.desktop_size;
+            let mut machine = SessionStateMachine::new(session_config, outcome.activation.leftover)
+                .expect("the test desktop size is within MAX_DESKTOP_DIM");
+            let mut stream = outcome.stream;
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<InputEvent>>(64);
+            let frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let frames_in_sink = frames.clone();
+            // The driver is aborted without being joined, so its verdict comes back through here.
+            let driver_fault = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+            let fault_in_driver = driver_fault.clone();
+            let driver = tokio::spawn(async move {
+                let result = async {
+                    vm::await_desktop(&frames, vm::DESKTOP_DEADLINE).await?;
+                    vm::start_menu_run(&tx, &frames, desktop, "notepad").await?;
+                    vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                    for _ in 0..4 {
+                        for line in [
+                            "the quick brown fox jumps over the lazy dog",
+                            "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG 0123456789",
+                            "a glyph cache hit should repeat these letters again and again",
+                        ] {
+                            vm::type_ascii(&tx, line).await?;
+                            tx.send(tap(0x0D))
+                                .await
+                                .map_err(|_| "the session closed".to_string())?;
+                        }
+                        vm::await_desktop(&frames, vm::MENU_DEADLINE).await?;
+                    }
+                    Ok::<(), String>(())
+                }
+                .await;
+                if let Err(why) = result {
+                    *fault_in_driver.lock().expect("driver fault slot") = Some(why);
+                }
+            });
+            // The timeout is the expected exit — a healthy session never ends on its own.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(150),
+                run_session_with_input(
+                    &mut stream,
+                    &mut machine,
+                    move |_: &FrameUpdate, _: &Framebuffer| {
+                        frames_in_sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    },
+                    |_| {},
+                    &mut rx,
+                ),
+            )
+            .await;
+            driver.abort();
+            // SAFETY: see the matching `set_var` above — same serialised, single-writer context.
+            unsafe {
+                std::env::remove_var("JUSTRDP_CLEAR_CAPTURE_DIR");
+            }
+            if let Some(why) = driver_fault.lock().expect("driver fault slot").take() {
+                panic!("{why} — the corpus this run would have written is not one to keep");
+            }
+
+            let manifest = std::fs::read_to_string(dump.join("manifest.tsv")).unwrap_or_default();
+            let mut body = Vec::new();
+            let mut entries = 0u32;
+            let (mut stores, mut hits) = (0usize, 0usize);
+            for row in manifest.lines() {
+                let f: Vec<&str> = row.split('\t').collect();
+                let (Some(idx), Some(w), Some(h)) = (
+                    f.first(),
+                    f.get(1).and_then(|s| s.parse::<u16>().ok()),
+                    f.get(2).and_then(|s| s.parse::<u16>().ok()),
+                ) else {
+                    continue;
+                };
+                let bytes = std::fs::read(dump.join(format!("clear-{idx}.bin")))
+                    .expect("a manifest row names a payload file");
+                match bytes.first() {
+                    Some(flags) if flags & 0x02 != 0 => hits += 1,
+                    Some(flags) if flags & 0x01 != 0 => stores += 1,
+                    _ => {}
+                }
+                body.extend_from_slice(&w.to_le_bytes());
+                body.extend_from_slice(&h.to_le_bytes());
+                body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                body.extend_from_slice(&bytes);
+                entries += 1;
+            }
+            let mut replay = entries.to_le_bytes().to_vec();
+            replay.extend_from_slice(&body);
+            std::fs::write(dump.join("replay-text.bin"), &replay).expect("write replay-text.bin");
+            eprintln!(
+                "ClearCodec text corpus: {entries} payloads, {stores} glyph stores, {hits} glyph \
+                 hits -> {}",
+                dump.display()
+            );
+            assert!(hits > 0, "the typed text drew no glyph hit");
+        })
+        .await
+    }
+
     /// DoD ④ for #193: does a WireToSurface2 payload from a real server actually **decode**?
     ///
     /// Before the `bitmapDataLength` fix it could not — the four length bytes reached the codec
@@ -15445,6 +15566,7 @@ mod tests {
         let rows: Vec<&str> = manifest.lines().collect();
 
         let mut decoded_ok = 0usize;
+        let mut tiles_decoded = 0usize;
         let mut decode_errors: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
         let (mut simple, mut first, mut upgrade) = (0usize, 0usize, 0usize);
@@ -15464,7 +15586,10 @@ mod tests {
                 continue;
             };
             match fields.get(5) {
-                Some(s) if s.starts_with("ok:") => decoded_ok += 1,
+                Some(s) if s.starts_with("ok:") => {
+                    decoded_ok += 1;
+                    tiles_decoded += s["ok:".len()..].parse::<usize>().unwrap_or(0);
+                }
                 Some(s) => {
                     let sig = s
                         .strip_prefix("err:")
@@ -15542,10 +15667,17 @@ mod tests {
             parse_errors.is_empty(),
             "the self-owned parser rejected a stream the real server sent: {parse_errors:?}"
         );
-        // `decoded_ok` is reported and **not** asserted: this test's claim is about the parser.
-        if decoded_ok == 0 {
-            eprintln!("  note: the decoder decoded none of them");
-        }
+        // And the self-owned decoder decodes every one of them, every tile included.
+        assert_eq!(
+            decoded_ok,
+            rows.len(),
+            "the decoder rejected a stream the real server sent: {decode_errors:?}"
+        );
+        assert_eq!(
+            tiles_decoded,
+            simple + first + upgrade,
+            "the decoder skipped a tile the real server sent"
+        );
         })
         .await
     }

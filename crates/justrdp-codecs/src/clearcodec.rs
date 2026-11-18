@@ -16,12 +16,9 @@
 //!    `shortVBarYOff < shortVBarYOn`; every column that band would have stored then misses the
 //!    full V-bar cache on a later hit (`vbarIndex`).
 //!
-//! 2. **RLEX region over-fill is clipped, not fatal.** A captured real Windows Server 2019
-//!    stream over-fills its RLEX region (replay corpus entry 0). FreeRDP `clear.c` *rejects* an
-//!    over-region run/suite (`:260`/`:286`/`:321`), but a client
-//!    must not drop a live frame over a server's over-encode, so we clip the surplus at the
-//!    region boundary (and short-fill under-runs). This is backed by the capture, **not** by
-//!    FreeRDP — an earlier comment mis-attributed it as "FreeRDP parity" (#120).
+//! 2. **RLEX region over-fill is clipped, not fatal.** The surplus of a run or suite past the
+//!    region boundary is dropped and an under-run is short-filled, where FreeRDP `clear.c`
+//!    *rejects* an over-region run/suite (`:260`/`:286`/`:321`).
 //!
 //! **Alpha contract:** ClearCodec carries no alpha; every output pixel's alpha byte is `0xFF`.
 
@@ -807,12 +804,7 @@ fn decode_rlex_region(
         output[dst + 3] = 0xFF;
     };
 
-    // Clip surplus at the region boundary rather than reject. A captured real Windows Server
-    // 2019 stream over-fills its RLEX region (replay corpus entry 0, 64x32); FreeRDP `clear.c`
-    // rejects that, but a client
-    // must not drop a live frame over a server's over-encode, so we stop emitting at the region
-    // boundary and short-fill under-runs. (NB: this is *not* FreeRDP parity — FreeRDP rejects;
-    // the basis is the real capture, verified 2026-07-02. See #120.)
+    // Clip surplus at the region boundary rather than reject, and short-fill under-runs.
     'segments: for seg in &rlex.segments {
         if usize::from(seg.start_index) >= palette_len {
             return Err(invalid("rlex", "start_index exceeds palette size"));
@@ -1176,11 +1168,9 @@ mod tests {
         stream
     }
 
-    // #120 — RLEX over/under-region is tolerated, not rejected. A captured real WS2019 stream
-    // over-fills its region (corpus entry 0); FreeRDP `clear.c` rejects that, but a client must
-    // not drop a live frame, so justrdp clips the surplus and short-fills under-runs. These
-    // assertions pin that intentional tolerance. palette_count=2 keeps the test off the
-    // single-palette 0-bit path (#121).
+    // RLEX over- and under-region: the surplus is clipped and an under-run short-filled, not
+    // rejected. These assertions pin that behaviour; palette_count=2 keeps them off the
+    // single-palette path.
 
     /// A one-segment RLEX bitmap: palette of 2 BGR colors, packed byte `0x00`
     /// (stopIndex=0, suiteDepth=0, startIndex=0) → `run_length` run px + 1 suite px of palette[0].

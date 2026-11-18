@@ -10,9 +10,13 @@ repository.workspace = true
 
 [dev-dependencies]
 # Differential oracle for wire round-trips (`tests/differential_ironrdp.rs`,
-# `tests/differential_activation.rs`) — role **R1 verifier** in ADR-0011's 2026-08-26 role table.
-# **What ends it (ADR-0011):** an owned basis for this layer — real server bytes plus expectations
-# derived independently of our encoder. `tests/fixtures/connect/` is the start of one (#203, #252)
+# `tests/differential_activation.rs`), in three roles of ADR-0011's role table: **R3 acceptance** for the
+# `our_*` tests, where `ironrdp_pdu::decode` parses bytes our encoders wrote; **R2 generator** for the
+# `ironrdp_*` tests, where `ironrdp` encodes bytes our decoders read; **R1 verifier** for the tests that
+# decode test-built bytes with both stacks or compare both encoders' bytes.
+# **What ends it (ADR-0011):** R1, an owned basis for this layer — real server bytes plus expectations
+# derived independently of our encoder; R2, an encoder of ours; R3, a real-server capture of the
+# client-to-server leg or a VM run. `tests/fixtures/connect/` is the start of an owned basis (#203, #252)
 # and `tests/real_server_connect.rs` is what reads it; every encoder in this crate writes
 # client-to-server, so the oracle is currently the only thing that grades a server-to-client
 # decode. This entry carried **no comment at all** until #225, which is why it is spelled out.

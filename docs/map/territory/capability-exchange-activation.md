@@ -219,6 +219,25 @@ IronRDP tracks nothing: one flat wait state, `FontMap → Finished`.
 reaches session-active, deliberately — but the field values the spec does fix are
 checked, identically on both legs.
 
+**What the activation differentials still catch on `ironrdp-pdu` 0.11** (#587).
+`justrdp-pdu/tests/differential_activation.rs` decodes our Confirm Active
+(`our_confirm_active_with_default_capabilities_decodes_in_ironrdp`) and our Synchronize, Control and
+Font List (`our_finalization_batch_decodes_identically_in_ironrdp`) with `ironrdp_pdu::decode`.
+Reading the 0.9 → 0.11 diff of the Share Control and Share Data headers, `CapabilitySet` and the
+finalization PDUs found no relaxation that reaches these frames:
+
+| What 0.11 changed (file in 0.11's `src/rdp/`) | Why it does not reach our frames |
+|---|---|
+| `shareId` is read only when 4 bytes remain after the 6-byte header (`headers.rs:345`) | every frame here has more than 4 bytes there, so it is read as in 0.9; the Confirm Active test asserts it |
+| a Data PDU may declare a `totalLength` below its content for an empty Update or Pointer (0) or a Server Font Map (18) (`headers.rs:364`, `:376`) | we send neither; a short length on Synchronize, Control or Font List is still refused |
+| `pduType` `0xA` (Server Redirection) decodes where 0.9 refused it | both tests match the variant they expect, so a frame typed `0xA` still fails |
+| a non-zero Input `keyboardType` outside 1..7 reads as `Some` (`capability_sets/input/mod.rs:104`) | 0.9 read it as `None` without refusing it, and neither test asserts it |
+| stricter: a Share Data PDU with a compression flag stays an undecoded `Compressed` body (`headers.rs:550`); Rail and Window List sets must have their exact length (`capability_sets/mod.rs:586`, `:593`) | a compression flag from our encoder now fails the finalization test's variant match, where 0.9 parsed the body anyway |
+
+The other sets our Confirm Active carries decode as in 0.9 apart from error context. Both tests
+still discriminate; no owned check was added. The licensing frames in the same file are in
+[licensing](licensing.md).
+
 ## Cross-cutting invariants
 
 - [What we advertise, we must implement](../invariant/what-we-advertise-we-must-implement.md)

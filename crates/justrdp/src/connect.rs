@@ -2558,6 +2558,15 @@ pub(crate) mod tests {
             info.credentials.password, "",
             "no secret enters the sans-IO machine (ADR-0002)"
         );
+        assert!(
+            info.password_cookie.is_none(),
+            "the Password field is empty, not opaque bytes"
+        );
+        assert_eq!(
+            info.flags.bits() & !ironrdp_pdu::rdp::client_info::ClientInfoFlags::all().bits(),
+            0,
+            "a flag bit ironrdp-pdu does not define"
+        );
         let tz = info
             .extra_info
             .optional_data
@@ -2669,6 +2678,14 @@ pub(crate) mod tests {
                 .unwrap()
                 .bits();
             assert_eq!(decoded_bits, bits, "flags must pass through unmodified");
+            assert!(
+                parsed
+                    .conference_create_request
+                    .gcc_blocks()
+                    .network
+                    .is_some(),
+                "the Network block arrives typed as one"
+            );
             // And the machine echoed the negotiated protocol, not a hardcoded one.
             assert_eq!(
                 parsed

@@ -84,6 +84,30 @@ the requests went out: user channel, I/O channel (`1003`), then each static chan
 confirm, and asserted in order by `connect_reaches_session_active_against_real_vm`. The machine
 accepts confirms in any order; this server never exercised that. One WS2019 box.
 
+**What the R3 acceptance checks still catch on `ironrdp-pdu` 0.11** (#587). `justrdp/src/connect.rs`
+decodes three of the machine's frames with `ironrdp_pdu::decode` (ADR-0011's R3 role). Reading the
+0.9 → 0.11 diff of each decode path found 10 inputs 0.9 refused and 0.11 accepts, and none on the
+X.224 Data / MCS Send Data Request path:
+
+| Frame (test) | What 0.11 accepts now | Verdict |
+|---|---|---|
+| Send Data Request (`client_user_data`, the Standard Security tests) | nothing new; 0.11 is stricter (TPKT length below 7) | still discriminates |
+| Connect-Initial (`tls_established_under_ssl_writes_connect_initial_without_nla`, `early_capability_flags_reach_the_connect_initial_verbatim`) | an unknown GCC block type is skipped; `keyboardType` outside 1..7; undefined bits in `serverSelectedProtocol`, client `encryptionMethods`, channel `options`, cluster, monitor and multitransport flags | **owned check added** for the block type: the second test asserts the Network block arrives, and a mistyped one turns it red. The two asserted fields still discriminate: `serverSelectedProtocol` is compared by exact bits and `earlyCapabilityFlags` is still parsed with `from_bits`. The other fields are not asserted at these sites and carry host policy verbatim; **accepted** |
+| Client Info (`client_info_pdu_is_sent_on_the_io_channel_with_caller_fields`) | a Password field that is not text reads as `password = ""` plus a cookie; undefined `ClientInfoFlags` bits are kept | **owned checks added**: no password cookie, and no flag bit outside `ClientInfoFlags::all()`. The basic security header is read with `from_bits_truncate` where 0.9 used `from_bits`, but both versions define all 16 bits of `BasicSecurityHeaderFlags`, so that accepts nothing new; INFO_PKT is still required, so a missing one still fails |
+
+Each added assertion was watched failing with a mutated encoder: a Password field of `00 D8`, flag
+bit `0x4`, and the Network block written as type `CS_NET + 0x100`. The old assertions passed all
+three.
+
+`justrdp-pdu/tests/differential_ironrdp.rs` `our_client_info_pdu_decodes_identically_in_ironrdp`
+decodes the encoder's Client Info alone and carries the same two owned checks; the same Password and
+flag mutations turn each red, and its old assertions passed both. The rest of that file feeds the
+same encoders through paths 0.11 left alone or made stricter: the Connection Request (0.11's
+`nego.rs` now checks the correlation info 0.9 refused), Erect Domain, Channel Join and Send Data
+Request (`mcs.rs`, error context only), and Refresh Rect and Suppress Output. Its Connect-Initial
+test meets the unknown-block skip as the `connect.rs` one did: 0.11 still requires the Core and
+Security blocks (`gcc/mod.rs:167`, `:169`), and the test unwraps the Network block.
+
 **No implementation comparison.** No verified external-fact store. The tolerance questions here (a server
 that omits a requested channel, an unexpected join order) are exactly the class
 ADR-0009 says is spec-unwritten and lives in FreeRDP's source — and none of it is
