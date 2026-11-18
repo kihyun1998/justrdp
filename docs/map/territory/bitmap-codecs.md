@@ -30,11 +30,20 @@ attacker-controlled bytes in the repo.
 - **Derive from the spec, prove against the oracle.** Structural similarity to
   IronRDP is explicitly *not* the goal, and byte-identical output is the only
   accepted evidence.
-- **Tolerances are corpus-driven, not spec-driven.** ClearCodec accepts RLEX runs
-  that overflow the declared rect, clipping them, which real Server 2019 streams
-  require (#127). This is recorded as a deliberate divergence against #127 and memory
-  `clearcodec_corpus_required_tolerances`. The NSCodec subcodec those streams also
-  carry is decoded (`decode_nscodec_region`, epic #132).
+- **ClearCodec clips an RLEX run that overflows the declared rect, and no corpus stream needs
+  it** (#587). FreeRDP rejects such a stream. The clip was recorded as corpus-required (#120,
+  #127), but the observation behind that, replay entry 0 over-filling (2026-07-02), was made
+  before #131 corrected the single-palette RLEX parse the same day. Under the old 0-bit parse,
+  which the 0.9 oracle shared, each segment over-fills by one pixel. Under the corrected one,
+  all 26 RLEX regions in `replay.bin` fill their rectangle exactly, and
+  `clearcodec_corpus.rs` `corpus_holds_every_shape_the_decoder_was_fixed_for` asserts it: with
+  the old parse it counts 8 inexact regions, the 8 single-palette ones. Replacing the clip with
+  a panic leaves the corpus replay green. Whether to keep the clip or reject as FreeRDP does
+  is open and is not decided by this measurement. One more input to it: the decoder has no channel
+  to report the clip as ADR-0009's always-observable rule asks, the same reason #586 gave for not
+  following FreeRDP's larger-area glyph hit. `replay-text.bin` (#587) adds 81 RLEX regions, all
+  exact too. The NSCodec subcodec the corpus carries
+  (entry 30) is decoded (`decode_nscodec_region`, epic #132).
 - **A ClearCodec glyph hit draws the cached pixels as any rectangle of the same area** (#586).
   `[MS-RDPEGFX]` 4.1.1.5 stores a glyph as a linear pixel stream with no dimensions and hits a
   2x8 glyph as 4x4 and as 8x2; the `ironrdp-graphics` 0.11 oracle does the same. A hit of a
@@ -43,6 +52,31 @@ attacker-controlled bytes in the repo.
   an earlier, larger glyph left behind); that is not followed,
   the maintainer's call (2026-11-03): no server has been seen sending one, and the decoder has
   no channel to report the tolerance as ADR-0009 requires.
+- **WS2019 sends glyph hits, and draws each into the rectangle its glyph was stored with**
+  (#587, 2026-11-18). Hits themselves had been seen before: #272's probes on 2026-09-17 decoded
+  glyph hits (`flags` 0x03) to compare kept and fresh caches
+  ([EGFX graphics pipeline](egfx-graphics-pipeline.md)), but nothing recorded their shape and no
+  fixture kept them. A Notepad session with text typed into it sent 781 ClearCodec payloads:
+  294 glyph stores and 368 glyph hits, every hit on a slot stored earlier in the session and
+  none with a different width or height, so the same-area rule above has no real-server stream
+  behind it either way. A second session through the committed harness the same day: 1098
+  payloads, 219 stores, 791 hits, none reshaped. A passive desktop sends few: `replay.bin` (2026-06-11) holds 0 hits in 73
+  payloads, and a 20 s capture on 2026-11-18 held 1 in 34. The typed-text session is
+  `fixtures/clearcodec/replay-text.bin`, captured by `capture_clearcodec_text_corpus_against_real_vm`;
+  `clearcodec_corpus.rs` asserts that every hit draws its slot's rectangle and the pixels its
+  store decoded to, a glyph-cache read `replay.bin` never reaches.
+- **The real-VM Planar/RLE differential passes on the 0.11 oracle** (#587, 2026-11-18).
+  `captured_bitmap_rectangles_decode_identically_in_ironrdp` captured 71 compressed bitmap
+  rectangles from WS2019 and all 71 decoded byte-identically in both stacks, under 0.10's new
+  Planar size checks and RLE dimension cap. The run does not report how many were Planar and how
+  many RLE.
+- **WS2019's Progressive payloads decode with no tile skipped** (#587, 2026-11-18).
+  `progressive_payloads_decode_against_real_vm` now asserts it: `ok:` in the capture manifest
+  counts a payload whose parse succeeded, and a tile that fails inside it is only counted in
+  `tiles_skipped`, so the test compares the decoded tile total with the tiles its own parser
+  found. Runs on 2026-11-18: 1 payload with 1 `TILE_FIRST`, then 3 payloads with 5, all decoded.
+  No `TILE_UPGRADE` arrived, so the upgrade path is not covered by this assertion on this
+  server's default connection type.
 - **NSCodec accepts a zero luma, Co or Cg plane count, which `[MS-RDPNSC]` 2.2.2 forbids** (#371,
   the maintainer's call). `decode_plane` fills a zero-length plane with `0xFF`, as FreeRDP does
   for every plane (`nsc.c`, `nsc_rle_decompress_data`); the spec allows that only for alpha.

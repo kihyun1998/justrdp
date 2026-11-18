@@ -492,6 +492,16 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_may_end_on_a_regular_fg_run() {
+        // 4×2 @ 8bpp: COLOR_RUN(4) of 0x0F, then REGULAR_FG_RUN(4) (header 1<<5 | 4 = 0x24) as the
+        // last byte. A regular FG run carries no pixel (`[MS-RDPBCGR]` 3.1.9): line 2 = line 1 ^
+        // the default white foreground 0xFF = 0xF0.
+        let src = [0x64, 0x0F, 0x24];
+        let out = decompress(&src, 4, 2, 8).unwrap();
+        assert_eq!(out, [0x0F, 0x0F, 0x0F, 0x0F, 0xF0, 0xF0, 0xF0, 0xF0]);
+    }
+
+    #[test]
     fn fgbg_image_drives_xor_from_the_bitmask() {
         // 8×2 @ 8bpp: line 1 raw zeros (COLOR_IMAGE run 8), then FGBG_IMAGE with one mask
         // byte 0b0101_0101 over 8 pixels: set bits become fg (white ^ 0), clear copy above.

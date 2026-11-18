@@ -25,13 +25,20 @@ impl Lcg {
 }
 
 /// Build a syntactically valid interleaved-RLE stream that fills exactly `width × height`
-/// pixels, exercising a seeded mix of order codes (including MEGA/LITE/SPECIAL forms).
-fn generate_rle_stream(seed: u64, width: usize, height: usize, pixel_size: usize) -> Vec<u8> {
+/// pixels, exercising a seeded mix of order codes (including MEGA/LITE/SPECIAL forms). The flag
+/// is true when the stream's last order is a regular foreground run.
+fn generate_rle_stream(
+    seed: u64,
+    width: usize,
+    height: usize,
+    pixel_size: usize,
+) -> (Vec<u8>, bool) {
     let mut lcg = Lcg(seed);
     let total = width * height;
     let mut emitted = 0usize;
     let mut out = Vec::new();
     let mut wrote_non_bg = false;
+    let mut last_order = 0usize;
 
     let push_pixel = |out: &mut Vec<u8>, lcg: &mut Lcg| {
         for _ in 0..pixel_size {
@@ -41,6 +48,7 @@ fn generate_rle_stream(seed: u64, width: usize, height: usize, pixel_size: usize
 
     while emitted < total {
         let remaining = total - emitted;
+        last_order = out.len();
         match lcg.below(10) {
             // Background run (regular). On a fresh stream this writes black / copies above.
             0 | 1 => {
@@ -48,16 +56,11 @@ fn generate_rle_stream(seed: u64, width: usize, height: usize, pixel_size: usize
                 out.push((run & 0x1F) as u8); // code 0 << 5 | run
                 emitted += run;
             }
-            // Foreground run (regular), always followed by a color run, so no generated stream
-            // ends on a regular FG run.
-            2 if remaining >= 2 => {
-                let run = 1 + lcg.below((remaining - 1).min(31));
+            // Foreground run (regular): the header alone, no pixel.
+            2 => {
+                let run = 1 + lcg.below(remaining.min(31));
                 out.push(0x20 | (run & 0x1F) as u8); // code 1 << 5
                 emitted += run;
-                let pair = 1 + lcg.below((total - emitted).min(31));
-                out.push(0x60 | (pair & 0x1F) as u8);
-                push_pixel(&mut out, &mut lcg);
-                emitted += pair;
                 wrote_non_bg = true;
             }
             // Lite SET-FG foreground run.
@@ -127,16 +130,21 @@ fn generate_rle_stream(seed: u64, width: usize, height: usize, pixel_size: usize
         }
     }
     assert_eq!(emitted, total, "generator must fill the image exactly");
-    out
+    // A regular FG run with a non-zero length field is one header byte, code 1 in bits [7:5].
+    let ends_on_fg = out.len() == last_order + 1 && out[last_order] & 0xE0 == 0x20;
+    (out, ends_on_fg)
 }
 
 #[test]
 fn interleaved_rle_matches_ironrdp_on_generated_streams() {
+    let mut ended_on_fg = 0usize;
     for (bpp, pixel_size) in [(8u16, 1usize), (15, 2), (16, 2), (24, 3)] {
         for seed in 0..32u64 {
             let width = 8 + (seed as usize % 5) * 13; // 8..60, not byte-aligned friendly
             let height = 1 + (seed as usize % 7) * 9; // 1..55
-            let stream = generate_rle_stream(seed * 4 + u64::from(bpp), width, height, pixel_size);
+            let (stream, ends_on_fg) =
+                generate_rle_stream(seed * 4 + u64::from(bpp), width, height, pixel_size);
+            ended_on_fg += usize::from(ends_on_fg);
 
             let ours = rle::decompress(&stream, width, height, bpp)
                 .unwrap_or_else(|e| panic!("ours failed (bpp {bpp} seed {seed}): {e}"));
@@ -151,6 +159,10 @@ fn interleaved_rle_matches_ironrdp_on_generated_streams() {
             );
         }
     }
+    assert!(
+        ended_on_fg > 0,
+        "no generated stream ends on a regular FG run"
+    );
 }
 
 #[test]

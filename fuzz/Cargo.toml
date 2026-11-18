@@ -69,6 +69,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "clearcodec_session"
+path = "fuzz_targets/clearcodec_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pointer"
 path = "fuzz_targets/pointer.rs"
 test = false

@@ -16,7 +16,7 @@ Both are, notably, **tolerant on version misreporting**: FreeRDP takes `MIN(serv
 justrdp already applies a **split posture** in code, without having named the principle:
 
 - **Strict** where a mismatch is a security/integrity threat: the connect machine rejects a server that selects a security protocol we never advertised (`connect.rs`), rejects Standard RDP Security, rejects an unsolicited Channel Join Confirm, and the DVC layer rejects a compressed chunk when compression was never advertised (`dvc.rs`).
-- **Tolerant** where a mismatch is a rendering-feature divergence: the ClearCodec decoder keeps real-server leniencies the spec and the ironrdp oracle reject (over-region RLEX clip, NSCodec subcodec) because the captured WS2019 corpus requires them (ADR-0007 amendment, #120/#121/#127).
+- **Tolerant** where a mismatch is a rendering-feature divergence: the ClearCodec decoder keeps real-server leniencies the spec and the ironrdp oracle reject (over-region RLEX clip, NSCodec subcodec) because the captured WS2019 corpus requires them (ADR-0007 amendment, #120/#121/#127). **The RLEX half is measured false (#587): see the #576 amendment.**
 - **Not yet exercised** for drawing orders — order decode is epic #22, so the advertised-but-violated-order problem has not bitten us yet. This ADR sets the posture *before* it does.
 
 This mirrors the project's stated identity (`CLAUDE.md`): *derivation from the normative spec, proof from the oracle/real VM* — "스펙 ≠ 상호운용". We already accept that real servers diverge from spec; the open question is only where the tolerance lives and how it is bounded. justrdp takes **IronRDP's default-tolerant stance on rendering, but with the two bounds IronRDP lacks** (still-validate-the-bytes, always-observable) — neither FreeRDP's disconnect-by-default nor IronRDP's silent, unbounded swallow.
@@ -44,7 +44,7 @@ Be **tolerant by default of a server's self-inconsistency in rendering features,
 
   So #101's "related hard-spots" were **stale** — both were solved before this ADR was written. This ADR records only the negotiation *posture*; no follow-up implementation issues are filed for them.
 - **Order decode (#22) is built tolerant from day one** — accept-and-log unannounced orders rather than adding strictness later and then relaxing it.
-- **Generalizes the ADR-0007 codec-tolerance precedent** from the codec layer to the negotiation layer: the corpus-required leniencies were the first instance of this principle; ADR-0009 names it.
+- **Generalizes the ADR-0007 codec-tolerance precedent** from the codec layer to the negotiation layer: the corpus-required leniencies were the first instance of this principle; ADR-0009 names it. (The RLEX clip has since lost its corpus ground; see the #576 amendment's 2026-11-18 correction.)
 - **Risk: tolerance can mask a bug in our own decoder as "server inconsistency."** Mitigated by invariant (b) — every tolerance is logged — and by the differential/corpus tests that still assert byte-identity wherever an oracle or a captured stream exists. Tolerance widens *what we accept*, never *what we stop verifying*.
 
 ## Amendment (2026-08-25, #252): §1 and §2 are not a partition
@@ -399,6 +399,12 @@ RLEX run and the NSCodec subcodec. `ironrdp-graphics` 0.11 clips the first and d
 so the spec's strict reading is what remains on the other side, with FreeRDP's rejection of the
 RLEX over-fill (`justrdp-codecs/src/clearcodec.rs`). The tolerance is unchanged: its ground was
 always the captured WS2019 corpus.
+**Corrected 2026-11-18 (#587): for the RLEX clip that ground is not there.** No stream in
+`replay.bin` over-fills an RLEX region; all 26 fill their rectangle exactly, and the corpus never
+reaches the clip. The over-fill seen on 2026-07-02 (#130) came from the single-palette parse #131
+corrected that day. The NSCodec subcodec half stands: entry 30 carries one. The clip itself is
+unchanged, and whether to keep it or reject as FreeRDP does is an open call. The measurement is in
+`docs/map/territory/bitmap-codecs.md`.
 
 ## Amendment (2026-11-06, #598): rejecting Standard RDP Security means rejecting a downgrade
 

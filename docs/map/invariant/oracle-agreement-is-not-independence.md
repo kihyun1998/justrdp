@@ -84,7 +84,9 @@ show it.
   is this fact applied one level down.
 - **#127** — ClearCodec divergences from FreeRDP adjudicated as **required
   tolerances**, backed by the `clearcodec_corpus` fixtures (memory
-  `clearcodec_corpus_required_tolerances`). The oracle lost that argument.
+  `clearcodec_corpus_required_tolerances`). The oracle lost that argument. #587 took the
+  RLEX over-fill clip out of that set: the over-fill came from a parse #131 corrected, and
+  no corpus stream over-fills ([bitmap codecs](../territory/bitmap-codecs.md)).
 - **#194 → #168** — the third shape above, found one slice after the basis landed.
   #194 built an owned basis precisely *because* the oracle could not arbitrate SRL, and
   the basis was still derived at the wrong initial state. The lesson is not that #194
@@ -160,7 +162,9 @@ Worked example, 0.9 → 0.11 (#576), both changelogs read entry by entry:
   compression, logon errors). One of these weakens an instrument rather than moving a value:
   `ironrdp-pdu` now tolerates unknown flag bits and several malformed headers, so the R3
   acceptance checks in `justrdp/src/connect.rs` that decode our frames with it no longer reject a
-  frame of ours that sets such a bit.
+  frame of ours that sets such a bit. #587 listed them per frame and gave the Connect-Initial and
+  Client Info checks owned assertions where the relaxation hid a field they read
+  ([MCS / GCC channel setup](../territory/mcs-gcc-channel-setup.md#reference-behaviour)).
 
 Concretely:
 

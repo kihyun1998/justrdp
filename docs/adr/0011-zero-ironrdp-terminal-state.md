@@ -405,6 +405,17 @@ example of a coverage assertion, and [ADR-0009](0009-tolerant-negotiation-postur
 oracle's rejections as part of the ground for ClearCodec's RLEX clip; 0.11 clips an over-filled
 RLEX region and decodes the NSCodec subcodec, so that ground is now the corpus alone. Both rules
 stand.
+**Closed 2026-11-18 (#587), with one shape that was never there.** `clearcodec_corpus.rs`
+`corpus_holds_every_shape_the_decoder_was_fixed_for` counts the shapes with a parser of its own:
+684 short V-bar cache misses the swapped layout rejects, 1726 full V-bar cache hits on a column
+only a stream the swap rejects stored, and 8 single-palette RLEX regions. It finds no over-filled
+RLEX region. The 0.9 oracle's `rlex` rejections came from its 0-bit single-palette
+parse, which over-fills by one pixel per segment, the same parse #131 removed from our decoder; with
+it the test counts 8 inexact regions, the 8 single-palette ones. So the test asserts that every RLEX
+region fills exactly, and the RLEX clip's corpus ground, which the sentence above assumed, is gone
+(ADR-0009's #576 amendment). Asserting exact fill and recording the lost ground, while leaving the
+clip itself and the keep-or-reject question open, is the maintainer's call (2026-11-18), made after
+being shown the measurement and the option of leaving RLEX out of the test.
 **How this was decided.** The red tests, the 0.9 reruns and the role each test now plays are
 measurements. Turning the comparing canaries into agreement checks rather than deleting all of
 them, as the role table's R4 row reads, is the maintainer's call (2026-11-03), made after being
