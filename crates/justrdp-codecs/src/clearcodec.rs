@@ -24,11 +24,13 @@
 //!    keep what the tile already held: the residual or bands pixel under an RLEX region, and zero
 //!    bytes where the residual layer stops short.
 //!
-//! 3. **A residual or subcodec layer holds whole structures, and two field values the spec
-//!    forbids are refused.** Bytes after a layer's last whole run segment or last whole subcodec are a
-//!    [`ClearError::NotEnoughBytes`] (`[MS-RDPEGFX]` 2.2.4.1.1.1, 2.2.4.1.1.3). A residual
-//!    `runLengthFactor1` of zero (2.2.4.1.1.1.1) and a raw subcodec whose `bitmapDataByteCount` is
-//!    not exactly `3 * width * height` (2.2.4.1.1.3.1) are [`ClearError::InvalidField`].
+//! 3. **Each layer holds whole structures, and these field values the spec forbids are refused.** Bytes
+//!    after a layer's last whole run segment, band or subcodec are a
+//!    [`ClearError::NotEnoughBytes`] (`[MS-RDPEGFX]` 2.2.4.1.1.1, 2.2.4.1.1.2, 2.2.4.1.1.3). A
+//!    residual run length whose `runLengthFactor1`, `runLengthFactor2` or `runLengthFactor3` is
+//!    zero (2.2.4.1.1.1.1), a subcodec of any `subCodecId` whose `bitmapDataByteCount` exceeds
+//!    `3 * width * height`, and a raw subcodec with fewer bytes than that (2.2.4.1.1.3.1) are
+//!    [`ClearError::InvalidField`].
 //!
 //! **Alpha contract:** ClearCodec carries no alpha; every pixel a layer writes has alpha `0xFF`. A
 //! pixel no layer reaches is zero bytes, alpha included (decision 2).
@@ -137,10 +139,6 @@ impl<'a> Cursor<'a> {
         self.remaining() == 0
     }
 
-    fn peek_u8(&self) -> u8 {
-        self.data[self.pos]
-    }
-
     fn ensure(&self, size: usize, ctx: &'static str) -> Result<(), ClearError> {
         if self.remaining() < size {
             Err(ClearError::NotEnoughBytes { ctx })
@@ -179,21 +177,32 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// The field of a variable-length run length that holds its value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunLengthFactor {
+    Factor1,
+    Factor2,
+    Factor3,
+}
+
 /// A variable-length run length shared by the residual and RLEX layers: a single byte, or
-/// `0xFF` then a u16, or `0xFF 0xFFFF` then a u32.
-fn read_run_length(c: &mut Cursor<'_>, ctx: &'static str) -> Result<u32, ClearError> {
+/// `0xFF` then a u16, or `0xFF 0xFFFF` then a u32. Returns the length and the field that held it.
+fn read_run_length(
+    c: &mut Cursor<'_>,
+    ctx: &'static str,
+) -> Result<(u32, RunLengthFactor), ClearError> {
     c.ensure(1, ctx)?;
     let factor1 = c.u8();
     if factor1 < 0xFF {
-        return Ok(u32::from(factor1));
+        return Ok((u32::from(factor1), RunLengthFactor::Factor1));
     }
     c.ensure(2, ctx)?;
     let factor2 = c.u16_le();
     if factor2 < 0xFFFF {
-        return Ok(u32::from(factor2));
+        return Ok((u32::from(factor2), RunLengthFactor::Factor2));
     }
     c.ensure(4, ctx)?;
-    Ok(c.u32_le())
+    Ok((c.u32_le(), RunLengthFactor::Factor3))
 }
 
 // --- Persistent cache state ---
@@ -446,7 +455,7 @@ impl ClearDecoder {
 
     /// Layer 1 — residual BGR run-length background, filling the tile row-major. A run past the
     /// tile's last pixel is an error; a tile the runs do not reach the end of keeps zero bytes
-    /// there (module docs, decision 2). A zero `runLengthFactor1` and bytes after the last whole
+    /// there (module docs, decision 2). A zero run length factor and bytes after the last whole
     /// segment are errors (decision 3).
     fn decode_residual_layer(&self, data: &[u8], output: &mut [u8]) -> Result<(), ClearError> {
         if data.is_empty() {
@@ -461,12 +470,19 @@ impl ClearDecoder {
             let blue = c.u8();
             let green = c.u8();
             let red = c.u8();
-            if c.peek_u8() == 0 {
-                return Err(invalid("residual", "runLengthFactor1 is zero"));
-            }
             // The run length (the variable-length factor1..factor3 sequence) follows the BGR
             // triple and is read by the shared reader.
-            let run_length = read_run_length(&mut c, "RgbRunSegment")?;
+            let (run_length, factor) = read_run_length(&mut c, "RgbRunSegment")?;
+            if run_length == 0 {
+                return Err(invalid(
+                    "residual",
+                    match factor {
+                        RunLengthFactor::Factor1 => "runLengthFactor1 is zero",
+                        RunLengthFactor::Factor2 => "runLengthFactor2 is zero",
+                        RunLengthFactor::Factor3 => "runLengthFactor3 is zero",
+                    },
+                ));
+            }
 
             let pixels_remaining = (max_offset - offset) / 4;
             if cast_usize(run_length) > pixels_remaining {
@@ -483,7 +499,8 @@ impl ClearDecoder {
         Ok(())
     }
 
-    /// Layer 2 — bands of cached vertical columns composited over the residual.
+    /// Layer 2 — bands of cached vertical columns composited over the residual. Bytes after the
+    /// last whole band are an error (module docs, decision 3).
     fn decode_bands_layer(
         &mut self,
         data: &[u8],
@@ -496,7 +513,8 @@ impl ClearDecoder {
         let w = usize::from(width);
         let mut c = Cursor::new(data);
 
-        while c.remaining() >= 11 {
+        while !c.is_empty() {
+            c.ensure(11, "ClearCodecBand")?;
             let x_start = c.u16_le();
             let x_end = c.u16_le();
             let y_start = c.u16_le();
@@ -623,7 +641,8 @@ impl ClearDecoder {
     }
 
     /// Layer 3 — subcodec rectangles composited over the result. Bytes after the last whole
-    /// subcodec are an error (module docs, decision 3).
+    /// subcodec, and a subcodec above `3 * width * height` bytes, are errors (module docs,
+    /// decision 3).
     fn decode_subcodec_layer(
         &self,
         data: &[u8],
@@ -643,12 +662,16 @@ impl ClearDecoder {
             let y_start = c.u16_le();
             let width = c.u16_le();
             let height = c.u16_le();
-            let bitmap_byte_count = cast_usize(c.u32_le());
+            let bitmap_byte_count = c.u32_le();
             let codec_id = c.u8();
 
             if width == 0 || height == 0 {
                 return Err(invalid("dimensions", "subcodec region has zero dimension"));
             }
+            if u64::from(bitmap_byte_count) > u64::from(width) * u64::from(height) * 3 {
+                return Err(invalid("bitmapDataByteCount", "exceeds 3 * width * height"));
+            }
+            let bitmap_byte_count = cast_usize(bitmap_byte_count);
             c.ensure(bitmap_byte_count, "ClearCodecSubcodec")?;
             let bitmap = c.slice(bitmap_byte_count);
 
@@ -785,9 +808,6 @@ fn decode_raw_region(
     if bitmap.len() < expected {
         return Err(invalid("bitmapData", "raw subcodec data too short"));
     }
-    if bitmap.len() > expected {
-        return Err(invalid("bitmapDataByteCount", "exceeds 3 * width * height"));
-    }
     for row in 0..h {
         for col in 0..w {
             let x = usize::from(x_start) + col;
@@ -920,7 +940,7 @@ fn decode_rlex(data: &[u8]) -> Result<RlexData, ClearError> {
         let start_index = stop_index
             .checked_sub(suite_depth)
             .ok_or_else(|| invalid("rlex", "suiteDepth exceeds stopIndex"))?;
-        let run_length = read_run_length(&mut c, "RlexRun")?;
+        let (run_length, _) = read_run_length(&mut c, "RlexRun")?;
         segments.push(RlexSegment {
             start_index,
             stop_index,
@@ -1240,12 +1260,7 @@ mod tests {
     /// A residual-only ClearCodec stream: `runs` as (B, G, R, one-byte run length).
     fn residual_stream(runs: &[[u8; 4]]) -> Vec<u8> {
         let residual: Vec<u8> = runs.iter().flatten().copied().collect();
-        let mut stream = vec![0x00, 0x00]; // flags, seq
-        stream.extend_from_slice(&u32::try_from(residual.len()).unwrap().to_le_bytes());
-        stream.extend_from_slice(&0u32.to_le_bytes()); // bandsByteCount
-        stream.extend_from_slice(&0u32.to_le_bytes()); // subcodecByteCount
-        stream.extend_from_slice(&residual);
-        stream
+        residual_bytes_stream(&residual)
     }
 
     #[test]
@@ -1433,37 +1448,114 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nscodec_subcodec_decodes_into_the_region() {
-        // An NSCodec subcodec (0x01) is now decoded via the self-owned codec (epic #132) and
-        // composited, not skipped. A 1×1 NSCodec stream (raw planes, ColorLossLevel 1) wrapped in a
-        // ClearCodec subcodec region must paint its pixel.
+    /// A 16-pixel NSCodec stream (ColorLossLevel 1, no subsampling) whose four planes are each one
+    /// RLE run of `[y, co, cg, alpha]`: 48 bytes, exactly `3 * 16`.
+    fn nscodec_16px(extra: &[u8]) -> Vec<u8> {
+        let plane = |v: u8| [v, v, 10, v, v, v, v]; // a run of 12, then the 4-byte raw tail
         let mut nsc = Vec::new();
-        for c in [1u32, 1, 1, 1] {
-            nsc.extend_from_slice(&c.to_le_bytes()); // plane byte counts
+        for _ in 0..4 {
+            nsc.extend_from_slice(&7u32.to_le_bytes()); // plane byte counts
         }
         nsc.push(1); // ColorLossLevel
         nsc.push(0); // ChromaSubsamplingLevel
         nsc.extend_from_slice(&[0, 0]); // reserved
-        nsc.extend_from_slice(&[100, 10, 5, 255]); // Y, Co, Cg, A (1 raw byte each)
+        for v in [100, 10, 5, 255] {
+            nsc.extend_from_slice(&plane(v)); // Y, Co, Cg, A
+        }
+        nsc.extend_from_slice(extra);
+        nsc
+    }
 
-        let mut subcodec = Vec::new();
-        subcodec.extend_from_slice(&0u16.to_le_bytes()); // x_start
-        subcodec.extend_from_slice(&0u16.to_le_bytes()); // y_start
-        subcodec.extend_from_slice(&1u16.to_le_bytes()); // width
-        subcodec.extend_from_slice(&1u16.to_le_bytes()); // height
-        subcodec.extend_from_slice(&u32::try_from(nsc.len()).unwrap().to_le_bytes());
-        subcodec.push(0x01); // codecId = NSCodec
-        subcodec.extend_from_slice(&nsc);
-
-        let mut stream = vec![0x00, 0x00]; // flags, seq
-        stream.extend_from_slice(&0u32.to_le_bytes()); // residualByteCount
-        stream.extend_from_slice(&0u32.to_le_bytes()); // bandsByteCount
-        stream.extend_from_slice(&u32::try_from(subcodec.len()).unwrap().to_le_bytes());
-        stream.extend_from_slice(&subcodec);
-
-        let out = ClearDecoder::new().decode(&stream, 1, 1).unwrap();
+    #[test]
+    fn nscodec_subcodec_decodes_into_the_region() {
+        let stream = subcodec_stream(&subcodec(16, 0x01, &nscodec_16px(&[])));
+        let out = ClearDecoder::new().decode(&stream, 16, 1).unwrap();
         // Y100 Co10 Cg5, shift 0 → R=105 G=105 B=85; BGRA.
-        assert_eq!(&out[0..4], &[85, 105, 105, 255]);
+        assert_eq!(out, [85, 105, 105, 255].repeat(16));
+    }
+
+    #[test]
+    fn subcodec_byte_count_above_three_per_pixel_is_refused_for_every_subcodec() {
+        let over = Err(invalid("bitmapDataByteCount", "exceeds 3 * width * height"));
+        // NSCodec: 48 bytes into 16 px decodes, 49 is refused.
+        let nsc = |extra: &[u8]| subcodec_stream(&subcodec(16, 0x01, &nscodec_16px(extra)));
+        assert!(ClearDecoder::new().decode(&nsc(&[]), 16, 1).is_ok());
+        assert_eq!(ClearDecoder::new().decode(&nsc(&[0]), 16, 1), over);
+        // RLEX: the 9-byte two-entry-palette bitmap, `run` run pixels and one suite pixel.
+        let rlex = |width: u16, run: u8| subcodec_stream(&subcodec(width, 0x02, &rlex_bitmap(run)));
+        assert_eq!(
+            ClearDecoder::new().decode(&rlex(3, 2), 3, 1),
+            Ok([10, 20, 30, 0xFF].repeat(3))
+        );
+        assert_eq!(
+            ClearDecoder::new().decode(&rlex(2, 1), 2, 1),
+            over,
+            "a run and suite that fill the 2-px region exactly, in 9 bytes"
+        );
+    }
+
+    /// A residual-only ClearCodec stream holding `residual` verbatim.
+    fn residual_bytes_stream(residual: &[u8]) -> Vec<u8> {
+        let mut stream = vec![0x00, 0x00]; // flags, seq
+        stream.extend_from_slice(&u32::try_from(residual.len()).unwrap().to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes()); // bandsByteCount
+        stream.extend_from_slice(&0u32.to_le_bytes()); // subcodecByteCount
+        stream.extend_from_slice(residual);
+        stream
+    }
+
+    #[test]
+    fn residual_run_length_factor2_or_factor3_of_zero_is_refused() {
+        let tile = [1, 2, 3, 0xFF].repeat(3);
+        // runLengthFactor2 = 3, and runLengthFactor3 = 3, each fill the 3-px tile.
+        let factor2 = |n: u8| residual_bytes_stream(&[1, 2, 3, 0xFF, n, 0, 4, 5, 6, 3]);
+        let factor3 =
+            |n: u8| residual_bytes_stream(&[1, 2, 3, 0xFF, 0xFF, 0xFF, n, 0, 0, 0, 4, 5, 6, 3]);
+        let fill2 = residual_bytes_stream(&[1, 2, 3, 0xFF, 3, 0]);
+        let fill3 = residual_bytes_stream(&[1, 2, 3, 0xFF, 0xFF, 0xFF, 3, 0, 0, 0]);
+        assert_eq!(ClearDecoder::new().decode(&fill2, 3, 1), Ok(tile.clone()));
+        assert_eq!(ClearDecoder::new().decode(&fill3, 3, 1), Ok(tile));
+        // A zero factor, then a run that fills the tile.
+        assert_eq!(
+            ClearDecoder::new().decode(&factor2(0), 3, 1),
+            Err(invalid("residual", "runLengthFactor2 is zero"))
+        );
+        assert_eq!(
+            ClearDecoder::new().decode(&factor3(0), 3, 1),
+            Err(invalid("residual", "runLengthFactor3 is zero"))
+        );
+    }
+
+    /// One band over `width`x1 whose every column is a zero-pixel SHORT_VBAR_CACHE_MISS, so the
+    /// band paints its background BGR 7, 8, 9.
+    fn background_band(width: u16) -> Vec<u8> {
+        let mut band = Vec::new();
+        for v in [0u16, width - 1, 0, 0] {
+            band.extend_from_slice(&v.to_le_bytes());
+        }
+        band.extend_from_slice(&[7, 8, 9]);
+        for _ in 0..width {
+            band.extend_from_slice(&0u16.to_le_bytes());
+        }
+        band
+    }
+
+    #[test]
+    fn bands_trailing_bytes_shorter_than_a_band_header_are_refused() {
+        assert_eq!(
+            ClearDecoder::new().decode(&build_stream(&background_band(2)), 2, 1),
+            Ok([7, 8, 9, 0xFF].repeat(2))
+        );
+        for trailing in 1..=10 {
+            let mut bands = background_band(2);
+            bands.extend(std::iter::repeat_n(0xAA, trailing));
+            assert_eq!(
+                ClearDecoder::new().decode(&build_stream(&bands), 2, 1),
+                Err(ClearError::NotEnoughBytes {
+                    ctx: "ClearCodecBand"
+                }),
+                "{trailing} trailing byte(s)"
+            );
+        }
     }
 }

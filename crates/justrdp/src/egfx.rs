@@ -2806,22 +2806,22 @@ mod tests {
         let white = [0xFF, 0xFF, 0xFF, 4];
         let rlex = |width: u16, run: u8| clear_stream(&white, Some((width, &rlex_run(run))));
         assert_eq!(
-            clear_over_grey(&rlex(2, 1)),
-            vec![RLEX_COLOR, RLEX_COLOR, WHITE, WHITE],
+            clear_over_grey(&rlex(3, 2)),
+            vec![RLEX_COLOR, RLEX_COLOR, RLEX_COLOR, WHITE],
             "exact fill paints"
         );
         assert_eq!(
-            clear_over_grey(&rlex(2, 3)),
+            clear_over_grey(&rlex(3, 4)),
             vec![GREY; 4],
             "a run past it is skipped"
         );
         assert_eq!(
-            clear_over_grey(&rlex(2, 2)),
+            clear_over_grey(&rlex(3, 3)),
             vec![GREY; 4],
             "a suite past it is skipped"
         );
         assert_eq!(
-            clear_over_grey(&rlex(2, 0)),
+            clear_over_grey(&rlex(3, 0)),
             vec![RLEX_COLOR, WHITE, WHITE, WHITE],
             "under-fill leaves the residual under the rest of the region"
         );
@@ -2886,6 +2886,91 @@ mod tests {
             vec![GREY; 4],
             "a raw region above 3 * width * height bytes is skipped"
         );
+    }
+
+    /// A ClearCodec NSCodec or RLEX subcodec whose `bitmapDataByteCount` exceeds
+    /// `3 * width * height` is refused through the session path, as above.
+    #[test]
+    fn a_clearcodec_nscodec_or_rlex_subcodec_above_three_bytes_per_pixel_skips_the_region() {
+        let white = [0xFF, 0xFF, 0xFF, 4];
+        let rlex = |width: u16, run: u8| {
+            clear_layers(&white, &clear_subcodec(width, 0x02, &rlex_run(run)))
+        };
+        assert_eq!(
+            clear_over_grey(&rlex(3, 2)),
+            vec![RLEX_COLOR, RLEX_COLOR, RLEX_COLOR, WHITE],
+            "9 RLEX bytes in a 3-px region paint"
+        );
+        // A two-entry palette and no segment: 7 bytes, one over a 2-px region's 6.
+        assert_eq!(
+            clear_over_grey(&clear_layers(
+                &white,
+                &clear_subcodec(2, 0x02, &[2, 10, 20, 30, 40, 50, 60])
+            )),
+            vec![GREY; 4],
+            "7 RLEX bytes in a 2-px region are skipped"
+        );
+        // A whole 1x1 NSCodec stream: its 20-byte header with four empty planes.
+        let mut nsc = vec![0; 16];
+        nsc.extend_from_slice(&[1, 0, 0, 0]);
+        assert_eq!(
+            clear_over_grey(&clear_layers(&white, &clear_subcodec(1, 0x01, &nsc))),
+            vec![GREY; 4],
+            "20 NSCodec bytes in a 1-px region are skipped"
+        );
+    }
+
+    /// ClearCodec residual `runLengthFactor2` or `runLengthFactor3` of zero, and bands bytes short
+    /// of a whole band, are refused through the session path, as above.
+    #[test]
+    fn a_clearcodec_zero_long_run_or_trailing_band_bytes_skips_the_region() {
+        let fill2 = [0xFF, 0xFF, 0xFF, 0xFF, 4, 0];
+        let fill3 = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0, 0, 0];
+        assert_eq!(clear_over_grey(&clear_layers(&fill2, &[])), vec![WHITE; 4]);
+        assert_eq!(clear_over_grey(&clear_layers(&fill3, &[])), vec![WHITE; 4]);
+        let zero2 = [0, 0, 0, 0xFF, 0, 0, 0xFF, 0xFF, 0xFF, 4];
+        let zero3 = [0, 0, 0, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 4];
+        assert_eq!(
+            clear_over_grey(&clear_layers(&zero2, &[])),
+            vec![GREY; 4],
+            "a zero runLengthFactor2 is skipped"
+        );
+        assert_eq!(
+            clear_over_grey(&clear_layers(&zero3, &[])),
+            vec![GREY; 4],
+            "a zero runLengthFactor3 is skipped"
+        );
+
+        // One band over the 4x1 rect, background BGR 10, 20, 30, every column a zero-pixel
+        // SHORT_VBAR_CACHE_MISS.
+        let mut band = Vec::new();
+        for v in [0u16, 3, 0, 0] {
+            band.extend_from_slice(&v.to_le_bytes());
+        }
+        band.extend_from_slice(&[10, 20, 30]);
+        band.extend_from_slice(&[0; 8]);
+        let with_bands = |bands: &[u8]| {
+            let mut s = vec![0x00, 0x00];
+            s.extend_from_slice(&0u32.to_le_bytes());
+            s.extend_from_slice(&(bands.len() as u32).to_le_bytes());
+            s.extend_from_slice(&0u32.to_le_bytes());
+            s.extend_from_slice(bands);
+            s
+        };
+        assert_eq!(
+            clear_over_grey(&with_bands(&band)),
+            vec![RLEX_COLOR; 4],
+            "a whole band paints"
+        );
+        for trailing in 1..=10 {
+            let mut bands = band.clone();
+            bands.extend(std::iter::repeat_n(0xAA, trailing));
+            assert_eq!(
+                clear_over_grey(&with_bands(&bands)),
+                vec![GREY; 4],
+                "{trailing} trailing band byte(s) are skipped"
+            );
+        }
     }
 
     #[test]
