@@ -79,7 +79,7 @@ The established pattern is the **#116 / #117 regression tests**: they assert aga
 ### Consequence
 
 - Verification is now explicitly two-tier: **primitives → oracle-diff (independent math); assembly → spec- or FreeRDP-independent conformance (the oracle is same-lineage).**
-- The specific ClearCodec / RemoteFX behavioural divergences from FreeRDP that the shared oracle hides are tracked as their own issues (RLEX over-region clip #120, single-palette RLEX layout #121, and the remaining lenient divergences #127) rather than left implicit in a green differential.
+- The specific ClearCodec / RemoteFX behavioural divergences from FreeRDP that the shared oracle hides are tracked as their own issues (RLEX over-region clip #120, since replaced by a refusal in #643 (ADR-0009's #643 amendment), single-palette RLEX layout #121, and the remaining lenient divergences #127) rather than left implicit in a green differential.
 
 ## Amendment (2026-11-03, #576): two examples above name tests that no longer exist
 

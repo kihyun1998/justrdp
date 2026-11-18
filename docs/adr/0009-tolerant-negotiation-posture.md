@@ -16,7 +16,7 @@ Both are, notably, **tolerant on version misreporting**: FreeRDP takes `MIN(serv
 justrdp already applies a **split posture** in code, without having named the principle:
 
 - **Strict** where a mismatch is a security/integrity threat: the connect machine rejects a server that selects a security protocol we never advertised (`connect.rs`), rejects Standard RDP Security, rejects an unsolicited Channel Join Confirm, and the DVC layer rejects a compressed chunk when compression was never advertised (`dvc.rs`).
-- **Tolerant** where a mismatch is a rendering-feature divergence: the ClearCodec decoder keeps real-server leniencies the spec and the ironrdp oracle reject (over-region RLEX clip, NSCodec subcodec) because the captured WS2019 corpus requires them (ADR-0007 amendment, #120/#121/#127). **The RLEX half is measured false (#587): see the #576 amendment.**
+- **Tolerant** where a mismatch is a rendering-feature divergence: the ClearCodec decoder keeps real-server leniencies the spec and the ironrdp oracle reject (over-region RLEX clip, NSCodec subcodec) because the captured WS2019 corpus requires them (ADR-0007 amendment, #120/#121/#127). **The RLEX half is measured false (#587): see the #576 amendment. Over-fill is now refused (#643 amendment).**
 - **Not yet exercised** for drawing orders — order decode is epic #22, so the advertised-but-violated-order problem has not bitten us yet. This ADR sets the posture *before* it does.
 
 This mirrors the project's stated identity (`CLAUDE.md`): *derivation from the normative spec, proof from the oracle/real VM* — "스펙 ≠ 상호운용". We already accept that real servers diverge from spec; the open question is only where the tolerance lives and how it is bounded. justrdp takes **IronRDP's default-tolerant stance on rendering, but with the two bounds IronRDP lacks** (still-validate-the-bytes, always-observable) — neither FreeRDP's disconnect-by-default nor IronRDP's silent, unbounded swallow.
@@ -44,7 +44,7 @@ Be **tolerant by default of a server's self-inconsistency in rendering features,
 
   So #101's "related hard-spots" were **stale** — both were solved before this ADR was written. This ADR records only the negotiation *posture*; no follow-up implementation issues are filed for them.
 - **Order decode (#22) is built tolerant from day one** — accept-and-log unannounced orders rather than adding strictness later and then relaxing it.
-- **Generalizes the ADR-0007 codec-tolerance precedent** from the codec layer to the negotiation layer: the corpus-required leniencies were the first instance of this principle; ADR-0009 names it. (The RLEX clip has since lost its corpus ground; see the #576 amendment's 2026-11-18 correction.)
+- **Generalizes the ADR-0007 codec-tolerance precedent** from the codec layer to the negotiation layer: the corpus-required leniencies were the first instance of this principle; ADR-0009 names it. (The RLEX clip has since lost its corpus ground and been replaced by a refusal; see the #576 and #643 amendments.)
 - **Risk: tolerance can mask a bug in our own decoder as "server inconsistency."** Mitigated by invariant (b) — every tolerance is logged — and by the differential/corpus tests that still assert byte-identity wherever an oracle or a captured stream exists. Tolerance widens *what we accept*, never *what we stop verifying*.
 
 ## Amendment (2026-08-25, #252): §1 and §2 are not a partition
@@ -404,10 +404,80 @@ always the captured WS2019 corpus.
 reaches the clip. The over-fill seen on 2026-07-02 (#130) came from the single-palette parse #131
 corrected that day. The NSCodec subcodec half stands: entry 30 carries one. The clip itself is
 unchanged, and whether to keep it or reject as FreeRDP does is an open call. The measurement is in
-`docs/map/territory/bitmap-codecs.md`.
+`docs/map/territory/bitmap-codecs.md`. **Decided 2026-11-18: see the #643 amendment.**
 
 ## Amendment (2026-11-06, #598): rejecting Standard RDP Security means rejecting a downgrade
 
 The Context lists "rejects Standard RDP Security" among the strict cases. A host may now opt in to it
 ([ADR-0020](0020-standard-rdp-security-when-the-host-opts-in.md)), so what §1 keeps is the downgrade:
 a server that selects this protection for a host that did not ask is refused, unchanged.
+
+## Amendment (2026-11-18, #643): ClearCodec refuses residual and RLEX over-fill and accepts under-fill
+
+The #576 amendment left the RLEX clip with no corpus ground and the keep-or-reject question open.
+It is closed by three calls.
+
+1. **Over-fill is refused.** An RLEX run or suite, or a residual run, that would write past the
+   region's pixel count is a `ClearError` naming the layer. Through `justrdp::egfx` that is the
+   existing decode-error path: an `rdp_egfx` warning, the WireToSurface1 region skipped, the
+   session alive. The clip broke §3(b), since nothing reported it, and it once hid this project's
+   own parse defect (#131).
+2. **Under-fill is accepted, as spec-conforming rather than as a tolerance.** The pixels no layer
+   writes keep what the tile held. `[MS-RDPEGFX]` 2.2.4.1.1.1 makes the residual count "less than
+   or equal to" the image's pixels, and example 4.1.1.2 decodes RLEX segments "until there is no
+   more data left". Because it is conforming, §3(b) asks no report for it. FreeRDP refuses
+   under-fill too; that difference is recorded, not followed.
+3. **The residual layer takes the same rule**, as the same root in the same decoder.
+
+**Kind: judgement.** The maintainer chose these after a lens pass over keep, reject and split,
+and was shown: FreeRDP's behaviour (it refuses both directions in both layers); the residual
+section's MUST; the sibling codecs (planar, NSCodec and interleaved RLE refuse over-fill, and
+interleaved RLE accepts under-fill); ADR-0003's ranking read literally (it defaults to the oracle
+where the owned basis is silent, while this record owns receive-path tolerance); that
+`ironrdp-graphics` 0.11 clips but shares this project's lineage; what the host sees on a decode
+error; the cost of being wrong each way; and that 107 of 107 RLEX regions in the WS2019 corpus fill
+exactly (#587). A better derivation does not reopen these; the maintainer does.
+
+**Measured since.** The corpus census now counts residual layers too: 69 across both WS2019
+captures and 119 in a Windows 11 capture, all exact, as are that capture's 495 RLEX regions,
+so no captured stream reaches either path. Both proofs of the refusal are
+wire-format round-trips through `GraphicsProcessor::process`, as the 2026-09-04 amendment's table
+asks for a refusal claim. The numbers are in `docs/map/territory/bitmap-codecs.md`.
+
+**What this does not decide.** The glyph, V-bar and band tolerances in the same decoder; any other
+codec; and what the core does on a decode error (warn and skip stays).
+
+### Continued the same day: byte counts and field values the spec forbids
+
+The maintainer applied the same principle, an input the spec rules out is refused, to three more
+inputs the decoder had accepted with no signal. The ground differs per call and is given with
+each: a MUST sentence, the layer's structure, FreeRDP where it agrees. Each is a `ClearError`
+and, through `justrdp::egfx`, the same warned and skipped region as call 1.
+
+4. **Bytes after a residual or subcodec layer's last whole structure are refused.** One to three
+   bytes after the last residual run segment, or one to twelve after the last subcodec, used to
+   end the loop unread. `[MS-RDPEGFX]` 2.2.4.1.1.1 and 2.2.4.1.1.3 make each layer a succession of
+   those structures and its byte count that field's size; no sentence names the trailing case.
+   FreeRDP 3.33.1 never skips such bytes: `clear_decompress_residual_data` and
+   `clear_decompress_subcodecs_data` read a full segment or header from the stream whatever the
+   layer's count says, so a partial one fails where the stream ends (always for the last layer)
+   and otherwise consumes the next layer's bytes.
+5. **A raw subcodec's `bitmapDataByteCount` must be exactly `3 * width * height`.** 2.2.4.1.1.3.1
+   says it "MUST NOT exceed" that; fewer bytes were already refused, as they cannot fill the
+   region. FreeRDP refuses both directions (`bitmapDataByteCount != nSrcSize`), so the two agree.
+6. **A residual `runLengthFactor1` of zero is refused.** 2.2.4.1.1.1.1: "The value of
+   runLengthFactor1 MUST be greater than zero." FreeRDP does not check it (a zero run writes
+   nothing, unless the tile is already full); here the spec alone is the ground, and the refusal is stricter than FreeRDP.
+
+**Kind: judgement**, the maintainer's (2026-11-18). **Measured:** no captured stream reaches any
+of the three. A throwaway census over `replay.bin`, `replay-text.bin` and a second Windows 11
+session (192.168.136.163, the same day, 551 payloads; neither the census nor the capture is
+committed) finds no trailing byte in 171 residual and 384 subcodec layers, no zero
+`runLengthFactor1`, and no raw subcodec at all, so call 5 rests on authored vectors alone. All
+551 payloads of that session decode under the new rules.
+The refusals are proven by wire-format round-trips through `GraphicsProcessor::process`.
+
+**What this does not decide.** The same 2.2.4.1.1.3.1 bound for the NSCodec and RLEX subcodecs,
+whose `bitmapDataByteCount` the sentence also covers; a zero `runLengthFactor2` or
+`runLengthFactor3`, which 2.2.4.1.1.1.1 forbids too; trailing bytes in the bands layer; and the
+under-fill pixel value (#646).

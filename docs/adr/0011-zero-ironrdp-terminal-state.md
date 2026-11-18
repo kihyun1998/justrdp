@@ -415,7 +415,9 @@ it the test counts 8 inexact regions, the 8 single-palette ones. So the test ass
 region fills exactly, and the RLEX clip's corpus ground, which the sentence above assumed, is gone
 (ADR-0009's #576 amendment). Asserting exact fill and recording the lost ground, while leaving the
 clip itself and the keep-or-reject question open, is the maintainer's call (2026-11-18), made after
-being shown the measurement and the option of leaving RLEX out of the test.
+being shown the measurement and the option of leaving RLEX out of the test. The question was
+closed the same day (#643): over-fill is refused, so no clip is left for a ground to stand under
+(ADR-0009's #643 amendment).
 **How this was decided.** The red tests, the 0.9 reruns and the role each test now plays are
 measurements. Turning the comparing canaries into agreement checks rather than deleting all of
 them, as the role table's R4 row reads, is the maintainer's call (2026-11-03), made after being

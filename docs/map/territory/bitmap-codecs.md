@@ -30,20 +30,50 @@ attacker-controlled bytes in the repo.
 - **Derive from the spec, prove against the oracle.** Structural similarity to
   IronRDP is explicitly *not* the goal, and byte-identical output is the only
   accepted evidence.
-- **ClearCodec clips an RLEX run that overflows the declared rect, and no corpus stream needs
-  it** (#587). FreeRDP rejects such a stream. The clip was recorded as corpus-required (#120,
-  #127), but the observation behind that, replay entry 0 over-filling (2026-07-02), was made
-  before #131 corrected the single-palette RLEX parse the same day. Under the old 0-bit parse,
-  which the 0.9 oracle shared, each segment over-fills by one pixel. Under the corrected one,
-  all 26 RLEX regions in `replay.bin` fill their rectangle exactly, and
-  `clearcodec_corpus.rs` `corpus_holds_every_shape_the_decoder_was_fixed_for` asserts it: with
-  the old parse it counts 8 inexact regions, the 8 single-palette ones. Replacing the clip with
-  a panic leaves the corpus replay green. Whether to keep the clip or reject as FreeRDP does
-  is open and is not decided by this measurement. One more input to it: the decoder has no channel
-  to report the clip as ADR-0009's always-observable rule asks, the same reason #586 gave for not
-  following FreeRDP's larger-area glyph hit. `replay-text.bin` (#587) adds 81 RLEX regions, all
-  exact too. The NSCodec subcodec the corpus carries
+- **ClearCodec refuses a residual or RLEX layer that writes past its region, and accepts one
+  that writes fewer pixels** (#643, the maintainer's call, 2026-11-18; recorded in
+  [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)'s #643 amendment). A residual run, an
+  RLEX run or an RLEX suite past the region's last pixel is a `ClearError` naming the layer, and
+  the core skips that WireToSurface1 region with an `rdp_egfx` warning. FreeRDP 3.33.1 refuses the
+  same over-fill (`clear.c`, `clear_decompress_subcode_rlex` and
+  `clear_decompress_residual_data`). It refuses under-fill as well (`pixelIndex != pixelCount` in
+  both functions), and that is not followed: `[MS-RDPEGFX]` 2.2.4.1.1.1 says the residual layer
+  encodes "less than or equal to the number of pixels in the original image", and example
+  4.1.1.2 decodes RLEX segments "until there is no more data left". The RLEX pages state no pixel
+  total. A pixel no layer reaches keeps what the tile held, which under the residual layer is zero
+  bytes, not the surface's earlier pixel.
+  Measured with the corpus census in `clearcodec_corpus.rs`, a parser independent of the
+  decoder: `replay.bin` holds 26 RLEX regions and 32 residual layers, `replay-text.bin` 81 and
+  37, and every one fills its rectangle exactly, so no captured stream reaches either the refusal
+  or the under-fill path. Both tests assert it. A Windows 11 Enterprise session (192.168.136.163,
+  2026-11-18, `capture_clearcodec_text_corpus_against_real_vm` with `JUSTRDP_TEST_SERVER=win11`)
+  sent 1092 payloads, all decoded under the refusal: 119 residual layers and 495 RLEX regions
+  (18 single-palette), every one exact by the census and by a second parser written apart from it,
+  plus 16 NSCodec subcodec regions, 242 glyph stores and 227 glyph hits. It holds no shape the
+  committed corpus lacks, so it was not committed. The over-fill clip this replaced had been recorded
+  as corpus-required (#120, #127); the observation behind that, replay entry 0 over-filling
+  (2026-07-02), was made before #131 corrected the single-palette RLEX parse the same day. Under
+  the old 0-bit parse, which the 0.9 oracle shared, each segment over-fills by one pixel, and the
+  census counts 8 inexact regions, the 8 single-palette ones (#587). `[MS-RDPEGFX]` example 4.1.1.2
+  is decoded as a test and fills its 78x17 region exactly. The NSCodec subcodec the corpus carries
   (entry 30) is decoded (`decode_nscodec_region`, epic #132).
+- **ClearCodec refuses trailing layer bytes, a zero residual `runLengthFactor1` and a raw
+  subcodec that is not exactly `3 * width * height` bytes** (the maintainer's call, 2026-11-18,
+  continuing ADR-0009's #643 amendment). Bytes after a residual layer's last whole run segment
+  (1-3) or a subcodec layer's last whole subcodec (1-12) are `NotEnoughBytes`; they used to end
+  the loop unread. FreeRDP 3.33.1 does not refuse them by count: `clear_decompress_residual_data`
+  and `clear_decompress_subcodecs_data` read a whole segment or header from the stream regardless
+  of the layer's count, so a partial one fails at the end of the stream and otherwise eats into the
+  next layer. A zero `runLengthFactor1` is refused on `[MS-RDPEGFX]` 2.2.4.1.1.1.1's MUST alone;
+  FreeRDP writes nothing for it, refusing it only once the tile is full. The raw count follows 2.2.4.1.1.3.1's "MUST NOT exceed", and
+  a short count was already refused, which together match FreeRDP's `!= nSrcSize`. A throwaway
+  census written apart from the decoder found none of the three in `replay.bin` (32 residual, 27
+  subcodec layers), `replay-text.bin` (37, 84) or a second Windows 11 session the same day (551
+  payloads, 102 and 273, every payload decoded; it is not the 1092-payload session above, and
+  neither it nor the census is committed). No capture holds a raw subcodec region, so that refusal
+  rests on authored vectors. Not covered: the same byte bound for NSCodec and RLEX (no captured
+  region of either exceeds it), a zero `runLengthFactor2`/`runLengthFactor3` (none captured), and
+  the bands layer's trailing bytes.
 - **A ClearCodec glyph hit draws the cached pixels as any rectangle of the same area** (#586).
   `[MS-RDPEGFX]` 4.1.1.5 stores a glyph as a linear pixel stream with no dimensions and hits a
   2x8 glyph as 4x4 and as 8x2; the `ironrdp-graphics` 0.11 oracle does the same. A hit of a

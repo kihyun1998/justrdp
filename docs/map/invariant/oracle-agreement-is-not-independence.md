@@ -46,10 +46,11 @@ Three shapes, and none of them announces itself:
    wrong on a server neither was tested against.
 2. **A "fix" that regresses against real servers.** The oracle rejects a stream a
    real Server 2019 sends, someone treats the divergence as our bug, and the
-   corpus-required tolerance is removed. `justrdp-codecs`'s own module doc records
-   that ClearCodec **corrected two bit-level defects the oracle had** (fixed upstream
-   by 0.11, #576), which rejected genuine Server 2019 streams — so this is not
-   hypothetical here.
+   corpus-required tolerance is removed. The 0.9 oracle had **two bit-level
+   ClearCodec defects** that rejected genuine Server 2019 streams: the swapped
+   SHORT_VBAR_CACHE_MISS field layout and the 0-bit single-palette RLEX parse (fixed
+   upstream by 0.11, #576; ADR-0011's #587 closure counts the shapes each rejected)
+   — so this is not hypothetical here.
 
 3. **An owned basis that is derived too narrowly to be independent of anything.** The
    subtlest shape, and the only one that survives *replacing* the oracle: hand-derived
@@ -86,7 +87,8 @@ show it.
   tolerances**, backed by the `clearcodec_corpus` fixtures (memory
   `clearcodec_corpus_required_tolerances`). The oracle lost that argument. #587 took the
   RLEX over-fill clip out of that set: the over-fill came from a parse #131 corrected, and
-  no corpus stream over-fills ([bitmap codecs](../territory/bitmap-codecs.md)).
+  no corpus stream over-fills. #643 then replaced the clip with a refusal, as FreeRDP has
+  ([bitmap codecs](../territory/bitmap-codecs.md)).
 - **#194 → #168** — the third shape above, found one slice after the basis landed.
   #194 built an owned basis precisely *because* the oracle could not arbitrate SRL, and
   the basis was still derived at the wrong initial state. The lesson is not that #194
