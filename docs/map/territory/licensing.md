@@ -94,6 +94,18 @@ IronRDP's tests and does not say where it was captured. It decodes through `serv
 through the steps ADR-0020's amendment gives a host, to the key IronRDP expects. Its server
 certificate has public-key algorithm `1.3.14.3.2.15` and five critical extensions.
 
+**What the licensing differentials still catch on `ironrdp-pdu` 0.11** (#587).
+`justrdp-pdu/tests/differential_activation.rs` decodes the New License Request and the Platform
+Challenge Response this crate encodes, and a test-built Server License Request, with
+`ironrdp_pdu::decode`. The 0.9 → 0.11 diff of that path (`src/rdp/server_license/` and
+`BasicSecurityHeader`) changes error context, an accessor in `get_public_key` and an import, none
+of which moves what is accepted. The one other change: `BasicSecurityHeader` reads its flags with
+`from_bits_truncate` instead of `from_bits` (0.11 `src/rdp/headers.rs:80`). Both versions define
+all 16 bits of `BasicSecurityHeaderFlags`, so neither ever refused a value: nothing new is
+accepted, `LICENSE_PKT` is still required, and the three tests still discriminate as they did on
+0.9. No owned check was added. The same holds for `justrdp-security/tests/differential_license_crypto.rs`,
+whose frames carry this crate's basic security header around test-built bodies.
+
 ## Cross-cutting invariants
 
 - [A decoded field with no reader is an unstated decision](../invariant/a-decoded-field-with-no-reader-is-an-unstated-decision.md)

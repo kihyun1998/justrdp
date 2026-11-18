@@ -358,6 +358,15 @@ fn our_client_info_pdu_decodes_identically_in_ironrdp() {
     assert_eq!(info.credentials.username, "rdptest");
     assert_eq!(info.credentials.domain.as_deref(), Some("WORKGROUP"));
     assert_eq!(info.credentials.password, "");
+    assert!(
+        info.password_cookie.is_none(),
+        "the Password field is empty, not opaque bytes"
+    );
+    assert_eq!(
+        info.flags.bits() & !iron_ci::ClientInfoFlags::all().bits(),
+        0,
+        "a flag bit ironrdp-pdu does not define"
+    );
     assert!(info.flags.contains(
         iron_ci::ClientInfoFlags::MOUSE
             | iron_ci::ClientInfoFlags::AUTOLOGON
