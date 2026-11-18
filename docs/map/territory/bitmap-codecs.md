@@ -57,6 +57,23 @@ attacker-controlled bytes in the repo.
   census counts 8 inexact regions, the 8 single-palette ones (#587). `[MS-RDPEGFX]` example 4.1.1.2
   is decoded as a test and fills its 78x17 region exactly. The NSCodec subcodec the corpus carries
   (entry 30) is decoded (`decode_nscodec_region`, epic #132).
+- **ClearCodec refuses trailing layer bytes, a zero residual `runLengthFactor1` and a raw
+  subcodec that is not exactly `3 * width * height` bytes** (the maintainer's call, 2026-11-18,
+  continuing ADR-0009's #643 amendment). Bytes after a residual layer's last whole run segment
+  (1-3) or a subcodec layer's last whole subcodec (1-12) are `NotEnoughBytes`; they used to end
+  the loop unread. FreeRDP 3.33.1 does not refuse them by count: `clear_decompress_residual_data`
+  and `clear_decompress_subcodecs_data` read a whole segment or header from the stream regardless
+  of the layer's count, so a partial one fails at the end of the stream and otherwise eats into the
+  next layer. A zero `runLengthFactor1` is refused on `[MS-RDPEGFX]` 2.2.4.1.1.1.1's MUST alone;
+  FreeRDP writes nothing for it, refusing it only once the tile is full. The raw count follows 2.2.4.1.1.3.1's "MUST NOT exceed", and
+  a short count was already refused, which together match FreeRDP's `!= nSrcSize`. A throwaway
+  census written apart from the decoder found none of the three in `replay.bin` (32 residual, 27
+  subcodec layers), `replay-text.bin` (37, 84) or a second Windows 11 session the same day (551
+  payloads, 102 and 273, every payload decoded; it is not the 1092-payload session above, and
+  neither it nor the census is committed). No capture holds a raw subcodec region, so that refusal
+  rests on authored vectors. Not covered: the same byte bound for NSCodec and RLEX (no captured
+  region of either exceeds it), a zero `runLengthFactor2`/`runLengthFactor3` (none captured), and
+  the bands layer's trailing bytes.
 - **A ClearCodec glyph hit draws the cached pixels as any rectangle of the same area** (#586).
   `[MS-RDPEGFX]` 4.1.1.5 stores a glyph as a linear pixel stream with no dimensions and hits a
   2x8 glyph as 4x4 and as 8x2; the `ironrdp-graphics` 0.11 oracle does the same. A hit of a

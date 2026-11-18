@@ -2705,25 +2705,36 @@ mod tests {
         b
     }
 
-    /// A ClearCodec stream: a residual layer, and one RLEX region at the origin when `rlex` is
-    /// `Some((width, bitmap))`.
-    fn clear_stream(residual: &[u8], rlex: Option<(u16, &[u8])>) -> Vec<u8> {
-        let mut subcodec = Vec::new();
-        if let Some((width, bitmap)) = rlex {
-            for v in [0u16, 0, width, 1] {
-                subcodec.extend_from_slice(&v.to_le_bytes());
-            }
-            subcodec.extend_from_slice(&(bitmap.len() as u32).to_le_bytes());
-            subcodec.push(0x02); // RLEX
-            subcodec.extend_from_slice(bitmap);
+    /// One ClearCodec subcodec region at the origin: `width`x1, `codec_id`, `bitmap` verbatim.
+    fn clear_subcodec(width: u16, codec_id: u8, bitmap: &[u8]) -> Vec<u8> {
+        let mut s = Vec::new();
+        for v in [0u16, 0, width, 1] {
+            s.extend_from_slice(&v.to_le_bytes());
         }
+        s.extend_from_slice(&(bitmap.len() as u32).to_le_bytes());
+        s.push(codec_id);
+        s.extend_from_slice(bitmap);
+        s
+    }
+
+    /// A ClearCodec stream holding `residual` and `subcodecs` verbatim, with no bands layer.
+    fn clear_layers(residual: &[u8], subcodecs: &[u8]) -> Vec<u8> {
         let mut s = vec![0x00, 0x00];
         s.extend_from_slice(&(residual.len() as u32).to_le_bytes());
         s.extend_from_slice(&0u32.to_le_bytes());
-        s.extend_from_slice(&(subcodec.len() as u32).to_le_bytes());
+        s.extend_from_slice(&(subcodecs.len() as u32).to_le_bytes());
         s.extend_from_slice(residual);
-        s.extend_from_slice(&subcodec);
+        s.extend_from_slice(subcodecs);
         s
+    }
+
+    /// A ClearCodec stream: a residual layer, and one RLEX region at the origin when `rlex` is
+    /// `Some((width, bitmap))`.
+    fn clear_stream(residual: &[u8], rlex: Option<(u16, &[u8])>) -> Vec<u8> {
+        let subcodec = rlex
+            .map(|(width, bitmap)| clear_subcodec(width, 0x02, bitmap))
+            .unwrap_or_default();
+        clear_layers(residual, &subcodec)
     }
 
     /// Paint the surface's top row grey, process one ClearCodec WireToSurface1 over it, and read
@@ -2813,6 +2824,67 @@ mod tests {
             clear_over_grey(&rlex(2, 0)),
             vec![RLEX_COLOR, WHITE, WHITE, WHITE],
             "under-fill leaves the residual under the rest of the region"
+        );
+    }
+
+    /// ClearCodec residual bytes short of a whole segment and a zero residual run are refused
+    /// through the session path: the region is skipped, so what was under it stays, and the
+    /// session goes on.
+    #[test]
+    fn a_clearcodec_residual_layer_with_trailing_bytes_or_a_zero_run_skips_the_region() {
+        let white = [0xFF, 0xFF, 0xFF, 4];
+        assert_eq!(
+            clear_over_grey(&clear_layers(&white, &[])),
+            vec![WHITE; 4],
+            "a whole segment paints"
+        );
+        for trailing in 1..=3 {
+            let mut residual = white.to_vec();
+            residual.extend(std::iter::repeat_n(0xAA, trailing));
+            assert_eq!(
+                clear_over_grey(&clear_layers(&residual, &[])),
+                vec![GREY; 4],
+                "{trailing} trailing residual byte(s) are skipped"
+            );
+        }
+        assert_eq!(
+            clear_over_grey(&clear_layers(&[0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 4], &[])),
+            vec![GREY; 4],
+            "a zero run is skipped"
+        );
+    }
+
+    /// One 2x1 raw subcodec region of BGR 10, 20, 30 and 40, 50, 60, with `extra` bytes after it.
+    fn raw_2x1(extra: &[u8]) -> Vec<u8> {
+        let mut bitmap = vec![10, 20, 30, 40, 50, 60];
+        bitmap.extend_from_slice(extra);
+        clear_subcodec(2, 0x00, &bitmap)
+    }
+
+    /// ClearCodec subcodec bytes short of a whole subcodec and a raw subcodec larger than its
+    /// region are refused through the session path, as above.
+    #[test]
+    fn a_clearcodec_subcodec_layer_with_trailing_bytes_or_an_oversized_raw_region_skips_it() {
+        let white = [0xFF, 0xFF, 0xFF, 4];
+        let raw = vec![[30, 20, 10], [60, 50, 40], WHITE, WHITE];
+        assert_eq!(
+            clear_over_grey(&clear_layers(&white, &raw_2x1(&[]))),
+            raw,
+            "an exact raw region paints"
+        );
+        for trailing in 1..=12 {
+            let mut subcodecs = raw_2x1(&[]);
+            subcodecs.extend(std::iter::repeat_n(0xAA, trailing));
+            assert_eq!(
+                clear_over_grey(&clear_layers(&white, &subcodecs)),
+                vec![GREY; 4],
+                "{trailing} trailing subcodec byte(s) are skipped"
+            );
+        }
+        assert_eq!(
+            clear_over_grey(&clear_layers(&white, &raw_2x1(&[70]))),
+            vec![GREY; 4],
+            "a raw region above 3 * width * height bytes is skipped"
         );
     }
 

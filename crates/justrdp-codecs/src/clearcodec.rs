@@ -7,7 +7,7 @@
 //!
 //! This decoder is re-derived from the MS-RDPEGFX spec and cross-checked against FreeRDP's
 //! `clear.c`; it does **not** depend on `ironrdp-graphics`, and its output is checked against
-//! that oracle differentially (`tests/clearcodec_*`). Two decisions are easy to get wrong:
+//! that oracle differentially (`tests/clearcodec_*`). Three decisions are easy to get wrong:
 //!
 //! 1. **SHORT_VBAR_CACHE_MISS field layout.** The 14 payload bits are `shortVBarYOn` in bits
 //!    `[7:0]` and `shortVBarYOff` in bits `[13:8]` (FreeRDP `vBarYOn = h & 0xFF`,
@@ -23,6 +23,12 @@
 //!    decodes RLEX segments "until there is no more data left". The pixels a layer does not reach
 //!    keep what the tile already held: the residual or bands pixel under an RLEX region, and zero
 //!    bytes where the residual layer stops short.
+//!
+//! 3. **A residual or subcodec layer holds whole structures, and two field values the spec
+//!    forbids are refused.** Bytes after a layer's last whole run segment or last whole subcodec are a
+//!    [`ClearError::NotEnoughBytes`] (`[MS-RDPEGFX]` 2.2.4.1.1.1, 2.2.4.1.1.3). A residual
+//!    `runLengthFactor1` of zero (2.2.4.1.1.1.1) and a raw subcodec whose `bitmapDataByteCount` is
+//!    not exactly `3 * width * height` (2.2.4.1.1.3.1) are [`ClearError::InvalidField`].
 //!
 //! **Alpha contract:** ClearCodec carries no alpha; every pixel a layer writes has alpha `0xFF`. A
 //! pixel no layer reaches is zero bytes, alpha included (decision 2).
@@ -129,6 +135,10 @@ impl<'a> Cursor<'a> {
 
     fn is_empty(&self) -> bool {
         self.remaining() == 0
+    }
+
+    fn peek_u8(&self) -> u8 {
+        self.data[self.pos]
     }
 
     fn ensure(&self, size: usize, ctx: &'static str) -> Result<(), ClearError> {
@@ -436,7 +446,8 @@ impl ClearDecoder {
 
     /// Layer 1 — residual BGR run-length background, filling the tile row-major. A run past the
     /// tile's last pixel is an error; a tile the runs do not reach the end of keeps zero bytes
-    /// there (module docs, decision 2).
+    /// there (module docs, decision 2). A zero `runLengthFactor1` and bytes after the last whole
+    /// segment are errors (decision 3).
     fn decode_residual_layer(&self, data: &[u8], output: &mut [u8]) -> Result<(), ClearError> {
         if data.is_empty() {
             return Ok(());
@@ -445,10 +456,14 @@ impl ClearDecoder {
         let max_offset = output.len();
         let mut offset = 0usize;
 
-        while c.remaining() >= 4 {
+        while !c.is_empty() {
+            c.ensure(4, "RgbRunSegment")?;
             let blue = c.u8();
             let green = c.u8();
             let red = c.u8();
+            if c.peek_u8() == 0 {
+                return Err(invalid("residual", "runLengthFactor1 is zero"));
+            }
             // The run length (the variable-length factor1..factor3 sequence) follows the BGR
             // triple and is read by the shared reader.
             let run_length = read_run_length(&mut c, "RgbRunSegment")?;
@@ -607,7 +622,8 @@ impl ClearDecoder {
         Ok(self.store_vbar(full))
     }
 
-    /// Layer 3 — subcodec rectangles composited over the result.
+    /// Layer 3 — subcodec rectangles composited over the result. Bytes after the last whole
+    /// subcodec are an error (module docs, decision 3).
     fn decode_subcodec_layer(
         &self,
         data: &[u8],
@@ -621,7 +637,8 @@ impl ClearDecoder {
         let sh = output.len() / (sw * 4).max(1);
         let mut c = Cursor::new(data);
 
-        while c.remaining() >= 13 {
+        while !c.is_empty() {
+            c.ensure(13, "ClearCodecSubcodec")?;
             let x_start = c.u16_le();
             let y_start = c.u16_le();
             let width = c.u16_le();
@@ -767,6 +784,9 @@ fn decode_raw_region(
         .ok_or_else(|| invalid("bitmapData", "raw subcodec dimensions overflow"))?;
     if bitmap.len() < expected {
         return Err(invalid("bitmapData", "raw subcodec data too short"));
+    }
+    if bitmap.len() > expected {
+        return Err(invalid("bitmapDataByteCount", "exceeds 3 * width * height"));
     }
     for row in 0..h {
         for col in 0..w {
@@ -1248,6 +1268,88 @@ mod tests {
     }
 
     #[test]
+    fn residual_trailing_bytes_shorter_than_a_segment_are_refused() {
+        for trailing in 1..=3 {
+            let mut stream = residual_stream(&[[1, 2, 3, 3]]);
+            stream.extend(std::iter::repeat_n(0xAA, trailing));
+            stream[2..6].copy_from_slice(&u32::try_from(4 + trailing).unwrap().to_le_bytes());
+            assert_eq!(
+                ClearDecoder::new().decode(&stream, 3, 1),
+                Err(ClearError::NotEnoughBytes {
+                    ctx: "RgbRunSegment"
+                }),
+                "{trailing} trailing byte(s)"
+            );
+        }
+    }
+
+    #[test]
+    fn residual_run_length_factor1_of_zero_is_refused() {
+        // A zero run, then a run that fills the tile.
+        let stream = residual_stream(&[[1, 2, 3, 0], [4, 5, 6, 3]]);
+        assert_eq!(
+            ClearDecoder::new().decode(&stream, 3, 1),
+            Err(invalid("residual", "runLengthFactor1 is zero"))
+        );
+    }
+
+    /// A subcodec-only ClearCodec stream holding `subcodecs` verbatim.
+    fn subcodec_stream(subcodecs: &[u8]) -> Vec<u8> {
+        let mut stream = vec![0x00, 0x00]; // flags, seq
+        stream.extend_from_slice(&0u32.to_le_bytes()); // residualByteCount
+        stream.extend_from_slice(&0u32.to_le_bytes()); // bandsByteCount
+        stream.extend_from_slice(&u32::try_from(subcodecs.len()).unwrap().to_le_bytes());
+        stream.extend_from_slice(subcodecs);
+        stream
+    }
+
+    /// One CLEARCODEC_SUBCODEC at the origin: `width`x1, `codec_id`, `bitmap` verbatim.
+    fn subcodec(width: u16, codec_id: u8, bitmap: &[u8]) -> Vec<u8> {
+        let mut s = Vec::new();
+        for v in [0u16, 0, width, 1] {
+            s.extend_from_slice(&v.to_le_bytes());
+        }
+        s.extend_from_slice(&u32::try_from(bitmap.len()).unwrap().to_le_bytes());
+        s.push(codec_id);
+        s.extend_from_slice(bitmap);
+        s
+    }
+
+    #[test]
+    fn subcodec_trailing_bytes_shorter_than_a_header_are_refused() {
+        for trailing in 1..=12 {
+            let mut subcodecs = subcodec(2, 0x00, &[1, 2, 3, 4, 5, 6]);
+            subcodecs.extend(std::iter::repeat_n(0xAA, trailing));
+            assert_eq!(
+                ClearDecoder::new().decode(&subcodec_stream(&subcodecs), 2, 1),
+                Err(ClearError::NotEnoughBytes {
+                    ctx: "ClearCodecSubcodec"
+                }),
+                "{trailing} trailing byte(s)"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_subcodec_byte_count_above_three_per_pixel_is_refused() {
+        let exact = subcodec(2, 0x00, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            ClearDecoder::new().decode(&subcodec_stream(&exact), 2, 1),
+            Ok(vec![1, 2, 3, 0xFF, 4, 5, 6, 0xFF])
+        );
+        let over = subcodec(2, 0x00, &[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            ClearDecoder::new().decode(&subcodec_stream(&over), 2, 1),
+            Err(invalid("bitmapDataByteCount", "exceeds 3 * width * height"))
+        );
+        let short = subcodec(2, 0x00, &[1, 2, 3, 4, 5]);
+        assert_eq!(
+            ClearDecoder::new().decode(&subcodec_stream(&short), 2, 1),
+            Err(invalid("bitmapData", "raw subcodec data too short"))
+        );
+    }
+
+    #[test]
     fn residual_exact_fill_paints_the_whole_tile() {
         let out = ClearDecoder::new()
             .decode(&residual_stream(&[[1, 2, 3, 1], [4, 5, 6, 2]]), 3, 1)
@@ -1294,19 +1396,10 @@ mod tests {
         assert_eq!(&out[4..8], &[10, 20, 30, 0xFF]);
     }
 
-    // #121 — single-palette RLEX. FreeRDP `numBits = CLEAR_LOG2_FLOOR[paletteCount-1] + 1` = 1 for
-    // paletteCount==1 (`clear_decompress_subcode_rlex`), so a packed stop/suite byte is present per
-    // segment even for a one-entry palette. The old 0-bit special case read no packed byte,
-    // misparsing genuine streams.
-    // (Rendered output for a *valid* single-palette stream is identical either way — one colour — so
-    // this is a spec/byte-consumption conformance fix, not an output change; the observable effect is
-    // that the packed index byte is now validated.)
-
     #[test]
     fn single_palette_rlex_validates_the_packed_index_byte() {
         // palette_count=1, palette=[10,20,30]; packed byte 0x01 → stopIndex=1, which exceeds the
         // single-entry palette → reject (FreeRDP `clear.c` `startIndex/stopIndex >= paletteCount`).
-        // Under the old 0-bit layout this byte was misread as a bare run length and accepted.
         let bitmap = vec![1, 10, 20, 30, 0x01, 0x00];
         let mut out = vec![0u8; 4 * 4];
         assert!(

@@ -446,3 +446,38 @@ asks for a refusal claim. The numbers are in `docs/map/territory/bitmap-codecs.m
 
 **What this does not decide.** The glyph, V-bar and band tolerances in the same decoder; any other
 codec; and what the core does on a decode error (warn and skip stays).
+
+### Continued the same day: byte counts and field values the spec forbids
+
+The maintainer applied the same principle, an input the spec rules out is refused, to three more
+inputs the decoder had accepted with no signal. The ground differs per call and is given with
+each: a MUST sentence, the layer's structure, FreeRDP where it agrees. Each is a `ClearError`
+and, through `justrdp::egfx`, the same warned and skipped region as call 1.
+
+4. **Bytes after a residual or subcodec layer's last whole structure are refused.** One to three
+   bytes after the last residual run segment, or one to twelve after the last subcodec, used to
+   end the loop unread. `[MS-RDPEGFX]` 2.2.4.1.1.1 and 2.2.4.1.1.3 make each layer a succession of
+   those structures and its byte count that field's size; no sentence names the trailing case.
+   FreeRDP 3.33.1 never skips such bytes: `clear_decompress_residual_data` and
+   `clear_decompress_subcodecs_data` read a full segment or header from the stream whatever the
+   layer's count says, so a partial one fails where the stream ends (always for the last layer)
+   and otherwise consumes the next layer's bytes.
+5. **A raw subcodec's `bitmapDataByteCount` must be exactly `3 * width * height`.** 2.2.4.1.1.3.1
+   says it "MUST NOT exceed" that; fewer bytes were already refused, as they cannot fill the
+   region. FreeRDP refuses both directions (`bitmapDataByteCount != nSrcSize`), so the two agree.
+6. **A residual `runLengthFactor1` of zero is refused.** 2.2.4.1.1.1.1: "The value of
+   runLengthFactor1 MUST be greater than zero." FreeRDP does not check it (a zero run writes
+   nothing, unless the tile is already full); here the spec alone is the ground, and the refusal is stricter than FreeRDP.
+
+**Kind: judgement**, the maintainer's (2026-11-18). **Measured:** no captured stream reaches any
+of the three. A throwaway census over `replay.bin`, `replay-text.bin` and a second Windows 11
+session (192.168.136.163, the same day, 551 payloads; neither the census nor the capture is
+committed) finds no trailing byte in 171 residual and 384 subcodec layers, no zero
+`runLengthFactor1`, and no raw subcodec at all, so call 5 rests on authored vectors alone. All
+551 payloads of that session decode under the new rules.
+The refusals are proven by wire-format round-trips through `GraphicsProcessor::process`.
+
+**What this does not decide.** The same 2.2.4.1.1.3.1 bound for the NSCodec and RLEX subcodecs,
+whose `bitmapDataByteCount` the sentence also covers; a zero `runLengthFactor2` or
+`runLengthFactor3`, which 2.2.4.1.1.1.1 forbids too; trailing bytes in the bands layer; and the
+under-fill pixel value (#646).
