@@ -480,4 +480,49 @@ The refusals are proven by wire-format round-trips through `GraphicsProcessor::p
 **What this does not decide.** The same 2.2.4.1.1.3.1 bound for the NSCodec and RLEX subcodecs,
 whose `bitmapDataByteCount` the sentence also covers; a zero `runLengthFactor2` or
 `runLengthFactor3`, which 2.2.4.1.1.1.1 forbids too; trailing bytes in the bands layer; and the
-under-fill pixel value (#646).
+under-fill pixel value (#646). **The first three are decided below (#647).**
+
+### Continued again the same day: the rest of the same MUSTs (#647)
+
+The maintainer applied the same principle to the three inputs the previous continuation left out.
+Each is a `ClearError` and, through `justrdp::egfx`, the same warned and skipped region as call 1.
+The spec text is `[MS-RDPEGFX]` v20260511, read from the PDF; FreeRDP is 3.33.1 `clear.c`.
+
+7. **A subcodec of any `subCodecId` whose `bitmapDataByteCount` exceeds `3 * width * height` is
+   refused.** 2.2.4.1.1.3.1: "The value in the bitmapDataByteCount field MUST NOT exceed (3 *
+   width * height)", a sentence on the field, not on one subcodec. The check now runs once for
+   every subcodec before its bitmap is decoded, so it also carries call 5's over-count half; a raw
+   subcodec short of the region stays refused by the raw decoder. FreeRDP applies the bound to raw
+   alone (`!= nSrcSize`); for NSCodec and RLEX `clear_decompress_subcodecs_data` checks only that
+   the bytes are in the stream, so here the spec alone is the ground and the refusal is stricter
+   than FreeRDP. Two consequences follow from `nscodec.rs`: an NSCodec bitmap's header alone is 20
+   bytes, so no NSCodec subcodec fits a region of fewer than 7 pixels; and a plane whose byte count
+   equals its decoded size is read raw, so an NSCodec bitmap without chroma subsampling whose Y, Co
+   and Cg planes are all raw holds at least `3 * width * height + 20` bytes and is refused at any
+   size. Such a region must be compressed to pass. The WS2019 NSCodec region (`replay.bin` entry
+   30) passes; the 16 in the Windows 11 session (`docs/map/territory/bitmap-codecs.md`) were not
+   re-measured against the bound.
+8. **A residual `runLengthFactor2` or `runLengthFactor3` of zero is refused**, as call 6 refuses
+   `runLengthFactor1`. 2.2.4.1.1.1.1: "If present, the value of runLengthFactor2 MUST be greater
+   than zero", the same for `runLengthFactor3`, and `runLengthFactor3` "MUST be present (and
+   nonzero)" when `runLengthFactor2` is 0xFFFF. The RLEX segment's factors (2.2.4.1.1.3.1.1.2)
+   carry no such sentence and are not checked. FreeRDP's `clear_decompress_residual_data` reads
+   either factor and writes nothing for zero, refusing it only once the tile is already full, as
+   for `runLengthFactor1`; the spec alone is the ground.
+9. **Bytes after the bands layer's last whole band are refused**, as call 4 refuses them in the
+   other two layers. One to ten bytes, too few for a band header, used to end the loop unread
+   (eleven or twelve were already refused while the band was read). 2.2.4.1.1.2 makes the layer "a
+   succession of CLEARCODEC_BAND structures"; no sentence names the trailing case. FreeRDP's
+   `clear_decompress_bands_data` behaves as in call 4: it reads an 11-byte header from the stream
+   whatever is left of `bandsByteCount`, so a partial band fails where the stream ends and
+   otherwise reads into the subcodec layer.
+
+**Kind: judgement**, the maintainer's (2026-11-18), the principle applied. **Measured:** both
+WS2019 captures, `replay.bin` and `replay-text.bin`, decode every entry with no error under the
+three checks, so no captured payload reaches any of them. The Windows 11 sessions were not
+re-run; the #643 worker's census over them (none of the three present, `runLengthFactor2` seen
+741 times) is reported in #647 and not reproduced. The refusals are proven by wire-format
+round-trips through `GraphicsProcessor::process`.
+
+**What this does not decide.** The under-fill pixel value (#646), the glyph, V-bar and band rules
+other than call 9, and any other codec.

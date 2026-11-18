@@ -71,9 +71,21 @@ attacker-controlled bytes in the repo.
   subcodec layers), `replay-text.bin` (37, 84) or a second Windows 11 session the same day (551
   payloads, 102 and 273, every payload decoded; it is not the 1092-payload session above, and
   neither it nor the census is committed). No capture holds a raw subcodec region, so that refusal
-  rests on authored vectors. Not covered: the same byte bound for NSCodec and RLEX (no captured
-  region of either exceeds it), a zero `runLengthFactor2`/`runLengthFactor3` (none captured), and
-  the bands layer's trailing bytes.
+  rests on authored vectors.
+- **ClearCodec refuses a subcodec of any kind above `3 * width * height` bytes, a zero residual
+  `runLengthFactor2` or `runLengthFactor3`, and trailing bands bytes** (#647, the maintainer's
+  call, 2026-11-18, continuing ADR-0009's #643 amendment as calls 7-9). The byte bound is
+  `[MS-RDPEGFX]` 2.2.4.1.1.3.1's sentence on `bitmapDataByteCount`, checked once per subcodec
+  before its bitmap is decoded; FreeRDP 3.33.1 applies it to raw alone, so for NSCodec and RLEX the
+  refusal is stricter than FreeRDP. An NSCodec bitmap's 20-byte header means no NSCodec subcodec
+  fits a region under 7 pixels, and one without chroma subsampling whose Y, Co and Cg planes are
+  all stored raw is refused at any size, so an NSCodec region must be compressed to pass. The zero factors follow 2.2.4.1.1.1.1's MUSTs, which FreeRDP does
+  not check; the RLEX segment's factors carry no such sentence and are not checked. One to ten
+  bytes after the last band are `NotEnoughBytes`, as in the other two layers; FreeRDP checks a
+  band header against the whole stream rather than `bandsByteCount`, so it fails only where the
+  stream ends and otherwise reads into the subcodec layer. Both WS2019 captures decode every entry
+  under the three checks, the NSCodec region of entry 30 included. The Windows 11 sessions, and
+  their 16 NSCodec regions, were not re-run against the bound.
 - **A ClearCodec glyph hit draws the cached pixels as any rectangle of the same area** (#586).
   `[MS-RDPEGFX]` 4.1.1.5 stores a glyph as a linear pixel stream with no dimensions and hits a
   2x8 glyph as 4x4 and as 8x2; the `ironrdp-graphics` 0.11 oracle does the same. A hit of a
