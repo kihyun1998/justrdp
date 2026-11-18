@@ -4,8 +4,7 @@
 //! Typed structs cover the sets the connect sequence and the differential criteria actually
 //! consume (General, Bitmap, Order, Bitmap Cache revisions 1 and 2, Pointer, Input, Brush, Glyph
 //! Cache, Offscreen Cache, Virtual Channel, Sound, Multifragment Update, Surface Commands, Bitmap Codecs);
-//! everything else round-trips as [`CapabilitySet::Unknown`] raw bytes, because the negotiation
-//! rule for unrecognized sets is "ignore, never reject" (MS-RDPBCGR 3.2.5.3.13).
+//! everything else round-trips as [`CapabilitySet::Unknown`] raw bytes and is never refused.
 
 use crate::DecodeError;
 use crate::cursor::ReadCursor;
