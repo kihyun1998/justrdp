@@ -35,6 +35,11 @@ Deactivation–Reactivation, which is how a resize actually happens.
   ordering.
 - **Server capability sets are handed over verbatim**, because the session loop —
   not this phase — decides what order/codec support means.
+- **An unrecognized capability set is kept, not refused, and that is this project's
+  choice, not a spec rule.** It decodes as `CapabilitySet::Unknown` with its raw bytes.
+  `[MS-RDPBCGR]` 3.2.5.3.13.1 says only that the server's capabilities are processed per
+  2.2.7, stored, and used to choose what the client sends; no section of the spec states a
+  rule for a set the client does not recognize (read against v20260309, #594).
 - **Reactivation is the same exchange with session state alive.** `Phase::Reactivating`
   re-runs it; caches belong to the *connection*, not the share, so they survive.
 - **The Font Map alone gates `session-active`, deliberately.** The server's Synchronize and

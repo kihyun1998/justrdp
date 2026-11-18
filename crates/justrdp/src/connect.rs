@@ -85,7 +85,7 @@ pub struct LicenseConfig {
 }
 
 /// Per-connection randomness for licensing: the client random and the premaster secret the
-/// session keys derive from (MS-RDPELE 5.1.2–5.1.3).
+/// session keys derive from (MS-RDPELE 5.1.1–5.1.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LicenseEntropy {
     /// `ClientRandom` (sent in the clear in the New License Request).
@@ -381,13 +381,13 @@ pub enum ConnectError {
         reason: u8,
     },
     /// The server ended licensing with a License Error PDU whose code is not
-    /// `STATUS_VALID_CLIENT` — no license, no session (MS-RDPELE 2.2.2.7).
+    /// `STATUS_VALID_CLIENT` — no license, no session (MS-RDPBCGR 2.2.1.12.1.3).
     LicensingFailed {
         /// The `dwErrorCode` the server reported.
         error_code: u32,
     },
     /// A licensing message failed its MAC check — the decrypted content does not match the
-    /// server's integrity data (MS-RDPELE 5.1.6).
+    /// server's integrity data (MS-RDPELE 5.1.5).
     LicenseMacMismatch,
     /// The adapter fed the machine an [`Event`] the current stage does not expect (the ordering
     /// contract on [`Event`]). Carries the stage label and the offending event kind. This is an
@@ -1272,7 +1272,7 @@ impl ConnectStateMachine {
             license::MSG_ERROR_ALERT => {
                 let alert =
                     license::LicenseError::decode(&mut cur).map_err(ConnectError::Decode)?;
-                // `dwStateTransition` pins the client's reaction (MS-RDPELE 2.2.2.7), not the
+                // `dwStateTransition` pins the client's reaction (MS-RDPBCGR 2.2.1.12.1.3), not the
                 // error code alone: ST_NO_TRANSITION means the licensing exchange is over and
                 // the connect proceeds — true for the STATUS_VALID_CLIENT short-circuit (the
                 // path most real servers take) and equally for a grace-period server that
@@ -1356,7 +1356,7 @@ impl ConnectStateMachine {
                 response.extend_from_slice(&0x0003u16.to_le_bytes());
                 response.extend_from_slice(&(plain.len() as u16).to_le_bytes());
                 response.extend_from_slice(&plain);
-                // CLIENT_HARDWARE_ID (2.2.2.5.2): PlatformId + the caller's four words.
+                // CLIENT_HARDWARE_ID (2.2.2.3.1): PlatformId + the caller's four words.
                 let mut hwid = Vec::with_capacity(20);
                 hwid.extend_from_slice(&self.config.license.platform_id.to_le_bytes());
                 for word in self.config.license.hardware_id {
@@ -3328,7 +3328,7 @@ pub(crate) mod tests {
     fn licensing_error_with_total_abort_fails_typed() {
         let mut sm = licensing();
         // ERR_NO_LICENSE (0x02) + ST_TOTAL_ABORT: the server refuses and aborts the exchange
-        // (MS-RDPELE 2.2.2.7) — no license, no session.
+        // (MS-RDPBCGR 2.2.1.12.1.3) — no license, no session.
         let actions = sm.process(Event::Received(&server_io_frame(&license_alert_with(
             0x02,
             license::ST_TOTAL_ABORT,

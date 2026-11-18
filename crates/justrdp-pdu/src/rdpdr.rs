@@ -118,7 +118,7 @@ pub const FILE_OVERWRITTEN: u8 = 0x03;
 /// `FileAttributes`: a directory (`[MS-FSCC]` 2.6).
 pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 
-/// `FileFullDirectoryInformation` (`[MS-FSCC]` 2.4.17).
+/// `FileFullDirectoryInformation` (`[MS-FSCC]` 2.4.15).
 pub const FILE_FULL_DIRECTORY_INFORMATION: u32 = 2;
 /// `FileBothDirectoryInformation` (`[MS-FSCC]` 2.4.8).
 pub const FILE_BOTH_DIRECTORY_INFORMATION: u32 = 3;
@@ -134,7 +134,7 @@ pub const FILE_RENAME_INFORMATION: u32 = 0x0A;
 pub const FILE_DISPOSITION_INFORMATION: u32 = 0x0D;
 /// `FileAllocationInformation` (`[MS-FSCC]` 2.4.4).
 pub const FILE_ALLOCATION_INFORMATION: u32 = 0x13;
-/// `FileEndOfFileInformation` (`[MS-FSCC]` 2.4.13).
+/// `FileEndOfFileInformation` (`[MS-FSCC]` 2.4.14).
 pub const FILE_END_OF_FILE_INFORMATION: u32 = 0x14;
 /// `FileFsVolumeInformation` (`[MS-FSCC]` 2.5.9).
 pub const FILE_FS_VOLUME_INFORMATION: u32 = 1;
@@ -286,7 +286,7 @@ pub enum IoBody {
 pub enum SetInformation {
     /// `FileBasicInformation` (`[MS-FSCC]` 2.4.7).
     Basic(BasicInformation),
-    /// `FileEndOfFileInformation` (`[MS-FSCC]` 2.4.13): the new size in bytes.
+    /// `FileEndOfFileInformation` (`[MS-FSCC]` 2.4.14): the new size in bytes.
     EndOfFile(u64),
     /// `FileAllocationInformation` (`[MS-FSCC]` 2.4.4): the new allocation size in bytes.
     Allocation(u64),

@@ -1,4 +1,4 @@
-//! RemoteFX dequantization and LL3 delta reconstruction (MS-RDPRFX 3.1.8.1.4 / 3.1.8.1.5) —
+//! RemoteFX dequantization and LL3 delta reconstruction (MS-RDPRFX 3.1.8.1.5 / 3.1.8.1.6) —
 //! the two cheap inverse stages between RLGR entropy decode and the inverse DWT. Self-owned
 //! (ADR-0003 phase-2); equivalence with the `ironrdp-graphics` `quantization` and
 //! `subband_reconstruction` primitives is proven by the ADR-0007 stage-boundary tests.

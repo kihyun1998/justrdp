@@ -182,13 +182,13 @@ impl core::fmt::Debug for Rc4 {
     }
 }
 
-/// `SaltedHash` (MS-RDPELE 5.1.3): `MD5(salt ‖ SHA1(input ‖ salt ‖ salt1 ‖ salt2))`.
+/// `SaltedHash` (MS-RDPELE 5.1.2): `MD5(salt ‖ SHA1(input ‖ salt ‖ salt1 ‖ salt2))`.
 pub(crate) fn salted_hash(salt: &[u8], salt1: &[u8], salt2: &[u8], input: &[u8]) -> [u8; 16] {
     let sha = sha1(&[input, salt, salt1, salt2].concat());
     md5(&[salt, &sha].concat())
 }
 
-/// The licensing session keys derived from the three randoms (MS-RDPELE 5.1.3).
+/// The licensing session keys derived from the three randoms (MS-RDPELE 5.1.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LicenseKeys {
     /// The RC4 key for `EncryptedPlatformChallenge` / responses / license info.
@@ -197,7 +197,7 @@ pub struct LicenseKeys {
     pub mac_salt: [u8; 16],
 }
 
-/// Derive [`LicenseKeys`] from the premaster secret and both randoms (MS-RDPELE 5.1.3):
+/// Derive [`LicenseKeys`] from the premaster secret and both randoms (MS-RDPELE 5.1.2):
 /// MasterSecret = SaltedHash(premaster, client, server; "A"/"BB"/"CCC"), SessionKeyBlob =
 /// SaltedHash(master, server, client; "A"/"BB"/"CCC"), MAC salt = blob[0..16], license key =
 /// `MD5(blob[16..32] ‖ client ‖ server)`.
@@ -224,7 +224,7 @@ pub fn derive_license_keys(
     }
 }
 
-/// The licensing MAC (MS-RDPELE 5.1.6): `MD5(salt ‖ pad2 ‖ SHA1(salt ‖ pad1 ‖ len_LE ‖ data))`
+/// The licensing MAC (MS-RDPELE 5.1.5): `MD5(salt ‖ pad2 ‖ SHA1(salt ‖ pad1 ‖ len_LE ‖ data))`
 /// with `pad1` = 40×0x36 and `pad2` = 48×0x5C. Computed over **plaintext**, sent alongside the
 /// RC4-encrypted copy.
 pub fn mac_data(mac_salt: &[u8; 16], data: &[u8]) -> [u8; 16] {
@@ -235,7 +235,7 @@ pub fn mac_data(mac_salt: &[u8; 16], data: &[u8]) -> [u8; 16] {
     md5(&[&mac_salt[..], &pad2, &sha].concat())
 }
 
-/// Textbook RSA for the premaster secret (MS-RDPELE 5.1.2.1): interpret the secret as a
+/// Textbook RSA for the premaster secret (MS-RDPELE 5.1.1.1): interpret the secret as a
 /// little-endian integer, raise to the certificate's public exponent mod its modulus, and emit
 /// the result little-endian with 8 trailing zero bytes (the proprietary blob convention,
 /// matching FreeRDP). `modulus_be` is **big-endian** — the connect machine in `justrdp` reverses the wire's

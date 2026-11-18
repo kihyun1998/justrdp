@@ -1022,7 +1022,7 @@ pub fn order_payload<'m, 'a>(messages: &'m [ProgressiveMessage<'a>]) -> PayloadO
 /// | channel close | free everything, **by dropping this** — there is no method | `GraphicsProcessor::close` |
 ///
 /// **`DELETEENCODINGCONTEXT` frees nothing, but not because it names nothing.** The PDU
-/// carries a `surfaceId` beside the `codecContextId` (`[MS-RDPEGFX]` 2.2.2.13; our parser
+/// carries a `surfaceId` beside the `codecContextId` (`[MS-RDPEGFX]` 2.2.2.3; our parser
 /// decodes both, `EgfxPdu::DeleteEncodingContext`), so a surface-keyed store *could* honour
 /// it exactly. The reason to ignore it is tolerance, not inability: `[MS-RDPEGFX]` has no
 /// client-side processing rule compelling the free, FreeRDP's handler is a literal no-op
