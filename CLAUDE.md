@@ -94,9 +94,16 @@ exactly (`=x.y.z`); a bump passes the real-VM suite before it lands (ADR-0004,
 
 - **Language**: code comments, `CLAUDE.md`, `GLOSSARY.md`, `docs/adr/` and `docs/agents/` in
   English (LLM token efficiency); other human-facing docs in Korean.
-- **Comments** say what the code is. Why it is this way, what it deliberately leaves out, the trap
-  and the measured value go to the matching note under `docs/map/territory/`; history goes to the
-  commit message.
+- **Comments**: a comment is one of: a license header; behaviour forced by an outside dependency,
+  platform, vendor or protocol we cannot reshape (Rust's `SAFETY:` on `unsafe` is one); a tool
+  directive; a doc comment on a public API; an issue or RFC link for a constraint the code cannot
+  express. Nothing else: a surprise in our own code is fixed, not explained. A measured value, an
+  outside constraint and the reason behind a design judgement go to the territory note under
+  `docs/map/`. Where none seems to hold it, search the folder and the code symbol first; only then
+  start a new note, named for what the system does there, not for the file. A workaround's reason
+  goes nowhere: the workaround is fixed. History goes to the commit message. Comments written
+  before this rule may still carry what the map keeps: never delete one whose content the map does
+  not yet hold — move it there first.
 - **Commit messages**: `feat(<scope>): … (#issue)`, with no `Co-Authored-By` or other AI
   attribution (memory `feedback_no_ai_attribution_external`).
 - **Issues**: always apply a triage label and a type label (memory
