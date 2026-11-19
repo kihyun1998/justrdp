@@ -419,6 +419,38 @@ attacker-controlled bytes in the repo.
   How a change is compared against this floor is `docs/agents/thegraph.md`
   § *Proof of a performance claim*.
 
+- **A ClearCodec V-bar column is allocated once, at the band's height, and filled in place**
+  (#649, measured 2026-11-19). `reconstruct_full_vbar` runs on every SHORT_VBAR_CACHE_MISS and
+  SHORT_VBAR_CACHE_HIT. Built from `<[u8]>::repeat` runs instead (a separate allocation for the
+  background above `shortVBarYOn` and for the one below the short V-bar, and up to two growths
+  as the parts are appended), the `clearcodec` group was about 50 % slower than master. In place,
+  a short V-bar that does not fit the band is refused by the split failing, the same inputs the
+  `checked_sub` form refused, given that a short V-bar is always a whole number of 3-byte pixels.
+  Measured on the #555 host with the `clearcodec` group alone, `--measurement-time 8`, each run
+  pinned with `start /wait /b /high /affinity 4`. Other sessions shared the host, so the builds
+  were rotated in one sitting rather than run as `docs/agents/thegraph.md`'s saved-baseline
+  sequence, and each build's own spread is its noise floor. First sitting: master (7a3d08f), the
+  `repeat` form and the in-place form, which differ in this function only, rotated five times.
+  Criterion point estimates in ms, interval half-width in brackets:
+
+  | Build | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 |
+  |---|---|---|---|---|---|
+  | master | 1.789 (0.6 %) | 1.825 (0.8 %) | 1.107 (6.4 %) | 1.834 (1.1 %) | 1.788 (0.5 %) |
+  | `repeat` | 2.718 (0.5 %) | 2.744 (0.7 %) | 2.744 (0.7 %) | 2.699 (0.6 %) | 2.726 (0.6 %) |
+  | in place | 1.689 (0.3 %) | 1.376 (4.6 %) | 1.721 (0.6 %) | 1.714 (0.5 %) | 1.690 (0.5 %) |
+
+  Second sitting, five master/in-place pairs on the committed code with the host busier:
+
+  | Build | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 |
+  |---|---|---|---|---|---|
+  | master | 1.174 (7.7 %) | 1.423 (5.0 %) | 1.645 (4.0 %) | 1.797 (1.9 %) | 1.782 (0.7 %) |
+  | in place | 1.032 (1.7 %) | 1.175 (7.8 %) | 1.700 (2.3 %) | 1.756 (0.9 %) | 1.702 (0.4 %) |
+
+  The `repeat` form lies outside master's spread in every run. The in-place form lies inside
+  master's full spread in both sittings; it sits about 5 % under master's narrow-interval runs in
+  the first sitting, which is less than that spread, so against master there is no measurable
+  difference.
+
 ## Code
 
 - `justrdp-codecs/benches/real_server_corpus.rs` — one criterion group per owned codec over its

@@ -759,12 +759,12 @@ fn reconstruct_full_vbar(
     bg_red: u8,
 ) -> Option<FullVBar> {
     let background = [bg_blue, bg_green, bg_red];
-    let below = usize::from(band_height)
-        .checked_sub(usize::from(y_on))?
-        .checked_sub(short_pixels.len() / 3)?;
-    let mut pixels = background.repeat(usize::from(y_on));
-    pixels.extend_from_slice(short_pixels);
-    pixels.extend_from_slice(&background.repeat(below));
+    let mut pixels = vec![0; usize::from(band_height) * 3];
+    let (above, rest) = pixels.split_at_mut_checked(usize::from(y_on) * 3)?;
+    let (bar, below) = rest.split_at_mut_checked(short_pixels.len())?;
+    above.as_chunks_mut::<3>().0.fill(background);
+    bar.copy_from_slice(short_pixels);
+    below.as_chunks_mut::<3>().0.fill(background);
     Some(FullVBar { pixels })
 }
 
@@ -1176,6 +1176,24 @@ mod tests {
                 "a 2-row short V-bar at yOn {y_on} in a {hit}-row band"
             );
         }
+        let empty_bar_at = |y_on: u8| {
+            let mut bands = band([0, 0], [0, 2], &short_miss(0));
+            bands.extend(band([1, 1], [0, 1], &[0x00, 0x40, y_on]));
+            ClearDecoder::new().decode(&build_stream(&bands), 2, 3)
+        };
+        assert_eq!(
+            empty_bar_at(2),
+            Ok([BKG, BKG, BKG, BKG, BKG, [0; 4]].concat()),
+            "an empty short V-bar at the end of a 2-row band is drawn"
+        );
+        assert_eq!(
+            empty_bar_at(3),
+            Err(invalid(
+                "shortVBarCacheHit",
+                "stored short V-bar exceeds band height - shortVBarYOn"
+            )),
+            "an empty short V-bar at yOn 3 in a 2-row band"
+        );
     }
 
     #[test]
