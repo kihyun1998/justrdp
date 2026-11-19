@@ -47,3 +47,12 @@ difference inside the floor is no difference. Three rules from #250 bound the re
   work, a 2× win is capped at 2.3 %.
 - **Measure the workload's shape, not only its duration.** #91's verdict came from the run-length
   distribution of real streams, not from a stopwatch.
+
+**On a host shared with other work, the three steps can fail to resolve anything.** #649 ran them
+while other sessions used the machine: master against itself moved −43 % to +19 % across codecs,
+and codecs the change never touched read as regressed. What resolved it was narrowing to the
+suspect codec and alternating: `<exe> --bench <codec> --measurement-time 8 --noplot
+--discard-baseline`, master and branch in turn, five pairs, each pinned as above. Judge by the
+spread within each side and by the minimum, since interference only adds time: clearcodec read
+1.77–1.81 ms on master against 2.62–2.72 ms on the branch, each side within 4 %, which no single
+three-step run had shown.
