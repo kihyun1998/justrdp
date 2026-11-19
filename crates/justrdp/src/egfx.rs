@@ -3062,6 +3062,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_clearcodec_stream_without_glyph_hit_and_with_no_composite_payload_skips_the_region() {
+        let mut reset_white = vec![0x04, 0];
+        reset_white.extend_from_slice(&clear_white_tile(0x00, 0, 4)[4..]);
+        assert_eq!(
+            clear_tiles_over_grey(4, 1, &[&reset_white]),
+            vec![WHITE; 4],
+            "CACHE_RESET with a payload paints"
+        );
+        assert_eq!(
+            clear_tiles_over_grey(4, 1, &[&[0x01, 0, 7, 0]]),
+            vec![GREY; 4],
+            "GLYPH_INDEX with no payload is skipped"
+        );
+        assert_eq!(
+            clear_tiles_over_grey(4, 1, &[&[0x01, 0, 7, 0], &[0x03, 1, 7, 0]]),
+            vec![GREY; 4],
+            "and stores no glyph for a later hit"
+        );
+        for flags in [0x00, 0x04] {
+            assert_eq!(
+                clear_tiles_over_grey(4, 1, &[&[flags, 0]]),
+                vec![GREY; 4],
+                "flags {flags:#04x} with no payload is skipped"
+            );
+        }
+    }
+
     fn clear_bands(bands: &[u8]) -> Vec<u8> {
         let mut s = vec![0x00, 0x00];
         s.extend_from_slice(&0u32.to_le_bytes());
