@@ -109,6 +109,15 @@ attacker-controlled bytes in the repo.
   (192.168.136.163, 2026-11-19, `capture_clearcodec_text_corpus_against_real_vm` with
   `JUSTRDP_TEST_SERVER=win11`) sent 1634 ClearCodec payloads, 542 glyph stores and 329 glyph hits,
   every one decoded. That capture was not committed.
+- **A ClearCodec stream without GLYPH_HIT and with no composite payload is refused** (#651, the
+  maintainer's call, 2026-11-19, ADR-0009's #643 amendment call 16), with GLYPH_INDEX or without,
+  CACHE_RESET alone included: `NotEnoughBytes` naming `CompositePayload`. It used to draw an
+  all-zero tile and, with GLYPH_INDEX, store it as the glyph. `[MS-RDPEGFX]` 2.2.4.1 calls the
+  payload optional but says the glyph data "is present" in it without GLYPH_HIT; FreeRDP 3.33.1
+  refuses a non-hit stream with fewer than 12 bytes left (`clear.c:1158-1170`). CACHE_RESET still
+  resets the V-bar cursors on the refused stream, as 2.2.4.1 resets them "before decoding the
+  stream" and FreeRDP does at `clear.c:1144-1147`;
+  `a_refused_cache_reset_only_stream_still_resets_the_vbar_cursors` pins it.
 - **A ClearCodec glyph hit draws the cached pixels as any rectangle of the same area** (#586).
   `[MS-RDPEGFX]` 4.1.1.5 stores a glyph as a linear pixel stream with no dimensions and hits a
   2x8 glyph as 4x4 and as 8x2; the `ironrdp-graphics` 0.11 oracle does the same. A hit of a

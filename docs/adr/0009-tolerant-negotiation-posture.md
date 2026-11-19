@@ -593,4 +593,36 @@ numbers are in `docs/map/territory/bitmap-codecs.md`.
 
 **What this does not decide.** The under-fill pixel value (#646), what the core does on a decode
 error, any other codec, and a GLYPH_INDEX stream with no composite payload, which the decoder still
-stores as an all-zero glyph.
+stores as an all-zero glyph. **A stream with no composite payload is decided below (#651).**
+
+### Continued: a stream without GLYPH_HIT and with no composite payload (#651)
+
+16. **A stream without GLYPH_HIT that has no bytes after its header (and glyph index) is refused**,
+    whether or not GLYPH_INDEX is set, a stream whose only flag is CACHE_RESET included. It is a
+    `ClearError::NotEnoughBytes` naming `CompositePayload`, the error one to eleven bytes there
+    already gave, and through `justrdp::egfx` the same warned and skipped region as call 1. The
+    decoder used to skip the composite, so it drew an all-zero tile and, with GLYPH_INDEX, stored it
+    as the glyph. `[MS-RDPEGFX]` v20260511 2.2.4.1 calls `compositePayload` "optional" and
+    forbids it only when GLYPH_INDEX and GLYPH_HIT are both set, but also says that without
+    GLYPH_HIT "the glyph data is present in the compositePayload field" and "MUST be placed in the
+    Decompressor Glyph Storage". FreeRDP 3.33.1 `clear_decompress` refuses any non-hit stream with
+    fewer than 12 bytes left (`clear.c:1158-1170`).
+
+    CACHE_RESET still applies on the refused stream: 2.2.4.1 resets both cursors "before decoding
+    the stream", FreeRDP resets them before the same check (`clear.c:1144-1147`), and every other
+    refusal after the header already leaves the reset applied (the bands layer also stores V-bars
+    before a later band fails, so no refusal leaves the decoder unchanged). The cost of the refusal
+    is therefore the skipped region only, not the reset.
+
+**Kind: judgement**, the maintainer's (2026-11-19), who chose to refuse both the GLYPH_INDEX case
+and the case without it where refusing only the first was recommended. They were shown the spec's
+"optional" and its glyph-data sentences, FreeRDP's refusal, that no test or corpus reaches the
+branch (a `panic!` there survived the WS2019 corpus, the ClearCodec unit tests and the EGFX
+tests), and as the cost that a server sending a cache-reset-only message would have that region
+skipped and its reset not applied. That last part was wrong: the reset is applied, as above, so the
+cost was smaller than shown. The ordering is a derivation from the spec sentence and the decoder's
+other refusals, not part of the judgement. The refusals are proven by wire-format round-trips
+through `GraphicsProcessor::process`.
+
+**What this does not decide.** What CACHE_RESET does on a stream with a payload, and any other
+codec.

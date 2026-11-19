@@ -24,13 +24,16 @@
 //!    keep what the tile already held: the residual or bands pixel under an RLEX region, and zero
 //!    bytes where the residual layer stops short.
 //!
-//! 3. **Each layer holds whole structures, and these field values the spec forbids are refused.** Bytes
-//!    after a layer's last whole run segment, band or subcodec are a
+//! 3. **The composite payload and each layer hold whole structures, and these field values the spec
+//!    forbids are refused.** Bytes after a layer's last whole run segment, band or subcodec are a
 //!    [`ClearError::NotEnoughBytes`] (`[MS-RDPEGFX]` 2.2.4.1.1.1, 2.2.4.1.1.2, 2.2.4.1.1.3). A
 //!    residual run length whose `runLengthFactor1`, `runLengthFactor2` or `runLengthFactor3` is
 //!    zero (2.2.4.1.1.1.1), a subcodec of any `subCodecId` whose `bitmapDataByteCount` exceeds
 //!    `3 * width * height`, and a raw subcodec with fewer bytes than that (2.2.4.1.1.3.1) are
-//!    [`ClearError::InvalidField`].
+//!    [`ClearError::InvalidField`]. A stream without GLYPH_HIT that ends after its header (and
+//!    glyph index) is a [`ClearError::NotEnoughBytes`] naming `CompositePayload`, so no all-zero
+//!    tile is drawn or stored as a glyph (ADR-0009, #651). CACHE_RESET on such a stream still
+//!    resets both V-bar cursors.
 //!
 //! 4. **Glyph flags, V-bar cache hits and bands must fit the tile they are used on.** Each of these
 //!    is a [`ClearError::InvalidField`]: GLYPH_INDEX on a tile over 1,024 pixels, and a GLYPH_HIT
@@ -416,11 +419,7 @@ impl ClearDecoder {
 
         let mut output = vec![0u8; pixel_count * 4];
 
-        // A composite payload is present unless the buffer is already spent (a cache-reset-only
-        // message has no payload).
-        if !c.is_empty() {
-            self.decode_composite(&mut c, &mut output, width, height)?;
-        }
+        self.decode_composite(&mut c, &mut output, width, height)?;
 
         if let Some(idx) = glyph_index {
             self.glyph_store(
@@ -1263,6 +1262,57 @@ mod tests {
                 "{trailing} trailing byte(s)"
             );
         }
+    }
+
+    #[test]
+    fn a_stream_without_glyph_hit_and_with_no_composite_payload_is_refused() {
+        let missing = Err(ClearError::NotEnoughBytes {
+            ctx: "CompositePayload",
+        });
+        let mut d = ClearDecoder::new();
+        assert_eq!(d.decode(&[FLAG_GLYPH_INDEX, 0x00, 4, 0], 2, 8), missing);
+        assert_eq!(
+            d.decode(&glyph_hit_stream(4), 2, 8),
+            Err(invalid("glyphIndex", "glyph cache miss on hit")),
+            "the refused stream stored no glyph"
+        );
+        for flags in [0x00, FLAG_CACHE_RESET] {
+            assert_eq!(
+                ClearDecoder::new().decode(&[flags, 0x00], 2, 2),
+                missing,
+                "flags {flags:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_cache_reset_only_stream_still_resets_the_vbar_cursors() {
+        let store = |bgr: [u8; 3]| {
+            let mut vbar = (2u16 << 8).to_le_bytes().to_vec();
+            vbar.extend_from_slice(&bgr.repeat(2));
+            build_stream(&band([0, 0], [0, 1], &vbar))
+        };
+        let hit_slot_0 = build_stream(&band([0, 0], [0, 1], &0x8000u16.to_le_bytes()));
+        let short_hit_slot_0 = build_stream(&band([0, 0], [0, 1], &[0x00, 0x40, 0]));
+        let mut d = ClearDecoder::new();
+        d.decode(&store([1, 2, 3]), 1, 2).unwrap();
+        assert_eq!(
+            d.decode(&[FLAG_CACHE_RESET, 0x00], 1, 2),
+            Err(ClearError::NotEnoughBytes {
+                ctx: "CompositePayload"
+            })
+        );
+        d.decode(&store([7, 8, 9]), 1, 2).unwrap();
+        assert_eq!(
+            d.decode(&hit_slot_0, 1, 2),
+            Ok([7, 8, 9, 0xFF].repeat(2)),
+            "the second V-bar overwrote slot 0"
+        );
+        assert_eq!(
+            d.decode(&short_hit_slot_0, 1, 2),
+            Ok([7, 8, 9, 0xFF].repeat(2)),
+            "the second short V-bar overwrote slot 0"
+        );
     }
 
     /// Wrap a bands-layer payload in the ClearCodec bitmap-stream header (no residual/subcodec).
