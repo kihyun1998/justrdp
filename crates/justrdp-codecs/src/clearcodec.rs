@@ -7,7 +7,7 @@
 //!
 //! This decoder is re-derived from the MS-RDPEGFX spec and cross-checked against FreeRDP's
 //! `clear.c`; it does **not** depend on `ironrdp-graphics`, and its output is checked against
-//! that oracle differentially (`tests/clearcodec_*`). Three decisions are easy to get wrong:
+//! that oracle differentially (`tests/clearcodec_*`). Four decisions are easy to get wrong:
 //!
 //! 1. **SHORT_VBAR_CACHE_MISS field layout.** The 14 payload bits are `shortVBarYOn` in bits
 //!    `[7:0]` and `shortVBarYOff` in bits `[13:8]` (FreeRDP `vBarYOn = h & 0xFF`,
@@ -31,6 +31,13 @@
 //!    zero (2.2.4.1.1.1.1), a subcodec of any `subCodecId` whose `bitmapDataByteCount` exceeds
 //!    `3 * width * height`, and a raw subcodec with fewer bytes than that (2.2.4.1.1.3.1) are
 //!    [`ClearError::InvalidField`].
+//!
+//! 4. **Glyph flags, V-bar cache hits and bands must fit the tile they are used on.** Each of these
+//!    is a [`ClearError::InvalidField`]: GLYPH_INDEX on a tile over 1,024 pixels, and a GLYPH_HIT
+//!    followed by any bytes (2.2.4.1); a VBAR_CACHE_HIT whose stored V-bar is not the band's height
+//!    (2.2.4.1.1.2.1.1.1); a SHORT_VBAR_CACHE_HIT whose stored short V-bar, placed at its
+//!    `shortVBarYOn`, runs past the band (2.2.4.1.1.2.1.1.2); and a band whose columns or rows fall
+//!    outside the tile. Nothing is clamped or skipped to make such an input fit.
 //!
 //! **Alpha contract:** ClearCodec carries no alpha; every pixel a layer writes has alpha `0xFF`. A
 //! pixel no layer reaches is zero bytes, alpha included (decision 2).
@@ -58,12 +65,8 @@ const MAX_PALETTE_COUNT: u8 = 127;
 /// Per-axis tile dimension cap, mirroring the bootstrap decoder's OOM guard: rejects
 /// implausible tile shapes (e.g. 63961x771) regardless of total area before allocation.
 const MAX_DECODE_DIM: u16 = 8_192;
-/// Glyph cache stores tiles no larger than this many pixels: `[MS-RDPEGFX]` 3.3.1.9 caps each
-/// of the [`GLYPH_CACHE_SIZE`] slots at 1,024 square pixels, which also bounds the cache's memory
-/// (#127). A larger tile is decoded and not stored, so a later GLYPH_HIT on its slot is a typed
-/// error (a miss, or an area mismatch with what the slot holds), never a panic. FreeRDP's
-/// `1024*1024` (`clear.c`) is a different thing — an anti-overflow sanity ceiling, not a
-/// cache-eligibility threshold.
+/// The largest tile GLYPH_INDEX may name: `[MS-RDPEGFX]` 2.2.4.1 forbids the flag on a bitmap
+/// over 1,024 square pixels, and 3.3.1.9 caps each glyph slot at that size.
 const MAX_GLYPH_PIXELS: usize = 1_024;
 
 /// Why a ClearCodec stream failed to decode. Malformed input is always a typed error, never a
@@ -377,12 +380,21 @@ impl ClearDecoder {
             .checked_mul(usize::from(height))
             .ok_or_else(|| invalid("dimensions", "width * height overflow"))?;
 
-        // Glyph hit: return the cached pixels verbatim, no payload follows. The destination
-        // rectangle supplies the shape, so any rectangle of the cached glyph's area draws it
-        // (`[MS-RDPEGFX]` 4.1.1.5).
+        if glyph_index.is_some() && pixel_count > MAX_GLYPH_PIXELS {
+            return Err(invalid(
+                "glyphIndex",
+                "GLYPH_INDEX on a tile over 1024 pixels",
+            ));
+        }
+
+        // The destination rectangle supplies the shape, so any rectangle of the cached glyph's area
+        // draws it (`[MS-RDPEGFX]` 4.1.1.5).
         if flags & FLAG_GLYPH_HIT != 0 {
             let idx =
                 glyph_index.ok_or_else(|| invalid("flags", "GLYPH_HIT without GLYPH_INDEX"))?;
+            if !c.is_empty() {
+                return Err(invalid("compositePayload", "present with GLYPH_HIT"));
+            }
             let entry = self
                 .glyph_get(idx)
                 .ok_or_else(|| invalid("glyphIndex", "glyph cache miss on hit"))?;
@@ -407,14 +419,10 @@ impl ClearDecoder {
         // A composite payload is present unless the buffer is already spent (a cache-reset-only
         // message has no payload).
         if !c.is_empty() {
-            self.decode_composite(&mut c, &mut output, width)?;
+            self.decode_composite(&mut c, &mut output, width, height)?;
         }
 
-        // Cache small tiles for later glyph hits.
-        if flags & FLAG_GLYPH_INDEX != 0
-            && let Some(idx) = glyph_index
-            && pixel_count <= MAX_GLYPH_PIXELS
-        {
+        if let Some(idx) = glyph_index {
             self.glyph_store(
                 idx,
                 GlyphEntry {
@@ -431,6 +439,7 @@ impl ClearDecoder {
         c: &mut Cursor<'_>,
         output: &mut [u8],
         width: u16,
+        height: u16,
     ) -> Result<(), ClearError> {
         c.ensure(12, "CompositePayload")?;
         let residual_count = cast_usize(c.u32_le());
@@ -448,7 +457,7 @@ impl ClearDecoder {
         let subcodec = c.slice(subcodec_count);
 
         self.decode_residual_layer(residual, output)?;
-        self.decode_bands_layer(bands, output, width)?;
+        self.decode_bands_layer(bands, output, width, height)?;
         self.decode_subcodec_layer(subcodec, output, width)?;
         Ok(())
     }
@@ -506,6 +515,7 @@ impl ClearDecoder {
         data: &[u8],
         output: &mut [u8],
         width: u16,
+        height: u16,
     ) -> Result<(), ClearError> {
         if data.is_empty() {
             return Ok(());
@@ -533,34 +543,24 @@ impl ClearDecoder {
             if x_end < x_start {
                 return Err(invalid("xEnd", "xEnd < xStart"));
             }
+            if x_end >= width {
+                return Err(invalid("xEnd", "band column outside the tile"));
+            }
+            if y_end >= height {
+                return Err(invalid("yEnd", "band row outside the tile"));
+            }
 
-            let column_count = usize::from(x_end - x_start) + 1;
-            for col in 0..column_count {
+            for x in usize::from(x_start)..=usize::from(x_end) {
                 let slot = self.decode_vbar(&mut c, band_height, bg_blue, bg_green, bg_red)?;
-                let x = usize::from(x_start) + col;
-                if x >= w {
-                    continue;
-                }
                 // The slot was just resolved/stored, so it is always populated; compositing
                 // straight from storage avoids the per-column clone (#86).
                 let Some(vbar) = self.vbar_storage.get(slot).and_then(|s| s.as_ref()) else {
                     continue;
                 };
-                // Clamp to the current band: a full V-bar CACHE_HIT (0x8000) reuses a stored column
-                // verbatim, which may have been built for a taller band. FreeRDP `clear.c` clamps at
-                // composite with `if (count > nHeight) count = nHeight`, so a tall column never
-                // bleeds below a shorter band (#116).
-                let rows = (vbar.pixels.len() / 3).min(usize::from(band_height));
-                for row in 0..rows {
-                    let y = usize::from(y_start) + row;
-                    let dst = (y * w + x) * 4;
-                    let src = row * 3;
-                    if dst + 3 < output.len() && src + 2 < vbar.pixels.len() {
-                        output[dst] = vbar.pixels[src];
-                        output[dst + 1] = vbar.pixels[src + 1];
-                        output[dst + 2] = vbar.pixels[src + 2];
-                        output[dst + 3] = 0xFF;
-                    }
+                for (row, bgr) in vbar.pixels.as_chunks::<3>().0.iter().enumerate() {
+                    let dst = ((usize::from(y_start) + row) * w + x) * 4;
+                    output[dst..dst + 3].copy_from_slice(bgr);
+                    output[dst + 3] = 0xFF;
                 }
             }
         }
@@ -591,10 +591,16 @@ impl ClearDecoder {
         // Bit 15 set: full V-bar cache hit (read-only, no cursor advance).
         if header & 0x8000 != 0 {
             let index = header & 0x7FFF;
-            return self
+            let cached = self
                 .vbar_get(index)
-                .map(|_| usize::from(index))
-                .ok_or_else(|| invalid("vbarIndex", "V-bar cache miss on hit"));
+                .ok_or_else(|| invalid("vbarIndex", "V-bar cache miss on hit"))?;
+            if cached.pixels.len() != usize::from(band_height) * 3 {
+                return Err(invalid(
+                    "vBarCacheHit",
+                    "stored V-bar height is not the band height",
+                ));
+            }
+            return Ok(usize::from(index));
         }
 
         // Bit 14 set: short V-bar cache hit — reuse cached pixels with this header's yOn.
@@ -606,7 +612,13 @@ impl ClearDecoder {
                 .short_vbar_get(index)
                 .ok_or_else(|| invalid("shortVbarIndex", "short V-bar cache miss on hit"))?;
             let full =
-                reconstruct_full_vbar(y_on, &cached.pixels, band_height, bg_blue, bg_green, bg_red);
+                reconstruct_full_vbar(y_on, &cached.pixels, band_height, bg_blue, bg_green, bg_red)
+                    .ok_or_else(|| {
+                        invalid(
+                            "shortVBarCacheHit",
+                            "stored short V-bar exceeds band height - shortVBarYOn",
+                        )
+                    })?;
             return Ok(self.store_vbar(full));
         }
 
@@ -635,7 +647,8 @@ impl ClearDecoder {
         c.ensure(pixel_byte_count, "ShortVBarCacheMiss")?;
         let pixels = c.slice(pixel_byte_count).to_vec();
 
-        let full = reconstruct_full_vbar(y_on, &pixels, band_height, bg_blue, bg_green, bg_red);
+        let full = reconstruct_full_vbar(y_on, &pixels, band_height, bg_blue, bg_green, bg_red)
+            .ok_or_else(|| invalid("shortVBarCacheMiss", "shortVBarYOff exceeds band height"))?;
         self.store_short_vbar(ShortVBar { pixels });
         Ok(self.store_vbar(full))
     }
@@ -744,23 +757,15 @@ fn reconstruct_full_vbar(
     bg_blue: u8,
     bg_green: u8,
     bg_red: u8,
-) -> FullVBar {
-    let height = usize::from(band_height);
-    let mut pixels = Vec::with_capacity(height * 3);
-    // Every fill is clamped to `band_height`: a SHORT_VBAR_CACHE_HIT can reuse a taller band's
-    // short bar under a fresh `y_on`, so `y_on + short_pixels` may exceed the current band. FreeRDP
-    // `clear.c` vBarUpdate clamps each of the three fills with `if ((y + count) > vBarPixelCount)
-    // count = vBarPixelCount - y`; the assembled column is always exactly `band_height` rows (#116).
-    let top = usize::from(y_on).min(height);
-    for _ in 0..top {
-        pixels.extend_from_slice(&[bg_blue, bg_green, bg_red]);
-    }
-    let copy_rows = (short_pixels.len() / 3).min(height - top);
-    pixels.extend_from_slice(&short_pixels[..copy_rows * 3]);
-    for _ in (top + copy_rows)..height {
-        pixels.extend_from_slice(&[bg_blue, bg_green, bg_red]);
-    }
-    FullVBar { pixels }
+) -> Option<FullVBar> {
+    let background = [bg_blue, bg_green, bg_red];
+    let mut pixels = vec![0; usize::from(band_height) * 3];
+    let (above, rest) = pixels.split_at_mut_checked(usize::from(y_on) * 3)?;
+    let (bar, below) = rest.split_at_mut_checked(short_pixels.len())?;
+    above.as_chunks_mut::<3>().0.fill(background);
+    bar.copy_from_slice(short_pixels);
+    below.as_chunks_mut::<3>().0.fill(background);
+    Some(FullVBar { pixels })
 }
 
 /// Decode an NSCodec subcodec region (codecId 0x01) via the self-owned NSCodec codec and composite
@@ -1100,107 +1105,162 @@ mod tests {
         assert_eq!(&out[5 * 4..5 * 4 + 3], &[0xFF, 0x00, 0x00]);
     }
 
-    /// #116 — a V-bar cache hit can carry a *taller* band's column into a *shorter* band. The
-    /// reconstruction must clamp the assembled column to the current band height (FreeRDP
-    /// `clear.c` vBarUpdate clamps every fill to `vBarPixelCount`); it must never be longer.
-    /// Expectation is hand-derived from the FreeRDP semantics, not from the `ironrdp-graphics`
-    /// oracle (see #118).
-    #[test]
-    fn reconstruct_full_vbar_clamps_to_band_height() {
-        // 40 rows of short pixels, but the current band is only 10 tall, with y_on = 5.
-        let short: Vec<u8> = std::iter::repeat_n([0x11u8, 0x22, 0x33], 40)
-            .flatten()
-            .collect();
-        let full = reconstruct_full_vbar(5, &short, 10, 0, 0, 0);
-        // Exactly band_height rows — not the buggy 5 + 40 = 45.
-        assert_eq!(full.pixels.len(), 10 * 3);
-        // Rows 0..5 background, rows 5..10 the first 5 short pixels (the surplus is dropped).
-        assert_eq!(&full.pixels[0..5 * 3], &[0u8; 15]);
-        assert_eq!(
-            &full.pixels[5 * 3..10 * 3],
-            &[0x11, 0x22, 0x33].repeat(5)[..]
-        );
+    fn band(x: [u16; 2], y: [u16; 2], vbars: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for v in [x[0], x[1], y[0], y[1]] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&[0, 0, 0]);
+        b.extend_from_slice(vbars);
+        b
     }
 
-    /// #116 — a full V-bar CACHE_HIT (0x8000) reuses a stored column verbatim; if that column was
-    /// built for a taller band it must not bleed below a shorter band. FreeRDP clamps at composite
-    /// (`clear.c`: `if (count > nHeight) count = nHeight`). Oracle-independent bitstream.
-    #[test]
-    fn full_vbar_cache_hit_does_not_bleed_below_a_shorter_band() {
-        let mut bands = Vec::new();
-        // Band 1: 1×20 (y 0..=19) — a SHORT_VBAR_CACHE_MISS stores a 20-row column at full slot 0.
-        bands.extend_from_slice(&0u16.to_le_bytes()); // x_start
-        bands.extend_from_slice(&0u16.to_le_bytes()); // x_end
-        bands.extend_from_slice(&0u16.to_le_bytes()); // y_start
-        bands.extend_from_slice(&19u16.to_le_bytes()); // y_end → height 20
-        bands.extend_from_slice(&[0, 0, 0]); // bkg BGR
-        let miss: u16 = 20 << 8; // yOn=0, yOff=20 → 20 short pixels
-        bands.extend_from_slice(&miss.to_le_bytes());
-        for _ in 0..20 {
-            bands.extend_from_slice(&[0x11, 0x22, 0x33]);
-        }
-        // Band 2: 1×5 (y 100..=104) — a full V-bar CACHE_HIT on slot 0 (the 20-row column).
-        bands.extend_from_slice(&0u16.to_le_bytes()); // x_start
-        bands.extend_from_slice(&0u16.to_le_bytes()); // x_end
-        bands.extend_from_slice(&100u16.to_le_bytes()); // y_start
-        bands.extend_from_slice(&104u16.to_le_bytes()); // y_end → height 5
-        bands.extend_from_slice(&[0, 0, 0]); // bkg BGR
-        bands.extend_from_slice(&0x8000u16.to_le_bytes()); // full V-bar cache hit, index 0
+    fn short_miss(rows: u8) -> Vec<u8> {
+        let mut v = (u16::from(rows) << 8).to_le_bytes().to_vec();
+        v.extend_from_slice(&[0x11, 0x22, 0x33].repeat(usize::from(rows)));
+        v
+    }
 
-        let out = ClearDecoder::new()
-            .decode(&build_stream(&bands), 1, 120)
-            .unwrap();
-        // Band 2 itself (row 100) shows the column.
-        assert_eq!(&out[100 * 4..100 * 4 + 3], &[0x11, 0x22, 0x33]);
-        // Rows below band 2 (105..120) must stay background — the tall column must not bleed down.
-        for y in 105..120 {
+    const BAR: [u8; 4] = [0x11, 0x22, 0x33, 0xFF];
+    const BKG: [u8; 4] = [0, 0, 0, 0xFF];
+
+    /// `[MS-RDPEGFX]` 2.2.4.1.1.2.1.1.1: the stored V-bar of a VBAR_CACHE_HIT "MUST be equal to 3 *
+    /// (yEnd - yStart + 1) bytes".
+    #[test]
+    fn a_vbar_cache_hit_whose_stored_vbar_is_not_the_band_height_is_refused() {
+        let stream = |stored: u16, hit: u16| {
+            let mut bands = band([0, 0], [0, stored - 1], &short_miss(stored as u8));
+            bands.extend(band([1, 1], [0, hit - 1], &0x8000u16.to_le_bytes()));
+            build_stream(&bands)
+        };
+        assert_eq!(
+            ClearDecoder::new().decode(&stream(2, 2), 2, 2),
+            Ok([BAR, BAR, BAR, BAR].concat()),
+            "a stored V-bar of the band height is drawn"
+        );
+        for (stored, hit) in [(2, 1), (1, 2)] {
             assert_eq!(
-                &out[y * 4..y * 4 + 3],
-                &[0, 0, 0],
-                "row {y} bled below the band"
+                ClearDecoder::new().decode(&stream(stored, hit), 2, 2),
+                Err(invalid(
+                    "vBarCacheHit",
+                    "stored V-bar height is not the band height"
+                )),
+                "a {stored}-row V-bar hit in a {hit}-row band"
             );
         }
     }
 
-    /// #116 headline scenario, end to end — a SHORT_VBAR_CACHE_HIT (0x4000) reuses a taller band's
-    /// short bar under a fresh `yOn` in a shorter band. The reconstructed column must be clamped to
-    /// the shorter band. Oracle-independent bitstream.
+    /// 2.2.4.1.1.2.1.1.2: the stored short V-bar of a SHORT_VBAR_CACHE_HIT "MUST NOT exceed 3 *
+    /// (yEnd - yStart + 1 - shortVBarYOn) bytes".
     #[test]
-    fn short_vbar_cache_hit_clamps_to_the_shorter_band() {
-        let mut bands = Vec::new();
-        // Band 1: 1×20 — SHORT_VBAR_CACHE_MISS stores a 10-row short bar at short slot 0.
-        bands.extend_from_slice(&0u16.to_le_bytes()); // x_start
-        bands.extend_from_slice(&0u16.to_le_bytes()); // x_end
-        bands.extend_from_slice(&0u16.to_le_bytes()); // y_start
-        bands.extend_from_slice(&19u16.to_le_bytes()); // y_end → height 20
-        bands.extend_from_slice(&[0, 0, 0]); // bkg BGR
-        let miss: u16 = 10 << 8; // yOn=0, yOff=10 → 10 short pixels
-        bands.extend_from_slice(&miss.to_le_bytes());
-        for _ in 0..10 {
-            bands.extend_from_slice(&[0x44, 0x55, 0x66]);
-        }
-        // Band 2: 1×5 (y 100..=104) — SHORT_VBAR_CACHE_HIT on slot 0, fresh yOn = 2.
-        bands.extend_from_slice(&0u16.to_le_bytes()); // x_start
-        bands.extend_from_slice(&0u16.to_le_bytes()); // x_end
-        bands.extend_from_slice(&100u16.to_le_bytes()); // y_start
-        bands.extend_from_slice(&104u16.to_le_bytes()); // y_end → height 5
-        bands.extend_from_slice(&[0, 0, 0]); // bkg BGR
-        bands.extend_from_slice(&0x4000u16.to_le_bytes()); // short V-bar cache hit, index 0
-        bands.push(2); // yOn
-
-        let out = ClearDecoder::new()
-            .decode(&build_stream(&bands), 1, 120)
-            .unwrap();
-        // Within band 2: rows 100..102 background, rows 102..105 the short bar (clamped from 10→3).
-        assert_eq!(&out[100 * 4..100 * 4 + 3], &[0, 0, 0]);
-        assert_eq!(&out[102 * 4..102 * 4 + 3], &[0x44, 0x55, 0x66]);
-        assert_eq!(&out[104 * 4..104 * 4 + 3], &[0x44, 0x55, 0x66]);
-        // Below band 2 must stay background — no bleed.
-        for y in 105..120 {
+    fn a_short_vbar_cache_hit_past_the_band_is_refused() {
+        let stream = |hit: u16, y_on: u8| {
+            let mut bands = band([0, 0], [0, 2], &short_miss(2));
+            let mut vbar = 0x4000u16.to_le_bytes().to_vec();
+            vbar.push(y_on);
+            bands.extend(band([1, 1], [0, hit - 1], &vbar));
+            build_stream(&bands)
+        };
+        assert_eq!(
+            ClearDecoder::new().decode(&stream(3, 1), 2, 3),
+            Ok([BAR, BKG, BAR, BAR, BKG, BAR].concat()),
+            "a short V-bar that ends on the band's last row is drawn"
+        );
+        for (hit, y_on) in [(3, 2), (2, 1), (1, 0), (2, 3)] {
             assert_eq!(
-                &out[y * 4..y * 4 + 3],
-                &[0, 0, 0],
-                "row {y} bled below the band"
+                ClearDecoder::new().decode(&stream(hit, y_on), 2, 3),
+                Err(invalid(
+                    "shortVBarCacheHit",
+                    "stored short V-bar exceeds band height - shortVBarYOn"
+                )),
+                "a 2-row short V-bar at yOn {y_on} in a {hit}-row band"
+            );
+        }
+        let empty_bar_at = |y_on: u8| {
+            let mut bands = band([0, 0], [0, 2], &short_miss(0));
+            bands.extend(band([1, 1], [0, 1], &[0x00, 0x40, y_on]));
+            ClearDecoder::new().decode(&build_stream(&bands), 2, 3)
+        };
+        assert_eq!(
+            empty_bar_at(2),
+            Ok([BKG, BKG, BKG, BKG, BKG, [0; 4]].concat()),
+            "an empty short V-bar at the end of a 2-row band is drawn"
+        );
+        assert_eq!(
+            empty_bar_at(3),
+            Err(invalid(
+                "shortVBarCacheHit",
+                "stored short V-bar exceeds band height - shortVBarYOn"
+            )),
+            "an empty short V-bar at yOn 3 in a 2-row band"
+        );
+    }
+
+    #[test]
+    fn a_band_outside_the_tile_is_refused() {
+        let stream = |x_end: u16, y_end: u16| {
+            let vbars = [0u8, 0].repeat(usize::from(x_end) + 1);
+            build_stream(&band([0, x_end], [0, y_end], &vbars))
+        };
+        assert_eq!(
+            ClearDecoder::new().decode(&stream(1, 1), 2, 2),
+            Ok(BKG.repeat(4))
+        );
+        assert_eq!(
+            ClearDecoder::new().decode(&stream(2, 1), 2, 2),
+            Err(invalid("xEnd", "band column outside the tile"))
+        );
+        assert_eq!(
+            ClearDecoder::new().decode(&stream(1, 2), 2, 2),
+            Err(invalid("yEnd", "band row outside the tile"))
+        );
+    }
+
+    fn glyph_tile_stream(w: u16, h: u16) -> Vec<u8> {
+        let mut residual = vec![1, 2, 3, 0xFF];
+        residual.extend_from_slice(&(w * h).to_le_bytes());
+        let mut stream = vec![FLAG_GLYPH_INDEX, 0x00, 9, 0];
+        stream.extend_from_slice(&u32::try_from(residual.len()).unwrap().to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&residual);
+        stream
+    }
+
+    /// 2.2.4.1: GLYPH_INDEX "MUST NOT be used" on a bitmap larger than 1,024 square pixels.
+    #[test]
+    fn a_glyph_index_on_a_tile_over_1024_pixels_is_refused() {
+        let mut d = ClearDecoder::new();
+        let tile = [1u8, 2, 3, 0xFF].repeat(1024);
+        assert_eq!(
+            d.decode(&glyph_tile_stream(32, 32), 32, 32),
+            Ok(tile.clone())
+        );
+        assert_eq!(d.decode(&glyph_hit_stream(9), 32, 32), Ok(tile));
+        for (w, h) in [(33u16, 32u16), (1025, 1)] {
+            assert_eq!(
+                ClearDecoder::new().decode(&glyph_tile_stream(w, h), w, h),
+                Err(invalid(
+                    "glyphIndex",
+                    "GLYPH_INDEX on a tile over 1024 pixels"
+                )),
+                "{w}x{h}"
+            );
+        }
+    }
+
+    /// 2.2.4.1: with GLYPH_HIT "the compositePayload field MUST NOT be present".
+    #[test]
+    fn a_glyph_hit_with_bytes_after_the_glyph_header_is_refused() {
+        for trailing in [1usize, 11, 12, 13] {
+            let mut d = ClearDecoder::new();
+            d.decode(&glyph_store_stream(4), 2, 8).unwrap();
+            let mut hit = glyph_hit_stream(4);
+            hit.extend(std::iter::repeat_n(0, trailing));
+            assert_eq!(
+                d.decode(&hit, 2, 8),
+                Err(invalid("compositePayload", "present with GLYPH_HIT")),
+                "{trailing} trailing byte(s)"
             );
         }
     }

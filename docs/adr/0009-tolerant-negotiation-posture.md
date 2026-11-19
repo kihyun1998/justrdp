@@ -445,7 +445,8 @@ wire-format round-trips through `GraphicsProcessor::process`, as the 2026-09-04 
 asks for a refusal claim. The numbers are in `docs/map/territory/bitmap-codecs.md`.
 
 **What this does not decide.** The glyph, V-bar and band tolerances in the same decoder; any other
-codec; and what the core does on a decode error (warn and skip stays).
+codec; and what the core does on a decode error (warn and skip stays). **The glyph, V-bar and band
+tolerances are decided below (#649).**
 
 ### Continued the same day: byte counts and field values the spec forbids
 
@@ -525,4 +526,71 @@ re-run; the #643 worker's census over them (none of the three present, `runLengt
 round-trips through `GraphicsProcessor::process`.
 
 **What this does not decide.** The under-fill pixel value (#646), the glyph, V-bar and band rules
-other than call 9, and any other codec.
+other than call 9, and any other codec. **The glyph, V-bar and band rules are decided below (#649),
+with NSCodec's two leniencies.**
+
+### Continued: glyph, V-bar and band geometry, and NSCodec's trailing bytes (#649)
+
+The maintainer decided the glyph, V-bar and band tolerances in the same decoder, and two in the
+NSCodec decoder it shares. Calls 10-14 are each a `ClearError` naming the field and, through `justrdp::egfx`, the same
+warned and skipped region as call 1. The spec text is `[MS-RDPEGFX]` and `[MS-RDPNSC]` as published
+on learn.microsoft.com, read from the PDFs on 2026-11-19; FreeRDP is 3.33.1 `clear.c`.
+
+10. **GLYPH_INDEX on a tile larger than 1,024 pixels is refused**, whether or not GLYPH_HIT is set.
+    2.2.4.1: the flag "MUST NOT be used in conjunction with a bitmap that has an area larger than
+    1024 square pixels", and 3.3.1.9 sizes each of the 4,000 glyph slots to "a bitmap image no
+    larger than 1,024 square pixels", which also bounds the cache's memory (#127). The decoder used
+    to decode such a tile and not store it, so a later hit on the slot failed as a cache miss and
+    hid the cause. FreeRDP refuses only above `1024 * 1024` pixels (`clear_decompress_glyph_data`,
+    `clear.c:951`), an overflow ceiling rather than the slot size, and stores everything below it.
+11. **A GLYPH_HIT followed by any bytes is refused.** 2.2.4.1 says twice that with GLYPH_HIT "the
+    compositePayload field MUST NOT be present". FreeRDP draws the glyph and then, in
+    `clear_decompress` (`clear.c:1158-1170`), ignores fewer than 12 remaining bytes and decodes 12
+    or more as a composite payload over it. The refusal follows calls 4 and 9: bytes after a
+    structure are refused.
+12. **A VBAR_CACHE_HIT whose stored V-bar is not exactly the band's height is refused**, taller or
+    shorter. 2.2.4.1.1.2.1.1.1: the stored data "MUST be equal to 3 * (yEnd - yStart + 1) bytes".
+    The decoder used to draw a taller V-bar cut to the band and a shorter one over part of it
+    (#116). FreeRDP fits the entry to the band in a check every column passes after the V-bar
+    update (`clear.c:881-890`): it logs an error, sets the count to the band height, and
+    `resize_vbar_entry` zero-fills an entry that was shorter. Its `if (count > nHeight)` at
+    `clear.c:900`, which #116 cited for the clamp, cuts a column to the tile's height, not the
+    band's.
+13. **A SHORT_VBAR_CACHE_HIT whose stored short V-bar, placed at its `shortVBarYOn`, runs past the
+    band is refused.** 2.2.4.1.1.2.1.1.2: the stored data "MUST NOT exceed 3 * (yEnd - yStart + 1 -
+    shortVBarYOn) bytes"; a `shortVBarYOn` past the band fails it for any stored length. FreeRDP's
+    V-bar update cuts each of its three fills to the band height without a log
+    (`clear.c:813-875`), and so did the decoder (#116). This follows call 6: a sender's MUST
+    violation is refused.
+14. **A band whose columns or rows fall outside the tile is refused** (`xEnd` or `yEnd` not less
+    than the tile's width or height). No MUST names this; the ground is §3(b), since the decoder
+    used to drop the outside part with no signal, and consistency: the residual and subcodec layers
+    refuse geometry past the tile, and so does FreeRDP's subcodec path (`clear.c:500-514`).
+    FreeRDP's band path checks the column index against the tile width without adding `xStart`
+    and fails only past the surface (`clear.c:896-909`), so it draws a band's outside part onto
+    the surface.
+15. **NSCodec keeps two leniencies, as an exception to call 6.** Bytes after the last plane are
+    ignored: `[MS-RDPNSC]` 2.2.2 has no sentence on them, and FreeRDP's `nsc_stream_initialize`
+    checks only that the declared planes are present. A plane whose byte count is larger than its
+    expected size is read as raw and truncated to that size, as FreeRDP's
+    `nsc_rle_decompress_data` does (`nsc.c:215-224`), although 2.2.2 says each count "MUST NOT be
+    larger than the expected size" of its plane. The NSCodec
+    decoder is shared with Set Surface Bits, where a decode error ends the session (see the
+    zero-plane-count tolerance, #371, in `docs/map/territory/bitmap-codecs.md`), so refusing would
+    turn a sender's cosmetic violation into a disconnect. The behaviour is unchanged, inside a
+    ClearCodec subcodec too.
+
+**Kind: judgement**, the maintainer's (2026-11-18), after a lens pass. For each case they were
+shown the spec sentence, FreeRDP 3.33.1's and `ironrdp-graphics` 0.11's behaviour, the commit
+that introduced the decoder's behaviour, what the host sees on a refusal, and a corpus-reach
+measurement: each lenient branch replaced with `panic!` and the WS2019 ClearCodec corpus plus 1432
+Surface Bits NSCodec records replayed, with none of the nine mutations reached. A better
+derivation does not reopen these calls; the maintainer does. The refusals are proven by
+wire-format round-trips through `GraphicsProcessor::process`. **Measured after the change:** both
+WS2019 ClearCodec captures and the 1432 Surface Bits NSCodec streams replay with no error, and a
+Windows 11 session (192.168.136.163, 2026-11-19) decoded all of its 1634 ClearCodec payloads; the
+numbers are in `docs/map/territory/bitmap-codecs.md`.
+
+**What this does not decide.** The under-fill pixel value (#646), what the core does on a decode
+error, any other codec, and a GLYPH_INDEX stream with no composite payload, which the decoder still
+stores as an all-zero glyph.

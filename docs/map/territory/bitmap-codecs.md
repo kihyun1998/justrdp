@@ -86,6 +86,29 @@ attacker-controlled bytes in the repo.
   stream ends and otherwise reads into the subcodec layer. Both WS2019 captures decode every entry
   under the three checks, the NSCodec region of entry 30 included. The Windows 11 sessions, and
   their 16 NSCodec regions, were not re-run against the bound.
+- **ClearCodec refuses glyph flags, V-bar cache hits and bands that do not fit their tile** (#649,
+  the maintainer's call, 2026-11-18, ADR-0009's #643 amendment calls 10-14): GLYPH_INDEX on a tile
+  over 1,024 pixels; a GLYPH_HIT followed by any bytes; a VBAR_CACHE_HIT whose stored V-bar is not
+  the band's height; a SHORT_VBAR_CACHE_HIT whose short V-bar, at its `shortVBarYOn`, runs past
+  the band; and a band whose `xEnd` or `yEnd` is outside the tile. The first four rest on
+  `[MS-RDPEGFX]` 2.2.4.1, 2.2.4.1.1.2.1.1.1 and 2.2.4.1.1.2.1.1.2; the band rule on ADR-0009
+  §3(b). Each replaced a silent fit: an oversized glyph tile decoded and went unstored, so its
+  later hit failed as a cache miss; the V-bars were clamped to the band (#116); the band's outside
+  part was dropped. FreeRDP 3.33.1 differs on each. It caps a glyph tile only at `1024 * 1024`
+  pixels (`clear.c:951`), an overflow ceiling, not the 1,024-pixel slot of 3.3.1.9. It draws a
+  glyph hit and then ignores fewer than 12 trailing bytes or composites 12 or more
+  (`clear.c:1158-1170`). It fits a V-bar to the band height: the V-bar update cuts the three fills
+  of a short V-bar to the band (`clear.c:813-875`), and a check every column passes after it logs
+  a stored V-bar of another height, then truncates or zero-fills it (`clear.c:881-890`); the `count > nHeight`
+  cut at `clear.c:900` is to the tile's height. And it draws a band's columns past the tile onto
+  the surface, failing only past the surface (`clear.c:896-909`), while its subcodec path refuses
+  out-of-tile geometry (`clear.c:500-514`). Measured after the
+  change: `clearcodec_corpus.rs` replays both WS2019 captures, `replay.bin` and `replay-text.bin`,
+  with every entry decoded and every glyph hit drawn from its store; `real_server_corpus.rs`
+  decodes all 1432 Surface Bits NSCodec streams; and a Windows 11 Enterprise session
+  (192.168.136.163, 2026-11-19, `capture_clearcodec_text_corpus_against_real_vm` with
+  `JUSTRDP_TEST_SERVER=win11`) sent 1634 ClearCodec payloads, 542 glyph stores and 329 glyph hits,
+  every one decoded. That capture was not committed.
 - **A ClearCodec glyph hit draws the cached pixels as any rectangle of the same area** (#586).
   `[MS-RDPEGFX]` 4.1.1.5 stores a glyph as a linear pixel stream with no dimensions and hits a
   2x8 glyph as 4x4 and as 8x2; the `ironrdp-graphics` 0.11 oracle does the same. A hit of a
@@ -127,6 +150,16 @@ attacker-controlled bytes in the repo.
   ClearCodec corpus and #150's 1432 Surface Bits streams), and that the cost such a stream buys
   is already bounded (#370's per-update budget, the ClearCodec region's rect), the maintainer kept
   the tolerance.
+- **NSCodec ignores bytes after its last plane and truncates a plane longer than its expected size**
+  (#649, the maintainer's call, ADR-0009's #643 amendment call 15, an exception to call 6).
+  `[MS-RDPNSC]` 2.2.2 says nothing of trailing bytes, and says a plane's byte count "MUST NOT be
+  larger than the expected size" of the plane; `decode_plane` reads such a plane as raw and keeps
+  its first expected-size bytes. FreeRDP 3.33.1 does both: `nsc_stream_initialize` checks only
+  that the declared planes are present, and `nsc_rle_decompress_data` copies the expected size of
+  a longer plane (`nsc.c:215-224`). Kept for the reason the
+  zero-count tolerance above was kept: the decoder serves Set Surface Bits, where a decode failure
+  ends the session. The corpus-reach mutations behind the call reached neither branch in the
+  ClearCodec corpus or #150's 1432 Surface Bits records.
 - **Stage boundaries are the unit of verification** where the assembled decoder has
   no counterpart to compare against (RemoteFX, ADR-0007).
 - **Decoders write into a caller-provided buffer** wherever the frame path allows
@@ -385,6 +418,38 @@ attacker-controlled bytes in the repo.
 
   How a change is compared against this floor is `docs/agents/thegraph.md`
   § *Proof of a performance claim*.
+
+- **A ClearCodec V-bar column is allocated once, at the band's height, and filled in place**
+  (#649, measured 2026-11-19). `reconstruct_full_vbar` runs on every SHORT_VBAR_CACHE_MISS and
+  SHORT_VBAR_CACHE_HIT. Built from `<[u8]>::repeat` runs instead (a separate allocation for the
+  background above `shortVBarYOn` and for the one below the short V-bar, and up to two growths
+  as the parts are appended), the `clearcodec` group was about 50 % slower than master. In place,
+  a short V-bar that does not fit the band is refused by the split failing, the same inputs the
+  `checked_sub` form refused, given that a short V-bar is always a whole number of 3-byte pixels.
+  Measured on the #555 host with the `clearcodec` group alone, `--measurement-time 8`, each run
+  pinned with `start /wait /b /high /affinity 4`. Other sessions shared the host, so the builds
+  were rotated in one sitting rather than run as `docs/agents/thegraph.md`'s saved-baseline
+  sequence, and each build's own spread is its noise floor. First sitting: master (7a3d08f), the
+  `repeat` form and the in-place form, which differ in this function only, rotated five times.
+  Criterion point estimates in ms, interval half-width in brackets:
+
+  | Build | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 |
+  |---|---|---|---|---|---|
+  | master | 1.789 (0.6 %) | 1.825 (0.8 %) | 1.107 (6.4 %) | 1.834 (1.1 %) | 1.788 (0.5 %) |
+  | `repeat` | 2.718 (0.5 %) | 2.744 (0.7 %) | 2.744 (0.7 %) | 2.699 (0.6 %) | 2.726 (0.6 %) |
+  | in place | 1.689 (0.3 %) | 1.376 (4.6 %) | 1.721 (0.6 %) | 1.714 (0.5 %) | 1.690 (0.5 %) |
+
+  Second sitting, five master/in-place pairs on the committed code with the host busier:
+
+  | Build | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 |
+  |---|---|---|---|---|---|
+  | master | 1.174 (7.7 %) | 1.423 (5.0 %) | 1.645 (4.0 %) | 1.797 (1.9 %) | 1.782 (0.7 %) |
+  | in place | 1.032 (1.7 %) | 1.175 (7.8 %) | 1.700 (2.3 %) | 1.756 (0.9 %) | 1.702 (0.4 %) |
+
+  The `repeat` form lies outside master's spread in every run. The in-place form lies inside
+  master's full spread in both sittings; it sits about 5 % under master's narrow-interval runs in
+  the first sitting, which is less than that spread, so against master there is no measurable
+  difference.
 
 ## Code
 

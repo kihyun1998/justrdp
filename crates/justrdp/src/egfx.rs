@@ -2973,6 +2973,182 @@ mod tests {
         }
     }
 
+    fn clear_tiles_over_grey(w: u16, h: u16, streams: &[&[u8]]) -> Vec<[u8; 3]> {
+        let mut p = GraphicsProcessor::default();
+        feed(
+            &mut p,
+            egfx::CMDID_CAPS_CONFIRM,
+            &caps_confirm_body(egfx::CAPVERSION_104),
+        );
+        create_surface(&mut p, 1, w, h);
+        for stream in streams {
+            feed(
+                &mut p,
+                egfx::CMDID_SOLID_FILL,
+                &solid_fill_body(1, [0x80, 0x80, 0x80, 0], [0, 0, w, h]),
+            );
+            let mut b = Vec::new();
+            b.extend_from_slice(&1u16.to_le_bytes());
+            b.extend_from_slice(&egfx::CODECID_CLEARCODEC.to_le_bytes());
+            b.push(egfx::PIXEL_FORMAT_XRGB_8888);
+            for v in [0u16, 0, w, h] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+            b.extend_from_slice(stream);
+            assert_eq!(
+                feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &b),
+                vec![],
+                "the session goes on"
+            );
+        }
+        map_surface(&mut p, 1, 0, 0);
+        let (fb, _) = flush(&mut p);
+        let px = region(
+            &fb,
+            &FrameUpdate {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            },
+        );
+        px.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| [px[0], px[1], px[2]])
+            .collect()
+    }
+
+    fn clear_white_tile(flags: u8, glyph_index: u16, pixels: u16) -> Vec<u8> {
+        let mut s = vec![flags, 0];
+        s.extend_from_slice(&glyph_index.to_le_bytes());
+        s.extend_from_slice(&6u32.to_le_bytes());
+        s.extend_from_slice(&0u32.to_le_bytes());
+        s.extend_from_slice(&0u32.to_le_bytes());
+        s.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        s.extend_from_slice(&pixels.to_le_bytes());
+        s
+    }
+
+    #[test]
+    fn a_clearcodec_glyph_index_over_1024_pixels_or_a_glyph_hit_with_a_payload_skips_the_region() {
+        assert_eq!(
+            clear_tiles_over_grey(32, 32, &[&clear_white_tile(0x01, 7, 1024)]),
+            vec![WHITE; 1024],
+            "GLYPH_INDEX on 1024 pixels paints"
+        );
+        assert_eq!(
+            clear_tiles_over_grey(33, 32, &[&clear_white_tile(0x01, 7, 1056)]),
+            vec![GREY; 1056],
+            "GLYPH_INDEX on 1056 pixels is skipped"
+        );
+
+        let store = clear_white_tile(0x01, 7, 4);
+        let hit = [0x03, 1, 7, 0];
+        assert_eq!(
+            clear_tiles_over_grey(4, 1, &[&store, &hit]),
+            vec![WHITE; 4],
+            "a bare hit paints the glyph"
+        );
+        for trailing in [1usize, 12] {
+            let mut with_payload = hit.to_vec();
+            with_payload.extend(std::iter::repeat_n(0, trailing));
+            assert_eq!(
+                clear_tiles_over_grey(4, 1, &[&store, &with_payload]),
+                vec![GREY; 4],
+                "a hit with {trailing} trailing byte(s) is skipped"
+            );
+        }
+    }
+
+    fn clear_bands(bands: &[u8]) -> Vec<u8> {
+        let mut s = vec![0x00, 0x00];
+        s.extend_from_slice(&0u32.to_le_bytes());
+        s.extend_from_slice(&(bands.len() as u32).to_le_bytes());
+        s.extend_from_slice(&0u32.to_le_bytes());
+        s.extend_from_slice(bands);
+        s
+    }
+
+    fn clear_band(x: [u16; 2], y: [u16; 2], vbars: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for v in [x[0], x[1], y[0], y[1]] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&[0, 0, 0]);
+        b.extend_from_slice(vbars);
+        b
+    }
+
+    fn clear_white_short_miss(rows: u8) -> Vec<u8> {
+        let mut v = (u16::from(rows) << 8).to_le_bytes().to_vec();
+        v.extend_from_slice(&[0xFF].repeat(3 * usize::from(rows)));
+        v
+    }
+
+    #[test]
+    fn a_clearcodec_vbar_that_does_not_fit_its_band_or_a_band_outside_the_tile_skips_the_region() {
+        const BLACK: [u8; 3] = [0; 3];
+        let vbar_hit = |stored: u16, hit: u16| {
+            let mut bands = clear_band(
+                [0, 0],
+                [0, stored - 1],
+                &clear_white_short_miss(stored as u8),
+            );
+            bands.extend(clear_band([1, 1], [0, hit - 1], &0x8000u16.to_le_bytes()));
+            clear_bands(&bands)
+        };
+        assert_eq!(
+            clear_tiles_over_grey(2, 2, &[&vbar_hit(2, 2)]),
+            vec![WHITE; 4],
+            "a V-bar hit of the band's height paints"
+        );
+        for (stored, hit) in [(2, 1), (1, 2)] {
+            assert_eq!(
+                clear_tiles_over_grey(2, 2, &[&vbar_hit(stored, hit)]),
+                vec![GREY; 4],
+                "a {stored}-row V-bar hit in a {hit}-row band is skipped"
+            );
+        }
+
+        let short_hit = |y_on: u8| {
+            let mut bands = clear_band([0, 0], [0, 2], &clear_white_short_miss(2));
+            bands.extend(clear_band([1, 1], [0, 2], &[0x00, 0x40, y_on]));
+            clear_bands(&bands)
+        };
+        assert_eq!(
+            clear_tiles_over_grey(2, 3, &[&short_hit(1)]),
+            vec![WHITE, BLACK, WHITE, WHITE, BLACK, WHITE],
+            "a short V-bar ending on the band's last row paints"
+        );
+        assert_eq!(
+            clear_tiles_over_grey(2, 3, &[&short_hit(2)]),
+            vec![GREY; 6],
+            "a short V-bar one row past the band is skipped"
+        );
+
+        let background = |x_end: u16, y_end: u16| {
+            let vbars = [0u8, 0].repeat(usize::from(x_end) + 1);
+            clear_bands(&clear_band([0, x_end], [0, y_end], &vbars))
+        };
+        assert_eq!(
+            clear_tiles_over_grey(2, 2, &[&background(1, 1)]),
+            vec![BLACK; 4],
+            "a band that ends on the tile's last column and row paints"
+        );
+        assert_eq!(
+            clear_tiles_over_grey(2, 2, &[&background(2, 1)]),
+            vec![GREY; 4],
+            "a band one column past the tile is skipped"
+        );
+        assert_eq!(
+            clear_tiles_over_grey(2, 2, &[&background(1, 2)]),
+            vec![GREY; 4],
+            "a band one row past the tile is skipped"
+        );
+    }
+
     #[test]
     fn reset_graphics_resizes_the_output() {
         let mut p = GraphicsProcessor::default();

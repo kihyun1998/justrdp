@@ -74,7 +74,7 @@ ADR-0003 and the Context above treat "ironrdp exposes a high-level decoder" (Cle
 
 The oracle diff (ADR-0003) and the primitives-based (A)+(B) above remain the proof for the **transform/math stages** — entropy, dequantize, inverse DWT, subband, colour — which are genuinely the oracle's own independent math. But for the **assembly layer** — residual/band/V-bar/RLEX compositing and cache reconstruction (ClearCodec); region/tile blit and clipping (RemoteFX) — correctness MUST be proven by a conformance test whose expected output is derived **independently of our implementation**: hand-computed from the normative spec, or cross-checked against FreeRDP's `clear.c` / `rfx.c`. A green diff against a same-lineage oracle is *necessary but not sufficient* there.
 
-The established pattern is the **#116 / #117 regression tests**: they assert against hand-derived expectations (FreeRDP clamp semantics; the opaque-black-init invariant), never against the shared-lineage oracle. New compositing / cache / region work follows this pattern.
+The established pattern is the **#116 / #117 regression tests**: they assert against hand-derived expectations (FreeRDP clamp semantics; the opaque-black-init invariant), never against the shared-lineage oracle. New compositing / cache / region work follows this pattern. (#649 replaced the #116 tests: a V-bar cache hit that does not fit its band is now refused rather than clamped, per [ADR-0009](0009-tolerant-negotiation-posture.md)'s #643 amendment, calls 12 and 13. The refusal tests derive their expectations from the spec the same way.)
 
 ### Consequence
 
