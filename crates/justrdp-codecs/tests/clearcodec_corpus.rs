@@ -282,10 +282,7 @@ fn walk_stream(i: usize, entry: &Entry, caches: &mut Caches, census: &mut Census
         caches.swap_rejected.push(false);
         return;
     }
-    // `[MS-RDPEGFX]` 3.3.1.9: a slot holds a glyph of at most 1,024 pixels.
-    if let Some(index) = glyph_index
-        && u32::from(entry.width) * u32::from(entry.height) <= 1024
-    {
+    if let Some(index) = glyph_index {
         caches.glyphs.insert(index, (entry.width, entry.height));
     }
     if stream.remaining() > 0 {
@@ -497,7 +494,7 @@ fn text_capture_draws_each_glyph_hit_from_its_store() {
                 Some(&out) == stored.get(&index),
                 "entry {i}: glyph hit on slot {index} is not its store's pixels"
             );
-        } else if usize::from(e.width) * usize::from(e.height) <= 1024 {
+        } else {
             stored.insert(index, out);
         }
     }

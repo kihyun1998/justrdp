@@ -86,6 +86,29 @@ attacker-controlled bytes in the repo.
   stream ends and otherwise reads into the subcodec layer. Both WS2019 captures decode every entry
   under the three checks, the NSCodec region of entry 30 included. The Windows 11 sessions, and
   their 16 NSCodec regions, were not re-run against the bound.
+- **ClearCodec refuses glyph flags, V-bar cache hits and bands that do not fit their tile** (#649,
+  the maintainer's call, 2026-11-18, ADR-0009's #643 amendment calls 10-14): GLYPH_INDEX on a tile
+  over 1,024 pixels; a GLYPH_HIT followed by any bytes; a VBAR_CACHE_HIT whose stored V-bar is not
+  the band's height; a SHORT_VBAR_CACHE_HIT whose short V-bar, at its `shortVBarYOn`, runs past
+  the band; and a band whose `xEnd` or `yEnd` is outside the tile. The first four rest on
+  `[MS-RDPEGFX]` 2.2.4.1, 2.2.4.1.1.2.1.1.1 and 2.2.4.1.1.2.1.1.2; the band rule on ADR-0009
+  §3(b). Each replaced a silent fit: an oversized glyph tile decoded and went unstored, so its
+  later hit failed as a cache miss; the V-bars were clamped to the band (#116); the band's outside
+  part was dropped. FreeRDP 3.33.1 differs on each. It caps a glyph tile only at `1024 * 1024`
+  pixels (`clear.c:951`), an overflow ceiling, not the 1,024-pixel slot of 3.3.1.9. It draws a
+  glyph hit and then ignores fewer than 12 trailing bytes or composites 12 or more
+  (`clear.c:1158-1170`). It fits a V-bar to the band height: the V-bar update cuts the three fills
+  of a short V-bar to the band (`clear.c:813-875`), and a check every column passes after it logs
+  a stored V-bar of another height, then truncates or zero-fills it (`clear.c:881-890`); the `count > nHeight`
+  cut at `clear.c:900` is to the tile's height. And it draws a band's columns past the tile onto
+  the surface, failing only past the surface (`clear.c:896-909`), while its subcodec path refuses
+  out-of-tile geometry (`clear.c:500-514`). Measured after the
+  change: `clearcodec_corpus.rs` replays both WS2019 captures, `replay.bin` and `replay-text.bin`,
+  with every entry decoded and every glyph hit drawn from its store; `real_server_corpus.rs`
+  decodes all 1432 Surface Bits NSCodec streams; and a Windows 11 Enterprise session
+  (192.168.136.163, 2026-11-19, `capture_clearcodec_text_corpus_against_real_vm` with
+  `JUSTRDP_TEST_SERVER=win11`) sent 1634 ClearCodec payloads, 542 glyph stores and 329 glyph hits,
+  every one decoded. That capture was not committed.
 - **A ClearCodec glyph hit draws the cached pixels as any rectangle of the same area** (#586).
   `[MS-RDPEGFX]` 4.1.1.5 stores a glyph as a linear pixel stream with no dimensions and hits a
   2x8 glyph as 4x4 and as 8x2; the `ironrdp-graphics` 0.11 oracle does the same. A hit of a
@@ -127,6 +150,16 @@ attacker-controlled bytes in the repo.
   ClearCodec corpus and #150's 1432 Surface Bits streams), and that the cost such a stream buys
   is already bounded (#370's per-update budget, the ClearCodec region's rect), the maintainer kept
   the tolerance.
+- **NSCodec ignores bytes after its last plane and truncates a plane longer than its expected size**
+  (#649, the maintainer's call, ADR-0009's #643 amendment call 15, an exception to call 6).
+  `[MS-RDPNSC]` 2.2.2 says nothing of trailing bytes, and says a plane's byte count "MUST NOT be
+  larger than the expected size" of the plane; `decode_plane` reads such a plane as raw and keeps
+  its first expected-size bytes. FreeRDP 3.33.1 does both: `nsc_stream_initialize` checks only
+  that the declared planes are present, and `nsc_rle_decompress_data` copies the expected size of
+  a longer plane (`nsc.c:215-224`). Kept for the reason the
+  zero-count tolerance above was kept: the decoder serves Set Surface Bits, where a decode failure
+  ends the session. The corpus-reach mutations behind the call reached neither branch in the
+  ClearCodec corpus or #150's 1432 Surface Bits records.
 - **Stage boundaries are the unit of verification** where the assembled decoder has
   no counterpart to compare against (RemoteFX, ADR-0007).
 - **Decoders write into a caller-provided buffer** wherever the frame path allows

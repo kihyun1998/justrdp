@@ -6,6 +6,12 @@
 //! `ironrdp-nscodec` ships an encoder but no decoder, so — like RemoteFX (#58) — there is no
 //! high-level oracle; correctness follows ADR-0007 (stage-boundary), cross-checked against FreeRDP
 //! `libfreerdp/codec/nsc.c` (`nsc_stream_initialize`).
+//!
+//! Two inputs `[MS-RDPNSC]` 2.2.2 rules out or leaves unsaid are accepted, as FreeRDP accepts them:
+//! bytes after the last plane are ignored, and a plane whose byte count is larger than its expected
+//! size, which the spec says MUST NOT happen, is read as raw and truncated to that size. The same
+//! decoder serves Set Surface Bits, where a decode error ends the session, so refusing either would
+//! turn a sender's cosmetic violation into a disconnect (ADR-0009, #643 amendment, call 15).
 
 use std::fmt;
 

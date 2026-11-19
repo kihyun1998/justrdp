@@ -7,7 +7,7 @@
 //!
 //! - **One decoder for the whole sequence.** A glyph hit after a glyph store, and a V-bar cache
 //!   hit after the bands that stored the column, reach the paths that read the caches: the
-//!   glyph-hit area check and the reuse of a stored column under a different band height.
+//!   glyph-hit area check and the refusal of a stored column whose height is not the band's.
 //! - **The output length is asserted.** A wrong glyph-hit area check returns `Ok` with the
 //!   cached glyph's length rather than panicking, so every `Ok` must hold `width * height * 4`
 //!   bytes.
