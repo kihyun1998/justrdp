@@ -276,8 +276,9 @@ impl Clear {
     /// caller has seeded, as [`ClearDecoder::decode`] does.
     ///
     /// When `JUSTRDP_CLEAR_CAPTURE_DIR` is set, the raw payload and its decode status are
-    /// dumped there first (see `capture_clear_payload`) — the corpus harness for the #56
-    /// rewrite, which needs streams no differential can arbitrate.
+    /// dumped there after the decode returns (see `capture_clear_payload`), so a decode that
+    /// panics leaves no capture — the corpus harness for the #56 rewrite, which needs streams no
+    /// differential can arbitrate.
     pub fn decode_to_bgra(
         &mut self,
         data: &[u8],
