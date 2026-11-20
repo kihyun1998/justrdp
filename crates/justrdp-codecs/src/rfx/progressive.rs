@@ -2218,9 +2218,7 @@ mod tests {
         };
         {
             let state = grid.tiles.get_mut(&0).expect("tile exists");
-            for c in 0..3 {
-                state.current[c] = spectrum(c);
-            }
+            state.current = core::array::from_fn(spectrum);
         }
         let store = grid.tiles[&0].current;
 
