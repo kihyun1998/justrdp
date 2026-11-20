@@ -143,7 +143,13 @@ acknowledge frames. It is server→client only, and it is reachable only if
     is that PDU's cost.
   - **What the call is charged.** The three list-bearing commands are charged to both budgets. A
     SurfaceToCache copy, up to a surface per PDU, is charged to the call only, so a message of
-    copies pauses too. The per-frame budget is #268's and stays on the list-bearing commands.
+    copies pauses too. So is a CreateSurface (#655): the opaque-black fill of a new surface
+    writes every byte, where the zeroed allocation it replaced cost nothing measurable. Measured
+    `--release` on the Windows dev host, 2026-11-20: a 256 MiB `vec![0u8; n]` took 4 to 20 µs
+    and `[0, 0, 0, 255].repeat` 45 to 93 ms; one message of eight 8192 x 8192 CreateSurface PDUs
+    for one id took 159 to 374 µs in one call with the zeroed allocation and 439 to 560 ms with
+    the fill uncharged, and with it charged a call stops after each such PDU. The per-frame
+    budget is #268's and stays on the list-bearing commands.
   - **What ZGFX adds is charged to the call** (#509). A message is decompressed, then every PDU
     decoded, before any PDU is handled, and neither step can stop part-way. So the bytes
     decompression added beyond those received are charged to the call at once, as #507 charges
@@ -162,7 +168,6 @@ acknowledge frames. It is server→client only, and it is reachable only if
   - **The cap stays at 64 MiB.** Neither the spec (3.1.9.1.2.1) nor FreeRDP bounds a message's
     `uncompressedSize`. The largest message over five WS2019 EGFX sessions decompressed to
     48,897 bytes.
-  - **What is not charged.** A CreateSurface's zeroed allocation is not charged.
 - **A pixel a ClearCodec or RemoteFX WireToSurface1 payload does not write keeps the surface's
   earlier pixel** (#646, the maintainer's call;
   [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)'s #646 amendment). `decode_wts1`
@@ -183,6 +188,24 @@ acknowledge frames. It is server→client only, and it is reachable only if
   decode and back after it, and keeps alpha as written: the codec writes `0xFF` on every pixel it
   writes, and an unwritten pixel keeps the surface's alpha. Uncompressed and Planar WireToSurface1
   cover the whole rectangle and are unchanged; Progressive blits only each rectangle it decodes.
+- **A new surface is opaque black, every pixel `[0,0,0,255]`** (#655, the maintainer's call,
+  2026-11-20). The CreateSurface arm fills it so, and a recreated surface id gets the same through
+  the same arm. Every path that reads a pixel nothing has painted shows it: MapSurfaceToOutput's
+  whole-surface repaint, a WireToSurface1 gap (the seed above), SurfaceToSurface, SurfaceToCache,
+  and a ClearCodec glyph stored over an unpainted area. It was zero bytes, so mapping a
+  never-painted surface turned the framebuffer transparent black, against the
+  [framebuffer note](framebuffer-frame-delivery.md)'s "a fresh buffer is opaque black, not
+  transparent black". Decided on: that owned rule, which ADR-0003's order puts ahead of the
+  oracle and FreeRDP; the #646 seed's opaque black off the surface, which agrees with it;
+  `[MS-RDPEGFX]` 3.3.5.9 (v20260511), which only requires a bitmap "with the appropriate width,
+  height, and pixel format"; FreeRDP 3.33.1's `gdi_CreateSurface` (`gdi/gfx.c`), which
+  `memset`s every scanline to `0xFF`, opaque white, rejected because it contradicts the
+  framebuffer rule and flashes white on map. With every surface pixel opaque, the 3.3.5.1
+  "copy RGB, leave alpha" difference of justrdp's WireToSurface1 codecs (they write alpha `0xFF`)
+  changes nothing. A ClearCodec glyph hit that copied only the pixels with alpha non-zero would
+  now draw the same as the whole copy, so no test can tell them apart (measured by mutation,
+  #655); that holds only while no surface pixel can have alpha 0, which an ALPHA codec would
+  change.
 - **One number answers two different questions here, and the shared derivation is the reason
   — not the convenience.** `MAX_TOTAL_SURFACE_BYTES` is *also* the **per-frame paint budget**
   (#268). The three list-bearing commands — `SOLID_FILL`, `SURFACE_TO_SURFACE`,

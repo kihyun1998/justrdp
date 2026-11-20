@@ -29,7 +29,9 @@ renderer begins.
 - **Resize discards content on purpose** — after Deactivation–Reactivation the
   server repaints, so carrying stale pixels forward would only show a torn frame.
 - **A fresh buffer is opaque black, not transparent black** — alpha is filled to
-  255. A host compositing an RGBA surface would otherwise show through.
+  255. A host compositing an RGBA surface would otherwise show through. A new EGFX surface
+  starts the same way, so mapping one keeps this true
+  ([EGFX graphics pipeline](egfx-graphics-pipeline.md), #655).
 - **The borrow is bounded by the sink call.** `pixels()` + the rect, or
   `copy_rect_into`, are valid *inside* the synchronous frame sink; the host that
   wants to keep pixels copies them itself, which is what makes the zero-copy path
