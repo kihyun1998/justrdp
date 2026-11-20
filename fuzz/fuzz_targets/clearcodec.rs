@@ -31,9 +31,11 @@ struct Input {
 }
 
 fuzz_target!(|input: Input| {
+    let mut tile = vec![0; usize::from(input.width) * usize::from(input.height) * 4];
     let _ = justrdp_codecs::clearcodec::ClearDecoder::new().decode(
         &input.data,
         u16::from(input.width),
         u16::from(input.height),
+        &mut tile,
     );
 });

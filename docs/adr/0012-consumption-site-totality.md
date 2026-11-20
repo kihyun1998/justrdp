@@ -423,3 +423,14 @@ not. It is the identical failure the code comment made, one document up: a claim
 some members, written about the set. Corrected by the change rather than by this record, and
 left standing with this note attached per the ADR-0002/0007 house pattern. §1–§5 are
 unaffected.
+
+## Amendment (2026-11-20, #646): the RemoteFX allocation moved to its caller
+
+`rfx::RemoteFx::decode_to_rgba` no longer allocates: it decodes onto a buffer its caller passes,
+and refuses one that is not `width × height × 4` bytes (`RfxError::OutputLength`). Its
+`.filter` at `isize::MAX` now decides only which refusal a rectangle whose RGBA cannot be
+addressed gets. The allocation the guard was written for is `justrdp::egfx`'s `seed_tile`, which
+bounds the rectangle by `MAX_TOTAL_SURFACE_BYTES` before it allocates, so `decode_wts1` stays
+total for a bare `Rect16`. Before that bound was written, the move made a direct call panic on
+i686; the measurement is in [decoder dimension overflow on
+32-bit](../map/invariant/decoder-dimension-overflow-32bit.md)'s `seed_tile` row.

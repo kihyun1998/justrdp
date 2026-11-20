@@ -8,9 +8,6 @@
 //! - **One decoder for the whole sequence.** A glyph hit after a glyph store, and a V-bar cache
 //!   hit after the bands that stored the column, reach the paths that read the caches: the
 //!   glyph-hit area check and the refusal of a stored column whose height is not the band's.
-//! - **The output length is asserted.** A wrong glyph-hit area check returns `Ok` with the
-//!   cached glyph's length rather than panicking, so every `Ok` must hold `width * height * 4`
-//!   bytes.
 //! - **Correlated indices.** Glyph indices are drawn from a pool of eight, so a store and a
 //!   later hit on the same slot are common rather than one in four thousand.
 //! - **Well-formed envelopes.** A composite frame's three layer byte counts are computed from
@@ -55,7 +52,8 @@ fn layer_len(layer: &[u8]) -> [u8; 4] {
 }
 
 fuzz_target!(|input: Input| {
-    let mut decoder = justrdp_codecs::clearcodec::ClearDecoder::new();
+    let mut on_zero = justrdp_codecs::clearcodec::ClearDecoder::new();
+    let mut on_ones = justrdp_codecs::clearcodec::ClearDecoder::new();
     for (seq, frame) in input.frames.iter().enumerate() {
         let seq = seq as u8;
         let (stream, width, height) = match frame {
@@ -99,8 +97,19 @@ fuzz_target!(|input: Input| {
                 data,
             } => (data.clone(), *width, *height),
         };
-        if let Ok(pixels) = decoder.decode(&stream, u16::from(width), u16::from(height)) {
-            assert_eq!(pixels.len(), usize::from(width) * usize::from(height) * 4);
+        let (w, h) = (u16::from(width), u16::from(height));
+        let len = usize::from(width) * usize::from(height) * 4;
+        let (mut zero, mut ones) = (vec![0x00; len], vec![0xFF; len]);
+        let a = on_zero.decode(&stream, w, h, &mut zero);
+        let b = on_ones.decode(&stream, w, h, &mut ones);
+        assert_eq!(a, b);
+        if a.is_ok() {
+            for (z, o) in zero.as_chunks::<4>().0.iter().zip(ones.as_chunks::<4>().0) {
+                assert!(
+                    z == o || (*z == [0x00; 4] && *o == [0xFF; 4]),
+                    "{z:?} / {o:?}"
+                );
+            }
         }
     }
 });

@@ -19,13 +19,19 @@
 //!    residual layer fills exactly.
 //! 3. Every glyph hit in `replay-text.bin` is drawn from the pixels its slot's store decoded to.
 
-use justrdp_codecs::clearcodec::ClearDecoder;
+use justrdp_codecs::clearcodec::{ClearDecoder, ClearError};
 
 /// One captured payload with the destination-rectangle dimensions it was decoded against.
 struct Entry {
     width: u16,
     height: u16,
     data: Vec<u8>,
+}
+
+fn decode(d: &mut ClearDecoder, e: &Entry) -> Result<Vec<u8>, ClearError> {
+    let mut tile = vec![0; usize::from(e.width) * usize::from(e.height) * 4];
+    d.decode(&e.data, e.width, e.height, &mut tile)
+        .map(|()| tile)
 }
 
 fn load_replay() -> Vec<Entry> {
@@ -85,14 +91,12 @@ fn self_owned_replays_full_capture_without_error() {
     let mut decoder = ClearDecoder::new();
     let mut nonblack_total = 0usize;
     for (i, e) in load_replay().iter().enumerate() {
-        let out = decoder
-            .decode(&e.data, e.width, e.height)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "entry {i} ({}x{}) failed to decode: {err}",
-                    e.width, e.height
-                )
-            });
+        let out = decode(&mut decoder, e).unwrap_or_else(|err| {
+            panic!(
+                "entry {i} ({}x{}) failed to decode: {err}",
+                e.width, e.height
+            )
+        });
         assert_eq!(
             out.len(),
             usize::from(e.width) * usize::from(e.height) * 4,
@@ -124,8 +128,7 @@ fn self_owned_matches_oracle_on_every_entry() {
     let mut oracle = ironrdp_graphics::clearcodec::ClearCodecDecoder::new();
 
     for (i, e) in entries.iter().enumerate() {
-        let ours = mine
-            .decode(&e.data, e.width, e.height)
+        let ours = decode(&mut mine, e)
             .unwrap_or_else(|err| panic!("entry {i}: self-owned decoder rejected it: {err}"));
         let theirs = oracle
             .decode(&e.data, e.width, e.height)
@@ -444,8 +447,7 @@ fn text_capture_replays_and_matches_the_oracle() {
     let mut mine = ClearDecoder::new();
     let mut oracle = ironrdp_graphics::clearcodec::ClearCodecDecoder::new();
     for (i, e) in entries.iter().enumerate() {
-        let ours = mine
-            .decode(&e.data, e.width, e.height)
+        let ours = decode(&mut mine, e)
             .unwrap_or_else(|err| panic!("entry {i}: self-owned decoder rejected it: {err}"));
         let theirs = oracle
             .decode(&e.data, e.width, e.height)
@@ -475,9 +477,7 @@ fn text_capture_draws_each_glyph_hit_from_its_store() {
     let mut stored: std::collections::HashMap<u16, Vec<u8>> = std::collections::HashMap::new();
     let mut hits = 0usize;
     for (i, e) in entries.iter().enumerate() {
-        let out = decoder
-            .decode(&e.data, e.width, e.height)
-            .unwrap_or_else(|err| panic!("entry {i}: {err}"));
+        let out = decode(&mut decoder, e).unwrap_or_else(|err| panic!("entry {i}: {err}"));
         assert_eq!(
             out.len(),
             usize::from(e.width) * usize::from(e.height) * 4,

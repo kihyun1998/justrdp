@@ -178,15 +178,11 @@ fn remotefx_decodes_every_wire_to_surface_1_payload_ws2019_sent_in_order() {
     let mut remotefx = RemoteFx::new();
     let mut painted = 0;
     for (i, r) in records.iter().enumerate() {
-        let rgba = remotefx
-            .decode_to_rgba(&r.payload, r.a, r.b)
-            .unwrap_or_else(|e| panic!("record {i} ({}x{}): {e}", r.a, r.b));
-        if let Some(rgba) = rgba {
-            assert_eq!(
-                rgba.len(),
-                usize::from(r.a) * usize::from(r.b) * 4,
-                "record {i}"
-            );
+        let mut rgba = vec![0; usize::from(r.a) * usize::from(r.b) * 4];
+        if remotefx
+            .decode_to_rgba(&r.payload, r.a, r.b, &mut rgba)
+            .unwrap_or_else(|e| panic!("record {i} ({}x{}): {e}", r.a, r.b))
+        {
             painted += 1;
         }
     }

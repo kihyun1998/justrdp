@@ -33,9 +33,11 @@ struct Input {
 }
 
 fuzz_target!(|input: Input| {
+    let mut out = vec![0; usize::from(input.width) * usize::from(input.height) * 4];
     let _ = justrdp_codecs::rfx::RemoteFx::new().decode_to_rgba(
         &input.data,
         u16::from(input.width),
         u16::from(input.height),
+        &mut out,
     );
 });

@@ -163,6 +163,26 @@ acknowledge frames. It is server→client only, and it is reachable only if
     `uncompressedSize`. The largest message over five WS2019 EGFX sessions decompressed to
     48,897 bytes.
   - **What is not charged.** A CreateSurface's zeroed allocation is not charged.
+- **A pixel a ClearCodec or RemoteFX WireToSurface1 payload does not write keeps the surface's
+  earlier pixel** (#646, the maintainer's call;
+  [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)'s #646 amendment). `decode_wts1`
+  seeds a tile of the destination rectangle's size with the surface's current pixels
+  (`seed_tile`, `Surface::copy_into`), and the part of the rectangle off the surface with
+  opaque black, which is what that part of either codec's tile painted before: ClearCodec's zero
+  bytes reached the surface with alpha forced to 255. It reaches the screen only through a
+  ClearCodec glyph stored over the surface's edge and hit on it. `seed_tile` refuses a rectangle
+  whose RGBA exceeds `MAX_TOTAL_SURFACE_BYTES` before allocating the tile, which keeps
+  `decode_wts1` total for a bare `Rect16` (ADR-0012 §1) now that the allocation sits in front
+  of each codec's own guard; the caller refuses the same rectangles first. The codec decodes onto
+  the tile and `Surface::blit` copies it only when the decode succeeds, so a decode error leaves
+  the region as it was, RemoteFX's included when a tile fails after an earlier one was decoded. A
+  headers-only RemoteFX payload paints nothing: the codec returns `Ok(false)` and nothing is
+  blitted. Decoding into the surface, as FreeRDP does (`gdi/gfx.c`),
+  would have saved the copy and lost that: FreeRDP leaves a failed RLEX decode's earlier layers in
+  surface memory. ClearCodec decodes BGRA, so the arm swaps the seed's R and B in place before the
+  decode and back after it, and keeps alpha as written: the codec writes `0xFF` on every pixel it
+  writes, and an unwritten pixel keeps the surface's alpha. Uncompressed and Planar WireToSurface1
+  cover the whole rectangle and are unchanged; Progressive blits only each rectangle it decodes.
 - **One number answers two different questions here, and the shared derivation is the reason
   — not the convenience.** `MAX_TOTAL_SURFACE_BYTES` is *also* the **per-frame paint budget**
   (#268). The three list-bearing commands — `SOLID_FILL`, `SURFACE_TO_SURFACE`,
@@ -181,6 +201,11 @@ acknowledge frames. It is server→client only, and it is reachable only if
   `--release`, so one maximal destRect is ~0.25 s and ~0.5 GiB of transient buffers, and nothing
   bounded how many such PDUs one frame held. The charge is the decoded size; an over-budget PDU
   is skipped with the same `note_budget` record, and the three real-VM EGFX tests drew none.
+  **The seed copy #646 added is not charged on its own.** ClearCodec and RemoteFX decode onto a
+  scratch tile that `seed_tile` fills with the surface's pixels first; that tile is the decoded
+  size the PDU was charged before decoding, so the copy is paid for inside that charge, as
+  `SURFACE_TO_SURFACE` charges the blit its `extract` feeds and not the extract.
+  `SURFACE_TO_CACHE` charges its copy because it paints nothing else to charge.
   **`WIRE_TO_SURFACE_2` (Progressive) is charged its painting since #377**, each `PaintedRect`
   at its clipped bytes, because the cost there is `paint_tile` meeting every tile with every
   region rect rather than the decode. Its tile decode stays uncharged on a measurement: the
@@ -298,7 +323,12 @@ sample byte-identically, so agreeing with it is not agreeing with either of them
   — the phase-2 rewrite is verified against a codebase sharing this project's
   lineage.
 - [The frame path carries no owned pixels](../invariant/frame-path-carries-no-owned-pixels.md)
-  — the surface→framebuffer blit is where the last extract copy was removed (#163).
+  — the surface→framebuffer blit is where the last extract copy was removed (#163). The
+  WireToSurface1 seed tile (#646) is a decode scratch buffer before the surface write, not a frame
+  step. `seed_tile` returning an owned `Vec` is a hit of the note's signature grep, answered here:
+  the tile must exist apart from the surface for a failed decode to leave the region as it was. Per ClearCodec pixel the arm copies the surface pixel into the tile, swaps it twice and
+  blits it, where it used to decode into a zeroed allocation and convert that into a second one;
+  RemoteFX fills its tile from the surface instead of with opaque black.
 - [Untrusted decode never panics](../invariant/untrusted-decode-never-panics.md)
 - [Decoder dimension overflow on 32-bit](../invariant/decoder-dimension-overflow-32bit.md)
   — surface allocation is `width × height × 4`, and since #263 so is a

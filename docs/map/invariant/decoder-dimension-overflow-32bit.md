@@ -305,6 +305,7 @@ every one of these functions *expands*.
 | `justrdp_codecs::nscodec::decode` | no — the output reservation is capped against `y_plane.len()`, a buffer that exists (#262) | `allocatable` anyway, for the signature |
 | `justrdp_codecs::clearcodec` | no — gated by `bitmap.len() < expected` | — |
 | `justrdp::egfx`'s `decode_wts1` | no — its `needed` feeds a length comparison only; nothing is allocated from it in that arm | — |
+| `justrdp::egfx`'s `seed_tile` (#646, after #263) | **yes, before its bound.** Called directly, `decode_wts1` on a 64x64 surface with a 65535 x 65535 or 40000 x 20000 rectangle panicked with *capacity overflow* in both seeded arms on i686 (two independent probes, 2026-11-20), where the codecs had refused it themselves before the tile moved to egfx | a `MAX_TOTAL_SURFACE_BYTES` bound before the allocation, asserted on every target by `decode_wts1_refuses_a_rectangle_no_surface_could_hold_before_seeding_it` |
 
 **The lesson the `pointer` row carries, and the reason "is there a length check above
 it" is the wrong way to sort a list like this:** a gate against a buffer the caller
