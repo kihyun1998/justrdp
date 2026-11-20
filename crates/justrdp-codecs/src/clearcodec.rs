@@ -21,8 +21,9 @@
 //!    [`ClearError`] naming the layer. Fewer is conforming: `[MS-RDPEGFX]` 2.2.4.1.1.1 says the residual layer encodes
 //!    "less than or equal to the number of pixels in the original image", and example 4.1.1.2
 //!    decodes RLEX segments "until there is no more data left". The pixels a layer does not reach
-//!    keep what the tile already held: the residual or bands pixel under an RLEX region, and zero
-//!    bytes where the residual layer stops short.
+//!    keep what the tile already held: the residual or bands pixel under an RLEX region, and the
+//!    caller's seed where no layer reaches. `justrdp::egfx` seeds the tile with the surface's
+//!    current pixels, so a WireToSurface1 region keeps the surface's earlier pixel there.
 //!
 //! 3. **The composite payload and each layer hold whole structures, and these field values the spec
 //!    forbids are refused.** Bytes after a layer's last whole run segment, band or subcodec are a
@@ -42,8 +43,9 @@
 //!    `shortVBarYOn`, runs past the band (2.2.4.1.1.2.1.1.2); and a band whose columns or rows fall
 //!    outside the tile. Nothing is clamped or skipped to make such an input fit.
 //!
-//! **Alpha contract:** ClearCodec carries no alpha; every pixel a layer writes has alpha `0xFF`. A
-//! pixel no layer reaches is zero bytes, alpha included (decision 2).
+//! **Alpha contract:** ClearCodec carries no alpha; every pixel a layer writes has alpha `0xFF`, an
+//! NSCodec subcodec's included, since `[MS-RDPEGFX]` 3.3.5.1 ignores alpha for every codec but
+//! ALPHA. A pixel no layer reaches keeps the caller's seed, alpha included (decision 2).
 
 use std::fmt;
 
@@ -88,6 +90,15 @@ pub enum ClearError {
         /// Why it is invalid.
         reason: &'static str,
     },
+    /// The caller's tile is not `width × height × 4` bytes.
+    OutputLength {
+        /// The tile width the caller asked for.
+        width: u16,
+        /// The tile height the caller asked for.
+        height: u16,
+        /// The length of the tile the caller passed.
+        len: usize,
+    },
 }
 
 impl fmt::Display for ClearError {
@@ -95,6 +106,9 @@ impl fmt::Display for ClearError {
         match self {
             ClearError::NotEnoughBytes { ctx } => write!(f, "not enough bytes for {ctx}"),
             ClearError::InvalidField { field, reason } => write!(f, "invalid `{field}`: {reason}"),
+            ClearError::OutputLength { width, height, len } => {
+                write!(f, "a {len}-byte tile is not {width}x{height} BGRA pixels")
+            }
         }
     }
 }
@@ -258,19 +272,21 @@ impl Clear {
         }
     }
 
-    /// Decode one ClearCodec bitmap stream into `width × height × 4` **BGRA** bytes
-    /// (alpha `0xFF` on every pixel a layer writes; see the module's alpha contract).
+    /// Decode one ClearCodec bitmap stream onto `tile`, `width × height × 4` **BGRA** bytes the
+    /// caller has seeded, as [`ClearDecoder::decode`] does.
     ///
     /// When `JUSTRDP_CLEAR_CAPTURE_DIR` is set, the raw payload and its decode status are
-    /// dumped there first (see `capture_clear_payload`) — the corpus harness for the #56
-    /// rewrite, which needs streams no differential can arbitrate.
+    /// dumped there after the decode returns (see `capture_clear_payload`), so a decode that
+    /// panics leaves no capture — the corpus harness for the #56 rewrite, which needs streams no
+    /// differential can arbitrate.
     pub fn decode_to_bgra(
         &mut self,
         data: &[u8],
         width: u16,
         height: u16,
-    ) -> Result<Vec<u8>, ClearError> {
-        let result = self.inner.decode(data, width, height);
+        tile: &mut [u8],
+    ) -> Result<(), ClearError> {
+        let result = self.inner.decode(data, width, height, tile);
         // An *empty* value counts as unset — otherwise `Path::new("")` resolves to the process
         // CWD and litters it with `clear-*.bin`.
         if let Ok(dir) = std::env::var("JUSTRDP_CLEAR_CAPTURE_DIR")
@@ -349,9 +365,32 @@ impl ClearDecoder {
         }
     }
 
-    /// Decode one ClearCodec bitmap stream into `width × height × 4` BGRA bytes (alpha `0xFF` on
-    /// every pixel a layer writes; see the module's alpha contract).
-    pub fn decode(&mut self, data: &[u8], width: u16, height: u16) -> Result<Vec<u8>, ClearError> {
+    /// Decode one ClearCodec bitmap stream onto `tile`, `width × height × 4` BGRA bytes the
+    /// caller has seeded. Every pixel a layer writes is replaced, with alpha `0xFF`; every pixel
+    /// no layer reaches keeps the seed (the module's decision 2 and alpha contract). A glyph hit
+    /// replaces the whole tile, and a glyph store keeps the tile as decoded onto the seed.
+    ///
+    /// On an error the tile may hold part of the decode, so a caller that must leave its
+    /// destination untouched decodes onto a copy. A tile of the wrong length is
+    /// [`ClearError::OutputLength`].
+    pub fn decode(
+        &mut self,
+        data: &[u8],
+        width: u16,
+        height: u16,
+        tile: &mut [u8],
+    ) -> Result<(), ClearError> {
+        let pixel_count = usize::from(width)
+            .checked_mul(usize::from(height))
+            .ok_or_else(|| invalid("dimensions", "width * height overflow"))?;
+        if pixel_count.checked_mul(4) != Some(tile.len()) {
+            return Err(ClearError::OutputLength {
+                width,
+                height,
+                len: tile.len(),
+            });
+        }
+
         let mut c = Cursor::new(data);
         c.ensure(2, "ClearCodecBitmapStream")?;
         let flags = c.u8();
@@ -379,10 +418,6 @@ impl ClearDecoder {
             return Err(invalid("glyphIndex", "glyph index out of range 0-3999"));
         }
 
-        let pixel_count = usize::from(width)
-            .checked_mul(usize::from(height))
-            .ok_or_else(|| invalid("dimensions", "width * height overflow"))?;
-
         if glyph_index.is_some() && pixel_count > MAX_GLYPH_PIXELS {
             return Err(invalid(
                 "glyphIndex",
@@ -407,7 +442,8 @@ impl ClearDecoder {
                     "cached glyph area does not match destination",
                 ));
             }
-            return Ok(entry.pixels.clone());
+            tile.copy_from_slice(&entry.pixels);
+            return Ok(());
         }
 
         if width > MAX_DECODE_DIM || height > MAX_DECODE_DIM {
@@ -417,20 +453,18 @@ impl ClearDecoder {
             ));
         }
 
-        let mut output = vec![0u8; pixel_count * 4];
-
-        self.decode_composite(&mut c, &mut output, width, height)?;
+        self.decode_composite(&mut c, tile, width, height)?;
 
         if let Some(idx) = glyph_index {
             self.glyph_store(
                 idx,
                 GlyphEntry {
-                    pixels: output.clone(),
+                    pixels: tile.to_vec(),
                 },
             );
         }
 
-        Ok(output)
+        Ok(())
     }
 
     fn decode_composite(
@@ -461,10 +495,6 @@ impl ClearDecoder {
         Ok(())
     }
 
-    /// Layer 1 — residual BGR run-length background, filling the tile row-major. A run past the
-    /// tile's last pixel is an error; a tile the runs do not reach the end of keeps zero bytes
-    /// there (module docs, decision 2). A zero run length factor and bytes after the last whole
-    /// segment are errors (decision 3).
     fn decode_residual_layer(&self, data: &[u8], output: &mut [u8]) -> Result<(), ClearError> {
         if data.is_empty() {
             return Ok(());
@@ -768,7 +798,8 @@ fn reconstruct_full_vbar(
 }
 
 /// Decode an NSCodec subcodec region (codecId 0x01) via the self-owned NSCodec codec and composite
-/// its BGRA output into the ClearCodec surface, like the raw subcodec. Region bounds were validated
+/// its BGR output into the ClearCodec surface with alpha `0xFF`, like the raw subcodec
+/// (`[MS-RDPEGFX]` 3.3.5.1 ignores alpha for every codec but ALPHA). Region bounds were validated
 /// by the caller; NSCodec produces exactly `width*height*4` bytes on success.
 fn decode_nscodec_region(
     bitmap: &[u8],
@@ -788,7 +819,8 @@ fn decode_nscodec_region(
             let y = usize::from(y_start) + row;
             let src = (row * w + col) * 4;
             let dst = (y * sw + x) * 4;
-            output[dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
+            output[dst..dst + 3].copy_from_slice(&pixels[src..src + 3]);
+            output[dst + 3] = 0xFF;
         }
     }
     Ok(())
@@ -976,6 +1008,26 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn decode_zeroed(
+        d: &mut ClearDecoder,
+        data: &[u8],
+        width: u16,
+        height: u16,
+    ) -> Result<Vec<u8>, ClearError> {
+        decode_onto(d, data, width, height, [0; 4])
+    }
+
+    fn decode_onto(
+        d: &mut ClearDecoder,
+        data: &[u8],
+        width: u16,
+        height: u16,
+        seed: [u8; 4],
+    ) -> Result<Vec<u8>, ClearError> {
+        let mut tile = seed.repeat(usize::from(width) * usize::from(height));
+        d.decode(data, width, height, &mut tile).map(|()| tile)
+    }
+
     proptest! {
         // ADR-0008 / issue #97 — the no-panic robustness property. `ClearError`'s contract is the
         // same as the other codecs': malformed input is always a typed error, never a panic. The
@@ -999,7 +1051,63 @@ mod tests {
             height in 0u16..=64,
             data in proptest::collection::vec(any::<u8>(), 0..=512),
         ) {
-            let _ = ClearDecoder::new().decode(&data, width, height);
+            let _ = decode_zeroed(&mut ClearDecoder::new(), &data, width, height);
+        }
+
+        #[test]
+        fn a_pixel_keeps_the_seed_exactly_where_no_layer_writes(
+            width in 1u16..=8,
+            height in 1u16..=8,
+            runs in proptest::collection::vec((any::<[u8; 3]>(), 1u8..=6), 0..=12),
+            sub in proptest::option::of((0u16..8, 0u16..8, 1u16..=8, 1u16..=8, any::<u8>())),
+            seed in any::<[u8; 4]>(),
+        ) {
+            let (w, h) = (usize::from(width), usize::from(height));
+            let mut colour_at = vec![None; w * h];
+            let mut residual = Vec::new();
+            let mut at = 0;
+            for (bgr, len) in runs {
+                if at + usize::from(len) > w * h {
+                    break;
+                }
+                residual.extend_from_slice(&bgr);
+                residual.push(len);
+                colour_at[at..at + usize::from(len)].fill(Some(bgr));
+                at += usize::from(len);
+            }
+            let mut subcodecs = Vec::new();
+            if let Some((x, y, sw, sh, v)) = sub {
+                let (x, y) = (x % width, y % height);
+                let (sw, sh) = (sw.min(width - x), sh.min(height - y));
+                let mut s = Vec::new();
+                for f in [x, y, sw, sh] {
+                    s.extend_from_slice(&f.to_le_bytes());
+                }
+                let bitmap = vec![v; usize::from(sw) * usize::from(sh) * 3];
+                s.extend_from_slice(&u32::try_from(bitmap.len()).unwrap().to_le_bytes());
+                s.push(0x00);
+                s.extend_from_slice(&bitmap);
+                subcodecs = s;
+                for row in usize::from(y)..usize::from(y + sh) {
+                    for col in usize::from(x)..usize::from(x + sw) {
+                        colour_at[row * w + col] = Some([v; 3]);
+                    }
+                }
+            }
+            let mut stream = vec![0x00, 0x00];
+            stream.extend_from_slice(&u32::try_from(residual.len()).unwrap().to_le_bytes());
+            stream.extend_from_slice(&0u32.to_le_bytes());
+            stream.extend_from_slice(&u32::try_from(subcodecs.len()).unwrap().to_le_bytes());
+            stream.extend_from_slice(&residual);
+            stream.extend_from_slice(&subcodecs);
+
+            let mut tile = seed.repeat(w * h);
+            prop_assert_eq!(ClearDecoder::new().decode(&stream, width, height, &mut tile), Ok(()));
+            let expected: Vec<u8> = colour_at
+                .iter()
+                .flat_map(|c| c.map_or(seed, |[b, g, r]| [b, g, r, 0xFF]))
+                .collect();
+            prop_assert_eq!(tile, expected);
         }
     }
 
@@ -1012,7 +1120,10 @@ mod tests {
         // 4×2 solid color in BGRA.
         let bgra: Vec<u8> = (0..8).flat_map(|_| [10u8, 20, 30, 255]).collect();
         let stream = encoder.encode(&bgra, 4, 2);
-        let decoded = Clear::new().decode_to_bgra(&stream, 4, 2).unwrap();
+        let mut decoded = vec![0; 4 * 2 * 4];
+        Clear::new()
+            .decode_to_bgra(&stream, 4, 2, &mut decoded)
+            .unwrap();
         assert_eq!(decoded, bgra);
     }
 
@@ -1041,7 +1152,7 @@ mod tests {
     #[test]
     fn a_glyph_hit_draws_the_cached_pixels_as_any_rectangle_of_the_same_area() {
         let mut d = ClearDecoder::new();
-        let stored = d.decode(&glyph_store_stream(4), 2, 8).unwrap();
+        let stored = decode_zeroed(&mut d, &glyph_store_stream(4), 2, 8).unwrap();
         let expected: Vec<u8> = (0u8..16)
             .flat_map(|i| [i, 0x40 + i, 0x80 + i, 0xFF])
             .collect();
@@ -1052,7 +1163,7 @@ mod tests {
 
         for (w, h) in [(2u16, 8u16), (4, 4), (8, 2), (16, 1)] {
             assert_eq!(
-                d.decode(&glyph_hit_stream(4), w, h).unwrap(),
+                decode_zeroed(&mut d, &glyph_hit_stream(4), w, h).unwrap(),
                 expected,
                 "a {w}x{h} hit returns the linear stream unchanged"
             );
@@ -1062,10 +1173,10 @@ mod tests {
     #[test]
     fn a_glyph_hit_of_a_different_area_is_an_error() {
         let mut d = ClearDecoder::new();
-        d.decode(&glyph_store_stream(4), 2, 8).unwrap();
+        decode_zeroed(&mut d, &glyph_store_stream(4), 2, 8).unwrap();
         for (w, h) in [(3u16, 5u16), (4, 5), (1, 1)] {
             assert_eq!(
-                d.decode(&glyph_hit_stream(4), w, h),
+                decode_zeroed(&mut d, &glyph_hit_stream(4), w, h),
                 Err(invalid(
                     "glyphIndex",
                     "cached glyph area does not match destination"
@@ -1099,7 +1210,7 @@ mod tests {
         stream.extend_from_slice(&0u32.to_le_bytes()); // subcodecByteCount
         stream.extend_from_slice(&bands);
 
-        let out = ClearDecoder::new().decode(&stream, 1, 52).unwrap();
+        let out = decode_zeroed(&mut ClearDecoder::new(), &stream, 1, 52).unwrap();
         // Row 5 (first pixel of the short v-bar) is blue 0xFF,0x00,0x00.
         assert_eq!(&out[5 * 4..5 * 4 + 3], &[0xFF, 0x00, 0x00]);
     }
@@ -1133,13 +1244,13 @@ mod tests {
             build_stream(&bands)
         };
         assert_eq!(
-            ClearDecoder::new().decode(&stream(2, 2), 2, 2),
+            decode_zeroed(&mut ClearDecoder::new(), &stream(2, 2), 2, 2),
             Ok([BAR, BAR, BAR, BAR].concat()),
             "a stored V-bar of the band height is drawn"
         );
         for (stored, hit) in [(2, 1), (1, 2)] {
             assert_eq!(
-                ClearDecoder::new().decode(&stream(stored, hit), 2, 2),
+                decode_zeroed(&mut ClearDecoder::new(), &stream(stored, hit), 2, 2),
                 Err(invalid(
                     "vBarCacheHit",
                     "stored V-bar height is not the band height"
@@ -1161,13 +1272,13 @@ mod tests {
             build_stream(&bands)
         };
         assert_eq!(
-            ClearDecoder::new().decode(&stream(3, 1), 2, 3),
+            decode_zeroed(&mut ClearDecoder::new(), &stream(3, 1), 2, 3),
             Ok([BAR, BKG, BAR, BAR, BKG, BAR].concat()),
             "a short V-bar that ends on the band's last row is drawn"
         );
         for (hit, y_on) in [(3, 2), (2, 1), (1, 0), (2, 3)] {
             assert_eq!(
-                ClearDecoder::new().decode(&stream(hit, y_on), 2, 3),
+                decode_zeroed(&mut ClearDecoder::new(), &stream(hit, y_on), 2, 3),
                 Err(invalid(
                     "shortVBarCacheHit",
                     "stored short V-bar exceeds band height - shortVBarYOn"
@@ -1178,7 +1289,7 @@ mod tests {
         let empty_bar_at = |y_on: u8| {
             let mut bands = band([0, 0], [0, 2], &short_miss(0));
             bands.extend(band([1, 1], [0, 1], &[0x00, 0x40, y_on]));
-            ClearDecoder::new().decode(&build_stream(&bands), 2, 3)
+            decode_zeroed(&mut ClearDecoder::new(), &build_stream(&bands), 2, 3)
         };
         assert_eq!(
             empty_bar_at(2),
@@ -1202,15 +1313,15 @@ mod tests {
             build_stream(&band([0, x_end], [0, y_end], &vbars))
         };
         assert_eq!(
-            ClearDecoder::new().decode(&stream(1, 1), 2, 2),
+            decode_zeroed(&mut ClearDecoder::new(), &stream(1, 1), 2, 2),
             Ok(BKG.repeat(4))
         );
         assert_eq!(
-            ClearDecoder::new().decode(&stream(2, 1), 2, 2),
+            decode_zeroed(&mut ClearDecoder::new(), &stream(2, 1), 2, 2),
             Err(invalid("xEnd", "band column outside the tile"))
         );
         assert_eq!(
-            ClearDecoder::new().decode(&stream(1, 2), 2, 2),
+            decode_zeroed(&mut ClearDecoder::new(), &stream(1, 2), 2, 2),
             Err(invalid("yEnd", "band row outside the tile"))
         );
     }
@@ -1232,13 +1343,16 @@ mod tests {
         let mut d = ClearDecoder::new();
         let tile = [1u8, 2, 3, 0xFF].repeat(1024);
         assert_eq!(
-            d.decode(&glyph_tile_stream(32, 32), 32, 32),
+            decode_zeroed(&mut d, &glyph_tile_stream(32, 32), 32, 32),
             Ok(tile.clone())
         );
-        assert_eq!(d.decode(&glyph_hit_stream(9), 32, 32), Ok(tile));
+        assert_eq!(
+            decode_zeroed(&mut d, &glyph_hit_stream(9), 32, 32),
+            Ok(tile)
+        );
         for (w, h) in [(33u16, 32u16), (1025, 1)] {
             assert_eq!(
-                ClearDecoder::new().decode(&glyph_tile_stream(w, h), w, h),
+                decode_zeroed(&mut ClearDecoder::new(), &glyph_tile_stream(w, h), w, h),
                 Err(invalid(
                     "glyphIndex",
                     "GLYPH_INDEX on a tile over 1024 pixels"
@@ -1253,11 +1367,11 @@ mod tests {
     fn a_glyph_hit_with_bytes_after_the_glyph_header_is_refused() {
         for trailing in [1usize, 11, 12, 13] {
             let mut d = ClearDecoder::new();
-            d.decode(&glyph_store_stream(4), 2, 8).unwrap();
+            decode_zeroed(&mut d, &glyph_store_stream(4), 2, 8).unwrap();
             let mut hit = glyph_hit_stream(4);
             hit.extend(std::iter::repeat_n(0, trailing));
             assert_eq!(
-                d.decode(&hit, 2, 8),
+                decode_zeroed(&mut d, &hit, 2, 8),
                 Err(invalid("compositePayload", "present with GLYPH_HIT")),
                 "{trailing} trailing byte(s)"
             );
@@ -1270,15 +1384,18 @@ mod tests {
             ctx: "CompositePayload",
         });
         let mut d = ClearDecoder::new();
-        assert_eq!(d.decode(&[FLAG_GLYPH_INDEX, 0x00, 4, 0], 2, 8), missing);
         assert_eq!(
-            d.decode(&glyph_hit_stream(4), 2, 8),
+            decode_zeroed(&mut d, &[FLAG_GLYPH_INDEX, 0x00, 4, 0], 2, 8),
+            missing
+        );
+        assert_eq!(
+            decode_zeroed(&mut d, &glyph_hit_stream(4), 2, 8),
             Err(invalid("glyphIndex", "glyph cache miss on hit")),
             "the refused stream stored no glyph"
         );
         for flags in [0x00, FLAG_CACHE_RESET] {
             assert_eq!(
-                ClearDecoder::new().decode(&[flags, 0x00], 2, 2),
+                decode_zeroed(&mut ClearDecoder::new(), &[flags, 0x00], 2, 2),
                 missing,
                 "flags {flags:#04x}"
             );
@@ -1295,21 +1412,21 @@ mod tests {
         let hit_slot_0 = build_stream(&band([0, 0], [0, 1], &0x8000u16.to_le_bytes()));
         let short_hit_slot_0 = build_stream(&band([0, 0], [0, 1], &[0x00, 0x40, 0]));
         let mut d = ClearDecoder::new();
-        d.decode(&store([1, 2, 3]), 1, 2).unwrap();
+        decode_zeroed(&mut d, &store([1, 2, 3]), 1, 2).unwrap();
         assert_eq!(
-            d.decode(&[FLAG_CACHE_RESET, 0x00], 1, 2),
+            decode_zeroed(&mut d, &[FLAG_CACHE_RESET, 0x00], 1, 2),
             Err(ClearError::NotEnoughBytes {
                 ctx: "CompositePayload"
             })
         );
-        d.decode(&store([7, 8, 9]), 1, 2).unwrap();
+        decode_zeroed(&mut d, &store([7, 8, 9]), 1, 2).unwrap();
         assert_eq!(
-            d.decode(&hit_slot_0, 1, 2),
+            decode_zeroed(&mut d, &hit_slot_0, 1, 2),
             Ok([7, 8, 9, 0xFF].repeat(2)),
             "the second V-bar overwrote slot 0"
         );
         assert_eq!(
-            d.decode(&short_hit_slot_0, 1, 2),
+            decode_zeroed(&mut d, &short_hit_slot_0, 1, 2),
             Ok([7, 8, 9, 0xFF].repeat(2)),
             "the second short V-bar overwrote slot 0"
         );
@@ -1378,18 +1495,94 @@ mod tests {
         // 2 + 2 px into a 3-px tile: the second run overruns by one.
         let stream = residual_stream(&[[1, 2, 3, 2], [4, 5, 6, 2]]);
         assert_eq!(
-            ClearDecoder::new().decode(&stream, 3, 1),
+            decode_zeroed(&mut ClearDecoder::new(), &stream, 3, 1),
             Err(invalid("residual", "run overruns the tile"))
         );
     }
 
     #[test]
-    fn residual_under_fill_decodes_and_leaves_the_rest_zero() {
-        // 2 px into a 3-px tile.
-        let out = ClearDecoder::new()
-            .decode(&residual_stream(&[[1, 2, 3, 2]]), 3, 1)
+    fn residual_under_fill_decodes_and_keeps_the_seed_over_the_rest() {
+        let mut tile = [0xEE; 3 * 4];
+        ClearDecoder::new()
+            .decode(&residual_stream(&[[1, 2, 3, 2]]), 3, 1, &mut tile)
             .unwrap();
-        assert_eq!(out, [1, 2, 3, 0xFF, 1, 2, 3, 0xFF, 0, 0, 0, 0]);
+        assert_eq!(tile, [1, 2, 3, 0xFF, 1, 2, 3, 0xFF, 0xEE, 0xEE, 0xEE, 0xEE]);
+    }
+
+    #[test]
+    fn a_pixel_no_layer_reaches_keeps_the_seed() {
+        const SEED: [u8; 4] = [0xEE, 0xDD, 0xCC, 0x11];
+        let onto_seed = |d: &mut ClearDecoder, stream: &[u8], w: u16, h: u16| {
+            decode_onto(d, stream, w, h, SEED)
+        };
+        let raw_1x1 = subcodec_stream(&subcodec(1, 0x00, &[9, 8, 7]));
+        assert_eq!(
+            onto_seed(&mut ClearDecoder::new(), &raw_1x1, 2, 1),
+            Ok([[9, 8, 7, 0xFF], SEED].concat()),
+            "no residual layer, and a subcodec over half the tile"
+        );
+        assert_eq!(
+            onto_seed(
+                &mut ClearDecoder::new(),
+                &build_stream(&background_band(2)),
+                3,
+                1
+            ),
+            Ok([[7, 8, 9, 0xFF], [7, 8, 9, 0xFF], SEED].concat()),
+            "a band over two of three columns"
+        );
+
+        let mut d = ClearDecoder::new();
+        let mut store = vec![FLAG_GLYPH_INDEX, 0x00, 3, 0];
+        store.extend_from_slice(&raw_1x1[2..]);
+        let stored = [[9, 8, 7, 0xFF], SEED].concat();
+        assert_eq!(onto_seed(&mut d, &store, 2, 1), Ok(stored.clone()));
+        let mut hit_tile = [0u8; 2 * 4];
+        d.decode(&glyph_hit_stream(3), 1, 2, &mut hit_tile).unwrap();
+        assert_eq!(
+            hit_tile.to_vec(),
+            stored,
+            "the hit draws the seed it was stored over"
+        );
+    }
+
+    #[test]
+    fn a_tile_of_the_wrong_length_leaves_the_vbar_cursors_alone() {
+        let mut d = ClearDecoder::new();
+        let first = build_stream(&band([0, 0], [0, 0], &short_miss(1)));
+        decode_zeroed(&mut d, &first, 1, 1).unwrap();
+        let mut reset = first.clone();
+        reset[0] = FLAG_CACHE_RESET;
+        assert_eq!(
+            d.decode(&reset, 1, 1, &mut [0; 3]),
+            Err(ClearError::OutputLength {
+                width: 1,
+                height: 1,
+                len: 3
+            })
+        );
+        let mut other = (1u16 << 8).to_le_bytes().to_vec();
+        other.extend_from_slice(&[0x44, 0x55, 0x66]);
+        decode_zeroed(&mut d, &build_stream(&band([0, 0], [0, 0], &other)), 1, 1).unwrap();
+        let hit_slot_0 = build_stream(&band([0, 0], [0, 0], &0x8000u16.to_le_bytes()));
+        assert_eq!(decode_zeroed(&mut d, &hit_slot_0, 1, 1), Ok(BAR.to_vec()));
+    }
+
+    #[test]
+    fn a_tile_of_the_wrong_length_is_an_error() {
+        let stream = residual_stream(&[[1, 2, 3, 2]]);
+        for len in [0, 7, 9, 12] {
+            let mut tile = vec![0; len];
+            assert_eq!(
+                ClearDecoder::new().decode(&stream, 2, 1, &mut tile),
+                Err(ClearError::OutputLength {
+                    width: 2,
+                    height: 1,
+                    len
+                }),
+                "{len} bytes"
+            );
+        }
     }
 
     #[test]
@@ -1399,7 +1592,7 @@ mod tests {
             stream.extend(std::iter::repeat_n(0xAA, trailing));
             stream[2..6].copy_from_slice(&u32::try_from(4 + trailing).unwrap().to_le_bytes());
             assert_eq!(
-                ClearDecoder::new().decode(&stream, 3, 1),
+                decode_zeroed(&mut ClearDecoder::new(), &stream, 3, 1),
                 Err(ClearError::NotEnoughBytes {
                     ctx: "RgbRunSegment"
                 }),
@@ -1413,7 +1606,7 @@ mod tests {
         // A zero run, then a run that fills the tile.
         let stream = residual_stream(&[[1, 2, 3, 0], [4, 5, 6, 3]]);
         assert_eq!(
-            ClearDecoder::new().decode(&stream, 3, 1),
+            decode_zeroed(&mut ClearDecoder::new(), &stream, 3, 1),
             Err(invalid("residual", "runLengthFactor1 is zero"))
         );
     }
@@ -1446,7 +1639,7 @@ mod tests {
             let mut subcodecs = subcodec(2, 0x00, &[1, 2, 3, 4, 5, 6]);
             subcodecs.extend(std::iter::repeat_n(0xAA, trailing));
             assert_eq!(
-                ClearDecoder::new().decode(&subcodec_stream(&subcodecs), 2, 1),
+                decode_zeroed(&mut ClearDecoder::new(), &subcodec_stream(&subcodecs), 2, 1),
                 Err(ClearError::NotEnoughBytes {
                     ctx: "ClearCodecSubcodec"
                 }),
@@ -1459,26 +1652,30 @@ mod tests {
     fn raw_subcodec_byte_count_above_three_per_pixel_is_refused() {
         let exact = subcodec(2, 0x00, &[1, 2, 3, 4, 5, 6]);
         assert_eq!(
-            ClearDecoder::new().decode(&subcodec_stream(&exact), 2, 1),
+            decode_zeroed(&mut ClearDecoder::new(), &subcodec_stream(&exact), 2, 1),
             Ok(vec![1, 2, 3, 0xFF, 4, 5, 6, 0xFF])
         );
         let over = subcodec(2, 0x00, &[1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(
-            ClearDecoder::new().decode(&subcodec_stream(&over), 2, 1),
+            decode_zeroed(&mut ClearDecoder::new(), &subcodec_stream(&over), 2, 1),
             Err(invalid("bitmapDataByteCount", "exceeds 3 * width * height"))
         );
         let short = subcodec(2, 0x00, &[1, 2, 3, 4, 5]);
         assert_eq!(
-            ClearDecoder::new().decode(&subcodec_stream(&short), 2, 1),
+            decode_zeroed(&mut ClearDecoder::new(), &subcodec_stream(&short), 2, 1),
             Err(invalid("bitmapData", "raw subcodec data too short"))
         );
     }
 
     #[test]
     fn residual_exact_fill_paints_the_whole_tile() {
-        let out = ClearDecoder::new()
-            .decode(&residual_stream(&[[1, 2, 3, 1], [4, 5, 6, 2]]), 3, 1)
-            .unwrap();
+        let out = decode_zeroed(
+            &mut ClearDecoder::new(),
+            &residual_stream(&[[1, 2, 3, 1], [4, 5, 6, 2]]),
+            3,
+            1,
+        )
+        .unwrap();
         assert_eq!(out, [1, 2, 3, 0xFF, 4, 5, 6, 0xFF, 4, 5, 6, 0xFF]);
     }
 
@@ -1507,7 +1704,7 @@ mod tests {
             .map(|s| cast_usize(s.run_length) + usize::from(s.stop_index - s.start_index) + 1)
             .sum();
         assert_eq!(emitted, 78 * 17);
-        let out = ClearDecoder::new().decode(&SPEC_EXAMPLE_2, 78, 17).unwrap();
+        let out = decode_zeroed(&mut ClearDecoder::new(), &SPEC_EXAMPLE_2, 78, 17).unwrap();
         assert_eq!(out.len(), 78 * 17 * 4);
         assert!(out.as_chunks::<4>().0.iter().all(|px| px[3] == 0xFF));
     }
@@ -1561,6 +1758,10 @@ mod tests {
     /// A 16-pixel NSCodec stream (ColorLossLevel 1, no subsampling) whose four planes are each one
     /// RLE run of `[y, co, cg, alpha]`: 48 bytes, exactly `3 * 16`.
     fn nscodec_16px(extra: &[u8]) -> Vec<u8> {
+        nscodec_16px_alpha(255, extra)
+    }
+
+    fn nscodec_16px_alpha(alpha: u8, extra: &[u8]) -> Vec<u8> {
         let plane = |v: u8| [v, v, 10, v, v, v, v]; // a run of 12, then the 4-byte raw tail
         let mut nsc = Vec::new();
         for _ in 0..4 {
@@ -1569,7 +1770,7 @@ mod tests {
         nsc.push(1); // ColorLossLevel
         nsc.push(0); // ChromaSubsamplingLevel
         nsc.extend_from_slice(&[0, 0]); // reserved
-        for v in [100, 10, 5, 255] {
+        for v in [100, 10, 5, alpha] {
             nsc.extend_from_slice(&plane(v)); // Y, Co, Cg, A
         }
         nsc.extend_from_slice(extra);
@@ -1579,9 +1780,21 @@ mod tests {
     #[test]
     fn nscodec_subcodec_decodes_into_the_region() {
         let stream = subcodec_stream(&subcodec(16, 0x01, &nscodec_16px(&[])));
-        let out = ClearDecoder::new().decode(&stream, 16, 1).unwrap();
+        let out = decode_zeroed(&mut ClearDecoder::new(), &stream, 16, 1).unwrap();
         // Y100 Co10 Cg5, shift 0 → R=105 G=105 B=85; BGRA.
         assert_eq!(out, [85, 105, 105, 255].repeat(16));
+    }
+
+    #[test]
+    fn an_nscodec_subcodec_writes_alpha_0xff_whatever_its_alpha_plane() {
+        for alpha in [0, 0x80] {
+            let stream = subcodec_stream(&subcodec(16, 0x01, &nscodec_16px_alpha(alpha, &[])));
+            assert_eq!(
+                decode_zeroed(&mut ClearDecoder::new(), &stream, 16, 1),
+                Ok([85, 105, 105, 255].repeat(16)),
+                "alpha plane {alpha}"
+            );
+        }
     }
 
     #[test]
@@ -1589,16 +1802,19 @@ mod tests {
         let over = Err(invalid("bitmapDataByteCount", "exceeds 3 * width * height"));
         // NSCodec: 48 bytes into 16 px decodes, 49 is refused.
         let nsc = |extra: &[u8]| subcodec_stream(&subcodec(16, 0x01, &nscodec_16px(extra)));
-        assert!(ClearDecoder::new().decode(&nsc(&[]), 16, 1).is_ok());
-        assert_eq!(ClearDecoder::new().decode(&nsc(&[0]), 16, 1), over);
+        assert!(decode_zeroed(&mut ClearDecoder::new(), &nsc(&[]), 16, 1).is_ok());
+        assert_eq!(
+            decode_zeroed(&mut ClearDecoder::new(), &nsc(&[0]), 16, 1),
+            over
+        );
         // RLEX: the 9-byte two-entry-palette bitmap, `run` run pixels and one suite pixel.
         let rlex = |width: u16, run: u8| subcodec_stream(&subcodec(width, 0x02, &rlex_bitmap(run)));
         assert_eq!(
-            ClearDecoder::new().decode(&rlex(3, 2), 3, 1),
+            decode_zeroed(&mut ClearDecoder::new(), &rlex(3, 2), 3, 1),
             Ok([10, 20, 30, 0xFF].repeat(3))
         );
         assert_eq!(
-            ClearDecoder::new().decode(&rlex(2, 1), 2, 1),
+            decode_zeroed(&mut ClearDecoder::new(), &rlex(2, 1), 2, 1),
             over,
             "a run and suite that fill the 2-px region exactly, in 9 bytes"
         );
@@ -1623,15 +1839,21 @@ mod tests {
             |n: u8| residual_bytes_stream(&[1, 2, 3, 0xFF, 0xFF, 0xFF, n, 0, 0, 0, 4, 5, 6, 3]);
         let fill2 = residual_bytes_stream(&[1, 2, 3, 0xFF, 3, 0]);
         let fill3 = residual_bytes_stream(&[1, 2, 3, 0xFF, 0xFF, 0xFF, 3, 0, 0, 0]);
-        assert_eq!(ClearDecoder::new().decode(&fill2, 3, 1), Ok(tile.clone()));
-        assert_eq!(ClearDecoder::new().decode(&fill3, 3, 1), Ok(tile));
+        assert_eq!(
+            decode_zeroed(&mut ClearDecoder::new(), &fill2, 3, 1),
+            Ok(tile.clone())
+        );
+        assert_eq!(
+            decode_zeroed(&mut ClearDecoder::new(), &fill3, 3, 1),
+            Ok(tile)
+        );
         // A zero factor, then a run that fills the tile.
         assert_eq!(
-            ClearDecoder::new().decode(&factor2(0), 3, 1),
+            decode_zeroed(&mut ClearDecoder::new(), &factor2(0), 3, 1),
             Err(invalid("residual", "runLengthFactor2 is zero"))
         );
         assert_eq!(
-            ClearDecoder::new().decode(&factor3(0), 3, 1),
+            decode_zeroed(&mut ClearDecoder::new(), &factor3(0), 3, 1),
             Err(invalid("residual", "runLengthFactor3 is zero"))
         );
     }
@@ -1653,14 +1875,19 @@ mod tests {
     #[test]
     fn bands_trailing_bytes_shorter_than_a_band_header_are_refused() {
         assert_eq!(
-            ClearDecoder::new().decode(&build_stream(&background_band(2)), 2, 1),
+            decode_zeroed(
+                &mut ClearDecoder::new(),
+                &build_stream(&background_band(2)),
+                2,
+                1
+            ),
             Ok([7, 8, 9, 0xFF].repeat(2))
         );
         for trailing in 1..=10 {
             let mut bands = background_band(2);
             bands.extend(std::iter::repeat_n(0xAA, trailing));
             assert_eq!(
-                ClearDecoder::new().decode(&build_stream(&bands), 2, 1),
+                decode_zeroed(&mut ClearDecoder::new(), &build_stream(&bands), 2, 1),
                 Err(ClearError::NotEnoughBytes {
                     ctx: "ClearCodecBand"
                 }),

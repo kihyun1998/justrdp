@@ -423,9 +423,10 @@ It is closed by three calls.
    session alive. The clip broke §3(b), since nothing reported it, and it once hid this project's
    own parse defect (#131).
 2. **Under-fill is accepted, as spec-conforming rather than as a tolerance.** The pixels no layer
-   writes keep what the tile held. `[MS-RDPEGFX]` 2.2.4.1.1.1 makes the residual count "less than
-   or equal to" the image's pixels, and example 4.1.1.2 decodes RLEX segments "until there is no
-   more data left". Because it is conforming, §3(b) asks no report for it. FreeRDP refuses
+   writes keep the surface's earlier pixel. (Restated by #646: this read "keep what the tile held",
+   and under the residual layer the tile held zero bytes, which painted black.) `[MS-RDPEGFX]`
+   2.2.4.1.1.1 makes the residual count "less than or equal to" the image's pixels, and example
+   4.1.1.2 decodes RLEX segments "until there is no more data left". Because it is conforming, §3(b) asks no report for it. FreeRDP refuses
    under-fill too; that difference is recorded, not followed.
 3. **The residual layer takes the same rule**, as the same root in the same decoder.
 
@@ -481,7 +482,8 @@ The refusals are proven by wire-format round-trips through `GraphicsProcessor::p
 **What this does not decide.** The same 2.2.4.1.1.3.1 bound for the NSCodec and RLEX subcodecs,
 whose `bitmapDataByteCount` the sentence also covers; a zero `runLengthFactor2` or
 `runLengthFactor3`, which 2.2.4.1.1.1.1 forbids too; trailing bytes in the bands layer; and the
-under-fill pixel value (#646). **The first three are decided below (#647).**
+under-fill pixel value (#646). **The first three are decided below (#647), the under-fill pixel
+value in the #646 amendment.**
 
 ### Continued again the same day: the rest of the same MUSTs (#647)
 
@@ -527,7 +529,7 @@ round-trips through `GraphicsProcessor::process`.
 
 **What this does not decide.** The under-fill pixel value (#646), the glyph, V-bar and band rules
 other than call 9, and any other codec. **The glyph, V-bar and band rules are decided below (#649),
-with NSCodec's two leniencies.**
+with NSCodec's two leniencies, and the under-fill pixel value in the #646 amendment.**
 
 ### Continued: glyph, V-bar and band geometry, and NSCodec's trailing bytes (#649)
 
@@ -593,7 +595,8 @@ numbers are in `docs/map/territory/bitmap-codecs.md`.
 
 **What this does not decide.** The under-fill pixel value (#646), what the core does on a decode
 error, any other codec, and a GLYPH_INDEX stream with no composite payload, which the decoder still
-stores as an all-zero glyph. **A stream with no composite payload is decided below (#651).**
+stores as an all-zero glyph. **A stream with no composite payload is decided below (#651), the
+under-fill pixel value in the #646 amendment.**
 
 ### Continued: a stream without GLYPH_HIT and with no composite payload (#651)
 
@@ -626,3 +629,54 @@ through `GraphicsProcessor::process`.
 
 **What this does not decide.** What CACHE_RESET does on a stream with a payload, and any other
 codec.
+
+## Amendment (2026-11-20, #646): a pixel a WireToSurface1 codec leaves unwritten keeps the surface's earlier pixel
+
+The #643 amendment's call 2 said the pixels no layer writes "keep what the tile held". The ClearCodec
+tile started as zero bytes and `justrdp::egfx` blitted all of it with alpha forced to 255, so those
+pixels painted opaque black. Call 2 is restated above, and the rule is widened to the whole
+WireToSurface1 contract by two calls.
+
+1. **A pixel of the destination rectangle that a ClearCodec or RemoteFX WireToSurface1 payload does
+   not write keeps the surface's earlier pixel.** `justrdp::egfx` seeds a scratch tile of the
+   rectangle's size with the surface's current pixels, and the part of the rectangle off the
+   surface with opaque black, what that part of either codec's tile painted before (ClearCodec's
+   zero bytes reached the surface with alpha forced to 255). The codec decodes onto the tile in place, and the tile is blitted only when the decode
+   succeeds, so a decode error still leaves the region as it was. That covers ClearCodec residual
+   under-fill, a ClearCodec stream whose bands or subcodecs leave gaps that no residual fills, and
+   RemoteFX pixels outside the frame's TS_RFX_REGION or its tile set. A ClearCodec glyph stores the
+   tile as decoded onto its seed, so a GLYPH_HIT draws the store site's earlier pixels where the
+   stream wrote nothing.
+2. **A ClearCodec NSCodec subcodec writes alpha `0xFF`.** It passed its alpha plane through, so the
+   decoder's "every pixel a layer writes has alpha 0xFF" was false, hidden while egfx forced alpha
+   to 255, which the seeded tile no longer does. `[MS-RDPEGFX]` 3.3.5.1 ignores alpha for every
+   codec but ALPHA.
+
+**Kind: judgement**, the maintainer's (2026-11-19): the whole WireToSurface1 contract rather than
+ClearCodec under-fill alone, and option A, decoding onto a seeded tile, on the conductor's
+recommendation. They were shown a lens pass that found: the gap is wider than under-fill (any pixel
+no layer reaches, such as a stream with no residual and a subcodec over part of the rectangle; the
+decoder's own test pinned zero bytes under a band gap); RemoteFX has the same shape, starting from
+opaque black; FreeRDP 3.33.1 decodes both codecs straight into the surface (`gdi/gfx.c`), so the
+earlier pixel stays, and copies a ClearCodec glyph out of the surface (`clear.c`); the spec does not
+say what an unwritten pixel holds; no captured stream reaches this (both WS2019 ClearCodec corpora,
+854 streams and 1.32 M pixels, decode with no unwritten pixel), and whether real RemoteFX streams
+leave gaps was not measured; Progressive already blits only each rectangle it decodes; ADR-0010's
+`FrameUpdate` is untouched. Rejected: B, a blit masked on alpha 0, which cannot cover RemoteFX
+(its unwritten pixels have alpha 255) and rests on the NSCodec alpha this amendment's call 2 corrects; C, reversing
+the #643 call 2 and refusing under-fill, which leaves partial coverage open; D, painting black and
+widening the docs. A better derivation does not reopen these; the maintainer does.
+
+**Derived, not judged:** the tile's pixel order (the surface's RGBA, swapped to BGRA around a
+ClearCodec decode), the off-surface seed, and that the seed copy is not charged to `call_spent` on
+its own (`docs/map/territory/egfx-graphics-pipeline.md`).
+
+**Measured after the change.** Both WS2019 ClearCodec captures replay with no error and
+byte-identical to the `ironrdp-graphics` oracle on a zero seed, and the RemoteFX corpus still
+matches FreeRDP's tile digests on an opaque-black seed, the buffer FreeRDP was given. The proofs are
+wire-format round-trips through `GraphicsProcessor::process` over a pre-painted surface. The timing
+is in `docs/map/territory/bitmap-codecs.md`.
+
+**What this does not decide.** A new surface's initial content (#655), which a pixel no codec writes
+over a never-painted area now shows, in a glyph stored there too; Planar and uncompressed
+WireToSurface1, which cover the whole rectangle; Progressive; Surface Bits.

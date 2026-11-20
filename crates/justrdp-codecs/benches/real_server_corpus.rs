@@ -135,7 +135,9 @@ fn graphics(c: &mut Criterion) {
         &records("remotefx/ws2019-thin-client.bin"),
         RemoteFx::new,
         |d, r| {
-            black_box(d.decode_to_rgba(&r.payload, r.a, r.b).unwrap());
+            let mut out = vec![0; usize::from(r.a) * usize::from(r.b) * 4];
+            black_box(d.decode_to_rgba(&r.payload, r.a, r.b, &mut out).unwrap());
+            black_box(out);
         },
     );
     session(
@@ -144,7 +146,9 @@ fn graphics(c: &mut Criterion) {
         &clearcodec_records(),
         ClearDecoder::new,
         |d, r| {
-            black_box(d.decode(&r.payload, r.a, r.b).unwrap());
+            let mut tile = vec![0; usize::from(r.a) * usize::from(r.b) * 4];
+            d.decode(&r.payload, r.a, r.b, &mut tile).unwrap();
+            black_box(tile);
         },
     );
     session(

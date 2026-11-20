@@ -40,8 +40,8 @@ attacker-controlled bytes in the repo.
   both functions), and that is not followed: `[MS-RDPEGFX]` 2.2.4.1.1.1 says the residual layer
   encodes "less than or equal to the number of pixels in the original image", and example
   4.1.1.2 decodes RLEX segments "until there is no more data left". The RLEX pages state no pixel
-  total. A pixel no layer reaches keeps what the tile held, which under the residual layer is zero
-  bytes, not the surface's earlier pixel.
+  total. A pixel no layer reaches keeps what the tile held, which `justrdp::egfx` seeds with the
+  surface's earlier pixel (#646, the next bullet).
   Measured with the corpus census in `clearcodec_corpus.rs`, a parser independent of the
   decoder: `replay.bin` holds 26 RLEX regions and 32 residual layers, `replay-text.bin` 81 and
   37, and every one fills its rectangle exactly, so no captured stream reaches either the refusal
@@ -57,6 +57,38 @@ attacker-controlled bytes in the repo.
   census counts 8 inexact regions, the 8 single-palette ones (#587). `[MS-RDPEGFX]` example 4.1.1.2
   is decoded as a test and fills its 78x17 region exactly. The NSCodec subcodec the corpus carries
   (entry 30) is decoded (`decode_nscodec_region`, epic #132).
+- **A ClearCodec or RemoteFX WireToSurface1 decode writes onto a tile its caller seeded, and a pixel
+  it does not write keeps the seed** (#646, the maintainer's call, 2026-11-19; recorded in
+  [ADR-0009](../../adr/0009-tolerant-negotiation-posture.md)'s #646 amendment).
+  `ClearDecoder::decode`, `Clear::decode_to_bgra` and `RemoteFx::decode_to_rgba` take a
+  `&mut [u8]` of `width × height × 4` bytes, a wrong length being `OutputLength`, instead of
+  returning a fresh buffer, and `decode_to_rgba` returns whether a tileset was decoded.
+  `justrdp::egfx` seeds the tile with the surface's current pixels, so ClearCodec under-fill,
+  bands or subcodecs that leave gaps, and RemoteFX pixels outside the region or the tile set keep
+  the surface's earlier pixel, as FreeRDP 3.33.1's decode into the surface does (`gdi/gfx.c`). A
+  ClearCodec glyph stores the tile as decoded onto its seed. A ClearCodec NSCodec subcodec writes
+  alpha `0xFF` (`[MS-RDPEGFX]` 3.3.5.1); it passed its alpha plane through, which egfx's forced
+  alpha hid. On an error the tile may hold part of the decode, which is why egfx decodes onto a copy
+  rather than into the surface. No captured stream leaves a pixel unwritten: both WS2019 ClearCodec
+  corpora replay byte-identical to the zero-initialised oracle on a zero seed, and the RemoteFX
+  corpus matches FreeRDP's digests on an opaque-black seed, the buffer FreeRDP was given. Each
+  module has a property whose model of which pixels a stream writes is written apart from the
+  decoder; `egfx.rs` proves each case through `GraphicsProcessor::process`. The
+  `clearcodec_session` fuzz target decodes every frame through two decoders, one onto a tile of
+  `0x00` bytes and one onto `0xFF`, and requires each pixel of an `Ok` to be written the same
+  on both or to keep each side's seed, so a write that depends on the seed fails; a glyph-hit
+  area check that let a glyph of another area through panics in the copy onto the tile. That
+  target was not run (`cargo fuzz` does not link on the Windows host), and its check was not
+  watched failing.
+  **Timing** (2026-11-20, alternating pairs per `docs/agents/thegraph.md`, five each, pinned to
+  one core, the host shared with other sessions): the codec benches moved inside their spread,
+  `clearcodec` 0.96–1.12 ms on master against 0.87–1.06 ms, `remotefx` 166–182 ms against
+  147–188 ms with one run at 256 ms. The seed copy is in egfx, which these benches do not time, so a
+  throwaway bench replayed the same corpora through each egfx arm's old and new work. ClearCodec's
+  old arm (decode onto a zeroed buffer, then `color::to_rgba` into a second one) took 1.29–1.70 ms
+  and the new one (seed copy, R/B swap, decode, swap back) 1.21–1.52 ms, lower in all five pairs,
+  because the swap in place replaces an allocating conversion. RemoteFX's old arm took
+  158–181 ms and the new one 161–270 ms: the minimum is 2 % higher, inside the spread.
 - **ClearCodec refuses trailing layer bytes, a zero residual `runLengthFactor1` and a raw
   subcodec that is not exactly `3 * width * height` bytes** (the maintainer's call, 2026-11-18,
   continuing ADR-0009's #643 amendment). Bytes after a residual layer's last whole run segment
@@ -172,7 +204,8 @@ attacker-controlled bytes in the repo.
 - **Stage boundaries are the unit of verification** where the assembled decoder has
   no counterpart to compare against (RemoteFX, ADR-0007).
 - **Decoders write into a caller-provided buffer** wherever the frame path allows
-  it, rather than returning an owned `Vec` — the copy ADR-0010 removed.
+  it, rather than returning an owned `Vec` — the copy ADR-0010 removed. ClearCodec and RemoteFX
+  WireToSurface1 do since #646.
 - **RemoteFX has two block namespaces that collide by value.** WireToSurface1's
   `TS_RFX_*` and WireToSurface2's `RFX_PROGRESSIVE_*` both number their blocks
   `0xCCCx`, and only **two of the eight agree** — `0xCCC0` Sync and `0xCCC3` Context.
@@ -320,7 +353,11 @@ attacker-controlled bytes in the repo.
   [EGFX](egfx-graphics-pipeline.md). On 64-bit the arithmetic guard refuses nothing at
   all: 65535 x 65535 x 4 fits, and a 93-byte tileset returned `Ok` after allocating
   16 GiB in 18.9 s. Two halves, two owners, stated so neither is read as covering the
-  other.
+  other. Since #646 the codec allocates nothing: it takes the caller's `width × height × 4`
+  buffer or refuses it as `OutputLength`, and egfx's `seed_tile` refuses a rectangle above
+  `MAX_TOTAL_SURFACE_BYTES` before it allocates the tile. The no-panic property hands each
+  case a buffer of its rectangle's size up to 1 MiB and an empty one past that, so its widened
+  dimensions reach the length refusal on 64-bit rather than an allocation.
 - **A no-panic property whose generator is bounded to the parser's range asserts the
   parser, not the function.** `nscodec`'s `reconstruct_never_panics_on_arbitrary_input`
   documented itself as covering *"any colour-loss level"* and generated `1u8..=7`.

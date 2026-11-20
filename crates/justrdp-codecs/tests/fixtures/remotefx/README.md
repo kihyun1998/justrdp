@@ -58,7 +58,7 @@ built in WSL Ubuntu 24.04 with gcc and `-DWITH_SIMD=OFF`, linked by a short C ha
 2. makes one `rfx_context_new(FALSE)` with `PIXEL_FORMAT_RGBA32`, and feeds it every record in
    order;
 3. per record, fills a `width × height` buffer with opaque black (`00 00 00 ff`), the value this
-   decoder leaves outside the region, and calls
+   decoder left outside the region until it took a caller's buffer (#646), and calls
    `rfx_process_message(ctx, payload, len, 0, 0, buf, PIXEL_FORMAT_RGBA32, width * 4, height, &r)`.
 
 A Python script turned the concatenated buffers into the digests. Neither is in the repository;

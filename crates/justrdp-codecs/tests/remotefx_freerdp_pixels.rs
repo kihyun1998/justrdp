@@ -78,11 +78,14 @@ fn every_tile_of_the_remotefx_corpus_decodes_to_freerdps_pixels() {
             "record {i}: the digests were made for another rectangle"
         );
         at += 4;
-        let rgba = remotefx
-            .decode_to_rgba(payload, *width, *height)
-            .unwrap_or_else(|e| panic!("record {i}: {e}"))
-            .unwrap_or_else(|| panic!("record {i}: no tileset"));
         let (w, h) = (usize::from(*width), usize::from(*height));
+        let mut rgba = [0, 0, 0, 255].repeat(w * h);
+        assert!(
+            remotefx
+                .decode_to_rgba(payload, *width, *height, &mut rgba)
+                .unwrap_or_else(|e| panic!("record {i}: {e}")),
+            "record {i}: no tileset"
+        );
         for (t, digest) in tile_digests(&rgba, w, h).into_iter().enumerate() {
             let want = u64::from_le_bytes(expected[at..at + 8].try_into().unwrap());
             if digest != want {

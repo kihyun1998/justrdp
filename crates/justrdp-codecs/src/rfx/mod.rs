@@ -97,6 +97,15 @@ pub enum RfxError {
         /// The requested height.
         height: u16,
     },
+    /// The caller's output buffer is not `width × height × 4` bytes.
+    OutputLength {
+        /// The requested width.
+        width: u16,
+        /// The requested height.
+        height: u16,
+        /// The length of the buffer the caller passed.
+        len: usize,
+    },
 }
 
 impl core::fmt::Display for RfxError {
@@ -119,6 +128,9 @@ impl core::fmt::Display for RfxError {
             }
             RfxError::DimensionsOverflow { width, height } => {
                 write!(f, "{width}x{height} pixels overflow usize on this target")
+            }
+            RfxError::OutputLength { width, height, len } => {
+                write!(f, "a {len}-byte buffer is not {width}x{height} RGBA pixels")
             }
         }
     }
@@ -154,16 +166,23 @@ impl RemoteFx {
         Self::default()
     }
 
-    /// Decode one WireToSurface1 CAVIDEO payload into top-down RGBA8888 of the destination
-    /// rectangle's `width × height`, or `Ok(None)` for a payload carrying headers only (no
-    /// tileset). Tiles land at `(x_idx·64, y_idx·64)` relative to the rectangle's origin,
-    /// masked to the frame's TS_RFX_REGION; uncovered pixels are opaque black.
+    /// Decode one WireToSurface1 CAVIDEO payload onto `out`, top-down RGBA8888 of the destination
+    /// rectangle's `width × height` that the caller has seeded. Tiles land at
+    /// `(x_idx·64, y_idx·64)` relative to the rectangle's origin, masked to the frame's
+    /// TS_RFX_REGION; a pixel outside the region or the tile set keeps the seed. `justrdp::egfx`
+    /// seeds `out` with the surface's current pixels.
+    ///
+    /// Returns `Ok(true)` once a tileset was decoded, and `Ok(false)` for a payload carrying
+    /// headers only, which leaves `out` as it was. On an error `out` may hold part of the
+    /// decode, so a caller that must leave its destination untouched decodes onto a copy. A
+    /// buffer of the wrong length is [`RfxError::OutputLength`].
     pub fn decode_to_rgba(
         &mut self,
         data: &[u8],
         width: u16,
         height: u16,
-    ) -> Result<Option<Vec<u8>>, RfxError> {
+        out: &mut [u8],
+    ) -> Result<bool, RfxError> {
         let (w, h) = (usize::from(width), usize::from(height));
         // The output buffer is `w * h * 4` bytes and both factors are `u16`s a server chose:
         // `[MS-RDPEGFX]` 2.2.1.2 bounds a `RDPGFX_RECT16`'s fields at `u16` and nothing else, and
@@ -172,25 +191,18 @@ impl RemoteFx {
         // ([the invariant](../../../../docs/map/invariant/decoder-dimension-overflow-32bit.md)).
         // Refused once, here, before a single block is walked — a rectangle whose pixels cannot
         // be addressed is not decodable at all, so there is nothing to be tolerant *of*.
-        //
-        // What this does **not** do is bound the *magnitude* below `isize::MAX`. On 64-bit the
-        // same product fits and 93 bytes of tileset buy a 16 GiB allocation (measured, #263);
-        // that half is **bounded** — not closed — by `justrdp::egfx` refusing a rectangle larger
-        // than any admissible surface before it reaches any codec. A magnitude comparison here
-        // would reach it too, so the reason it is not here is ownership rather than visibility:
-        // the number that would make such a cap principled is `MAX_TOTAL_SURFACE_BYTES`, which
-        // belongs to the surface model and not to a codec. Keeping the two separate is
-        // deliberate — this is the totality
-        // [ADR-0012](../../../../docs/adr/0012-consumption-site-totality.md) §1 requires of a
-        // `pub fn`'s own signature, that is reachability.
         let out_len = w
             .checked_mul(h)
             .and_then(|n| n.checked_mul(4))
-            // `isize::MAX`, not `usize::MAX` — see `crate::allocatable`, which is the family's
-            // one answer to that threshold. Measured on i686: `40000 x 20000 x 4` is
-            // 3_200_000_000, passes `checked_mul`, and then panics with *capacity overflow*.
             .and_then(crate::allocatable)
             .ok_or(RfxError::DimensionsOverflow { width, height })?;
+        if out.len() != out_len {
+            return Err(RfxError::OutputLength {
+                width,
+                height,
+                len: out.len(),
+            });
+        }
         // Before the parse, not after it. The sibling codecs check their dimensions first
         // (`planar.rs`, `nscodec.rs`) and the reason is measurable here: behind `decode_all`,
         // this arm is reachable only by a payload that parses as a TILESET, which random bytes
@@ -198,7 +210,7 @@ impl RemoteFx {
         // ways; see that property's note.
         let messages = rfx::decode_all(data)?;
 
-        let mut out: Option<Vec<u8>> = None;
+        let mut painted = false;
         // The clip region in force for the current frame: `None` until a TS_RFX_REGION
         // arrives (clip to the full rectangle), then that region's rects. A region with
         // numRects==0 means the *whole surface*, not an empty clip ([MS-RDPRFX] 2.2.2.3.3),
@@ -237,7 +249,7 @@ impl RemoteFx {
                     if self.video_mode {
                         return Err(RfxError::VideoMode);
                     }
-                    let out = out.get_or_insert_with(|| opaque_black(out_len));
+                    painted = true;
                     for tile in &tileset.tiles {
                         decode_tile(
                             tile,
@@ -257,7 +269,7 @@ impl RemoteFx {
                 | RfxMessage::FrameEnd => {}
             }
         }
-        Ok(out)
+        Ok(painted)
     }
 }
 
@@ -276,16 +288,6 @@ impl Default for TilePlanes {
             cr: vec![0; COMPONENT_LEN],
         }
     }
-}
-
-/// Takes the byte count rather than the dimensions, so the caller's `checked_mul` is the only
-/// place the product is formed and this function has no arithmetic left to get wrong.
-fn opaque_black(len: usize) -> Vec<u8> {
-    let mut out = vec![0u8; len];
-    for px in out.as_chunks_mut::<4>().0 {
-        px[3] = 255;
-    }
-    out
 }
 
 /// Run one tile through the full inverse chain into `tile_rgba` (64×64×4).
@@ -395,13 +397,6 @@ mod tests {
         // is what separated them — a widened generator alone would have been machinery that
         // reads as coverage.
         //
-        // Residue, stated rather than left implicit: on a **64-bit** target the widened arms
-        // refuse nothing, because 65535 x 65535 x 4 fits. A case that reached a valid TILESET
-        // there would allocate 16 GiB rather than fail — unreachable by chance for the same
-        // reason as above, and bounded a layer out in `justrdp::egfx`, not here. What this
-        // property still cannot reach on any target is `opaque_black` itself; the directed test
-        // above is what covers that.
-        //
         // A fresh decoder per case keeps each run independent of the persisted video-mode verdict.
         // Reaching the end without unwinding IS the assertion — proptest fails (and shrinks to a
         // minimal counterexample) on any panic / arithmetic overflow / OOB.
@@ -412,7 +407,51 @@ mod tests {
             height in prop_oneof![6 => 0u16..=128, 2 => 60_000u16..=u16::MAX, 1 => any::<u16>()],
             data in proptest::collection::vec(any::<u8>(), 0..=512),
         ) {
-            let _ = RemoteFx::new().decode_to_rgba(&data, width, height);
+            let len = usize::from(width)
+                .checked_mul(usize::from(height))
+                .and_then(|n| n.checked_mul(4))
+                .filter(|&n| n <= 1 << 20)
+                .unwrap_or(0);
+            let _ = RemoteFx::new().decode_to_rgba(&data, width, height, &mut vec![0; len]);
+        }
+
+        #[test]
+        fn a_pixel_keeps_the_seed_exactly_outside_the_region_and_tiles(
+            width in 1u16..=140,
+            height in 1u16..=140,
+            rect in (0u16..140, 0u16..140, 1u16..=140, 1u16..=140),
+            tiles in proptest::collection::btree_set((0u16..3, 0u16..3), 1..=4),
+            seeds in (any::<[u8; 4]>(), any::<[u8; 4]>()),
+        ) {
+            let tiles: Vec<_> = tiles.into_iter().map(|(x, y)| (x, y, vec![0x00; 8])).collect();
+            let frame = stream(&[rect], &tiles);
+            let (w, h) = (usize::from(width), usize::from(height));
+            let decode = |seed: [u8; 4]| {
+                let mut out = seed.repeat(w * h);
+                RemoteFx::new()
+                    .decode_to_rgba(&frame, width, height, &mut out)
+                    .map(|painted| (painted, out))
+            };
+            let (a, b) = (decode(seeds.0), decode(seeds.1));
+            prop_assert_eq!(a.as_ref().map(|r| r.0), Ok(true));
+            let (a, b) = (a.unwrap().1, b.unwrap().1);
+            let (rx, ry) = (usize::from(rect.0), usize::from(rect.1));
+            let (rw, rh) = (usize::from(rect.2), usize::from(rect.3));
+            for y in 0..h {
+                for x in 0..w {
+                    let in_region = (rx..rx + rw).contains(&x) && (ry..ry + rh).contains(&y);
+                    let in_tiles = tiles
+                        .iter()
+                        .any(|(tx, ty, _)| x / 64 == usize::from(*tx) && y / 64 == usize::from(*ty));
+                    let i = (y * w + x) * 4;
+                    if in_region && in_tiles {
+                        prop_assert_eq!(&a[i..i + 4], &b[i..i + 4], "({}, {}) is written", x, y);
+                    } else {
+                        prop_assert_eq!(&a[i..i + 4], &seeds.0[..], "({}, {}) keeps seed 0", x, y);
+                        prop_assert_eq!(&b[i..i + 4], &seeds.1[..], "({}, {}) keeps seed 1", x, y);
+                    }
+                }
+            }
         }
     }
 
@@ -504,7 +543,7 @@ mod tests {
     fn a_rect_whose_rgba_cannot_be_addressed_is_a_typed_error_not_a_panic() {
         let frame = stream(&[(0, 0, 64, 64)], &[(0, 0, vec![0x00; 8])]);
         assert_eq!(
-            RemoteFx::new().decode_to_rgba(&frame, u16::MAX, u16::MAX),
+            RemoteFx::new().decode_to_rgba(&frame, u16::MAX, u16::MAX, &mut []),
             Err(RfxError::DimensionsOverflow {
                 width: u16::MAX,
                 height: u16::MAX,
@@ -518,14 +557,18 @@ mod tests {
         // reason had everything to do with the guard, which was written against the wrong
         // ceiling.
         assert_eq!(
-            RemoteFx::new().decode_to_rgba(&frame, 40_000, 20_000),
+            RemoteFx::new().decode_to_rgba(&frame, 40_000, 20_000, &mut []),
             Err(RfxError::DimensionsOverflow {
                 width: 40_000,
                 height: 20_000,
             })
         );
         // And it must not over-refuse.
-        assert!(RemoteFx::new().decode_to_rgba(&frame, 64, 64).is_ok());
+        assert!(
+            RemoteFx::new()
+                .decode_to_rgba(&frame, 64, 64, &mut [0; 64 * 64 * 4])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -541,7 +584,25 @@ mod tests {
         data.push(0xFF);
         data.extend_from_slice(&ctx);
         let mut decoder = RemoteFx::new();
-        assert_eq!(decoder.decode_to_rgba(&data, 64, 64).unwrap(), None);
+        let mut out = vec![7; 64 * 64 * 4];
+        assert_eq!(decoder.decode_to_rgba(&data, 64, 64, &mut out), Ok(false));
+        assert_eq!(out, vec![7; 64 * 64 * 4], "the buffer is left as it was");
+    }
+
+    #[test]
+    fn a_buffer_of_the_wrong_length_is_an_error() {
+        let frame = stream(&[(0, 0, 64, 64)], &[(0, 0, vec![0x00; 8])]);
+        for len in [0, 64 * 64 * 4 - 1, 64 * 64 * 4 + 4] {
+            assert_eq!(
+                RemoteFx::new().decode_to_rgba(&frame, 64, 64, &mut vec![0; len]),
+                Err(RfxError::OutputLength {
+                    width: 64,
+                    height: 64,
+                    len
+                }),
+                "{len} bytes"
+            );
+        }
     }
 
     #[test]
@@ -557,36 +618,33 @@ mod tests {
         data.extend_from_slice(&ctx);
         let mut decoder = RemoteFx::new();
         assert_eq!(
-            decoder.decode_to_rgba(&data, 64, 64),
+            decoder.decode_to_rgba(&data, 64, 64, &mut [0; 64 * 64 * 4]),
             Err(RfxError::VideoMode)
         );
         // The verdict persists: a later tiles-only payload is still rejected.
         let frame = stream(&[(0, 0, 64, 64)], &[(0, 0, vec![0x00; 8])]);
         assert_eq!(
-            decoder.decode_to_rgba(&frame, 64, 64),
+            decoder.decode_to_rgba(&frame, 64, 64, &mut [0; 64 * 64 * 4]),
             Err(RfxError::VideoMode)
         );
     }
 
     #[test]
     fn an_all_zero_tile_paints_the_ict_black_inside_the_region_only() {
-        // All-zero coefficients → Y = Cb = Cr = 0 → the ICT's black-ish constant; outside
-        // the region the buffer keeps its opaque-black initialization. Both are computed
-        // through the real pipeline, so assert the *region masking*, not exact colors:
-        // a region narrower than the tile must leave the uncovered column untouched.
+        const SEED: [u8; 4] = [1, 2, 3, 4];
         let frame = stream(&[(0, 0, 32, 64)], &[(0, 0, vec![0x00; 8])]);
         let mut decoder = RemoteFx::new();
-        let rgba = decoder
-            .decode_to_rgba(&frame, 64, 64)
-            .expect("valid stream")
-            .expect("a tileset paints");
-        assert_eq!(rgba.len(), 64 * 64 * 4);
+        let mut rgba = SEED.repeat(96 * 64);
+        assert_eq!(decoder.decode_to_rgba(&frame, 96, 64, &mut rgba), Ok(true));
         // Inside the region: the decoded value for zero spectrum, alpha 255.
         let inside = &rgba[..4];
         assert_eq!(inside[3], 255);
-        // Outside the region (column 32+): exactly the opaque-black initialization.
-        let outside = &rgba[(32 * 4)..(32 * 4) + 4];
-        assert_eq!(outside, &[0, 0, 0, 255]);
+        let px = |x: usize, y: usize| &rgba[(y * 96 + x) * 4..(y * 96 + x) * 4 + 4];
+        assert_eq!(px(32, 0), SEED);
+        assert_eq!(px(63, 63), SEED);
+        assert_eq!(px(64, 0), SEED);
+        assert_eq!(px(95, 63), SEED);
+        assert_eq!(px(31, 63), inside);
         // And the decoded zero-spectrum pixel differs from raw black (Y=0 maps to 128-ish
         // luma via the +4096 level shift), proving the pipeline actually ran.
         assert_ne!(inside, &[0u8, 0, 0, 255][..]);
@@ -600,13 +658,8 @@ mod tests {
         // masked out would reintroduce the black-region symptom the RemoteFX work removed.
         let frame = stream(&[], &[(0, 0, vec![0x00; 8])]);
         let mut decoder = RemoteFx::new();
-        let rgba = decoder
-            .decode_to_rgba(&frame, 64, 64)
-            .expect("valid stream")
-            .expect("a tileset paints");
-        assert_eq!(rgba.len(), 64 * 64 * 4);
-        // The decoded zero-spectrum value (not the opaque-black init) must appear — proving the
-        // tile painted rather than being clipped away by an empty region.
+        let mut rgba = [0, 0, 0, 255].repeat(64 * 64);
+        assert_eq!(decoder.decode_to_rgba(&frame, 64, 64, &mut rgba), Ok(true));
         let decoded = &rgba[..4];
         assert_ne!(
             decoded,
@@ -624,10 +677,7 @@ mod tests {
         // A tile at grid (1, 1) against a 70×70 rectangle: only its 6×6 corner lands.
         let frame = stream(&[(0, 0, 70, 70)], &[(1, 1, vec![0x00; 8])]);
         let mut decoder = RemoteFx::new();
-        let rgba = decoder
-            .decode_to_rgba(&frame, 70, 70)
-            .expect("valid stream")
-            .expect("a tileset paints");
-        assert_eq!(rgba.len(), 70 * 70 * 4);
+        let mut rgba = vec![0; 70 * 70 * 4];
+        assert_eq!(decoder.decode_to_rgba(&frame, 70, 70, &mut rgba), Ok(true));
     }
 }

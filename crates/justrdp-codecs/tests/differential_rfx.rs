@@ -583,10 +583,13 @@ fn full_payload_rgba_matches_the_composed_oracle_reference() {
         ] {
             let stream = build_stream(mode, &quant, &rects, &tiles);
             let mut decoder = ours::RemoteFx::new();
-            let mine = decoder
-                .decode_to_rgba(&stream, 128, 128)
-                .expect("our decoder accepts the oracle's stream")
-                .expect("a tileset paints");
+            let mut mine = [0, 0, 0, 255].repeat(128 * 128);
+            assert!(
+                decoder
+                    .decode_to_rgba(&stream, 128, 128, &mut mine)
+                    .expect("our decoder accepts the oracle's stream"),
+                "a tileset paints"
+            );
             let theirs = reference_decode(&stream, 128, 128);
             assert_eq!(
                 mine, theirs,

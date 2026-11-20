@@ -266,6 +266,20 @@ impl Surface {
         w * h * 4
     }
 
+    fn copy_into(&self, x: u16, y: u16, w: u16, h: u16, tile: &mut [u8]) {
+        let on_w = usize::from(w.min(self.width.saturating_sub(x)));
+        let on_h = usize::from(h.min(self.height.saturating_sub(y)));
+        if on_w == 0 || on_h == 0 {
+            return;
+        }
+        let stride = usize::from(self.width) * 4;
+        let tile_stride = usize::from(w) * 4;
+        for row in 0..on_h {
+            let src = (usize::from(y) + row) * stride + usize::from(x) * 4;
+            tile[row * tile_stride..][..on_w * 4].copy_from_slice(&self.rgba[src..][..on_w * 4]);
+        }
+    }
+
     /// Extract a rectangle (clipped) as `(width, height, tight RGBA)`.
     ///
     /// The reserve is total by construction, for the same reason `Surface::bytes` is and stated
@@ -348,6 +362,12 @@ fn note_budget(pdu: &'static str, declared: usize, painted: usize) {
             skipped = declared - painted,
             "per-frame paint budget reached; the remaining entries were skipped",
         );
+    }
+}
+
+fn swap_red_blue(pixels: &mut [u8]) {
+    for px in pixels.as_chunks_mut::<4>().0 {
+        px.swap(0, 2);
     }
 }
 
@@ -451,6 +471,10 @@ fn invalid(field: &'static str, reason: &'static str) -> DecodeError {
 }
 
 impl GraphicsProcessor {
+    fn surface(&self, id: u16) -> Option<&Surface> {
+        self.surfaces.iter().find(|s| s.id == id)
+    }
+
     fn surface_mut(&mut self, id: u16) -> Option<&mut Surface> {
         self.surfaces.iter_mut().find(|s| s.id == id)
     }
@@ -476,6 +500,7 @@ impl GraphicsProcessor {
     fn decode_wts1(
         &mut self,
         codec_id: u16,
+        surface_id: u16,
         rect: Rect16,
         data: &[u8],
     ) -> Result<Option<Vec<u8>>, DecodeError> {
@@ -530,36 +555,54 @@ impl GraphicsProcessor {
                 Ok(Some(rgba))
             }
             egfx::CODECID_CLEARCODEC => {
-                let Ok(bgra) = self.clear.decode_to_bgra(data, w, h).map_err(|e| {
+                let mut tile = self.seed_tile(surface_id, rect)?;
+                swap_red_blue(&mut tile);
+                if let Err(e) = self.clear.decode_to_bgra(data, w, h, &mut tile) {
                     tracing::warn!(target: "rdp_egfx", error = %e, "ClearCodec WTS1 decode failed — region skipped");
-                }) else {
                     return Ok(None);
-                };
-                let Ok(rgba) = color::to_rgba(&bgra, uw, uh, 32, &Palette::default(), false)
-                    .map_err(|e| {
-                        tracing::warn!(target: "rdp_egfx", error = %e, "ClearCodec conversion failed — region skipped");
-                    })
-                else {
-                    return Ok(None);
-                };
-                Ok(Some(rgba))
+                }
+                swap_red_blue(&mut tile);
+                Ok(Some(tile))
             }
-            // RemoteFX non-progressive: the self-owned TS_RFX decoder (issue #58). A
-            // headers-only payload legitimately paints nothing (`Ok(None)` from the codec);
-            // a malformed stream warn-and-skips like the sibling codecs.
+            // RemoteFX non-progressive: the self-owned TS_RFX decoder (issue #58).
             egfx::CODECID_CAVIDEO => {
-                let Ok(rgba) = self.remotefx.decode_to_rgba(data, w, h).map_err(|e| {
-                    tracing::warn!(target: "rdp_egfx", error = %e, "RemoteFX WTS1 decode failed — region skipped");
-                }) else {
-                    return Ok(None);
-                };
-                Ok(rgba)
+                let mut tile = self.seed_tile(surface_id, rect)?;
+                match self.remotefx.decode_to_rgba(data, w, h, &mut tile) {
+                    Ok(true) => Ok(Some(tile)),
+                    Ok(false) => Ok(None),
+                    Err(e) => {
+                        tracing::warn!(target: "rdp_egfx", error = %e, "RemoteFX WTS1 decode failed — region skipped");
+                        Ok(None)
+                    }
+                }
             }
             other => {
                 tracing::debug!(target: "rdp_egfx", codec_id = other, "unsupported WTS1 codec skipped");
                 Ok(None)
             }
         }
+    }
+
+    fn seed_tile(&self, surface_id: u16, rect: Rect16) -> Result<Vec<u8>, DecodeError> {
+        let surface = self.surface(surface_id).ok_or_else(|| {
+            invalid(
+                "RDPGFX_WIRE_TO_SURFACE_PDU_1",
+                "unknown destination surface",
+            )
+        })?;
+        let (w, h) = (rect.width(), rect.height());
+        let pixels = usize::from(w)
+            .checked_mul(usize::from(h))
+            .filter(|&px| px <= MAX_TOTAL_SURFACE_BYTES / 4)
+            .ok_or_else(|| {
+                invalid(
+                    "RDPGFX_WIRE_TO_SURFACE_PDU_1",
+                    "destination rectangle is larger than any admissible surface",
+                )
+            })?;
+        let mut tile = [0, 0, 0, 0xFF].repeat(pixels);
+        surface.copy_into(rect.left, rect.top, w, h, &mut tile);
+        Ok(tile)
     }
 
     /// Handle one decoded EGFX PDU, accumulating processor outputs.
@@ -776,7 +819,7 @@ impl GraphicsProcessor {
                 self.frame_paint += decoded;
                 self.call_spent += decoded;
                 if let Some(rgba) = self
-                    .decode_wts1(codec_id, dest_rect, data)
+                    .decode_wts1(codec_id, surface_id, dest_rect, data)
                     .map_err(Failure::Miss)?
                 {
                     let surface = self.surface_mut(surface_id).ok_or(miss(
@@ -2693,28 +2736,37 @@ mod tests {
 
     /// A WireToSurface1 body carrying ClearCodec `stream` for a 4x1 rect at the surface origin.
     fn clear_4x1(stream: &[u8]) -> Vec<u8> {
+        clear_wts1([0, 0, 4, 1], stream)
+    }
+
+    fn clear_wts1(rect: [u16; 4], stream: &[u8]) -> Vec<u8> {
+        wts1_body(egfx::CODECID_CLEARCODEC, rect, stream)
+    }
+
+    fn wts1_body(codec_id: u16, rect: [u16; 4], payload: &[u8]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&egfx::CODECID_CLEARCODEC.to_le_bytes());
+        b.extend_from_slice(&codec_id.to_le_bytes());
         b.push(egfx::PIXEL_FORMAT_XRGB_8888);
-        for v in [0u16, 0, 4, 1] {
+        for v in rect {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        b.extend_from_slice(&(stream.len() as u32).to_le_bytes());
-        b.extend_from_slice(stream);
+        b.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        b.extend_from_slice(payload);
         b
     }
 
     /// One ClearCodec subcodec region at the origin: `width`x1, `codec_id`, `bitmap` verbatim.
     fn clear_subcodec(width: u16, codec_id: u8, bitmap: &[u8]) -> Vec<u8> {
-        let mut s = Vec::new();
-        for v in [0u16, 0, width, 1] {
-            s.extend_from_slice(&v.to_le_bytes());
-        }
-        s.extend_from_slice(&(bitmap.len() as u32).to_le_bytes());
-        s.push(codec_id);
-        s.extend_from_slice(bitmap);
-        s
+        clear_subcodec_at([0, 0, width, 1], codec_id, bitmap)
+    }
+
+    fn rgb(rgba: &[u8]) -> Vec<[u8; 3]> {
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| [px[0], px[1], px[2]])
+            .collect()
     }
 
     /// A ClearCodec stream holding `residual` and `subcodecs` verbatim, with no bands layer.
@@ -2762,11 +2814,7 @@ mod tests {
                 height: 1,
             },
         );
-        row.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|px| [px[0], px[1], px[2]])
-            .collect()
+        rgb(&row)
     }
 
     const GREY: [u8; 3] = [0x80; 3];
@@ -2796,8 +2844,8 @@ mod tests {
         );
         assert_eq!(
             clear_over_grey(&white(2)),
-            vec![WHITE, WHITE, [0; 3], [0; 3]],
-            "under-fill paints what it carries, and the tile's zero bytes over the rest"
+            vec![WHITE, WHITE, GREY, GREY],
+            "under-fill paints what it carries and keeps the surface's earlier pixels (#646)"
         );
     }
 
@@ -2859,6 +2907,227 @@ mod tests {
         let mut bitmap = vec![10, 20, 30, 40, 50, 60];
         bitmap.extend_from_slice(extra);
         clear_subcodec(2, 0x00, &bitmap)
+    }
+
+    fn clear_subcodec_at(rect: [u16; 4], codec_id: u8, bitmap: &[u8]) -> Vec<u8> {
+        let mut s = Vec::new();
+        for v in rect {
+            s.extend_from_slice(&v.to_le_bytes());
+        }
+        s.extend_from_slice(&(bitmap.len() as u32).to_le_bytes());
+        s.push(codec_id);
+        s.extend_from_slice(bitmap);
+        s
+    }
+
+    #[test]
+    fn a_clearcodec_stream_keeps_the_surface_pixels_it_does_not_write() {
+        let subcodec_only = clear_over_grey(&clear_layers(&[], &raw_2x1(&[])));
+
+        let stream = clear_bands(&clear_band_on(
+            [10, 20, 30],
+            [0, 1],
+            [0, 0],
+            &clear_white_short_miss(0).repeat(2),
+        ));
+        assert_eq!(
+            [subcodec_only, clear_over_grey(&stream)],
+            [
+                vec![[30, 20, 10], [60, 50, 40], GREY, GREY],
+                vec![RLEX_COLOR, RLEX_COLOR, GREY, GREY],
+            ],
+            "no residual layer and a subcodec over half the rect; a band over half the rect"
+        );
+    }
+
+    #[test]
+    fn a_clearcodec_seed_follows_the_rect_and_clips_at_the_surface_edge() {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        feed(
+            &mut p,
+            egfx::CMDID_SOLID_FILL,
+            &solid_fill_body(1, [0x80, 0x80, 0x80, 0], [0, 0, 8, 2]),
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_SOLID_FILL,
+            &solid_fill_body(1, [0, 0, 0xFF, 0], [2, 0, 3, 1]),
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_SOLID_FILL,
+            &solid_fill_body(1, [0xFF, 0, 0, 0], [7, 1, 8, 2]),
+        );
+        let raw_1x1 = clear_layers(&[], &clear_subcodec(1, 0x00, &[10, 20, 30]));
+        feed(
+            &mut p,
+            egfx::CMDID_WIRE_TO_SURFACE_1,
+            &clear_wts1([1, 0, 3, 1], &raw_1x1),
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_WIRE_TO_SURFACE_1,
+            &clear_wts1([6, 1, 10, 2], &raw_1x1),
+        );
+        map_surface(&mut p, 1, 0, 0);
+        let (fb, _) = flush(&mut p);
+        let rows = region(
+            &fb,
+            &FrameUpdate {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 2,
+            },
+        );
+        let (raw, red, blue) = ([30, 20, 10], [0xFF, 0, 0], [0, 0, 0xFF]);
+        assert_eq!(
+            rgb(&rows),
+            [
+                vec![GREY, raw, red, GREY, GREY, GREY, GREY, GREY],
+                vec![GREY, GREY, GREY, GREY, GREY, GREY, raw, blue],
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn a_clearcodec_glyph_stored_over_the_surface_edge_draws_opaque_black_for_the_part_off_it() {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        feed(
+            &mut p,
+            egfx::CMDID_SOLID_FILL,
+            &solid_fill_body(1, [0x80, 0x80, 0x80, 0], [0, 0, 8, 2]),
+        );
+        let mut store = vec![0x01, 0x00, 5, 0];
+        store.extend_from_slice(&clear_layers(&[], &clear_subcodec(1, 0x00, &[10, 20, 30]))[2..]);
+        feed(
+            &mut p,
+            egfx::CMDID_WIRE_TO_SURFACE_1,
+            &clear_wts1([6, 0, 10, 1], &store),
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_WIRE_TO_SURFACE_1,
+            &clear_wts1([0, 1, 4, 2], &[0x03, 0x01, 5, 0]),
+        );
+        map_surface(&mut p, 1, 0, 0);
+        let (fb, _) = flush(&mut p);
+        let row = region(
+            &fb,
+            &FrameUpdate {
+                x: 0,
+                y: 1,
+                width: 4,
+                height: 1,
+            },
+        );
+        assert_eq!(
+            row,
+            [
+                [30, 20, 10, 255],
+                [0x80, 0x80, 0x80, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255]
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn decode_wts1_refuses_a_rectangle_no_surface_could_hold_before_seeding_it() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 64, 64);
+        for codec in [egfx::CODECID_CLEARCODEC, egfx::CODECID_CAVIDEO] {
+            for (right, bottom) in [(8193, 8192), (u16::MAX, u16::MAX)] {
+                let rect = Rect16 {
+                    left: 0,
+                    top: 0,
+                    right,
+                    bottom,
+                };
+                assert_eq!(
+                    p.decode_wts1(codec, 1, rect, &[0, 0]),
+                    Err(invalid(
+                        "RDPGFX_WIRE_TO_SURFACE_PDU_1",
+                        "destination rectangle is larger than any admissible surface"
+                    )),
+                    "codec {codec:#x}, {right}x{bottom}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_clearcodec_nscodec_subcodec_paints_opaque_pixels_whatever_its_alpha_plane() {
+        let mut nsc = Vec::new();
+        for _ in 0..4 {
+            nsc.extend_from_slice(&7u32.to_le_bytes());
+        }
+        nsc.extend_from_slice(&[1, 0, 0, 0]);
+        for v in [100u8, 10, 5, 0] {
+            nsc.extend_from_slice(&[v, v, 10, v, v, v, v]);
+        }
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        feed(
+            &mut p,
+            egfx::CMDID_WIRE_TO_SURFACE_1,
+            &clear_wts1(
+                [0, 0, 4, 4],
+                &clear_layers(&[], &clear_subcodec_at([0, 0, 4, 4], 0x01, &nsc)),
+            ),
+        );
+        map_surface(&mut p, 1, 0, 0);
+        let (fb, _) = flush(&mut p);
+        let tile = region(
+            &fb,
+            &FrameUpdate {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+        );
+        assert_eq!(tile, [105, 105, 85, 255].repeat(16));
+    }
+
+    #[test]
+    fn a_clearcodec_glyph_stored_with_gaps_draws_the_store_sites_pixels_on_a_hit() {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        feed(
+            &mut p,
+            egfx::CMDID_SOLID_FILL,
+            &solid_fill_body(1, [0x80, 0x80, 0x80, 0], [0, 0, 4, 1]),
+        );
+        let mut store = vec![0x01, 0x00, 5, 0];
+        store.extend_from_slice(&clear_layers(&[], &clear_subcodec(1, 0x00, &[10, 20, 30]))[2..]);
+        feed(
+            &mut p,
+            egfx::CMDID_WIRE_TO_SURFACE_1,
+            &clear_wts1([0, 0, 2, 1], &store),
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_SOLID_FILL,
+            &solid_fill_body(1, [0, 0, 0xFF, 0], [2, 0, 4, 1]),
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_WIRE_TO_SURFACE_1,
+            &clear_wts1([2, 0, 4, 1], &[0x03, 0x01, 5, 0]),
+        );
+        map_surface(&mut p, 1, 0, 0);
+        let (fb, _) = flush(&mut p);
+        let row = region(
+            &fb,
+            &FrameUpdate {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+        );
+        assert_eq!(rgb(&row), vec![[30, 20, 10], GREY, [30, 20, 10], GREY]);
     }
 
     /// ClearCodec subcodec bytes short of a whole subcodec and a raw subcodec larger than its
@@ -3100,11 +3369,15 @@ mod tests {
     }
 
     fn clear_band(x: [u16; 2], y: [u16; 2], vbars: &[u8]) -> Vec<u8> {
+        clear_band_on([0, 0, 0], x, y, vbars)
+    }
+
+    fn clear_band_on(background: [u8; 3], x: [u16; 2], y: [u16; 2], vbars: &[u8]) -> Vec<u8> {
         let mut b = Vec::new();
         for v in [x[0], x[1], y[0], y[1]] {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        b.extend_from_slice(&[0, 0, 0]);
+        b.extend_from_slice(&background);
         b.extend_from_slice(vbars);
         b
     }
@@ -3602,7 +3875,7 @@ mod tests {
             bottom: u16::MAX,
         };
         assert_eq!(
-            p.decode_wts1(egfx::CODECID_UNCOMPRESSED, rect, &[0xAB; 16])
+            p.decode_wts1(egfx::CODECID_UNCOMPRESSED, 1, rect, &[0xAB; 16])
                 .unwrap_err(),
             invalid(
                 "RDPGFX_WIRE_TO_SURFACE_PDU_1",
@@ -3614,6 +3887,19 @@ mod tests {
     /// Build a minimal valid TS_RFX payload: one full-tile region plus one tile whose three
     /// components are the given RLGR bytes (entropy: RLGR1, quants: all-1 exponents).
     fn cavideo_payload(component: &[u8]) -> Vec<u8> {
+        cavideo_payload_in([0, 0, 64, 64], component)
+    }
+
+    fn cavideo_payload_in(region_rect: [u16; 4], component: &[u8]) -> Vec<u8> {
+        cavideo_payload_tiles(region_rect, &[(0, 0, 0)], &[[0x11; 5]], component)
+    }
+
+    fn cavideo_payload_tiles(
+        region_rect: [u16; 4],
+        tiles: &[(u16, u16, u8)],
+        quants: &[[u8; 5]],
+        component: &[u8],
+    ) -> Vec<u8> {
         fn push_block(out: &mut Vec<u8>, ty: u16, channel_id: u8, body: &[u8]) {
             out.extend_from_slice(&ty.to_le_bytes());
             out.extend_from_slice(&((8 + body.len()) as u32).to_le_bytes());
@@ -3624,37 +3910,120 @@ mod tests {
         let mut data = Vec::new();
         let mut region = vec![0x01u8];
         region.extend_from_slice(&1u16.to_le_bytes());
-        for v in [0u16, 0, 64, 64] {
+        for v in region_rect {
             region.extend_from_slice(&v.to_le_bytes());
         }
         region.extend_from_slice(&0xCAC1u16.to_le_bytes());
         region.extend_from_slice(&1u16.to_le_bytes());
         push_block(&mut data, 0xCCC6, 0, &region);
-        let mut tile = Vec::new();
-        tile.extend_from_slice(&0xCAC3u16.to_le_bytes());
-        tile.extend_from_slice(&((6 + 13 + component.len() * 3) as u32).to_le_bytes());
-        tile.extend_from_slice(&[0, 0, 0]); // quant indices
-        tile.extend_from_slice(&0u16.to_le_bytes()); // xIdx
-        tile.extend_from_slice(&0u16.to_le_bytes()); // yIdx
-        for _ in 0..3 {
-            tile.extend_from_slice(&(component.len() as u16).to_le_bytes());
-        }
-        for _ in 0..3 {
-            tile.extend_from_slice(component);
+        let mut tile_blocks = Vec::new();
+        for &(x_idx, y_idx, quant) in tiles {
+            tile_blocks.extend_from_slice(&0xCAC3u16.to_le_bytes());
+            tile_blocks.extend_from_slice(&((6 + 13 + component.len() * 3) as u32).to_le_bytes());
+            tile_blocks.extend_from_slice(&[quant; 3]);
+            tile_blocks.extend_from_slice(&x_idx.to_le_bytes());
+            tile_blocks.extend_from_slice(&y_idx.to_le_bytes());
+            for _ in 0..3 {
+                tile_blocks.extend_from_slice(&(component.len() as u16).to_le_bytes());
+            }
+            for _ in 0..3 {
+                tile_blocks.extend_from_slice(component);
+            }
         }
         let properties: u16 = 0x01 | (1 << 4) | (1 << 6) | (0x01 << 10) | (1 << 14);
         let mut tileset = Vec::new();
         tileset.extend_from_slice(&0xCAC2u16.to_le_bytes());
         tileset.extend_from_slice(&0u16.to_le_bytes());
         tileset.extend_from_slice(&properties.to_le_bytes());
-        tileset.push(1); // numQuant
+        tileset.push(quants.len() as u8); // numQuant
         tileset.push(64); // tileSize
-        tileset.extend_from_slice(&1u16.to_le_bytes()); // numTiles
-        tileset.extend_from_slice(&(tile.len() as u32).to_le_bytes());
-        tileset.extend_from_slice(&[0x11; 5]); // all-1 quant exponents (no shift)
-        tileset.extend_from_slice(&tile);
+        tileset.extend_from_slice(&(tiles.len() as u16).to_le_bytes()); // numTiles
+        tileset.extend_from_slice(&(tile_blocks.len() as u32).to_le_bytes());
+        for quant in quants {
+            tileset.extend_from_slice(quant);
+        }
+        tileset.extend_from_slice(&tile_blocks);
         push_block(&mut data, 0xCCC7, 0, &tileset);
         data
+    }
+
+    #[test]
+    fn a_remotefx_wts1_that_fails_after_its_first_tile_leaves_the_region_as_it_was() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 128, 64);
+        feed(
+            &mut p,
+            egfx::CMDID_SOLID_FILL,
+            &solid_fill_body(1, [0, 0, 0xFF, 0], [0, 0, 128, 64]),
+        );
+        let payload = cavideo_payload_tiles(
+            [0, 0, 128, 64],
+            &[(0, 0, 0), (1, 0, 1)],
+            &[[0x11; 5], [0x00; 5]],
+            &[0x00; 8],
+        );
+        let body = wts1_body(egfx::CODECID_CAVIDEO, [0, 0, 128, 64], &payload);
+        assert!(feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &body).is_empty());
+        map_surface(&mut p, 1, 0, 0);
+        let (fb, _) = flush(&mut p);
+        let all = region(
+            &fb,
+            &FrameUpdate {
+                x: 0,
+                y: 0,
+                width: 128,
+                height: 64,
+            },
+        );
+        assert_eq!(all, [0xFF, 0, 0, 255].repeat(128 * 64));
+    }
+
+    #[test]
+    fn wts1_remotefx_keeps_the_surface_pixels_outside_its_region_and_tiles() {
+        let mut p = GraphicsProcessor::default();
+        create_surface(&mut p, 1, 128, 64);
+        feed(
+            &mut p,
+            egfx::CMDID_SOLID_FILL,
+            &solid_fill_body(1, [0, 0, 0xFF, 0], [0, 0, 128, 64]),
+        );
+        let payload = cavideo_payload_in([0, 0, 32, 64], &[0x00; 8]);
+        let body = wts1_body(egfx::CODECID_CAVIDEO, [0, 0, 128, 64], &payload);
+        assert!(feed(&mut p, egfx::CMDID_WIRE_TO_SURFACE_1, &body).is_empty());
+        map_surface(&mut p, 1, 0, 0);
+        let (fb, _) = flush(&mut p);
+        let px = |x: u16, y: u16| {
+            region(
+                &fb,
+                &FrameUpdate {
+                    x,
+                    y,
+                    width: 1,
+                    height: 1,
+                },
+            )
+        };
+        let grey = vec![128, 128, 128, 255];
+        let red = vec![0xFF, 0, 0, 255];
+        assert_eq!(
+            [
+                px(0, 0),
+                px(31, 63),
+                px(32, 0),
+                px(63, 63),
+                px(64, 0),
+                px(127, 63)
+            ],
+            [
+                grey.clone(),
+                grey,
+                red.clone(),
+                red.clone(),
+                red.clone(),
+                red
+            ],
+            "inside the region, twice; outside the region, twice; outside the tile set, twice"
+        );
     }
 
     #[test]
