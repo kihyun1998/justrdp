@@ -667,9 +667,8 @@ impl GraphicsProcessor {
                     .into());
                 }
                 self.remove_surface(surface_id);
-                if self.total_surface_bytes() + Surface::bytes(width, height)
-                    > MAX_TOTAL_SURFACE_BYTES
-                {
+                let bytes = Surface::bytes(width, height);
+                if self.total_surface_bytes() + bytes > MAX_TOTAL_SURFACE_BYTES {
                     return Err(invalid(
                         "RDPGFX_CREATE_SURFACE_PDU",
                         "total surface allocation exceeds the cap",
@@ -677,11 +676,12 @@ impl GraphicsProcessor {
                     .into());
                 }
                 tracing::debug!(target: "rdp_egfx", surface_id, width, height, "CreateSurface");
+                self.call_spent += bytes;
                 self.surfaces.push(Surface {
                     id: surface_id,
                     width,
                     height,
-                    rgba: vec![0; Surface::bytes(width, height)],
+                    rgba: [0, 0, 0, 255].repeat(bytes / 4),
                     mapped: None,
                     dirty: Vec::new(),
                 });
@@ -1705,6 +1705,26 @@ mod tests {
             calls += 1;
         }
         assert_eq!(calls, 4, "three copies a call");
+    }
+
+    /// Issue #655: a new surface is filled opaque black, which writes every byte, so the fill is
+    /// charged to the call and a message of CreateSurface PDUs pauses too.
+    #[test]
+    fn a_message_of_create_surfaces_pauses_at_its_allowance() {
+        let create = header(egfx::CMDID_CREATE_SURFACE, &create_surface_body(1, 16, 8));
+        let message = egfx::wrap_uncompressed(&create.repeat(10));
+        let mut p = GraphicsProcessor::default();
+        p.begin_call(3 * 16 * 8 * 4);
+        p.process(&message).unwrap();
+        let mut calls = 1;
+        while p.has_pending() {
+            assert!(calls < 100, "resuming makes no progress");
+            p.begin_call(3 * 16 * 8 * 4);
+            p.resume().unwrap();
+            calls += 1;
+        }
+        assert_eq!(calls, 4, "three surfaces a call");
+        assert_eq!(p.surfaces.len(), 1, "each PDU replaced surface 1");
     }
 
     /// Issue #496: with no allowance a message still handles one PDU a call.
@@ -3130,6 +3150,73 @@ mod tests {
         assert_eq!(rgb(&row), vec![[30, 20, 10], GREY, [30, 20, 10], GREY]);
     }
 
+    #[test]
+    fn a_mapped_surface_never_painted_puts_opaque_black_in_the_framebuffer() {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        feed(&mut p, egfx::CMDID_START_FRAME, &[0; 8]);
+        map_surface(&mut p, 1, 0, 0);
+        feed(&mut p, egfx::CMDID_END_FRAME, &[0; 4]);
+        let (fb, frames) = flush(&mut p);
+        let whole = FrameUpdate {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        assert_eq!(frames, vec![whole], "the map delivers the whole surface");
+        assert_eq!(region(&fb, &whole), [0, 0, 0, 255].repeat(64));
+    }
+
+    #[test]
+    fn a_clearcodec_glyph_stored_over_a_never_painted_area_draws_opaque_black_in_its_gaps() {
+        let mut p = confirmed(egfx::CAPVERSION_104);
+        map_surface(&mut p, 1, 0, 0);
+        let mut store = vec![0x01, 0x00, 5, 0];
+        store.extend_from_slice(&clear_layers(&[], &clear_subcodec(1, 0x00, &[10, 20, 30]))[2..]);
+        feed(
+            &mut p,
+            egfx::CMDID_WIRE_TO_SURFACE_1,
+            &clear_wts1([0, 0, 4, 1], &store),
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_SOLID_FILL,
+            &solid_fill_body(1, [0xFF, 0, 0, 0], [0, 1, 4, 2]),
+        );
+        let row = |p: &mut GraphicsProcessor| {
+            let (fb, _) = flush(p);
+            region(
+                &fb,
+                &FrameUpdate {
+                    x: 0,
+                    y: 1,
+                    width: 4,
+                    height: 1,
+                },
+            )
+        };
+        assert_eq!(
+            row(&mut p),
+            [0, 0, 0xFF, 255].repeat(4),
+            "the hit site is blue before the hit"
+        );
+        feed(
+            &mut p,
+            egfx::CMDID_WIRE_TO_SURFACE_1,
+            &clear_wts1([0, 1, 4, 2], &[0x03, 0x01, 5, 0]),
+        );
+        assert_eq!(
+            row(&mut p),
+            [
+                [30, 20, 10, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255]
+            ]
+            .concat()
+        );
+    }
+
     /// ClearCodec subcodec bytes short of a whole subcodec and a raw subcodec larger than its
     /// region are refused through the session path, as above.
     #[test]
@@ -4147,7 +4234,7 @@ mod tests {
     /// `Rlgr(EmptyInput)` and the tile is skipped, so a payload that looks even more minimal
     /// would have quietly asserted nothing. A single zero byte decodes to zero coefficients, so
     /// the tile is flat mid-grey (`128, 128, 128, 255` — `YCbCr(0,0,0)`), which is *visible*
-    /// against a zeroed surface. Being flat, it cannot discriminate a **source-offset** error;
+    /// against the surface's opaque black. Being flat, it cannot discriminate a **source-offset** error;
     /// that is `blit_expresses_a_source_offset_by_slicing_the_tile`'s job here and the corpus
     /// suite's over real tiles.
     fn progressive_one_tile_payload(clip: (u16, u16, u16, u16)) -> Vec<u8> {
@@ -4283,7 +4370,7 @@ mod tests {
             ]
         };
         const GREY: [u8; 4] = [128, 128, 128, 255];
-        const UNTOUCHED: [u8; 4] = [0, 0, 0, 0];
+        const UNTOUCHED: [u8; 4] = [0, 0, 0, 255];
         assert_eq!(px(16, 16), GREY, "the rect's top-left corner");
         assert_eq!(px(47, 47), GREY, "the rect's bottom-right corner");
         assert_eq!(px(15, 16), UNTOUCHED, "one column left of the rect");
