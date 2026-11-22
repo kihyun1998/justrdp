@@ -97,7 +97,7 @@ use justrdp_tokio::{connect, run_session, Credentials, ServerAddr};
 let config: ConnectConfig = /* your GCC, capability and license settings */;
 let credentials = Credentials {
     username: "user".into(),
-    password: "secret".into(),
+    password: String::from("secret").into(),
     domain: None,
 };
 

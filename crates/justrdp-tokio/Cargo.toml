@@ -27,6 +27,7 @@ ring = { workspace = true }
 # NLA authentication (slice-3, ADR-0002): the adapter drives `sspi::credssp::CredSspClient`
 # over the TLS stream; the sans-IO core never sees a TSRequest.
 sspi = { workspace = true }
+zeroize = { workspace = true }
 
 [features]
 # The fuzz seam (#613), off by default: re-exports the WebSocket frame reader and the upgrade

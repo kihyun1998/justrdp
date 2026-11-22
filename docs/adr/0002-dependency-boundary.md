@@ -117,3 +117,24 @@ in `justrdp-tokio` with the rest, and the `fuzz/` crate depends on `justrdp-toki
 close (2026-11-16), shown the cost: `fuzz/Cargo.lock` about 2,300 lines longer and the fuzz
 crate check 21 to 25 s warm, against 10.5 to 16.5 s cold before (#578); the alternative shown
 was moving the two parsers into the core.
+
+## Amendment (2026-11-20, #616): `zeroize` enters the adapter
+
+- Kind: **judgement**. The maintainer chose it on 2026-11-20 in #616; the maintainer reopens it.
+
+`zeroize` is a direct dependency of `justrdp-tokio` and of no other crate. It fits this record's
+terms: leaf (its two dependencies, `serde` and `zeroize_derive`, are both optional, and only
+`zeroize_derive` is on here, turned on by `sspi`), security-critical (it clears a secret from
+memory), non-RDP. It was already in `Cargo.lock` through `sspi`, at 1.8.2, so no crate
+entered the graph.
+
+It holds the host's password: `Credentials::password` is a `zeroize::Zeroizing<String>`. The type
+is in the adapter's public API, so a major release of `zeroize` is a breaking change of
+`justrdp-tokio`. What the choice was made on: under NLA the password goes from `Credentials` into
+one `sspi::Secret`, which zeroes itself, and `ClientInfo.password` is sent empty, so the field was
+the one copy the adapter left unzeroed. What is zeroed on that path is in
+[NLA / CredSSP](../map/territory/nla-credssp.md).
+
+What it did not cover: the secrets below the adapter (the PAA cookie, `ClientInfo.password` under
+Standard RDP Security, `justrdp-security`'s key material) need a decision on those crates' rule
+of no dependency, and are #658's.

@@ -274,8 +274,9 @@ impl<W: ConnectWire> Transport<W> {
 pub struct Credentials {
     /// The account name without domain, e.g. `"rdptest"`.
     pub username: String,
-    /// The account password.
-    pub password: String,
+    /// The account password, zeroed when this value drops. A copy the host made before handing
+    /// it over, or a buffer the `String` left behind by reallocating, is not reached.
+    pub password: zeroize::Zeroizing<String>,
     /// The account's domain (NetBIOS or DNS), or `None` for a local / workgroup account.
     pub domain: Option<String>,
 }
@@ -284,8 +285,7 @@ impl Credentials {
     /// Build the `sspi` auth identity the `CredSspClient` consumes. The `username` field may be a
     /// bare account name (with the domain supplied separately) or already qualified
     /// (`DOMAIN\user` / `user@domain`); an unparseable name surfaces as an [`ConnectFailure::Nla`]
-    /// rather than a panic. The password is moved into an `sspi::Secret` so it is zeroized on drop
-    /// and never logged.
+    /// rather than a panic.
     fn to_sspi(&self) -> Result<SspiCredentials, ConnectFailure> {
         let username = match self.domain.as_deref() {
             Some(domain) => Username::new(&self.username, Some(domain)),
@@ -299,7 +299,7 @@ impl Credentials {
         })?;
         Ok(SspiCredentials::AuthIdentity(AuthIdentity {
             username,
-            password: Secret::new(self.password.clone()),
+            password: Secret::new(String::clone(&self.password)),
         }))
     }
 }
@@ -1964,9 +1964,15 @@ mod tests {
     fn test_credentials() -> Credentials {
         Credentials {
             username: "test".to_string(),
-            password: "test".to_string(),
+            password: "test".to_string().into(),
             domain: None,
         }
+    }
+
+    #[test]
+    fn credentials_password_is_zeroized_on_drop() {
+        fn zeroized_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+        zeroized_on_drop(&test_credentials().password);
     }
 
     /// [`connect`] with the explicit accept-any opt-in the mock-server tests need: the mocks
@@ -3124,7 +3130,9 @@ mod tests {
             std::env::var("JUSTRDP_TEST_GATEWAY_COOKIE").expect("set JUSTRDP_TEST_GATEWAY_COOKIE");
         let credentials = Credentials {
             username: std::env::var("JUSTRDP_TEST_USERNAME").expect("set JUSTRDP_TEST_USERNAME"),
-            password: std::env::var("JUSTRDP_TEST_PASSWORD").expect("set JUSTRDP_TEST_PASSWORD"),
+            password: std::env::var("JUSTRDP_TEST_PASSWORD")
+                .expect("set JUSTRDP_TEST_PASSWORD")
+                .into(),
             domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
         };
 
@@ -3231,7 +3239,7 @@ mod tests {
         });
         let credentials = Credentials {
             username: "test".to_string(),
-            password: PASSWORD.to_string(),
+            password: PASSWORD.to_string().into(),
             domain: None,
         };
 
@@ -11493,7 +11501,8 @@ mod tests {
                 username: std::env::var("JUSTRDP_TEST_USERNAME")
                     .expect("set JUSTRDP_TEST_USERNAME"),
                 password: std::env::var("JUSTRDP_TEST_PASSWORD")
-                    .expect("set JUSTRDP_TEST_PASSWORD"),
+                    .expect("set JUSTRDP_TEST_PASSWORD")
+                    .into(),
                 domain: std::env::var("JUSTRDP_TEST_DOMAIN").ok(),
             }
         }

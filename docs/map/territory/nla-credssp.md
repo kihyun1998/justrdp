@@ -61,8 +61,16 @@ and binding the exchange to the server's public key.
   `run_credssp` that the adapter holds; the machine's `Action::StartNla` carries only the selected protocol and the
   server key it extracted itself. This is why `justrdp-pdu` has no `TSRequest` codec and the
   core hand-rolls none of the CredSSP crypto (ADR-0002).
-- Credentials are host-supplied and `Debug` is implemented by hand so a password
-  never reaches a log.
+- **Credentials are host-supplied and zeroed on drop** (#616). `Credentials::password` is a
+  `zeroize::Zeroizing<String>` (ADR-0002's 2026-11-20 amendment). `Debug` is implemented by hand
+  and `connect`'s tracing span skips the credentials, so a password never reaches a log.
+  - Under NLA the adapter makes one copy: `to_sspi` clones the password into the
+    `sspi::Secret` of the auth identity, and `Secret` derives `ZeroizeOnDrop` (`sspi` 0.23.1,
+    `src/secret.rs`). `ClientInfo.password` is sent empty (`connect.rs`).
+  - Not reached: a copy the host made before handing the password over; a buffer the `String`
+    left behind by reallocating, which `zeroize` 1.8.2 documents it cannot reach; what `sspi`
+    and `rustls` copy inside themselves.
+  - The secrets under Standard RDP Security and on the gateway path are #658's.
 
 ## Code
 
@@ -71,7 +79,8 @@ and binding the exchange to the server's public key.
 - `justrdp/src/connect.rs` — `Action::StartNla`, `Event::NlaComplete`,
   `ConnectStateMachine`
 - `Cargo.toml` — `sspi = "=0.23.1"`, the exact pin ADR-0004 requires (the
-  `[patch.crates-io]` bridge that used to sit here was removed 2026-08-10)
+  `[patch.crates-io]` bridge that used to sit here was removed 2026-08-10); `zeroize = "1.8.2"`, which
+  the adapter's `Cargo.toml` takes for the password's type
 - Stage string: `nla-credssp`
 
 ## Reference behaviour
