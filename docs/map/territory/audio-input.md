@@ -122,6 +122,8 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
 - `crates/justrdp-tokio/src/lib.rs` — `a_signal_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm`,
   `a_signal_pushed_in_alaw_is_what_the_session_records_on_the_real_vm`,
   `the_signal_check_finds_the_pushed_signal_whole_and_nothing_else`, `holds_pushed_signal`,
+  `assert_records_the_pushed_signal`, `pusher_report`,
+  `the_pusher_report_splits_late_ticks_by_where_their_time_went`,
   `pushed_sample`,
   `without_the_capture_flag_the_session_has_no_microphone_on_the_real_vm`,
   `record_a_signal_pushed_as_audio_input`
@@ -212,8 +214,9 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   (#411). With the harness's first pusher, a tokio interval that on Windows ticks to a 15.6 ms
   quantum and now and then missed two or three ticks, packets arrived in bursts of three or four
   and half the PCM and A-law runs lost 10 to 40 ms; paced by its own thread to each 10 ms
-  deadline, A-law recorded whole in 6 runs of 6. PCM still loses whole packets in about two runs
-  of five (13 of 34), though every packet is written to the socket the moment it is pushed, no
+  deadline, A-law recorded whole in 6 runs of 6 and PCM lost whole packets in about two runs of
+  five (13 of 34), in October 2026 (re-measured in #606, below), though every packet is written
+  to the socket the moment it is pushed, no
   read took more than 2 ms to process, and TCP retransmitted no more than the idle host does.
   Pushing 0.5 % slower or faster, single-fragment 5 ms packets (5 of 6 lost), and four vCPUs
   for the VM (8 of 16) did not remove it; neither did MCI recording in the pushed format,
@@ -231,6 +234,23 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   against at most 21 ms in clean runs. The client cannot prevent it: its packets arrive whole
   and on time. A host should still deliver captured audio steadily, since bursts overrun the
   same buffer: the helper keeps no clock and sends what it is given when it is given it.
+- **Re-measured on 2026-11-22/23, both tests fail more often, and most failures follow a late
+  host** (#606). Run one at a time on the Windows 11 VM, A-law passed 15 of 20 runs and PCM 8 of
+  20. In 14 of the 17 failures, this host had not run the harness's pusher thread on time just
+  before the failure point: its worst lateness before that point was 22 to 118 ms, and 327 to 546
+  ms in the three runs whose recording ended short. The ticks it owed went out back to back, the
+  burst this VM drops (above). In the 12 passing runs whose timing was printed, no tick woke more
+  than 15 ms late. The late time was the OS not running the thread: a sleep, even one of zero,
+  ended 20 to 44 ms after it should have, while the waits on the harness's mutexes and the send
+  summed to under 7 ms a run. Host CPU level did not predict it: one A-law run passed with no late
+  tick at 66 to 98 % total CPU through its recording. One sample a second cannot rule CPU out
+  either: in 5 of the 7 host-late failures of one series, the late stretch met the recording's
+  highest CPU sample (46 to 77 %). Why the host stalls the thread is not measured; the host is an
+  i7-14700K (hybrid cores) with the Windows hypervisor under VMware. In one series of 10 runs
+  each, late stretches came in 6 PCM runs and 1 A-law run, which is why PCM failed more there; why
+  the codec would change the host's scheduling is not known either. The other 3 failures (2 A-law,
+  1 PCM) had no late tick before the failure point. They look like the guest overrun above, but
+  ETW was not run for them.
 - **These Data PDUs found a static channel defect**: each DVC fragment has to ride one SVC
   chunk, and until #404 an SVC chunk carried 1,592 data bytes where `[MS-RDPBCGR]` 2.2.6.1
   allows 1,600, so a 1,594-byte fragment straddled two chunks and Windows 11 ended the session
@@ -277,10 +297,11 @@ against the spec, and #404 proves it against a real server, the Windows 11 VM
   ADPCM whole would bring them back: their tags into `ENCODABLE_FORMAT_TAGS`, packets of whole
   blocks, and a live proof. AAC waits on #21's decoder-backend question; GSM 6.10 is not
   encoded.
-- **PCM audio input loses packets on this Windows 11 VM** in about two runs of five, by the
-  guest's audio engine overrunning its endpoint buffer when it skips processing passes (#416,
-  Reference behaviour). Not measured on Windows on hardware; the PCM live test says it fails
-  that often, and why.
+- **Audio input loses packets on this Windows 11 VM**: A-law in 5 runs of 20 and PCM in 12 of
+  20 (#606, 2026-11-23), mostly after this host ran the harness's pusher late, and otherwise, as
+  far as measured, by the guest's audio engine overrunning its endpoint buffer when it skips
+  processing passes (#416, Reference behaviour). Not measured on Windows on hardware; the live
+  tests say how often they fail, and the pusher's timing says which kind a failure is.
 - **8-bit PCM is unmeasured.** Windows 11 offers none, and at the capture rate its packet is
   `FramesPerPacket` × `nBlockAlign` bytes, the size it discards for A-law.
 - **One server.** Only a Windows 11 client SKU has been measured; a Server SKU with the RD

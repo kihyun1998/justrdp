@@ -4210,13 +4210,145 @@ mod tests {
         format: Option<justrdp_pdu::audin::AudioFormat>,
         /// The Data PDUs sent, by length.
         data_lengths: Vec<usize>,
-        /// When, in seconds since recording started, the pusher woke more than 15 ms after a
-        /// tick was due, and by how many milliseconds.
-        late_pushes: Vec<(f64, f64)>,
         /// `open=…;record=…;save=…;close=…`, the MCI return codes the session's script wrote.
         mci_codes: Option<String>,
         /// The WAV the session recorded, as it wrote it to the host's drive.
         wav: Option<Vec<u8>>,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq)]
+    struct PusherTick {
+        due_since_recording_s: f64,
+        asked_ms: f64,
+        slept_ms: f64,
+        woke_late_ms: f64,
+        recording_wait_ms: f64,
+        input_wait_ms: f64,
+        encode_ms: f64,
+        send_ms: f64,
+    }
+
+    fn pusher_report(ticks: &[PusherTick]) -> String {
+        const LATE_MS: f64 = 15.0;
+        let late: Vec<&PusherTick> = ticks.iter().filter(|t| t.woke_late_ms > LATE_MS).collect();
+        let mut out = format!(
+            "pusher: {} ticks, {} woke more than {LATE_MS} ms late",
+            ticks.len(),
+            late.len()
+        );
+        let span = |t: &PusherTick| {
+            t.slept_ms + t.recording_wait_ms + t.input_wait_ms + t.encode_ms + t.send_ms
+        };
+        let parts = |t: &[&PusherTick]| {
+            let sum = |f: fn(&PusherTick) -> f64| t.iter().map(|t| f(t)).sum::<f64>();
+            format!(
+                "sleep past asked {:.1}, recording wait {:.1}, input wait {:.1}, encode {:.1}, \
+                 send {:.1}",
+                sum(|t| (t.slept_ms - t.asked_ms).max(0.0)),
+                sum(|t| t.recording_wait_ms),
+                sum(|t| t.input_wait_ms),
+                sum(|t| t.encode_ms),
+                sum(|t| t.send_ms)
+            )
+        };
+        if let Some(worst) = late
+            .iter()
+            .max_by(|a, b| a.woke_late_ms.total_cmp(&b.woke_late_ms))
+        {
+            out += &format!(
+                ", worst {:.1} ms at {:.2} s",
+                worst.woke_late_ms, worst.due_since_recording_s
+            );
+        }
+        if let Some(slowest) = ticks.iter().max_by(|a, b| span(a).total_cmp(&span(b))) {
+            out += &format!(
+                "\npusher: slowest tick {:.1} ms at {:.2} s (asked {:.1}): {}",
+                span(slowest),
+                slowest.due_since_recording_s,
+                slowest.asked_ms,
+                parts(&[slowest])
+            );
+        }
+        if !late.is_empty() {
+            out += &format!(
+                "\npusher: late ticks' time, ms: {}\npusher: late ticks (s since recording, ms \
+                 late): {:?}",
+                parts(&late),
+                late.iter()
+                    .map(|t| (
+                        (t.due_since_recording_s * 100.0).round() / 100.0,
+                        t.woke_late_ms.round()
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+        out
+    }
+
+    fn push_signal(
+        commands_tx: tokio::sync::mpsc::Sender<SessionCommand>,
+        cancel: CancellationToken,
+        input: std::sync::Arc<std::sync::Mutex<justrdp::audin::AudioInput>>,
+        recording: std::sync::Arc<
+            std::sync::Mutex<Option<(justrdp::DynamicChannelHandle, u16, u32)>>,
+        >,
+    ) -> (Vec<PusherTick>, Vec<usize>) {
+        use std::time::Instant;
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let start = Instant::now();
+        let (mut frame, mut ticks, mut beat) = (0u64, 0u64, 0u32);
+        let mut recording_since = None;
+        let mut timing = Vec::with_capacity(1 << 15);
+        let mut data_lengths = Vec::with_capacity(1 << 15);
+        'pushing: while !cancel.is_cancelled() {
+            beat += 1;
+            let due = start + Duration::from_millis(10) * beat;
+            let asleep = Instant::now();
+            let asked = due.saturating_duration_since(asleep);
+            std::thread::sleep(asked);
+            let woke = Instant::now();
+            let Some((channel, channels, rate)) = *recording.lock().unwrap() else {
+                continue;
+            };
+            let locked = Instant::now();
+            let since = *recording_since.get_or_insert(due);
+            // A tick is a hundredth of a second, and 22,050 frames are not a whole
+            // number of hundredths.
+            ticks += 1;
+            let until = ticks * u64::from(rate) / 100;
+            let samples: Vec<i16> = (frame..until)
+                .flat_map(|n| std::iter::repeat_n(pushed_sample(n), usize::from(channels)))
+                .collect();
+            frame = until;
+            let built = Instant::now();
+            let mut helper = input.lock().unwrap();
+            let taken = Instant::now();
+            let messages = helper.push(&samples);
+            drop(helper);
+            let encoded = Instant::now();
+            for data in messages {
+                if data.first() == Some(&justrdp_pdu::audin::MSG_SNDIN_DATA) {
+                    data_lengths.push(data.len());
+                }
+                if commands_tx
+                    .blocking_send(SessionCommand::DynamicChannelData { channel, data })
+                    .is_err()
+                {
+                    break 'pushing;
+                }
+            }
+            timing.push(PusherTick {
+                due_since_recording_s: (due - since).as_secs_f64(),
+                asked_ms: ms(asked),
+                slept_ms: ms(woke - asleep),
+                woke_late_ms: ms(woke.saturating_duration_since(due)),
+                recording_wait_ms: ms(locked - woke),
+                input_wait_ms: ms(taken - built),
+                encode_ms: ms(built - locked) + ms(encoded - taken),
+                send_ms: ms(encoded.elapsed()),
+            });
+        }
+        (timing, data_lengths)
     }
 
     /// Connect to the audio input VM with `AUDIO_INPUT` registered and a host drive holding a
@@ -4329,58 +4461,13 @@ mod tests {
             // it every ten milliseconds, on a thread of its own that sleeps to each tick's
             // deadline.
             let pusher = {
-                let (commands_tx, cancel, input, recording, run) = (
+                let (commands_tx, cancel, input, recording) = (
                     commands_tx.clone(),
                     cancel.clone(),
                     input.clone(),
                     recording.clone(),
-                    run.clone(),
                 );
-                std::thread::spawn(move || {
-                    let start = std::time::Instant::now();
-                    let (mut frame, mut ticks, mut beat) = (0u64, 0u64, 0u32);
-                    let mut recording_since = None;
-                    while !cancel.is_cancelled() {
-                        beat += 1;
-                        let due = start + Duration::from_millis(10) * beat;
-                        std::thread::sleep(
-                            due.saturating_duration_since(std::time::Instant::now()),
-                        );
-                        let Some((channel, channels, rate)) = *recording.lock().unwrap() else {
-                            continue;
-                        };
-                        let since = *recording_since.get_or_insert(due);
-                        let late = due.elapsed();
-                        if late > Duration::from_millis(15) {
-                            run.lock()
-                                .unwrap()
-                                .late_pushes
-                                .push(((due - since).as_secs_f64(), late.as_secs_f64() * 1000.0));
-                        }
-                        // A tick is a hundredth of a second, and 22,050 frames are not a whole
-                        // number of hundredths.
-                        ticks += 1;
-                        let until = ticks * u64::from(rate) / 100;
-                        let samples: Vec<i16> = (frame..until)
-                            .flat_map(|n| {
-                                std::iter::repeat_n(pushed_sample(n), usize::from(channels))
-                            })
-                            .collect();
-                        frame = until;
-                        let messages = input.lock().unwrap().push(&samples);
-                        for data in messages {
-                            if data.first() == Some(&justrdp_pdu::audin::MSG_SNDIN_DATA) {
-                                run.lock().unwrap().data_lengths.push(data.len());
-                            }
-                            if commands_tx
-                                .blocking_send(SessionCommand::DynamicChannelData { channel, data })
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    }
-                })
+                std::thread::spawn(move || push_signal(commands_tx, cancel, input, recording))
             };
 
             let driver = {
@@ -4586,11 +4673,13 @@ mod tests {
             )
             .await;
             let driven = driver.await.expect("the driver task");
-            pusher.join().expect("the pusher thread");
+            let (timing, data_lengths) = pusher.join().expect("the pusher thread");
+            eprintln!("{}", pusher_report(&timing));
             ended
                 .expect("the session ended within 300 s")
                 .expect("the session ran without a protocol failure");
             let mut run = std::mem::take(&mut *run.lock().unwrap());
+            run.data_lengths = data_lengths;
             let host = host.lock().unwrap();
             let file = |name: &str| {
                 host.drives[&1]
@@ -4742,6 +4831,87 @@ mod tests {
         })
     }
 
+    fn assert_records_the_pushed_signal(run: &AudioInputRun) {
+        let wav = run
+            .wav
+            .as_ref()
+            .expect("the recording reached the host's drive");
+        let rate = run
+            .format
+            .as_ref()
+            .expect("the server opened recording")
+            .samples_per_sec;
+        let found = holds_pushed_signal(wav, rate).unwrap_or_else(|reason| {
+            panic!(
+                "the recording is the pushed signal, nothing dropped or repeated: {reason}; the \
+                 pusher's timing is printed above"
+            )
+        });
+        eprintln!(
+            "the recording is {:.2} s of the pushed signal, each 10 ms matching it at {:.2} or \
+             better",
+            found.seconds, found.worst_correlation
+        );
+    }
+
+    #[test]
+    fn the_pusher_report_splits_late_ticks_by_where_their_time_went() {
+        let on_time = |due_since_recording_s| PusherTick {
+            due_since_recording_s,
+            asked_ms: 9.5,
+            slept_ms: 9.6,
+            woke_late_ms: 0.1,
+            encode_ms: 0.2,
+            send_ms: 0.2,
+            ..PusherTick::default()
+        };
+        let starved = PusherTick {
+            due_since_recording_s: 0.03,
+            slept_ms: 20.0,
+            woke_late_ms: 25.0,
+            input_wait_ms: 1.0,
+            encode_ms: 0.5,
+            send_ms: 0.5,
+            ..PusherTick::default()
+        };
+        let blocked = PusherTick {
+            due_since_recording_s: 0.04,
+            asked_ms: 2.0,
+            slept_ms: 3.0,
+            woke_late_ms: 15.0,
+            send_ms: 30.0,
+            ..PusherTick::default()
+        };
+        let worse = PusherTick {
+            due_since_recording_s: 0.05,
+            slept_ms: 4.0,
+            woke_late_ms: 35.0,
+            recording_wait_ms: 2.0,
+            send_ms: 1.0,
+            ..PusherTick::default()
+        };
+        let report = pusher_report(&[on_time(0.01), on_time(0.02), starved, blocked, worse]);
+        assert_eq!(
+            report,
+            "pusher: 5 ticks, 2 woke more than 15 ms late, worst 35.0 ms at 0.05 s\n\
+             pusher: slowest tick 33.0 ms at 0.04 s (asked 2.0): sleep past asked 1.0, \
+             recording wait 0.0, input wait 0.0, encode 0.0, send 30.0\n\
+             pusher: late ticks' time, ms: sleep past asked 24.0, recording wait 2.0, input wait \
+             1.0, encode 0.5, send 1.5\n\
+             pusher: late ticks (s since recording, ms late): [(0.03, 25.0), (0.05, 35.0)]"
+        );
+        assert_eq!(
+            pusher_report(&[on_time(0.01)]),
+            "pusher: 1 ticks, 0 woke more than 15 ms late\npusher: slowest tick 10.0 ms at 0.01 \
+             s (asked 9.5): sleep past asked 0.1, recording wait 0.0, input wait 0.0, encode \
+             0.2, send 0.2"
+        );
+        assert_eq!(
+            pusher_report(&[]),
+            "pusher: 0 ticks, 0 woke more than 15 ms late"
+        );
+    }
+
     /// Real-VM acceptance for #404: without `INFO_AUDIOCAPTURE` the server opens no
     /// `AUDIO_INPUT` channel, and the session has no capture device for MCI to record from.
     #[tokio::test]
@@ -4808,19 +4978,21 @@ mod tests {
 
     /// Real-VM acceptance for #404: the server opens `AUDIO_INPUT` when the session records,
     /// the helper negotiates PCM and answers its Open, and the signal the host pushes is what the
-    /// session's recording holds, whole, read back over drive redirection. Known to fail in
-    /// about two runs of five: the guest's audio engine skips processing passes and overruns the
-    /// buffer the packets arrive in (#416, `docs/map/territory/audio-input.md`).
+    /// session's recording holds, whole, read back over drive redirection.
     #[tokio::test]
     #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation, \
-                expires around 2027-01) and JUSTRDP_TEST_* env vars; fails in about two runs of \
-                five, the guest's audio engine overrunning its buffer (#416)"]
+                expires around 2027-01) and JUSTRDP_TEST_* env vars; fails in about three runs \
+                of five, mostly after this host runs the pusher late, which its printed timing \
+                shows (#606, #416)"]
     async fn a_signal_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm() {
         let run =
             record_a_signal_pushed_as_audio_input(true, &[justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM])
                 .await;
         assert!(run.channel.is_some(), "the server opened AUDIO_INPUT");
-        let codes = run.mci_codes.expect("the script wrote MCI's return codes");
+        let codes = run
+            .mci_codes
+            .as_deref()
+            .expect("the script wrote MCI's return codes");
         assert!(
             !codes.contains("record=328"),
             "MCI found no capture device (328, MCIERR_WAVE_INPUTSUNSUITABLE): the VM has no \
@@ -4857,23 +5029,7 @@ mod tests {
             "every Data PDU spans more than one drdynvc fragment: {:?}",
             run.data_lengths.first()
         );
-        let wav = run.wav.expect("the recording reached the host's drive");
-        let rate = run
-            .format
-            .expect("the server opened recording")
-            .samples_per_sec;
-        let found = holds_pushed_signal(&wav, rate).unwrap_or_else(|reason| {
-            panic!(
-                "the recording is the pushed signal, nothing dropped or repeated: {reason}; the \
-                 pusher woke late (s since recording, ms) at {:?}",
-                run.late_pushes
-            )
-        });
-        eprintln!(
-            "the recording is {:.2} s of the pushed signal, each 10 ms matching it at {:.2} or \
-             better",
-            found.seconds, found.worst_correlation
-        );
+        assert_records_the_pushed_signal(&run);
     }
 
     /// Real-VM acceptance for #402: a host that lists only A-law answers with the server's one
@@ -4881,13 +5037,18 @@ mod tests {
     /// session's recording holds, whole.
     #[tokio::test]
     #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation, \
-                expires around 2027-01) and JUSTRDP_TEST_* env vars"]
+                expires around 2027-01) and JUSTRDP_TEST_* env vars; fails in about one run of \
+                four, mostly after this host runs the pusher late, which its printed timing \
+                shows (#606)"]
     async fn a_signal_pushed_in_alaw_is_what_the_session_records_on_the_real_vm() {
         use justrdp_pdu::audin::ServerPdu;
         use justrdp_pdu::rdpsnd::WAVE_FORMAT_ALAW;
         let run = record_a_signal_pushed_as_audio_input(true, &[WAVE_FORMAT_ALAW]).await;
         assert!(run.channel.is_some(), "the server opened AUDIO_INPUT");
-        let codes = run.mci_codes.expect("the script wrote MCI's return codes");
+        let codes = run
+            .mci_codes
+            .as_deref()
+            .expect("the script wrote MCI's return codes");
         assert_eq!(codes, "open=0;record=0;save=0;close=0");
         let [alaw] = run.negotiated.as_slice() else {
             panic!("one A-law format answered: {:?}", run.negotiated);
@@ -4922,23 +5083,7 @@ mod tests {
              capture format, one byte a sample: {:?}",
             run.data_lengths.first()
         );
-        let wav = run.wav.expect("the recording reached the host's drive");
-        let rate = run
-            .format
-            .expect("the server opened recording")
-            .samples_per_sec;
-        let found = holds_pushed_signal(&wav, rate).unwrap_or_else(|reason| {
-            panic!(
-                "the recording is the pushed signal, nothing dropped or repeated: {reason}; the \
-                 pusher woke late (s since recording, ms) at {:?}",
-                run.late_pushes
-            )
-        });
-        eprintln!(
-            "the recording is {:.2} s of the pushed signal, each 10 ms matching it at {:.2} or \
-             better",
-            found.seconds, found.worst_correlation
-        );
+        assert_records_the_pushed_signal(&run);
     }
 
     /// Real-VM acceptance for #388: a host that lists only A-law has the server send A-law, and

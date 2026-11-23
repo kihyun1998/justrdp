@@ -771,13 +771,20 @@ right (2026-11-09).
     number of hundredths and pushing `rate ÷ 100` a tick fell 50 frames a second behind at
     A-law's rate (#402). It sleeps to each tick's deadline on an OS thread: a tokio interval on
     Windows ticks to a 15.6 ms quantum and now and then missed two or three ticks, and the burst
-    that followed lost audio on the server (#411). It records when it woke more than 15 ms late,
-    and a failed signal check names those times, so a stall of this host shows as one.
-  - **The PCM audio input test fails in about two runs of five**: the guest's audio engine
-    skips processing passes and overruns the endpoint buffer the PCM packets arrive in, which
-    ETW inside the VM shows as `Audio` event 35, "Read Pointer Overwrite" (#416,
-    [Audio input](audio-input.md), Reference behaviour). Rerun it before reading a failure as a
-    regression; the A-law test recorded whole in every run measured.
+    that followed lost audio on the server (#411). Every run that gets past connecting prints
+    its timing (`pusher_report`) once the pusher stops, whether the session ended well or not:
+    how many ticks woke more than 15 ms late, the slowest tick, and, summed over the late ticks,
+    how long the sleep ran past what it asked, the waits on the `recording` and `input`
+    mutexes, the encoding and `blocking_send` (#606).
+  - **The audio input tests fail often, and the pusher's timing says which kind a failure is**
+    (#606, 2026-11-23: A-law passed 15 of 20 runs, PCM 8 of 20, one at a time). Late ticks just
+    before the failure point, their time in `sleep past asked`, mean this host did not run the
+    pusher thread, and its backlog reached the server as a burst it drops
+    ([Audio input](audio-input.md), Reference behaviour). Host CPU level does not predict it, so a
+    quiet host is no guarantee. No late tick looks like the guest's audio engine overrunning the
+    endpoint buffer, which ETW inside the VM showed as `Audio` event 35, "Read Pointer
+    Overwrite", for PCM (#416); none of #606's three such failures was traced. Rerun before
+    reading either as a regression.
   - **Tracing inside the audio input VM needs an elevated process**: `rdptest` is in
     Administrators and the VM's `ConsentPromptBehaviorAdmin` is 0, so a script started from the
     Run dialog can `Start-Process -Verb RunAs` without a prompt (#416, the maintainer's change,
