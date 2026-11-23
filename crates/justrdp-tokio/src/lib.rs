@@ -4219,6 +4219,7 @@ mod tests {
     #[derive(Debug, Clone, Copy, Default, PartialEq)]
     struct PusherTick {
         due_since_recording_s: f64,
+        inherited_ms: f64,
         asked_ms: f64,
         slept_ms: f64,
         woke_late_ms: f64,
@@ -4230,15 +4231,18 @@ mod tests {
 
     fn pusher_report(ticks: &[PusherTick]) -> String {
         const LATE_MS: f64 = 15.0;
-        let late: Vec<&PusherTick> = ticks.iter().filter(|t| t.woke_late_ms > LATE_MS).collect();
+        let is_late = |t: &PusherTick| t.woke_late_ms > LATE_MS;
+        let late: Vec<&PusherTick> = ticks.iter().filter(|t| is_late(t)).collect();
+        let stretch_starts: Vec<usize> = (0..ticks.len())
+            .filter(|&i| is_late(&ticks[i]) && (i == 0 || !is_late(&ticks[i - 1])))
+            .collect();
         let mut out = format!(
             "pusher: {} ticks, {} woke more than {LATE_MS} ms late",
             ticks.len(),
             late.len()
         );
-        let span = |t: &PusherTick| {
-            t.slept_ms + t.recording_wait_ms + t.input_wait_ms + t.encode_ms + t.send_ms
-        };
+        let work = |t: &PusherTick| t.recording_wait_ms + t.input_wait_ms + t.encode_ms + t.send_ms;
+        let span = |t: &PusherTick| t.slept_ms + work(t);
         let parts = |t: &[&PusherTick]| {
             let sum = |f: fn(&PusherTick) -> f64| t.iter().map(|t| f(t)).sum::<f64>();
             format!(
@@ -4251,6 +4255,8 @@ mod tests {
                 sum(|t| t.send_ms)
             )
         };
+        let s = |t: &PusherTick| (t.due_since_recording_s * 100.0).round() / 100.0;
+        let tenth = |ms: f64| (ms * 10.0).round() / 10.0;
         if let Some(worst) = late
             .iter()
             .max_by(|a, b| a.woke_late_ms.total_cmp(&b.woke_late_ms))
@@ -4262,24 +4268,40 @@ mod tests {
         }
         if let Some(slowest) = ticks.iter().max_by(|a, b| span(a).total_cmp(&span(b))) {
             out += &format!(
-                "\npusher: slowest tick {:.1} ms at {:.2} s (asked {:.1}): {}",
+                "\npusher: slowest tick {:.1} ms at {:.2} s (asked {:.1}, inherited {:.1}): {}",
                 span(slowest),
                 slowest.due_since_recording_s,
                 slowest.asked_ms,
+                slowest.inherited_ms,
                 parts(&[slowest])
             );
         }
         if !late.is_empty() {
             out += &format!(
-                "\npusher: late ticks' time, ms: {}\npusher: late ticks (s since recording, ms \
-                 late): {:?}",
+                "\npusher: late ticks' time, ms: inherited at a late stretch's start {:.1}, {}\n\
+                 pusher: late ticks (s since recording, ms late): {:?}",
+                stretch_starts
+                    .iter()
+                    .map(|&i| ticks[i].inherited_ms)
+                    .sum::<f64>(),
                 parts(&late),
                 late.iter()
-                    .map(|t| (
-                        (t.due_since_recording_s * 100.0).round() / 100.0,
-                        t.woke_late_ms.round()
-                    ))
+                    .map(|t| (s(t), t.woke_late_ms.round()))
                     .collect::<Vec<_>>()
+            );
+        }
+        let carried: Vec<_> = stretch_starts
+            .iter()
+            .filter(|&&i| i > 0 && ticks[i].inherited_ms > 0.0)
+            .map(|&i| {
+                let before = &ticks[i - 1];
+                (s(before), tenth(ticks[i].inherited_ms), tenth(work(before)))
+            })
+            .collect();
+        if !carried.is_empty() {
+            out += &format!(
+                "\npusher: the tick before each late stretch (s since recording, ms it carried \
+                 into the stretch, ms of its waits, encode and send): {carried:?}"
             );
         }
         out
@@ -4339,6 +4361,7 @@ mod tests {
             }
             timing.push(PusherTick {
                 due_since_recording_s: (due - since).as_secs_f64(),
+                inherited_ms: ms(asleep.saturating_duration_since(due)),
                 asked_ms: ms(asked),
                 slept_ms: ms(woke - asleep),
                 woke_late_ms: ms(woke.saturating_duration_since(due)),
@@ -4581,6 +4604,13 @@ mod tests {
                         {
                             eprintln!("AUDIO_INPUT opened as channel {channel}");
                             run_in.lock().unwrap().channel = Some(channel);
+                        }
+                        SessionEvent::DynamicChannelClosed { channel } => {
+                            let mut recording = recording_in.lock().unwrap();
+                            if recording.is_some_and(|(open, ..)| open == channel) {
+                                eprintln!("AUDIO_INPUT channel {channel} closed");
+                                *recording = None;
+                            }
                         }
                         SessionEvent::DynamicChannelData { channel, data } => {
                             if let Ok(pdu) = ServerPdu::decode(&data) {
@@ -4865,46 +4895,74 @@ mod tests {
             send_ms: 0.2,
             ..PusherTick::default()
         };
-        let starved = PusherTick {
+        let sender = PusherTick {
             due_since_recording_s: 0.03,
-            slept_ms: 20.0,
+            asked_ms: 9.5,
+            slept_ms: 9.6,
+            woke_late_ms: 0.1,
+            send_ms: 40.0,
+            ..PusherTick::default()
+        };
+        let behind = |due_since_recording_s, inherited_ms| PusherTick {
+            due_since_recording_s,
+            inherited_ms,
+            slept_ms: 0.1,
+            woke_late_ms: inherited_ms + 0.1,
+            send_ms: 0.2,
+            ..PusherTick::default()
+        };
+        let starved = PusherTick {
+            due_since_recording_s: 0.07,
+            inherited_ms: 1.0,
+            slept_ms: 24.0,
             woke_late_ms: 25.0,
             input_wait_ms: 1.0,
             encode_ms: 0.5,
             send_ms: 0.5,
             ..PusherTick::default()
         };
-        let blocked = PusherTick {
-            due_since_recording_s: 0.04,
-            asked_ms: 2.0,
-            slept_ms: 3.0,
-            woke_late_ms: 15.0,
-            send_ms: 30.0,
-            ..PusherTick::default()
-        };
-        let worse = PusherTick {
-            due_since_recording_s: 0.05,
-            slept_ms: 4.0,
-            woke_late_ms: 35.0,
-            recording_wait_ms: 2.0,
-            send_ms: 1.0,
-            ..PusherTick::default()
-        };
-        let report = pusher_report(&[on_time(0.01), on_time(0.02), starved, blocked, worse]);
+        let report = pusher_report(&[
+            on_time(0.01),
+            on_time(0.02),
+            sender,
+            behind(0.04, 30.1),
+            behind(0.05, 20.4),
+            behind(0.06, 10.7),
+            starved,
+        ]);
         assert_eq!(
             report,
-            "pusher: 5 ticks, 2 woke more than 15 ms late, worst 35.0 ms at 0.05 s\n\
-             pusher: slowest tick 33.0 ms at 0.04 s (asked 2.0): sleep past asked 1.0, \
-             recording wait 0.0, input wait 0.0, encode 0.0, send 30.0\n\
-             pusher: late ticks' time, ms: sleep past asked 24.0, recording wait 2.0, input wait \
-             1.0, encode 0.5, send 1.5\n\
-             pusher: late ticks (s since recording, ms late): [(0.03, 25.0), (0.05, 35.0)]"
+            "pusher: 7 ticks, 3 woke more than 15 ms late, worst 30.2 ms at 0.04 s\n\
+             pusher: slowest tick 49.6 ms at 0.03 s (asked 9.5, inherited 0.0): sleep past asked \
+             0.1, recording wait 0.0, input wait 0.0, encode 0.0, send 40.0\n\
+             pusher: late ticks' time, ms: inherited at a late stretch's start 31.1, sleep past \
+             asked 24.2, recording wait 0.0, input wait 1.0, encode 0.5, send 0.9\n\
+             pusher: late ticks (s since recording, ms late): [(0.04, 30.0), (0.05, 21.0), (0.07, \
+             25.0)]\n\
+             pusher: the tick before each late stretch (s since recording, ms it carried into the \
+             stretch, ms of its waits, encode and send): [(0.03, 30.1, 40.0), (0.06, 1.0, 0.2)]"
+        );
+        let slept_through = PusherTick {
+            due_since_recording_s: 0.02,
+            asked_ms: 9.5,
+            slept_ms: 34.5,
+            woke_late_ms: 25.0,
+            ..PusherTick::default()
+        };
+        assert_eq!(
+            pusher_report(&[on_time(0.01), slept_through]),
+            "pusher: 2 ticks, 1 woke more than 15 ms late, worst 25.0 ms at 0.02 s\n\
+             pusher: slowest tick 34.5 ms at 0.02 s (asked 9.5, inherited 0.0): sleep past asked \
+             25.0, recording wait 0.0, input wait 0.0, encode 0.0, send 0.0\n\
+             pusher: late ticks' time, ms: inherited at a late stretch's start 0.0, sleep past \
+             asked 25.0, recording wait 0.0, input wait 0.0, encode 0.0, send 0.0\n\
+             pusher: late ticks (s since recording, ms late): [(0.02, 25.0)]"
         );
         assert_eq!(
             pusher_report(&[on_time(0.01)]),
             "pusher: 1 ticks, 0 woke more than 15 ms late\npusher: slowest tick 10.0 ms at 0.01 \
-             s (asked 9.5): sleep past asked 0.1, recording wait 0.0, input wait 0.0, encode \
-             0.2, send 0.2"
+             s (asked 9.5, inherited 0.0): sleep past asked 0.1, recording wait 0.0, input wait \
+             0.0, encode 0.2, send 0.2"
         );
         assert_eq!(
             pusher_report(&[]),
@@ -4981,9 +5039,9 @@ mod tests {
     /// session's recording holds, whole, read back over drive redirection.
     #[tokio::test]
     #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation, \
-                expires around 2027-01) and JUSTRDP_TEST_* env vars; fails in about three runs \
-                of five, mostly after this host runs the pusher late, which its printed timing \
-                shows (#606, #416)"]
+                expires around 2027-01) and JUSTRDP_TEST_* env vars; fails often, mostly when \
+                this host runs the pusher late, see docs/map/territory/audio-input.md (#606, \
+                #416)"]
     async fn a_signal_pushed_as_audio_input_is_what_the_session_records_on_the_real_vm() {
         let run =
             record_a_signal_pushed_as_audio_input(true, &[justrdp_pdu::rdpsnd::WAVE_FORMAT_PCM])
@@ -5037,9 +5095,8 @@ mod tests {
     /// session's recording holds, whole.
     #[tokio::test]
     #[ignore = "requires the audio input VM at 192.168.136.163:3389 (Windows 11 evaluation, \
-                expires around 2027-01) and JUSTRDP_TEST_* env vars; fails in about one run of \
-                four, mostly after this host runs the pusher late, which its printed timing \
-                shows (#606)"]
+                expires around 2027-01) and JUSTRDP_TEST_* env vars; fails often, mostly when \
+                this host runs the pusher late, see docs/map/territory/audio-input.md (#606)"]
     async fn a_signal_pushed_in_alaw_is_what_the_session_records_on_the_real_vm() {
         use justrdp_pdu::audin::ServerPdu;
         use justrdp_pdu::rdpsnd::WAVE_FORMAT_ALAW;
