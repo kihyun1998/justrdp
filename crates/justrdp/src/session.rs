@@ -790,7 +790,9 @@ impl SessionStateMachine {
     /// Why the session ended, as far as the server said (issue #42). The adapter calls this
     /// when the transport closes: a recorded Set Error Info code is the attribution, then an
     /// MCS ultimatum, then an X.224 Disconnect Request — the higher layer's word outranks the
-    /// lower's; with none of them, the close is [`DisconnectReason::UnexpectedDisconnect`].
+    /// lower's; with none of them, the close is [`DisconnectReason::UnexpectedDisconnect`]. An
+    /// adapter that learns why the transport ended below RDP, as from an RD Gateway's close
+    /// status, reports it in place of that last answer ([`DisconnectReason::GatewayClosed`]).
     pub fn disconnect_reason(&self) -> DisconnectReason {
         if let Some(info) = self.error_info {
             DisconnectReason::ServerDisconnected(ServerDisconnectCause::ErrorInfo(info))

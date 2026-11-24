@@ -138,6 +138,7 @@ enum Ended {
     Eof,
     /// The tunnel failed; every later read reports it.
     Error(io::ErrorKind, String),
+    Closed(u32),
 }
 
 /// The byte stream to the target server through an RD Gateway: what is written goes out in
@@ -185,6 +186,34 @@ impl std::fmt::Debug for GatewayStream {
     }
 }
 
+/// The error inside a read or write error of a [`GatewayStream`] whose gateway closed the
+/// Gateway Channel with a non-zero status. [`GatewayClosed::from_io_error`] recovers it, through
+/// any stream that hands the error on unchanged, as the target's TLS stream does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayClosed {
+    /// The close packet's `statusCode`, an HRESULT, as the gateway sent it.
+    pub status: u32,
+}
+
+impl GatewayClosed {
+    /// The gateway's close that `error` carries, if it carries one.
+    pub fn from_io_error(error: &io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref::<Self>().copied()
+    }
+}
+
+impl std::fmt::Display for GatewayClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the RD Gateway closed the channel with status {:#010x}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for GatewayClosed {}
+
 impl GatewayStream {
     /// What the gateway granted with the Gateway Channel: the tunnel and channel ids, the
     /// negotiated capabilities, the redirection flags of its policy, and the idle timeout.
@@ -193,7 +222,8 @@ impl GatewayStream {
     }
 
     /// The `statusCode` of the packet the gateway closed the Gateway Channel with, an HRESULT,
-    /// once it has. A read reports a non-zero one as an error; this is the code itself.
+    /// once it has. A read and a write report a non-zero one as an error carrying a
+    /// [`GatewayClosed`]; this is the code itself.
     pub fn close_status(&self) -> Option<u32> {
         self.closed
     }
@@ -342,10 +372,7 @@ impl GatewayStream {
         }
         self.ended = match self.closed {
             Some(0) => Some(Ended::Eof),
-            Some(code) => Some(Ended::Error(
-                io::ErrorKind::ConnectionAborted,
-                format!("the RD Gateway closed the channel with status {code:#010x}"),
-            )),
+            Some(status) => Some(Ended::Closed(status)),
             None if self.io_ended => Some(Ended::Eof),
             None => None,
         };
@@ -401,6 +428,12 @@ impl AsyncRead for GatewayStream {
                 Some(Ended::Error(kind, message)) => {
                     return Poll::Ready(Err(io::Error::new(*kind, message.clone())));
                 }
+                Some(Ended::Closed(status)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        GatewayClosed { status: *status },
+                    )));
+                }
                 None => {}
             }
             // Past the limit, reading waits for the replies to drain.
@@ -423,6 +456,12 @@ impl AsyncWrite for GatewayStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if let Some(Ended::Closed(status)) = this.ended {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                GatewayClosed { status },
+            )));
+        }
         if this.ended.is_some() || this.close_sent {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -978,7 +1017,7 @@ pub(crate) mod tests {
     }
 
     /// Open a tunnel against a stand-in gateway that grants everything. Returns both ends.
-    async fn opened() -> (GatewayStream, StandIn<DuplexStream>) {
+    pub(crate) async fn opened() -> (GatewayStream, StandIn<DuplexStream>) {
         let (client, mut gateway) = pipe();
         let serve = tokio::spawn(async move {
             gateway.upgrade().await;
@@ -1222,13 +1261,29 @@ pub(crate) mod tests {
             "the RD Gateway closed the channel with status 0x800759f8"
         );
         assert_eq!(
-            stream.write(b"x").await.unwrap_err().kind(),
-            io::ErrorKind::BrokenPipe
+            GatewayClosed::from_io_error(&error),
+            Some(GatewayClosed {
+                status: 0x8007_59F8
+            }),
+            "the status is typed, not only in the text"
+        );
+        let write_error = stream.write(b"x").await.unwrap_err();
+        assert_eq!(write_error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            GatewayClosed::from_io_error(&write_error),
+            Some(GatewayClosed {
+                status: 0x8007_59F8
+            }),
+            "a write after the close carries the status too"
         );
         // The failure is sticky.
+        let again = stream.read_u8().await.unwrap_err();
+        assert_eq!(again.kind(), io::ErrorKind::ConnectionAborted);
         assert_eq!(
-            stream.read_u8().await.unwrap_err().kind(),
-            io::ErrorKind::ConnectionAborted
+            GatewayClosed::from_io_error(&again),
+            Some(GatewayClosed {
+                status: 0x8007_59F8
+            })
         );
         assert_eq!(stream.close_status(), Some(0x8007_59F8));
         // The response went out with the read that saw the close, with no flush from the host.

@@ -140,7 +140,8 @@ growing a third of its size.
   `with_stage_timeout`, `announce_stage`,
   `configure_session_socket`, `Transport`, `SessionStream`, `ConnectOutcome`, `ConnectOptions`,
   `ConnectTimeouts`, `ConnectFailure`, `Credentials`, `ServerAddr`, `run_session`,
-  `run_session_with_input`, `run_session_with_commands`, `SessionCommand`,
+  `run_session_with_input`, `run_session_with_commands`, `drive_session_with_input`,
+  `drive_session_with_commands`, `SessionCommand`,
   `SessionEvent`, `SessionFailure`, `generate_license_entropy`, `write_frame`,
   `OPEN_FRAME_RELEASE`, `OpenFrameRelease`
 - `justrdp-tokio/src/trust.rs` — the injected policy (see

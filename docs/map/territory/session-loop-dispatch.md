@@ -263,8 +263,10 @@ one of its outputs. Neither says what the loop dispatches or in what order.
   Request's `REASON` as they arrive, and `disconnect_reason` returns them in that order:
   `ServerDisconnectCause::ErrorInfo`, then `ProviderUltimatum`, then `DisconnectRequest`. The
   order is a derivation: each layer's word is more specific than the one under it, so the lowest
-  layer's reason says least about why. A Disconnect Request is tested on the TPDU before the Data TPDU is
-  decoded, logged at `rdp_x224` info, and classifies as `DisconnectClass::Unknown` whatever its
+  layer's reason says least about why. Below all three, the adapter puts an RD Gateway's
+  non-zero close status, `DisconnectReason::GatewayClosed` (#622,
+  [RD Gateway](rd-gateway.md)), and only then `UnexpectedDisconnect`. A Disconnect Request is
+  tested on the TPDU before the Data TPDU is decoded, logged at `rdp_x224` info, and classifies as `DisconnectClass::Unknown` whatever its
   reason: no X.224 13.5.3 reason names a reaction the host could take. A truncated one is a
   `SessionError::Decode`.
 
@@ -372,7 +374,7 @@ Measured with throwaway probes and by mutating the adapter's command handler
 
 - [RD Gateway](rd-gateway.md) — inside a tunnel the gateway's keep-alives and pings are
   answered from the stream's read side, so a runner that stops reading stops answering them,
-  and a runner that ends on a read error does not say why the gateway closed.
+  and the gateway's close status reaches the runner only through a read or write error.
 - [Framebuffer & frame delivery](framebuffer-frame-delivery.md) — every bitmap
   update lands there, and the frame-sink contract is shared.
 - [Bitmap codecs](bitmap-codecs.md) — slow-path bitmap updates route here by codec.

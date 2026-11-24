@@ -30,7 +30,14 @@ pub enum ServerDisconnectCause {
 pub enum DisconnectReason {
     /// The server attributed the end before closing: clean and explainable.
     ServerDisconnected(ServerDisconnectCause),
-    /// The transport ended (EOF or a broken connection) with no server-supplied reason.
+    /// The RD Gateway closed the Gateway Channel with a non-zero status (`[MS-TSGU]` 2.2.10.23,
+    /// `HTTP_CLOSE_PACKET`) and the server attributed nothing before it.
+    GatewayClosed {
+        /// The close packet's `statusCode`, an HRESULT, as the gateway sent it.
+        status: u32,
+    },
+    /// The transport ended (EOF or a broken connection) with no server-supplied reason and no
+    /// RD Gateway close status.
     UnexpectedDisconnect,
     /// The host ended the session locally (cancellation) — not a disconnect at all.
     LocalClosed,
@@ -69,6 +76,7 @@ impl DisconnectReason {
             DisconnectReason::ServerDisconnected(ServerDisconnectCause::DisconnectRequest {
                 ..
             })
+            | DisconnectReason::GatewayClosed { .. }
             | DisconnectReason::UnexpectedDisconnect
             | DisconnectReason::LocalClosed => DisconnectClass::Unknown,
         }
@@ -176,6 +184,18 @@ mod tests {
             DisconnectReason::UnexpectedDisconnect.class(),
             DisconnectClass::Unknown
         );
+    }
+
+    /// #622: a gateway's close status is reported as sent; no HRESULT picks a bucket.
+    #[test]
+    fn a_gateway_close_is_unknown_whatever_its_status() {
+        for status in [0x8007_59F8u32, 0x8007_05B4, 0x0000_0001, u32::MAX] {
+            assert_eq!(
+                DisconnectReason::GatewayClosed { status }.class(),
+                DisconnectClass::Unknown,
+                "status {status:#010x}"
+            );
+        }
     }
 
     #[test]

@@ -195,9 +195,21 @@ already holds. See `## Known holes / open` for the rest.
 - **The two directions may run on different tasks.** A reader held back by unsent replies and a
   writer waiting for them share the connection's one write registration, so the stream keeps a
   waker for each and the drain wakes both.
-- **Why the gateway closed is on the stream.** A non-zero close status is the read's error
-  (`ConnectionAborted`, the status in its text), and `GatewayStream::close_status` returns the
-  code. The session runners take the stream by reference, so a host can ask after they return.
+- **Why the gateway closed is the session's terminal value** (#622). A non-zero close status
+  fails every later read with `ConnectionAborted` and every later write with `BrokenPipe`,
+  each carrying a `GatewayClosed`. The write can come first: data that arrived with the close is
+  read before the close is reported, and the runner may answer it, as it answers a `drdynvc`
+  Capabilities Request. The target's TLS stream hands either error on unchanged (`tokio-rustls`
+  0.26.6, `common/mod.rs`, `read_io` and `poll_write`;
+  `a_gateway_close_reaches_the_runner_through_the_targets_tls`), and the session runners
+  recover it with `GatewayClosed::from_io_error` into `DisconnectReason::GatewayClosed`, so
+  they stay generic over the stream. A server attribution that arrived before the close
+  outranks it on a read and on a write, the higher layer's word over the lower's
+  ([Session loop & dispatch](session-loop-dispatch.md)). A close with status 0 is an orderly end
+  and stays an unexpected disconnect. `class()` puts every status in `DisconnectClass::Unknown`:
+  mapping HRESULTs to host reactions was left out of #622 at its confirm stop, and what a
+  Windows gateway sends when it ends a session is not measured. `GatewayStream::close_status`
+  still returns the code.
 - **The client answers keep-alives and does not originate them**, as FreeRDP
   (`rdg_process_keep_alive_packet`). `[MS-TSGU]` 3.3.3.1 and 3.3.6.4 give the client a
   keep-alive timer of its own (15 minutes by default, 8 in the clients note <53> lists). It is
@@ -240,13 +252,14 @@ already holds. See `## Known holes / open` for the rest.
   `GatewayChannel`, `GatewayError`, `GatewayErrorKind`, `ADVERTISED_CAPS`, `MAX_PACKET_LEN`,
   `MAX_DATA_LEN`, `accept_consent`, `decline_consent`
 - `justrdp-tokio/src/gateway.rs` — `open_gateway`, `open_over`, `act`, `host_header`,
-  `announce_up_to`, `GatewayStream`, `close_status`, `GatewayOptions`, `GatewayFailure`,
-  `GatewayFailureKind`, `MAX_PENDING_OUT`, `GATEWAY_CAPTURE_FILE`
+  `announce_up_to`, `GatewayStream`, `close_status`, `GatewayClosed`, `GatewayOptions`,
+  `GatewayFailure`, `GatewayFailureKind`, `MAX_PENDING_OUT`, `GATEWAY_CAPTURE_FILE`
 - `justrdp-tokio/src/websocket.rs` — `upgrade_request`, `parse_upgrade_response`, `accept_for`,
   `base64`, `encode_frame`, `FrameDecoder`, `FrameError`, `UpgradeError`,
   `MAX_UPGRADE_RESPONSE_LEN`
 - `justrdp-tokio/src/lib.rs` — `connect_over_gateway`, `ConnectWire`, `SessionStream`,
-  `relay_gateway`, `a_real_rd_gateway_reaches_the_target_server`
+  `ended_by`, `settle_session_end`, `relay_gateway`, `relay_gateway_closing`,
+  `a_real_rd_gateway_reaches_the_target_server`
 - `fuzz/fuzz_targets/tsgu.rs`, `fuzz/fuzz_targets/gateway.rs`, `fuzz/fuzz_targets/websocket.rs`
 - Stage strings: `gateway-tcp-connect`, `gateway-tls-handshake`, `gateway-websocket-upgrade`,
   `gateway-handshake`, `gateway-tunnel-create`, `gateway-tunnel-auth`, `gateway-channel-create`,
@@ -383,8 +396,10 @@ connect reached session-active.
   service messages, UDP, and HTTP proxies. A service message or a reauth message
   that arrives is skipped; a gateway that then closes for a failed reauthentication says so only
   in its close status.
-- **The session runners do not report why the gateway closed.** A read error ends them as an
-  unexpected disconnect, as for a socket. The host asks `GatewayStream::close_status`.
+- **A write that fails on the gateway's close ends the session before the rest of the data
+  that came with it is read.** A runner reads at most 16 KiB at a time. When that data is
+  longer and the answer to its first part fails, a server attribution further on is never fed,
+  and the end is `GatewayClosed`. Traced, not tested.
 - **No test reaches session-active through a tunnel.** The loopback connect ends after CredSSP,
   where the mock target hangs up, so `ConnectWire`'s two conversions to a `SessionStream` run
   only in the real-gateway test. A session runner over `SessionStream::GatewayTls` is tested

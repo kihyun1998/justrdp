@@ -47,8 +47,8 @@ mod gateway;
 mod trust;
 mod websocket;
 pub use gateway::{
-    GatewayFailure, GatewayFailureKind, GatewayOptions, GatewayStream, STAGE_TCP_CONNECT,
-    STAGE_TLS_HANDSHAKE, STAGE_WEBSOCKET_UPGRADE, open_gateway,
+    GatewayClosed, GatewayFailure, GatewayFailureKind, GatewayOptions, GatewayStream,
+    STAGE_TCP_CONNECT, STAGE_TLS_HANDSHAKE, STAGE_WEBSOCKET_UPGRADE, open_gateway,
 };
 pub use websocket::{FrameError, UpgradeError};
 
@@ -1003,6 +1003,28 @@ impl core::fmt::Display for SessionFailure {
 
 impl core::error::Error for SessionFailure {}
 
+fn ended_by(machine: &SessionStateMachine, gateway: Option<GatewayClosed>) -> DisconnectReason {
+    match (machine.disconnect_reason(), gateway) {
+        (DisconnectReason::UnexpectedDisconnect, Some(GatewayClosed { status })) => {
+            DisconnectReason::GatewayClosed { status }
+        }
+        (reason, _) => reason,
+    }
+}
+
+fn settle_session_end(
+    machine: &SessionStateMachine,
+    ended: Result<DisconnectReason, SessionFailure>,
+) -> Result<DisconnectReason, SessionFailure> {
+    match ended {
+        Err(SessionFailure::Io(e)) => match GatewayClosed::from_io_error(&e) {
+            Some(closed) => Ok(ended_by(machine, Some(closed))),
+            None => Err(SessionFailure::Io(e)),
+        },
+        ended => ended,
+    }
+}
+
 /// Drive the sans-IO [`SessionStateMachine`] over the connected stream: read raw bytes, feed
 /// them to the machine, deliver every decoded [`FrameUpdate`] to `on_frame` **synchronously**,
 /// and write the machine's outbound frames (Deactivation–Reactivation traffic) back to the
@@ -1014,12 +1036,16 @@ impl core::error::Error for SessionFailure {}
 /// `activation.leftover`, and `server` from [`justrdp::ServerAnnouncement::from_capabilities`]
 /// over `activation.server_capabilities`), then pass [`ConnectOutcome::stream`].
 ///
-/// Runs until the transport ends, returning the typed [`DisconnectReason`] (issue #42): the
-/// server's Set Error Info / MCS ultimatum / X.224 Disconnect Request attribution when one
-/// arrived before the close,
-/// [`DisconnectReason::UnexpectedDisconnect`] otherwise. Protocol violations still surface as
-/// `Err`. The future may also simply be dropped (the caller owns cancellation); the machine is
-/// borrowed, so the caller keeps access to its framebuffer afterwards.
+/// Runs until the transport ends, at an orderly close or at a failed read (a reset, a missing
+/// `close_notify`, a dead network), returning the typed [`DisconnectReason`] (issue #42). The
+/// server's Set Error Info / MCS ultimatum / X.224 Disconnect Request attribution, when one
+/// arrived before the end, is the reason. Without one, a read or a write that failed because an
+/// RD Gateway closed the channel with a non-zero status (a [`GatewayClosed`] in the error, which
+/// the target's TLS stream hands on) ends it as [`DisconnectReason::GatewayClosed`] (issue #622).
+/// Any other failed read is [`DisconnectReason::UnexpectedDisconnect`], a gateway close with
+/// status 0 included, and any other failed write is [`SessionFailure::Io`]. Protocol violations
+/// still surface as `Err`. The future may also simply be dropped (the caller owns cancellation);
+/// the machine is borrowed, so the caller keeps access to its framebuffer afterwards.
 pub async fn run_session(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     machine: &mut SessionStateMachine,
@@ -1042,6 +1068,17 @@ pub async fn run_session(
 /// after the session starts, and again whenever a lock LED changes). Closing the channel
 /// disables the input branch; the session keeps running output-only.
 pub async fn run_session_with_input(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    machine: &mut SessionStateMachine,
+    on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
+    on_cursor: impl FnMut(&CursorEvent),
+    input: &mut tokio::sync::mpsc::Receiver<Vec<InputEvent>>,
+) -> Result<DisconnectReason, SessionFailure> {
+    let ended = drive_session_with_input(stream, machine, on_frame, on_cursor, input).await;
+    settle_session_end(machine, ended)
+}
+
+async fn drive_session_with_input(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     machine: &mut SessionStateMachine,
     mut on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
@@ -1143,17 +1180,13 @@ pub async fn run_session_with_input(
             }
             received = stream.read(&mut readbuf), if !resume => {
                 match received {
-                    // Orderly server close: surface whatever the server attributed.
                     Ok(0) => return Ok(machine.disconnect_reason()),
                     Ok(n) => {
                         pending = feed_session(machine, &readbuf[..n])?;
                     }
-                    // A broken read (reset, missing close_notify, dead network) ends the
-                    // session the same way — with the recorded attribution if the server
-                    // got its farewell out first, UnexpectedDisconnect otherwise.
                     Err(e) => {
                         tracing::debug!(error = %e, "session read failed; classifying the disconnect");
-                        return Ok(machine.disconnect_reason());
+                        return Ok(ended_by(machine, GatewayClosed::from_io_error(&e)));
                     }
                 }
             }
@@ -1326,9 +1359,10 @@ pub enum SessionEvent {
 }
 
 /// [`run_session_with_input`] generalized to host *commands* (input + resize) and
-/// **cancel-aware teardown**: when `cancel` fires, the loop returns `Ok(())` promptly without
-/// waiting for server traffic, so a host abandoning a resize mid-cycle (or shutting down) can
-/// never deadlock on the session (issue #8's cancel-safety criterion). Dropping the returned
+/// **cancel-aware teardown**: when `cancel` fires, the loop returns
+/// `Ok(DisconnectReason::LocalClosed)` promptly without waiting for server traffic, so a host
+/// abandoning a resize mid-cycle (or shutting down) can never deadlock on the session (issue #8's
+/// cancel-safety criterion). Dropping the returned
 /// future remains equally safe — the machine is pure and the socket is caller-owned.
 ///
 /// `on_event` receives session milestones ([`SessionEvent::Deactivated`],
@@ -1338,8 +1372,25 @@ pub enum SessionEvent {
 /// [`SessionEvent::ChannelData`], [`SessionEvent::ChannelMessageDropped`],
 /// [`SessionEvent::DynamicChannelOpened`], [`SessionEvent::DynamicChannelData`],
 /// [`SessionEvent::DynamicChannelClosed`]);
-/// `on_frame` and `on_cursor` keep the synchronous sink contracts of [`run_session`].
+/// `on_frame` and `on_cursor` keep the synchronous sink contracts of [`run_session`], and
+/// the end of the transport is attributed as there.
 pub async fn run_session_with_commands(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    machine: &mut SessionStateMachine,
+    on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
+    on_cursor: impl FnMut(&CursorEvent),
+    on_event: impl FnMut(SessionEvent),
+    commands: &mut tokio::sync::mpsc::Receiver<SessionCommand>,
+    cancel: &CancellationToken,
+) -> Result<DisconnectReason, SessionFailure> {
+    let ended = drive_session_with_commands(
+        stream, machine, on_frame, on_cursor, on_event, commands, cancel,
+    )
+    .await;
+    settle_session_end(machine, ended)
+}
+
+async fn drive_session_with_commands(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     machine: &mut SessionStateMachine,
     mut on_frame: impl FnMut(&FrameUpdate, &Framebuffer),
@@ -1426,13 +1477,13 @@ pub async fn run_session_with_commands(
             }
             received = stream.read(&mut readbuf), if !resume => {
                 match received {
-                    Ok(0) => return Ok(machine.disconnect_reason()), // orderly server close
+                    Ok(0) => return Ok(machine.disconnect_reason()),
                     Ok(n) => {
                         pending = feed_session(machine, &readbuf[..n])?;
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "session read failed; classifying the disconnect");
-                        return Ok(machine.disconnect_reason());
+                        return Ok(ended_by(machine, GatewayClosed::from_io_error(&e)));
                     }
                 }
             }
@@ -2916,6 +2967,14 @@ mod tests {
     /// tunnel, dials the target the channel create names, and relays data packets both ways
     /// until either side ends.
     async fn relay_gateway() -> SocketAddr {
+        relay_gateway_with(None).await
+    }
+
+    async fn relay_gateway_closing(close: Arc<tokio::sync::Notify>, status: u32) -> SocketAddr {
+        relay_gateway_with(Some((close, status))).await
+    }
+
+    async fn relay_gateway_with(close: Option<(Arc<tokio::sync::Notify>, u32)>) -> SocketAddr {
         use crate::gateway::tests::StandIn;
         use justrdp_pdu::tsgu::{Packet, PacketHeader};
 
@@ -2963,13 +3022,32 @@ mod tests {
             });
             let mut client = StandIn::new(tokio::io::join(tokio::io::empty(), to_client));
             let mut buf = [0u8; 4096];
-            loop {
-                match from_target.read(&mut buf).await {
-                    Ok(n) if n > 0 => {
-                        let packet = Packet::Data(&buf[..n]).encode().unwrap();
-                        client.send(&packet).await;
+            let closing = async {
+                match &close {
+                    Some((notify, status)) => {
+                        notify.notified().await;
+                        *status
                     }
-                    _ => break,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(closing);
+            loop {
+                tokio::select! {
+                    read = from_target.read(&mut buf) => match read {
+                        Ok(n) if n > 0 => {
+                            let packet = Packet::Data(&buf[..n]).encode().unwrap();
+                            client.send(&packet).await;
+                        }
+                        _ => break,
+                    },
+                    status_code = &mut closing => {
+                        client
+                            .send(&Packet::CloseChannel { status_code }.encode().unwrap())
+                            .await;
+                        let _ = upstream.await;
+                        return;
+                    }
                 }
             }
             upstream.abort();
@@ -13360,6 +13438,244 @@ mod tests {
                 )
             ),
             "expected the Error Info attribution, got {reason:?}"
+        );
+    }
+
+    async fn gateway_terminal_values(packets: &[u8]) -> [justrdp::DisconnectReason; 2] {
+        gateway_session_ends(packets, terminal_value_machine)
+            .await
+            .map(Result::unwrap)
+    }
+
+    async fn gateway_session_ends(
+        packets: &[u8],
+        machine: fn() -> SessionStateMachine,
+    ) -> [Result<justrdp::DisconnectReason, SessionFailure>; 2] {
+        let (mut stream, mut gateway) = crate::gateway::tests::opened().await;
+        gateway.send(packets).await;
+        let by_input = run_session(&mut stream, &mut machine(), |_, _fb| {}, |_| {}).await;
+
+        let (mut stream, mut gateway) = crate::gateway::tests::opened().await;
+        gateway.send(packets).await;
+        let (_commands_tx, mut commands) = tokio::sync::mpsc::channel(1);
+        let by_commands = run_session_with_commands(
+            &mut stream,
+            &mut machine(),
+            |_, _fb| {},
+            |_| {},
+            |_| {},
+            &mut commands,
+            &CancellationToken::new(),
+        )
+        .await;
+        [by_input, by_commands]
+    }
+
+    fn drdynvc_machine() -> SessionStateMachine {
+        let config = justrdp::SessionConfig {
+            user_channel_id: 1007,
+            io_channel_id: 1003,
+            share_id: 0x0001_03EA,
+            desktop_size: (16, 8),
+            capabilities: Vec::new(),
+            server: justrdp::ServerAnnouncement::default(),
+            drdynvc_channel_id: Some(1004),
+            static_channels: Vec::new(),
+            dynamic_channels: Vec::new(),
+            egfx: Default::default(),
+            persistent_bitmaps: Vec::new(),
+        };
+        SessionStateMachine::new(config, Vec::new())
+            .expect("the test desktop size is within MAX_DESKTOP_DIM")
+    }
+
+    fn drdynvc_capabilities_request() -> Vec<u8> {
+        let svc = [
+            0x04, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x50, 0x00, 0x01, 0x00,
+        ];
+        server_io_frame(1004, &svc)
+    }
+
+    fn tunnelled(frame: &[u8]) -> Vec<u8> {
+        justrdp_pdu::tsgu::Packet::Data(frame).encode().unwrap()
+    }
+
+    fn gateway_close(status_code: u32) -> Vec<u8> {
+        justrdp_pdu::tsgu::Packet::CloseChannel { status_code }
+            .encode()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_gateway_close_ends_the_session_with_its_status() {
+        let reasons = gateway_terminal_values(&gateway_close(0x8007_59F8)).await;
+        assert_eq!(
+            reasons,
+            [justrdp::DisconnectReason::GatewayClosed {
+                status: 0x8007_59F8
+            }; 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_attribution_outranks_the_gateway_close_after_it() {
+        let error_info = justrdp_pdu::share::encode_share_data(
+            1002,
+            0x0001_03EA,
+            justrdp_pdu::share::STREAM_MED,
+            justrdp_pdu::share::PDU_TYPE2_SET_ERROR_INFO,
+            &0x0000_000Cu32.to_le_bytes(),
+        );
+        let mut packets = justrdp_pdu::tsgu::Packet::Data(&server_io_frame(1003, &error_info))
+            .encode()
+            .unwrap();
+        packets.extend(gateway_close(0x8007_59F8));
+
+        let reasons = gateway_terminal_values(&packets).await;
+
+        assert_eq!(
+            reasons,
+            [justrdp::DisconnectReason::ServerDisconnected(
+                justrdp::ServerDisconnectCause::ErrorInfo(
+                    justrdp_pdu::errinfo::ErrorInfo::from_u32(0x0000_000C)
+                )
+            ); 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_written_after_the_gateway_close_ends_the_session_with_its_status() {
+        let mut packets = tunnelled(&drdynvc_capabilities_request());
+        packets.extend(gateway_close(0x8007_59F8));
+
+        let ends = gateway_session_ends(&packets, drdynvc_machine).await;
+
+        for end in ends {
+            assert!(
+                matches!(
+                    end,
+                    Ok(justrdp::DisconnectReason::GatewayClosed {
+                        status: 0x8007_59F8
+                    })
+                ),
+                "expected the gateway's status, got {end:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_attribution_outranks_the_gateway_close_a_reply_meets() {
+        let error_info = justrdp_pdu::share::encode_share_data(
+            1002,
+            0x0001_03EA,
+            justrdp_pdu::share::STREAM_MED,
+            justrdp_pdu::share::PDU_TYPE2_SET_ERROR_INFO,
+            &0x0000_000Cu32.to_le_bytes(),
+        );
+        let mut packets = justrdp_pdu::tsgu::Packet::Data(&server_io_frame(1003, &error_info))
+            .encode()
+            .unwrap();
+        packets.extend(tunnelled(&drdynvc_capabilities_request()));
+        packets.extend(gateway_close(0x8007_59F8));
+
+        let ends = gateway_session_ends(&packets, drdynvc_machine).await;
+
+        for end in ends {
+            assert!(
+                matches!(
+                    end,
+                    Ok(justrdp::DisconnectReason::ServerDisconnected(
+                        justrdp::ServerDisconnectCause::ErrorInfo(_)
+                    ))
+                ),
+                "expected the Error Info attribution, got {end:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_without_a_gateway_close_is_an_io_failure() {
+        let request = drdynvc_capabilities_request();
+
+        let (writer, peer) = tokio::io::duplex(64);
+        drop(peer);
+        let mut stream = tokio::io::join(request.as_slice(), writer);
+        let by_input = run_session(&mut stream, &mut drdynvc_machine(), |_, _fb| {}, |_| {}).await;
+
+        let (writer, peer) = tokio::io::duplex(64);
+        drop(peer);
+        let mut stream = tokio::io::join(request.as_slice(), writer);
+        let (_commands_tx, mut commands) = tokio::sync::mpsc::channel(1);
+        let by_commands = run_session_with_commands(
+            &mut stream,
+            &mut drdynvc_machine(),
+            |_, _fb| {},
+            |_| {},
+            |_| {},
+            &mut commands,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        for end in [by_input, by_commands] {
+            assert!(
+                matches!(end, Err(SessionFailure::Io(_))),
+                "expected the write's I/O failure, got {end:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gateway_close_with_status_zero_is_an_unexpected_disconnect() {
+        let reasons = gateway_terminal_values(&gateway_close(0)).await;
+        assert_eq!(
+            reasons,
+            [justrdp::DisconnectReason::UnexpectedDisconnect; 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gateway_close_reaches_the_runner_through_the_targets_tls() {
+        let held = Arc::new(tokio::sync::Notify::new());
+        let target = scripted_session_server(Vec::new(), held.clone()).await;
+        let close = Arc::new(tokio::sync::Notify::new());
+        let tunnel = open_gateway(
+            relay_gateway_closing(close.clone(), 0x8007_59F8).await,
+            gateway_config(target),
+            |_| {},
+            async |_: &str| false,
+            GatewayOptions {
+                trust: TrustPolicy::DangerAcceptAny,
+                ..GatewayOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let connector = TlsConnector::from(Arc::new(
+            client_config(&TrustPolicy::DangerAcceptAny, "localhost").unwrap(),
+        ));
+        let tls = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tunnel)
+            .await
+            .unwrap();
+        let mut stream = SessionStream::GatewayTls(Box::new(tls));
+        close.notify_one();
+
+        let reason = run_session(
+            &mut stream,
+            &mut terminal_value_machine(),
+            |_, _fb| {},
+            |_| {},
+        )
+        .await
+        .unwrap();
+        held.notify_one();
+
+        assert_eq!(
+            reason,
+            justrdp::DisconnectReason::GatewayClosed {
+                status: 0x8007_59F8
+            }
         );
     }
 
