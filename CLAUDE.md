@@ -92,8 +92,8 @@ exactly (`=x.y.z`); a bump passes the real-VM suite before it lands (ADR-0004,
 
 ## Core rules
 
-- **Language**: code comments, `CLAUDE.md`, `GLOSSARY.md`, `docs/adr/` and `docs/agents/` in
-  English (LLM token efficiency); other human-facing docs in Korean.
+- **Language**: code comments, `CLAUDE.md`, `GLOSSARY.md`, `docs/adr/`, `docs/agents/` and
+  `docs/map/` in English (LLM token efficiency); other human-facing docs in Korean.
 - **Comments**: a comment is one of: a license header; behaviour forced by an outside dependency,
   platform, vendor or protocol we cannot reshape (Rust's `SAFETY:` on `unsafe` is one); a tool
   directive; a doc comment on a public API; an issue or RFC link for a constraint the code cannot
