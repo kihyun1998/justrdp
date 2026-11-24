@@ -200,8 +200,9 @@ already holds. See `## Known holes / open` for the rest.
   each carrying a `GatewayClosed`. The write can come first: data that arrived with the close is
   read before the close is reported, and the runner may answer it, as it answers a `drdynvc`
   Capabilities Request. The target's TLS stream hands either error on unchanged (`tokio-rustls`
-  0.26.6, `common/mod.rs`, `read_io` and `poll_write`;
-  `a_gateway_close_reaches_the_runner_through_the_targets_tls`), and the session runners
+  0.26.6, `common/mod.rs`, `read_io` and `poll_write`; on a read,
+  `a_gateway_close_reaches_the_runner_through_the_targets_tls`; on a write,
+  `a_reply_written_after_the_gateway_close_ends_the_session_through_the_targets_tls`), and the session runners
   recover it with `GatewayClosed::from_io_error` into `DisconnectReason::GatewayClosed`, so
   they stay generic over the stream. A server attribution that arrived before the close
   outranks it on a read and on a write, the higher layer's word over the lower's
@@ -259,6 +260,7 @@ already holds. See `## Known holes / open` for the rest.
   `MAX_UPGRADE_RESPONSE_LEN`
 - `justrdp-tokio/src/lib.rs` — `connect_over_gateway`, `ConnectWire`, `SessionStream`,
   `ended_by`, `settle_session_end`, `relay_gateway`, `relay_gateway_closing`,
+  `relay_gateway_closing_with_next_data`, `gated_session_server`,
   `a_real_rd_gateway_reaches_the_target_server`
 - `fuzz/fuzz_targets/tsgu.rs`, `fuzz/fuzz_targets/gateway.rs`, `fuzz/fuzz_targets/websocket.rs`
 - Stage strings: `gateway-tcp-connect`, `gateway-tls-handshake`, `gateway-websocket-upgrade`,

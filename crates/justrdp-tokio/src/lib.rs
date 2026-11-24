@@ -2971,10 +2971,33 @@ mod tests {
     }
 
     async fn relay_gateway_closing(close: Arc<tokio::sync::Notify>, status: u32) -> SocketAddr {
-        relay_gateway_with(Some((close, status))).await
+        relay_gateway_with(Some(GatewayClose {
+            notify: close,
+            status,
+            with_next_data: false,
+        }))
+        .await
     }
 
-    async fn relay_gateway_with(close: Option<(Arc<tokio::sync::Notify>, u32)>) -> SocketAddr {
+    async fn relay_gateway_closing_with_next_data(
+        close: Arc<tokio::sync::Notify>,
+        status: u32,
+    ) -> SocketAddr {
+        relay_gateway_with(Some(GatewayClose {
+            notify: close,
+            status,
+            with_next_data: true,
+        }))
+        .await
+    }
+
+    struct GatewayClose {
+        notify: Arc<tokio::sync::Notify>,
+        status: u32,
+        with_next_data: bool,
+    }
+
+    async fn relay_gateway_with(close: Option<GatewayClose>) -> SocketAddr {
         use crate::gateway::tests::StandIn;
         use justrdp_pdu::tsgu::{Packet, PacketHeader};
 
@@ -3024,9 +3047,9 @@ mod tests {
             let mut buf = [0u8; 4096];
             let closing = async {
                 match &close {
-                    Some((notify, status)) => {
-                        notify.notified().await;
-                        *status
+                    Some(close) => {
+                        close.notify.notified().await;
+                        (close.status, close.with_next_data)
                     }
                     None => std::future::pending().await,
                 }
@@ -3034,6 +3057,19 @@ mod tests {
             tokio::pin!(closing);
             loop {
                 tokio::select! {
+                    biased;
+                    (status_code, with_next_data) = &mut closing => {
+                        let mut frame = if with_next_data {
+                            let n = from_target.read(&mut buf).await.unwrap();
+                            Packet::Data(&buf[..n]).encode().unwrap()
+                        } else {
+                            Vec::new()
+                        };
+                        frame.extend(Packet::CloseChannel { status_code }.encode().unwrap());
+                        client.send(&frame).await;
+                        let _ = upstream.await;
+                        return;
+                    }
                     read = from_target.read(&mut buf) => match read {
                         Ok(n) if n > 0 => {
                             let packet = Packet::Data(&buf[..n]).encode().unwrap();
@@ -3041,13 +3077,6 @@ mod tests {
                         }
                         _ => break,
                     },
-                    status_code = &mut closing => {
-                        client
-                            .send(&Packet::CloseChannel { status_code }.encode().unwrap())
-                            .await;
-                        let _ = upstream.await;
-                        return;
-                    }
                 }
             }
             upstream.abort();
@@ -13679,6 +13708,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_reply_written_after_the_gateway_close_ends_the_session_through_the_targets_tls() {
+        let go = Arc::new(tokio::sync::Notify::new());
+        let held = Arc::new(tokio::sync::Notify::new());
+        let target = gated_session_server(
+            Some(go.clone()),
+            vec![(Duration::ZERO, drdynvc_capabilities_request())],
+            held.clone(),
+        )
+        .await;
+        let close = Arc::new(tokio::sync::Notify::new());
+        let tunnel = open_gateway(
+            relay_gateway_closing_with_next_data(close.clone(), 0x8007_59F8).await,
+            gateway_config(target),
+            |_| {},
+            async |_: &str| false,
+            GatewayOptions {
+                trust: TrustPolicy::DangerAcceptAny,
+                ..GatewayOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let connector = TlsConnector::from(Arc::new(
+            client_config(&TrustPolicy::DangerAcceptAny, "localhost").unwrap(),
+        ));
+        let tls = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tunnel)
+            .await
+            .unwrap();
+        let mut stream = SessionStream::GatewayTls(Box::new(tls));
+        close.notify_one();
+        go.notify_one();
+
+        let end = run_session(&mut stream, &mut drdynvc_machine(), |_, _fb| {}, |_| {}).await;
+        held.notify_one();
+
+        assert!(
+            matches!(
+                end,
+                Ok(justrdp::DisconnectReason::GatewayClosed {
+                    status: 0x8007_59F8
+                })
+            ),
+            "expected the gateway's status, got {end:?}"
+        );
+    }
+
     /// A server→client MCS Send Data Indication frame on `channel` (initiator 1002), TPKT
     /// framed — the transport every slow-path Share PDU rides.
     fn server_io_frame(channel: u16, payload: &[u8]) -> Vec<u8> {
@@ -13698,6 +13775,14 @@ mod tests {
         script: Vec<(Duration, Vec<u8>)>,
         done: Arc<tokio::sync::Notify>,
     ) -> SocketAddr {
+        gated_session_server(None, script, done).await
+    }
+
+    async fn gated_session_server(
+        go: Option<Arc<tokio::sync::Notify>>,
+        script: Vec<(Duration, Vec<u8>)>,
+        done: Arc<tokio::sync::Notify>,
+    ) -> SocketAddr {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.der().clone();
         let key = ck.signing_key.serialize_der();
@@ -13707,6 +13792,9 @@ mod tests {
         tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
             let mut tls = acceptor.accept(sock).await.unwrap();
+            if let Some(go) = go {
+                go.notified().await;
+            }
             for (delay, frame) in script {
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
